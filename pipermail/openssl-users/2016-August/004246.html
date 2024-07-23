@@ -1,0 +1,305 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] OCSP verification issue
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20OCSP%20verification%20issue&In-Reply-To=%3C998F44A4-0E4B-48C3-95CE-9BA8ECC84CE3%40amzn.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004245.html">
+   <LINK REL="Next"  HREF="004247.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] OCSP verification issue</H1>
+    <B>Peter Bowen</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20OCSP%20verification%20issue&In-Reply-To=%3C998F44A4-0E4B-48C3-95CE-9BA8ECC84CE3%40amzn.com%3E"
+       TITLE="[openssl-users] OCSP verification issue">pzb at amzn.com
+       </A><BR>
+    <I>Fri Aug 19 03:41:59 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004245.html">[openssl-users] _armv7_tick  undefined instruction error
+</A></li>
+        <LI>Next message: <A HREF="004247.html">[openssl-users] OpenSSL FOM 2.0.12 - Windows Compliance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4246">[ date ]</a>
+              <a href="thread.html#4246">[ thread ]</a>
+              <a href="subject.html#4246">[ subject ]</a>
+              <a href="author.html#4246">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I recently ran into a bug with verification of OCSP responses that appears to be in all versions of OpenSSL (including current 1.1.0 builds).
+
+RFC 6960 and its predecessor 2560 allow that the response may be signed by the key for &quot;the CA who issued the certificate in question&#8221; (section 2.2).  In this case it should not be necessary to include any certs in the basicResponse, as the signature can be validated using the public key used to validate the certificate whose status is being checked.
+
+While this is contemplated by the RFCs, OpenSSL fails in certain cases if no certificates are provided in the response. If there are at least two intermediate CAs in the certificate chain between a trust anchor and end entity certificate, then OCSP_basic_verify will return a certificate verify error.
+
+The code below reproduces the failure and demonstrates that reducing the path length from anchor to end entity certificate resolves the issue as does adding a certificate from the trust anchor to the first CA to the response.
+
+I think the correct behaviour would be to check if the issuer of the certificate matches the signer of the OCSP response and, if so, simply skip the X509_verify_cert check.
+
+Thanks,
+Peter
+
+#!/usr/bin/env ruby
+# Copyright 2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+# this file except in compliance with the License.  You can obtain a copy
+# in the file LICENSE in the source distribution or at
+# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+
+require 'openssl'
+require 'base64'
+require 'open3'
+
+# Ruby has no to_text method for OCSP responses, so shell out
+def ocsp_to_text(ocsp_der)
+  # Figure out if our base64 uses -D or -d to decode
+  %x/echo | base64 -D/
+  if $? == 0
+    dparam=&quot;-D&quot;
+  else
+    dparam=&quot;-d&quot;
+  end
+
+  out = &quot;&quot;
+  Open3::popen2(&quot;/bin/bash -t&quot;) do |i, o, t|
+    i.puts(&quot;openssl ocsp -noverify -text -respin &lt;(echo #{Base64.strict_encode64(ocsp_der)} | base64 #{dparam})&quot;)
+    o.each{|l|out += l}
+  end
+  out
+end
+
+# Set up Names and Keys for all the certs
+nodes = {
+  :root =&gt; {
+    :name =&gt; OpenSSL::X509::Name.new([[&quot;C&quot;, &quot;US&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;O&quot;, &quot;Beyond Hypersecure Inc&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;CN&quot;, &quot;Beyond Hypersecure Root CA&quot;, OpenSSL::ASN1::PRINTABLESTRING]]),
+    :key =&gt; OpenSSL::PKey::RSA.new(2048)
+  },
+  :ca1 =&gt; {
+    :name =&gt; OpenSSL::X509::Name.new([[&quot;C&quot;, &quot;US&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;O&quot;, &quot;Beyond Hypersecure Inc&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;CN&quot;, &quot;Beyond Hypersecure Partner CA&quot;, OpenSSL::ASN1::PRINTABLESTRING]]),
+    :key =&gt; OpenSSL::PKey::RSA.new(2048)
+  },
+  :ca2 =&gt; {
+    :name =&gt; OpenSSL::X509::Name.new([[&quot;C&quot;, &quot;US&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;O&quot;, &quot;HyperCyberHost LLC&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;CN&quot;, &quot;HyperCyberHost Server CA&quot;, OpenSSL::ASN1::PRINTABLESTRING]]),
+    :key =&gt; OpenSSL::PKey::RSA.new(2048)
+  },
+  :ee =&gt; {
+    :name =&gt; OpenSSL::X509::Name.new([[&quot;C&quot;, &quot;US&quot;, OpenSSL::ASN1::PRINTABLESTRING],
+              [&quot;CN&quot;, &quot;localdemo.sslmap.com&quot;, OpenSSL::ASN1::PRINTABLESTRING]]),
+    :key =&gt; OpenSSL::PKey::RSA.new(2048),
+    :sans =&gt; &quot;DNS:localdemo.sslmap.com&quot;
+  }
+}
+
+# Generate all the certs
+root_cert = OpenSSL::X509::Certificate.new
+root_cert.version = 0x2
+root_cert.serial = 0x0
+root_cert.not_before = Time.new(2004,01,01,00,00,01)
+root_cert.not_after =  Time.new(2028,12,31,23,59,59)
+root_cert.subject = nodes[:root][:name]
+root_cert.issuer = root_cert.subject
+root_cert.public_key = nodes[:root][:key]
+ef = OpenSSL::X509::ExtensionFactory.new
+ef.subject_certificate = root_cert
+ef.issuer_certificate = root_cert
+root_cert.add_extension(ef.create_extension(&quot;subjectKeyIdentifier&quot;, &quot;hash&quot;, false))
+root_cert.add_extension(ef.create_extension(&quot;basicConstraints&quot;, &quot;CA:TRUE&quot;, true))
+root_cert.add_extension(ef.create_extension(&quot;keyUsage&quot;,&quot;digitalSignature, keyCertSign, cRLSign&quot;, true))
+root_cert.sign(nodes[:root][:key], OpenSSL::Digest::SHA256.new)
+
+puts root_cert.to_text
+puts root_cert.to_pem
+
+ca1_cert = OpenSSL::X509::Certificate.new
+ca1_cert.version = 0x2
+ca1_cert.serial = 0xa
+ca1_cert.not_before = Time.new(2011,01,01,00,00,01)
+ca1_cert.not_after =  Time.new(2020,12,31,23,59,59)
+ca1_cert.subject = nodes[:ca1][:name] 
+ca1_cert.issuer = root_cert.subject
+ca1_cert.public_key = nodes[:ca1][:key]
+ef = OpenSSL::X509::ExtensionFactory.new
+ef.config = OpenSSL::Config.parse('
+[polsect]
+policyIdentifier = 2.5.29.32.0
+CPS.1=&quot;<A HREF="http://beyondhypersecure.example.com/cps">http://beyondhypersecure.example.com/cps</A>&quot;
+')
+ef.subject_certificate = ca1_cert
+ef.issuer_certificate = root_cert
+ca1_cert.add_extension(ef.create_extension(&quot;subjectKeyIdentifier&quot;, &quot;hash&quot;, false))
+ca1_cert.add_extension(ef.create_extension(&quot;authorityKeyIdentifier&quot;, &quot;keyid:always&quot;, false))
+ca1_cert.add_extension(ef.create_extension(&quot;basicConstraints&quot;, &quot;CA:TRUE&quot;, true))
+ca1_cert.add_extension(ef.create_extension(&quot;certificatePolicies&quot;,&quot;2.5.29.32.0&quot;))
+ca1_cert.add_extension(ef.create_extension(&quot;keyUsage&quot;,&quot;digitalSignature, keyCertSign, cRLSign&quot;, true))
+ca1_cert.add_extension(ef.create_extension(&quot;authorityInfoAccess&quot;,&quot;caIssuers;URI:<A HREF="http://beyondhypersecure.example.com/root.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com">http://beyondhypersecure.example.com/root.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com</A>&quot;))
+ca1_cert.add_extension(ef.create_extension(&quot;crlDistributionPoints&quot;,&quot;URI:<A HREF="http://beyondhypersecure.example.com/root.crl">http://beyondhypersecure.example.com/root.crl</A>&quot;))
+ca1_cert.sign(nodes[:root][:key], OpenSSL::Digest::SHA256.new)
+
+puts ca1_cert.to_text
+puts ca1_cert.to_pem
+
+ca2_cert = OpenSSL::X509::Certificate.new
+ca2_cert.version = 0x2
+ca2_cert.serial = 0xfb
+ca2_cert.not_before = Time.new(2012,01,01,00,00,01)
+ca2_cert.not_after =  Time.new(2018,12,31,23,59,59)
+ca2_cert.subject = nodes[:ca2][:name] 
+ca2_cert.issuer = ca1_cert.subject
+ca2_cert.public_key = nodes[:ca2][:key]
+ef = OpenSSL::X509::ExtensionFactory.new
+ef.config = OpenSSL::Config.parse('
+[polsect]
+policyIdentifier = 2.5.29.32.0
+CPS.1=&quot;<A HREF="http://beyondhypersecure.example.com/cps">http://beyondhypersecure.example.com/cps</A>&quot;
+')
+ef.subject_certificate = ca2_cert
+ef.issuer_certificate = ca1_cert
+ca2_cert.add_extension(ef.create_extension(&quot;subjectKeyIdentifier&quot;, &quot;hash&quot;, false))
+ca2_cert.add_extension(ef.create_extension(&quot;authorityKeyIdentifier&quot;, &quot;keyid:always&quot;, false))
+ca2_cert.add_extension(ef.create_extension(&quot;basicConstraints&quot;, &quot;CA:TRUE&quot;, true))
+ca2_cert.add_extension(ef.create_extension(&quot;certificatePolicies&quot;,&quot;2.5.29.32.0&quot;))
+ca2_cert.add_extension(ef.create_extension(&quot;keyUsage&quot;,&quot;digitalSignature, keyCertSign, cRLSign&quot;, true))
+ca2_cert.add_extension(ef.create_extension(&quot;authorityInfoAccess&quot;,&quot;caIssuers;URI:<A HREF="http://beyondhypersecure.example.com/ca1.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com">http://beyondhypersecure.example.com/ca1.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com</A>&quot;))
+ca2_cert.add_extension(ef.create_extension(&quot;crlDistributionPoints&quot;,&quot;URI:<A HREF="http://beyondhypersecure.example.com/ca1.crl">http://beyondhypersecure.example.com/ca1.crl</A>&quot;))
+ca2_cert.sign(nodes[:ca1][:key], OpenSSL::Digest::SHA256.new)
+
+puts ca2_cert.to_text
+puts ca2_cert.to_pem
+
+ee_cert = OpenSSL::X509::Certificate.new
+ee_cert.version = 0x2
+ee_cert.serial = OpenSSL::BN.rand(64, -1, 0)
+ee_cert.not_before = Time.new(2015,02,26,16,00,00)
+ee_cert.not_after =  Time.new(2016,02,28,15,59,59)
+ee_cert.subject = nodes[:ee][:name]
+ee_cert.issuer = ca2_cert.subject
+ee_cert.public_key = nodes[:ee][:key]
+ef = OpenSSL::X509::ExtensionFactory.new
+ef.config = OpenSSL::Config.parse('
+[polsect]
+policyIdentifier = 2.23.140.1.2.1
+CPS.1=&quot;<A HREF="http://beyondhypersecure.example.com/cps">http://beyondhypersecure.example.com/cps</A>&quot;
+')
+ef.subject_certificate = ee_cert 
+ef.issuer_certificate = ca2_cert
+ee_cert.add_extension(ef.create_extension(&quot;authorityKeyIdentifier&quot;, &quot;keyid:always&quot;, false))
+ee_cert.add_extension(ef.create_extension(&quot;certificatePolicies&quot;,&quot;@polsect&quot;))
+ee_cert.add_extension(ef.create_extension(&quot;subjectAltName&quot;,nodes[:ee][:sans]))
+ee_cert.add_extension(ef.create_extension(&quot;keyUsage&quot;,&quot;digitalSignature,keyEncipherment&quot;, true))
+ee_cert.add_extension(ef.create_extension(&quot;extendedKeyUsage&quot;, &quot;serverAuth, clientAuth&quot;))
+ee_cert.add_extension(ef.create_extension(&quot;crlDistributionPoints&quot;,&quot;URI:<A HREF="http://beyondhypersecure.example.com/ca2.crl">http://beyondhypersecure.example.com/ca2.crl</A>&quot;))
+ee_cert.add_extension(ef.create_extension(&quot;authorityInfoAccess&quot;,&quot;caIssuers;URI:<A HREF="http://beyondhypersecure.example.com/ca2.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com">http://beyondhypersecure.example.com/ca2.cer,OCSP;URI:http://ocsp.beyondhypersecure.example.com</A>&quot;))
+ee_cert.sign(nodes[:ca2][:key], OpenSSL::Digest::SHA256.new)
+
+puts nodes[:ee][:key].to_text
+puts nodes[:ee][:key].to_pem
+
+puts ee_cert.to_text
+puts ee_cert.to_pem
+
+bres = OpenSSL::OCSP::BasicResponse.new
+cid = OpenSSL::OCSP::CertificateId.new(ee_cert, ca2_cert, OpenSSL::Digest::SHA1.new)
+bres.add_status(cid, OpenSSL::OCSP::V_CERTSTATUS_GOOD, 0, nil, -1*60*60*6, 60*60*24*3, [])
+bres.sign(ca2_cert, nodes[:ca2][:key], nil, OpenSSL::OCSP::RESPID_KEY)
+ocsp_res = OpenSSL::OCSP::Response.create(OpenSSL::OCSP::RESPONSE_STATUS_SUCCESSFUL, bres)
+ocsp_res_1_der = ocsp_res.to_der
+
+puts ocsp_to_text(ocsp_res_1_der)
+puts &quot;-----BEGIN OCSP RESPONSE 1-----&quot;
+puts Base64.encode64(ocsp_res_1_der)
+puts &quot;-----END OCSP RESPONSE 1-----&quot;
+
+bres.sign(ca2_cert, nodes[:ca2][:key], [ca1_cert], OpenSSL::OCSP::RESPID_KEY)
+ocsp_res = OpenSSL::OCSP::Response.create(OpenSSL::OCSP::RESPONSE_STATUS_SUCCESSFUL, bres)
+ocsp_res_2_der = ocsp_res.to_der
+
+# OCSP_basic_sign adds the signer cert unless OCSP_NOCERTS is passed
+# Ruby doesn't expose OCSP_basic_add1_cert, so instead we rip out the signer
+# cert, just leaving the certs we explicitly passed to OCSP_basic_sign
+# (Yes, this is a horrible hack)
+a = OpenSSL::ASN1.decode(ocsp_res_2_der)
+bres_a = OpenSSL::ASN1.decode(a.value[1].value[0].value[1].value)
+bres_a.value[3].value[0].value.delete_at(0)
+a.value[1].value[0].value[1].value = bres_a.to_der
+ocsp_res_2_der = a.to_der
+
+puts ocsp_to_text(ocsp_res_2_der)
+puts &quot;-----BEGIN OCSP RESPONSE 2-----&quot;
+puts Base64.encode64(ocsp_res_2_der)
+puts &quot;-----END OCSP RESPONSE 2-----&quot;
+
+## Now test
+
+# Encode/decode loops to ensure the client test objects are clean
+trust_store_1 = OpenSSL::X509::Store.new
+[root_cert].each do |c|
+  trust_store_1.add_cert(OpenSSL::X509::Certificate.new(c.to_der))
+end
+
+trust_store_2 = OpenSSL::X509::Store.new
+[root_cert, ca1_cert].each do |c|
+  trust_store_2.add_cert(OpenSSL::X509::Certificate.new(c.to_der))
+end
+
+server_chain = [ee_cert, ca2_cert, ca1_cert].map{|c|OpenSSL::X509::Certificate.new(c.to_der)}
+
+ocsp_res_1 = OpenSSL::OCSP::Response.new(ocsp_res_1_der)
+ocsp_res_2 = OpenSSL::OCSP::Response.new(ocsp_res_2_der)
+
+puts &quot;\nTrying with only root cert in trust store&quot;
+puts ocsp_res_1.basic.verify(server_chain, trust_store_1)
+
+puts &quot;\nTrying with root and issuer of CA cert in trust store&quot;
+puts ocsp_res_1.basic.verify(server_chain, trust_store_2)
+
+puts &quot;\nTrying with only root cert in trust store and with CA1 cert in response&quot;
+puts ocsp_res_2.basic.verify(server_chain, trust_store_1)
+
+puts &quot;\nTrying with root and issuer of CA cert in trust store and with CA1 cert in response&quot;
+puts ocsp_res_2.basic.verify(server_chain, trust_store_2)
+
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004245.html">[openssl-users] _armv7_tick  undefined instruction error
+</A></li>
+	<LI>Next message: <A HREF="004247.html">[openssl-users] OpenSSL FOM 2.0.12 - Windows Compliance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4246">[ date ]</a>
+              <a href="thread.html#4246">[ thread ]</a>
+              <a href="subject.html#4246">[ subject ]</a>
+              <a href="author.html#4246">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

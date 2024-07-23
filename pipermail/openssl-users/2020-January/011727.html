@@ -1,0 +1,192 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Determine that there is no forward progress with non blocking SSL socket
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Determine%20that%20there%20is%20no%20forward%20progress%20with%20non%20blocking%20SSL%0A%20socket&In-Reply-To=%3CBYAPR18MB2664A042B8425CC1FE8E6989F90B0%40BYAPR18MB2664.namprd18.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011723.html">
+   <LINK REL="Next"  HREF="011738.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Determine that there is no forward progress with non blocking SSL socket</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Determine%20that%20there%20is%20no%20forward%20progress%20with%20non%20blocking%20SSL%0A%20socket&In-Reply-To=%3CBYAPR18MB2664A042B8425CC1FE8E6989F90B0%40BYAPR18MB2664.namprd18.prod.outlook.com%3E"
+       TITLE="Determine that there is no forward progress with non blocking SSL socket">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Mon Jan 27 19:03:10 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011723.html">Determine that there is no forward progress with non blocking SSL socket
+</A></li>
+        <LI>Next message: <A HREF="011738.html">Determine that there is no forward progress with non blocking SSL socket
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11727">[ date ]</a>
+              <a href="thread.html#11727">[ thread ]</a>
+              <a href="subject.html#11727">[ subject ]</a>
+              <a href="author.html#11727">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf Of Eran Borovik
+Sent: Monday, January 27, 2020 07:07
+
+&gt;<i> When do I stop? what is the best way to actually determine there can
+</I>&gt;<i> be no more forward progress both on the send and the receive side, and
+</I>&gt;<i> epoll must be used?
+</I>
+...
+
+&gt;<i> I am afraid that if the send buffer is full and there is nothing to receive,
+</I>&gt;<i> I will keep getting WANT_READ for receive, and WANT_WRITE for send until
+</I>&gt;<i> actual data arrives or can be sent which defeats the purpose of epoll.
+</I>
+The following is untested and off the top of my head.
+
+Think of it this way. You have these possible states:
+
+1. You don't want to do anything with the conversation. It can be closed.
+2. You want to receive. There are three possible causes:
+  - You'd like to receive data (or close/error indication) from the peer.
+  - SSL_send returned WANT_READ.
+  - Both of the above are true.
+3. You want to send. There are three possible causes:
+  - You have buffered outbound application data (or shutdown/close) which you
+    haven't been able to send yet.
+  - SSL_receive returned WANT_WRITE.
+  - Both of the above are true.
+4. You want to receive and to send.
+
+So, keep track of the above using a per-conversation pair of want_to_send and want_to_receive variables and use the following algorithm:
+
+
+   /* any time we buffer outbound data, set want_to_send = 1 */
+   want_to_receive = 1 /* at start of conversation, we want data from peer */
+
+   while want_to_send or want_to_receive
+      {
+      /* Wait until we can do something we want to do */
+      do_recv = false, do_send = false
+      if want_to_send and want_to_receive
+         {
+         epoll until socket is readable or writable
+         do_recv = readable
+         do_send = writable
+         }
+      else if want_to_send
+         {
+         epoll until socket is writable
+         do_send = true
+         }
+      else if want_to_receive
+         {
+         epoll until socket is readable
+         do_recv = true
+         }
+
+      /* Now perform I/O */
+      if do_recv
+         {
+         SSL_read(...)
+         if WANT_WRITE
+            want_to_send = true
+         else if WANT_READ
+            want_to_receive = true /* couldn't send enough to clear WANT_WRITE */
+         else if error
+            ...
+         else
+            want_to_receive = false /* maybe, depending on application */
+
+         process_received_data(...)
+         }
+      if do_send
+         {
+         SSL_write(...)
+         if WANT_READ
+            want_to_receive = true
+         else if WANT_WRITE
+            want_to_send = true /* couldn't send enough to clear WANT_WRITE */
+         else if error
+            ...
+         else
+            {
+            update send buffer info
+            if all buffered data sent
+               want_to_send = false /* any pending WANT_WRITE should now be clear */
+            }
+         }
+      }
+   close conversation
+
+Now, in practice, you probably always want to poll on readability even if you're not
+expecting data from the peer, because you'll want to be notified of peer close. And
+you may want to be able to break out of an epoll for readability only in order to send
+data, depending on your application design and requirements. You can do that using a
+timeout and polling the want_to_send state variable, or using an internal channel such
+as a pipe or socket which the polling thread adds to the epoll readable-descriptor set,
+and the sending thread writes a wakeup message to.
+
+It's an open design question if you want to set want_to_receive to false in the do_recv
+body, as I have it above, and then set it back to true if you decide you're not done
+with the conversation in process_received_data; or leave it set to true and set it to
+false only when you've received a close indication from the peer; or possibly some
+other behavior that's appropriate for your application.
+
+
+In brief: at the top of the loop, figure out if you want to try to send, receive, or
+both. The types of I/O you want to do is the union of the application state and the
+OpenSSL WANT_* state. Then poll for all the types of I/O you want, and when the socket
+is available for any of them, attempt that type. Deal with any successful operation,
+and loop.
+
+
+In the &quot;problem case&quot; you described above, this code will discover that you want to
+receive and to send, so it will first poll for either type of availability on the
+socket. If the socket ends up readable, you'll do a receive, which may succeed or
+may return WANT_WRITE or may indicate a peer close or may indicate an error. It could
+also return WANT_READ if it's not able to receive enough TLS data to satisfy a pending
+WANT_READ. In that case we keep want_to_receive set and go around the loop again.
+
+And if the socket is writable (regardless of whether it's also readable), it will try
+to send some of your application data; that will also try to handle any pending
+WANT_WRITE condition. The result might be sending all the application data, sending
+some or none of the application data, satisfying a WANT_WRITE condition, failing to
+send enough to satisfy the WANT_WRITE, getting an error, etc. If we do send some
+application data, we can assume any pending WANT_WRITE from the previous receive
+operation was satisfied.
+
+--
+Michael Wojcik
+Distinguished Engineer, Micro Focus
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011723.html">Determine that there is no forward progress with non blocking SSL socket
+</A></li>
+	<LI>Next message: <A HREF="011738.html">Determine that there is no forward progress with non blocking SSL socket
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11727">[ date ]</a>
+              <a href="thread.html#11727">[ thread ]</a>
+              <a href="subject.html#11727">[ subject ]</a>
+              <a href="author.html#11727">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

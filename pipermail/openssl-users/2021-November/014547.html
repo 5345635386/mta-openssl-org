@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> X509_get_pubkey() in OpenSSL 3.0?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20X509_get_pubkey%28%29%20in%20OpenSSL%203.0%3F&In-Reply-To=%3CSN6PR10MB2653B98CFDD85D879FD81542C78C9%40SN6PR10MB2653.namprd10.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014546.html">
+   <LINK REL="Next"  HREF="014548.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>X509_get_pubkey() in OpenSSL 3.0?</H1>
+    <B>Jason Schultz</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20X509_get_pubkey%28%29%20in%20OpenSSL%203.0%3F&In-Reply-To=%3CSN6PR10MB2653B98CFDD85D879FD81542C78C9%40SN6PR10MB2653.namprd10.prod.outlook.com%3E"
+       TITLE="X509_get_pubkey() in OpenSSL 3.0?">jetson23 at hotmail.com
+       </A><BR>
+    <I>Wed Nov  3 20:32:43 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014546.html">X509_get_pubkey() in OpenSSL 3.0?
+</A></li>
+        <LI>Next message: <A HREF="014548.html">X509_get_pubkey() in OpenSSL 3.0?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14547">[ date ]</a>
+              <a href="thread.html#14547">[ thread ]</a>
+              <a href="subject.html#14547">[ subject ]</a>
+              <a href="author.html#14547">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Victor-
+
+Since the only code that's changed from this working with OpenSSL 1.1.1 is the code we've been talking about in this thread, it's possible that this is causing the problem.
+
+I should explain more what I am doing and how, and also mention that you helped me with this when I was trying to sort things out when porting from 1.0.2 to 1.1.1 over a year ago:
+
+<A HREF="https://www.mail-archive.com/openssl-users@openssl.org/msg87754.html">https://www.mail-archive.com/openssl-users@openssl.org/msg87754.html</A>
+
+To summarize, at application start time I read in all of the certificates in /etc/ssl/certs/ to a trusted store created with X509_STORE_new().
+
+When getting ready to &quot;start&quot; a server (again, leaving a lot of specifics out to avoid getting bogged down in details), I'm doing the processing in the previous messages on this thread. Here are the API calls again, with the changes previously discussed:
+
+
+    ctx = SSL_CTX_new_ex(non_fips_libctx, NULL, TLS_method());
+    SSL_CTX_use_PrivateKey_file(ctx,&lt;keyfile&gt;,SSL_FILETYPE_PEM);
+    SSL_CTX_use_certificate_file(ctx,&lt;certfile&gt;,SSL_FILETYPE_PEM);
+    SSL_CTX_check_private_key(ctx);
+    mycert = SSL_CTX_get0_certificate(ctx);
+    pkey = X509_get_pubkey(mycert);
+
+ After that's done, I make several OpenSSL calls to get things set up the way I want:
+
+        param = X509_VERIFY_PARAM_new();
+        X509_VERIFY_PARAM_set_flags(param, X509_V_FLAG_PARTIAL_CHAIN);
+        X509_STORE_set1_param(ssl_trusted_certs, param);
+        X509_VERIFY_PARAM_free(param);
+
+I call these to treat intermediate certs as trust-anchors, so I can trust an intermediate certificate; ssl_trusted_certs is the aforementioned X509_STORE.
+
+Another call:
+
+        status = SSL_CTX_set1_verify_cert_store(ctx,ssl_trusted_certs);
+
+...is to set the store for verifying peer certificates (in the case of client authentication) to the entire trusted store.
+
+Then this API:
+
+    status = SSL_CTX_set1_chain_cert_store(ctx, ssl_trusted_certs);
+
+...makes sure OpenSSL has access to that entire store to form a full certificate chain to a peer in a handshake. Our certificates are stored one per file, we do not store a full or partial chains in a single file.
+
+Then, the final two calls before I hit the error:
+
+    status = SSL_CTX_set_mode(ctx, SSL_MODE_NO_AUTO_CHAIN);
+    status = SSL_CTX_build_cert_chain(ctx, SSL_BUILD_CHAIN_FLAG_NO_ROOT);
+
+The purpose of the first is to allow self signed certificates to be used by the server. (This is only for testing purposes, but in this particular case where SSL_CTX_build_cert_chain() is throwing errors, I am using a self-signed certificate.) The second is to tell OpenSSL to (even though we have access to the entire chain, including the root) not include the root certificate when building the chain to send during a handshake.
+
+I'm not clear on if the calls I've added to SSL_CTX_get0_certificate(ctx) and X509_get_pubkey(), the latter of which was being used before, are what's causing the problem. The OpenSSL error queue shows the following on the SSL_CTX_build_cert_chain() failure:
+
+00B741558E7F0000:error:0308010C:digital envelope routines:(unknown function):unsupported:crypto/evp/evp_fetch.c:346:Global default library context, Algorithm (SHA1 : 96), Properties (&lt;null&gt;)
+00B741558E7F0000:error:03000072:digital envelope routines:(unknown function):decode error:crypto/x509/x_pubkey.c:444:
+00B741558E7F0000:error:03000072:digital envelope routines:(unknown function):decode error:crypto/x509/x_pubkey.c:444:
+00B741558E7F0000:error:0580006C:x509 certificate routines:(unknown function):unable to get certs public key:crypto/x509/x509_vfy.c:1986:
+00B741558E7F0000:error:0A000086:SSL routines:(unknown function):certificate verify failed:ssl/ssl_cert.c:905:Verify error:unspecified certificate verification error
+
+I'm using the non-FIPS library context in this case, and the first error makes me think I need to load the legacy provider for my non FIPS library context if there are any SHA1 certificates in the X509_store? The one I am using for the server cert is not SHA1, but there are probably some SHA1 certs in /etc/ssl/certs/. I don't see errors when adding those certificates to the store though. I also don't see SHA1 in the list of algorithms provided by the legacy provider in the Wiki.
+
+The next two errors are the same ones that I was getting when attempting to call X509_get_pubkey() before changing the code to get it to work, which is interesting.
+
+Maybe this is what you were trying to explain in your email, but I'm not understanding?
+
+Jason
+
+
+________________________________
+From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; on behalf of Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at dukhovni.org</A>&gt;
+Sent: Wednesday, November 3, 2021 4:47 PM
+To: <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A> &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>&gt;
+Subject: Re: X509_get_pubkey() in OpenSSL 3.0?
+
+On Wed, Nov 03, 2021 at 12:38:51PM +0000, Jason Schultz wrote:
+
+&gt;<i> In any case, things appear to be working now, but I'm hitting an issue
+</I>&gt;<i> later on when calling SSL_CTX_build_cert_chain(). I working on
+</I>&gt;<i> debugging that, I may have to start yet another thread later.
+</I>
+Your mistake is probably in loading a certificate file, rather than
+a certificate chain file.  With the latter, you'd also pick up any
+associated intermediate issuer certificates (e.g. from certbot's
+&quot;fullchain.pem&quot;).
+
+With the intermediate certificates thus obtained, you're far more likely
+to be able to verify the completely server's chain relative to some
+trust store with exclusively or mostly just a bunch of root CAs.
+
+I'd in fact recommend not rebuilding the provided chain, but just
+observing whether it is complete, the user may have good reasons
+for going with some alternative sequence of issuer CAs (e.g. to
+support old Android devices, as with e.g. current Let's Encrypt
+redundant cross cert).  Therefore, per:
+
+    SSL_CTX_build_cert_chain() builds the certificate chain for ctx.
+    Normally this uses the chain store or the verify store if the chain
+    store is not set. If the function is successful the built chain will
+    replace any existing chain. The flags parameter can be set to
+    SSL_BUILD_CHAIN_FLAG_UNTRUSTED to use existing chain certificates as
+    untrusted CAs, SSL_BUILD_CHAIN_FLAG_NO_ROOT to omit the root CA from
+    the built chain, SSL_BUILD_CHAIN_FLAG_CHECK to use all existing
+    chain certificates only to build the chain (effectively sanity
+    checking and rearranging them if necessary), the flag
+    SSL_BUILD_CHAIN_FLAG_IGNORE_ERROR ignores any errors during
+    verification: if flag SSL_BUILD_CHAIN_FLAG_CLEAR_ERROR is also set
+    verification errors are cleared from the error queue. Details of the
+    chain building process are described in &quot;Certification Path
+    Building&quot; in openssl-verification-options(1).
+
+I'd set the flags to:
+
+    SSL_BUILD_CHAIN_FLAG_UNTRUSTED | SSL_BUILD_CHAIN_FLAG_CHECK
+
+if you're sure the service is not DANE TLSA enabled, and there's
+definitely good reason to omit the root CA from the chain, or
+you provide a configuration to let the user make the choice,
+you can also add:
+
+    SSL_BUILD_CHAIN_FLAG_NO_ROOT
+
+which is often, but not always appropriate, and should ideally
+not be unconditionally hardcoded.
+
+Be sure to clear the error queue before starting, and after reporting
+any errors observed.
+
+--
+    Viktor.
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20211103/8a336237/attachment-0001.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20211103/8a336237/attachment-0001.html</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014546.html">X509_get_pubkey() in OpenSSL 3.0?
+</A></li>
+	<LI>Next message: <A HREF="014548.html">X509_get_pubkey() in OpenSSL 3.0?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14547">[ date ]</a>
+              <a href="thread.html#14547">[ thread ]</a>
+              <a href="subject.html#14547">[ subject ]</a>
+              <a href="author.html#14547">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,156 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2016-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Root-Level%20queries%20while%20using%20SSL-connections%0A%20wrapping%20%22sockets%22&In-Reply-To=%3C20161007174701.GN4670%40mournblade.imrryr.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004601.html">
+   <LINK REL="Next"  HREF="004604.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Root-Level%20queries%20while%20using%20SSL-connections%0A%20wrapping%20%22sockets%22&In-Reply-To=%3C20161007174701.GN4670%40mournblade.imrryr.org%3E"
+       TITLE="[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;">openssl-users at dukhovni.org
+       </A><BR>
+    <I>Fri Oct  7 17:47:01 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004601.html">[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;
+</A></li>
+        <LI>Next message: <A HREF="004604.html">[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4602">[ date ]</a>
+              <a href="thread.html#4602">[ thread ]</a>
+              <a href="subject.html#4602">[ subject ]</a>
+              <a href="author.html#4602">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Fri, Oct 07, 2016 at 10:30:06PM +0530, Ajay Garg wrote:
+
+&gt;<i> Ok, so for sending app-payload-bytes, we do a bio_write() to &quot;bio1&quot;,
+</I>&gt;<i> and if &quot;bio1&quot; requires reading from bio2/peer, bio_write() will return
+</I>&gt;<i> SSL_ERROR_WANT_READ (even for blocking sockets). We then read-in some
+</I>&gt;<i> app-payload-encrypted-bytes from device-socket,
+</I>
+No, it will *usually* return SSL_ERROR_WANT_WRITE, that's when you
+write &quot;some&quot; (based on pending data amount from bio2) to the network
+that you read from bio2.  Those writes might be written via a buffer
+you interpose, however it is important to flush that buffer as
+much as possible before attempting any network reads (flush fully
+if the network reads are potentially blocking).
+
+However, it might sometimes return SSL_ERROR_WANT_READ, in which
+case, the SSL layer wants to read, even though the application
+wants to write.  Your job is to do the read on the SSL layer's
+behalf, and then retry the write.
+
+Where &quot;some&quot; is obtained by queried bio2 for the amount of pending
+data.  You can loop reading/sending smaller amounts that if the
+entire amount is too big to write to the target in one go without
+blocking.  Otherwise, you need a large enough write buffer downstream.
+If you can't fully drain bio2's output in one go, just keep the
+socket selected for write and try again later when more space is
+available.
+
+&gt;<i> put them into &quot;bio2&quot;
+</I>&gt;<i> (thus internally fulfilling bio1's need for read), and then again try
+</I>&gt;<i> bio_write() to &quot;bio1&quot; WITH IDENTICAL APP-PAYLOAD-BYTES. If it again
+</I>&gt;<i> returns SSL_ERROR_WANT_READ, we repeat the cycle.
+</I>
+Well, you may not fulfill that need, if you don't drain all the
+pending data, and so the SSL_ERROR_WANT_... may repeat.  What you
+do with bio2 has no direct relationship on the direction of the
+I/O in bio1.  Just keep track of whether the crypto wants to read
+or write, and whether either bio2 or any buffer you interpose
+downstream has pending data.  Then move data between the network
+and bio2 as appropriate.
+
+&gt;<i> For reading app-payload-bytes, we do a bio_read() from &quot;bio1&quot;, and if
+</I>&gt;<i> &quot;bio1&quot; requires writing bytes to bio2/peer, bio_read() will return
+</I>&gt;<i> SSL_ERROR_WANT_WRITE (even for blocking sockets).
+</I>
+No, it will *usually* return SSL_ERROR_WANT_READ, that's when you
+read &quot;some&quot; (based on desired read size from bio2) from the network
+and write the results to bio2.  Those reads might be satisfied from
+a buffer you interpose.
+
+However, it might sometimes return SSL_ERROR_WANT_WRITE, in which
+case, the SSL layer wants to write, even though the application wants
+to read.  Your job is to do the write on the SSL layer's behalf,
+and then retry the read.
+
+&gt;<i> We then pick up the
+</I>&gt;<i> app-payload-encrypted-bytes from &quot;bio2&quot;, transfer them over the wire
+</I>&gt;<i> via device-specific-socket (thus fulfilling bio1's need to send bytes
+</I>&gt;<i> to peer), and then again try bio_read() from &quot;bio1&quot; WITH IDENTICAL
+</I>&gt;<i> APP-PAYLOAD-BYTES. If it again returns SSL_ERROR_WANT_WRITE, we repeat
+</I>&gt;<i> the cycle.
+</I>
+When retrying app-layer reads, you do not need to provide the same
+buffer or read request size on subsequent attempts.
+
+&gt;<i> Obviously, for the above two sub-plots, the only chance of failure if
+</I>&gt;<i> reading/writing bytes fails over the wire.
+</I>&gt;<i> But that is not the norm; if it does happen, then everything will be
+</I>&gt;<i> restarted from scratch (at least by me).
+</I>
+&gt;<i> If yes, then it seems everything can be done fully synchronously for
+</I>&gt;<i> blocking-sockets,
+</I>
+No, synchronous operation will not work.  The network may not be
+ready to receive more data when you're ready to write (network
+layer data), or have more data when you're ready to read.  Use of
+bio-pairs with blocking sockets is highly risky, you'll probably
+dead-lock with some regularity.
+
+&gt;<i> thus eliminating the need of multiple threads,
+</I>
+You don't need threads, an event loop will do.  Indeed an event
+loop is generally better, don't know whether the same bio-pair is
+safe for use by multiple threads.
+
+You just need to be able to perform the equivalent of
+
+	select()/poll()/...
+
+on whatever interface you have for moving data to/from
+the network.
+
+-- 
+	Viktor.
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004601.html">[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;
+</A></li>
+	<LI>Next message: <A HREF="004604.html">[openssl-users] Root-Level queries while using SSL-connections wrapping &quot;sockets&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4602">[ date ]</a>
+              <a href="thread.html#4602">[ thread ]</a>
+              <a href="subject.html#4602">[ subject ]</a>
+              <a href="author.html#4602">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,162 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C2181c43c-2374-5aa1-ba1d-80168f350de8%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012874.html">
+   <LINK REL="Next"  HREF="012877.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C2181c43c-2374-5aa1-ba1d-80168f350de8%40measurement-factory.com%3E"
+       TITLE="SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Tue Aug 18 21:31:55 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012874.html">FIPS canister questions
+</A></li>
+        <LI>Next message: <A HREF="012877.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12875">[ date ]</a>
+              <a href="thread.html#12875">[ thread ]</a>
+              <a href="subject.html#12875">[ subject ]</a>
+              <a href="author.html#12875">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    TLDR: How can we pause the SSL_connect() progress and return to its
+caller after the origin certificate is fetched/decrypted, but before
+OpenSSL starts validating it (so that we can fetch the missing
+intermediate certificates without threads or blocking I/O)?
+ASYNC_pause_job() does not seem to be the right answer.
+
+
+My team is working on an HTTP proxy Squid. Squid does not have the
+luxury of knowing what secure servers it will be talking to (on behalf
+of its clients). Thus, it cannot simply preload _intermediate_
+certificates for servers that do not supply them in their TLS handshakes
+(e.g. <A HREF="https://incomplete-chain.badssl.com/">https://incomplete-chain.badssl.com/</A> )
+
+The standard solution for the missing intermediate certificate problem
+is to fetch the missing intermediate certificates upon their discovery.
+AIA (RFC 5280) is a mechanism that applications can use to learn about
+the location of the missing intermediate certificates. Popular browsers
+fetch what they miss: If you go to the above URL, your browser will
+probably be happy!
+
+As you know, OpenSSL provides the certificate verification callback that
+can discover that the origin certificate chain is incomplete. An
+application using threads or blocking I/O can probably &quot;pause&quot; its
+verification callback execution, fetch the intermediate certificates,
+and then complete validation before happily returning to the
+SSL_connect() caller. Life is easy when you can use threads or block
+thousands of concurrent transactions!
+
+Unfortunately, Squid can use neither threads nor blocking I/O. Upon
+discovery of the missing intermediate certificates, Squid has to return
+to the SSL_connect() caller, fetch the certificates, and then resume
+SSL_connect() with the fetched certificates available to OpenSSL.
+However, the certificate verification callback does not have a &quot;please
+call me later&quot; return code. We can only return &quot;yes, valid&quot; or &quot;no,
+invalid&quot; results.
+
+
+We found an ugly workaround for the above problem. Here is a simplified
+description: Using OpenSSL BIO API, Squid parses the server certificate
+during the TLS handshake, discovers the missing intermediate
+certificates, pauses TLS I/O (this results in SSL_connect() returning
+back to the caller with SSL_ERROR_WANT_READ), fetches the missing
+certificates, supplies them to OpenSSL, and then resumes SSL_connect().
+This hack has worked for many years.
+
+
+Now comes TLS v1.3. Squid code can no longer parse the certificates
+before OpenSSL because they are contained in the _encrypted_ part of the
+server handshake. Thus, Squid cannot discover what is missing and fetch
+that for OpenSSL before certificate validation starts.
+
+What can we do? How can we pause the SSL_connect() progress after the
+origin certificate is fetched but before it is validated?
+
+
+I am aware of the ASYNC_pause_job() and related async APIs in OpenSSL.
+If I interpret related documentation, discussions, and our test results
+correctly, that API is not meant as the correct answer for our problem.
+Today, abusing that API will probably work. Tomorrow,
+internal/unpredictable OpenSSL changes might break our Squid
+enhancements beyond repair as detailed below.
+
+Somewhat counter-intuitively, the OpenSSL async API is meant for
+activities that can work correctly _without_ becoming asynchronous (i.e.
+without being paused to temporary give way to other activities). Squid
+cannot fetch the missing intermediate certificates without pausing TLS
+negotiations with the server...
+
+The async API was added to support custom OpenSSL engines, not
+application callbacks. The API does not guarantee that an
+ASYNC_pause_job() will actually pause processing and return to the
+SSL_connect() caller! That will only happen if OpenSSL internal code
+does not call ASYNC_block_pause(), effectively converting all subsequent
+ASYNC_pause_job() calls into a no-op. That pause-nullification was added
+to work around deadlocks, but it effectively places the API off limits
+to user-level code that cannot control the timing of those
+ASYNC_block_pause() calls.
+
+
+Squid could kill the current TLS session (and its TCP connection), fetch
+the missing certificates, and then retry from scratch, but that is a
+very ugly (unreliable, wasteful, and noisy) solution.
+
+
+Can you think of another trick?
+
+
+Thank you,
+
+Alex.
+P.S. Squid does not support BoringSSL, but BoringSSL's
+SSL_ERROR_WANT_CERTIFICATE_VERIFY result of the certificate validation
+callback seemingly addresses our use case. I do not know whether OpenSSL
+decision makers would be open to adding something along those lines and
+decided to ask for existing solutions here before proposing adding
+SSL_ERROR_WANT_TIME :-).
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012874.html">FIPS canister questions
+</A></li>
+	<LI>Next message: <A HREF="012877.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12875">[ date ]</a>
+              <a href="thread.html#12875">[ thread ]</a>
+              <a href="subject.html#12875">[ subject ]</a>
+              <a href="author.html#12875">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

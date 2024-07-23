@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Cert hot-reloading
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Cert%20hot-reloading&In-Reply-To=%3Cef6c8943-30c3-9b15-6492-651eb6a420e1%40denninger.net%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012918.html">
+   <LINK REL="Next"  HREF="012919.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Cert hot-reloading</H1>
+    <B>Karl Denninger</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Cert%20hot-reloading&In-Reply-To=%3Cef6c8943-30c3-9b15-6492-651eb6a420e1%40denninger.net%3E"
+       TITLE="Cert hot-reloading">karl at denninger.net
+       </A><BR>
+    <I>Mon Aug 31 13:29:24 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012918.html">Cert hot-reloading
+</A></li>
+        <LI>Next message: <A HREF="012919.html">Cert hot-reloading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12913">[ date ]</a>
+              <a href="thread.html#12913">[ thread ]</a>
+              <a href="subject.html#12913">[ subject ]</a>
+              <a href="author.html#12913">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 8/30/2020 20:19, Jordan Brown wrote:
+&gt;<i> Well, I can restate the problem that I encountered.
+</I>&gt;<i>
+</I>&gt;<i> We deliver an integrated storage system.&#160; Under the covers it is a 
+</I>&gt;<i> modified Solaris running a usual collection of proprietary and 
+</I>&gt;<i> open-source components.&#160; We supply an administrative user interface 
+</I>&gt;<i> that, among many other things, lets you manage a list of &quot;trusted&quot; 
+</I>&gt;<i> certificates - typically CA certificates that a program would use to 
+</I>&gt;<i> authenticate its peers.&#160; That is, it's the equivalent of Firefox's 
+</I>&gt;<i> Tools / Options / Privacy &amp; Security / Certificates / View 
+</I>&gt;<i> Certificates, and the &quot;Servers&quot; and &quot;Authorities&quot; tabs there, with the 
+</I>&gt;<i> additional tidbit that for each certificate you can control which 
+</I>&gt;<i> services (e.g. LDAP, et cetera) that certificate is trusted for.
+</I>&gt;<i>
+</I>&gt;<i> When an administrator makes a change to the trusted-certificates list, 
+</I>&gt;<i> we want that change to take effect, system-wide.
+</I>&gt;<i>
+</I>&gt;<i> The problem is that that means that some number of processes with 
+</I>&gt;<i> active OpenSSL contexts need to drop those contexts and recreate them, 
+</I>&gt;<i> and we don't know which processes those are.&#160; Client operations are 
+</I>&gt;<i> typically driven through a library, not a separate daemon, and so 
+</I>&gt;<i> there's no centralized way to know which processes might be TLS 
+</I>&gt;<i> clients.&#160; In addition, there's the question of how to *tell* the 
+</I>&gt;<i> process to recreate the context.&#160; Simply restarting them may involve 
+</I>&gt;<i> disruption of various sorts.
+</I>&gt;<i>
+</I>&gt;<i> What we'd like would be for OpenSSL to, on every authentication, stat 
+</I>&gt;<i> the file or directory involved, and if it's changed then wipe the 
+</I>&gt;<i> in-memory cache.
+</I>&gt;<i>
+</I>&gt;<i> Yes, aspects of this are system-specific, but that's true of many 
+</I>&gt;<i> things.&#160; There could easily be an internal API that captures a 
+</I>&gt;<i> current-stage object, and another that answers &quot;is this still the 
+</I>&gt;<i> same&quot;.&#160; The default implementation could always say &quot;yes&quot;.
+</I>
+I'm trying to figure out why you want to replace the context in an 
+*existing* connection that is currently passing data rather than for new 
+ones.
+
+For new ones, as I've noted, it already works as you'd likely expect it 
+to work, at least in my use case, including in multiple threads where 
+the context is picked up and used for connections in more than one 
+place.&#160; I've had no trouble with this and a perusal of the documentation 
+(but not the code in depth) suggested it would be safe due to how 
+OpenSSL does reference counts.
+
+While some of the client connections to the back end in my use case are 
+&quot;controlled&quot; (an app on a phone, for example, so I could have control 
+over what happens on the other end and could, for example, send down a 
+sequence demanding the client close and reconnect) there is also a 
+general web-style interface so the connecting party could be on any of 
+the commodity web browsers, over which I have no code control.
+
+Example meta-code:
+
+get_lock(mutex)
+
+if (web_context) { /* If there is an existing context then free it up */
+ &#160;&#160;&#160; SSL_CTX_free(web_context);
+ &#160;&#160;&#160; www_context = NULL;&#160;&#160;&#160; /* It is not ok to attempt to use SSL */
+}
+
+www_context = SSL_CTX_new(server_method);&#160;&#160;&#160; /* Now get a new context */
+.... (set options, callbacks, verification requirement on certs 
+presented, DH and ECDH preferences, cert and key, etc)
+if NOT (happy with the previous sequence of options, setting key and 
+cert, etc) {
+ &#160; &#160; SSL_CTX_free(web_context);
+ &#160;&#160;&#160; web_context = NULL;
+}
+
+unlock(mutex)
+
+Then in the code that actually accepts a new connection:
+
+get_lock(mutex)
+
+if (web_context) {
+ &#160;&#160;&#160; ssl_socket = starttls(inbound_socket, www_context, &amp;error);
+ &#160;&#160;&#160; .... check non-null to know it's ok, if it is, store and use it
+}
+
+unlock(mutex)
+
+(&quot;starttls&quot; does an SSL_new on the context passed, does the SSL_set_fd 
+and SSL_accept, etc, handles any errors generated from that and if 
+everything is ok returns the SSL structure)
+
+I've had no trouble with this for a good long time; if there are 
+existing connections they continue to run on the previous www_context 
+until they close.&#160; New connections come off the new one.&#160; You just have 
+to run a mutex to make sure that you don't try to create a new 
+connection while the &quot;re-keying&quot; is &quot;in process&quot;.
+
+-- 
+Karl Denninger
+<A HREF="../../../mailman/listinfo/openssl-users.html">karl at denninger.net</A> &lt;mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">karl at denninger.net</A>&gt;
+/The Market Ticker/
+/[S/MIME encrypted email preferred]/
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20200831/f6564aa1/attachment.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20200831/f6564aa1/attachment.html</A>&gt;
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: smime.p7s
+Type: application/pkcs7-signature
+Size: 4897 bytes
+Desc: S/MIME Cryptographic Signature
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20200831/f6564aa1/attachment.bin">https://mta.openssl.org/pipermail/openssl-users/attachments/20200831/f6564aa1/attachment.bin</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012918.html">Cert hot-reloading
+</A></li>
+	<LI>Next message: <A HREF="012919.html">Cert hot-reloading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12913">[ date ]</a>
+              <a href="thread.html#12913">[ thread ]</a>
+              <a href="subject.html#12913">[ subject ]</a>
+              <a href="author.html#12913">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

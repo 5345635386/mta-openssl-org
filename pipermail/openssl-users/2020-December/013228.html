@@ -1,0 +1,166 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> private key not available for client_cert_cb
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20private%20key%20not%20available%20for%20client_cert_cb&In-Reply-To=%3CCDA23355-A5EA-4DB2-B0E7-F6554C3321CE%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013263.html">
+   <LINK REL="Next"  HREF="013223.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>private key not available for client_cert_cb</H1>
+    <B>Paul Nelson</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20private%20key%20not%20available%20for%20client_cert_cb&In-Reply-To=%3CCDA23355-A5EA-4DB2-B0E7-F6554C3321CE%40openssl.org%3E"
+       TITLE="private key not available for client_cert_cb">nelson at openssl.org
+       </A><BR>
+    <I>Mon Dec 14 16:47:35 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013263.html">private key not available for client_cert_cb
+</A></li>
+        <LI>Next message: <A HREF="013223.html">DH_compute_key ()  - replacement in 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13228">[ date ]</a>
+              <a href="thread.html#13228">[ thread ]</a>
+              <a href="subject.html#13228">[ subject ]</a>
+              <a href="author.html#13228">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>How I did this:
+
+1) You can make up your own EVP_PKEY that uses your own engine implementation and attach a data ptr to it
+                        EVP_PKEY* returnPKey;
+                        returnPKey = EVP_PKEY_new();
+                        if( returnPKey )
+                        {
+        		    ENGINE* engine = ENGINE_by_id(YOUR_ENGINE_ID);
+                            RSA* sc_rsa = RSA_new_method(engine);
+                            if( sc_rsa )
+                            {
+				// attach a reference to a structure holding your smart card middleware info
+                                RSA_set_ex_data(sc_rsa, ENGINE_smartcard_rsa_idx_middleware(),
+                                                (void*)middleware-&gt;handle);
+                                
+                                EVP_PKEY* pk = X509_get_pubkey( returnCert );
+                                if( pk )
+                                {
+                                    sc_rsa-&gt;e = BN_new();
+                                    sc_rsa-&gt;n = BN_new();
+                                    BN_copy(sc_rsa-&gt;e, pk-&gt;pkey.rsa-&gt;e);
+                                    BN_copy(sc_rsa-&gt;n, pk-&gt;pkey.rsa-&gt;n);
+                                    EVP_PKEY_free(pk);
+                                    
+                                    EVP_PKEY_set1_RSA(returnPKey, sc_rsa);
+                                    RSA_free(sc_rsa);
+                                    
+                                    *outCert = make this X509 from your smart card certificate;
+                                    *outpkey = returnPKey;
+                                }
+                                else
+                                    LogError(&quot;smartcards_fetch_identity can't get pubkey\n&quot;);
+                            }
+
+Then for your engine you will need some methods to configure it as follows:
+void ENGINE_load_smartcard_keychain(void);
+/*
+ * ENGINE_tss_keychain_rsa_idx_middleware returns a ex_data index where engine user should store the
+ *  pointer to the info needed to use the middleware
+ */
+int ENGINE_smartcard_rsa_idx_middleware(void);
+
+Your ENGINE_load_smartcard_keychain method should set global values that get returned by ENGINE_smartcard_rsa_idx_middleware:
+        gMiddlewareRSAIndex = RSA_get_ex_new_index(0x1234, NULL, NULL, NULL, NULL);
+
+Configure your engine filling in an RSA_METHOD structure with what you will need. You don&#8217;t really need all the methods in RSA_METHOD structure, and if you don&#8217;t need them add a stub that returns a 0. I did not need either of the mod_exp method or the public key encrypt and decrypt methods. I also did not need the verify or keygen methods. Your init and finish methods just need to return 1.
+I set the RSA_METHOD flags to RSA_FLAG_FIPS_METHOD|RSA_METHOD_FLAG_NO_CHECK|RSA_FLAG_CACHE_PUBLIC 
+
+This leaves the cipher methods for private key encrypt/decrypt and sign. The private key methods will be where all the work is done.  Write a function to perform the smartcard &#8216;crypt&#8217; method and use it in private encrypt/decrypt and the signing methods. You will need to pay attention to padding and make sure you know how to pad for PKCS1 type 1.  The RSA_SSLV23_PADDING is not required and you can just return an error if you get called with this. 
+
+I handle the PIN entry requirement by having the engine return a specific error if the PIN is needed, then handle the PIN entry in the application.  Once the PIN is entered and available to the middleware, I retry the connection.
+
+The trick is to get a pointer to your middleware implementation from the private key engine methods like this:
+
+    my_middleware_handle =
+    	(my_middleware_handle)RSA_get_ex_data(rsa, gMiddlewareRSAIndex);
+
+I found that writing the engine was more straightforward that attempting to use PKCS11.
+
+&gt;<i> On Dec 14, 2020, at 1:08 AM, George &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">whippet0 at gmail.com</A>&gt; wrote:
+</I>&gt;<i> 
+</I>&gt;<i> Hi,
+</I>&gt;<i> 
+</I>&gt;<i>    I'm new to OpenSSL and am trying to set up mutual authentication in a client. The client is setup with OpenSSL 1.0.2u. and the client's certificate + private key is stored on a Smart Card.  When the client receives a certificate request from the server during the mutual authentication handshake, the OpenSSL client_cert_cb callback function is automatically invoked. The problem is that client_cert_cb requires a private key. Unfortunately, it is not possible to get a private key from a Smart Card. Is there a way to send a certificate to the server without needing the private key?
+</I>&gt;<i> 
+</I>&gt;<i> I'm setting up the callback function with:
+</I>&gt;<i>  
+</I>&gt;<i> void SSL_CTX_set_client_cert_cb(SSL_CTX *ctx, int (*client_cert_cb)(SSL *ssl, X509 **x509, EVP_PKEY **pkey));
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Here is a sample of what my code looks like when I set this up:
+</I>&gt;<i> 
+</I>&gt;<i> SSL_CTX_set_client_cert_cb(context, openSSLClientAuthenticationCallBack);
+</I>&gt;<i> 
+</I>&gt;<i> int openSSLClientAuthenticationCallBack(SSL *ssl, X509 **x509, EVP_PKEY **pkey)
+</I>&gt;<i> {
+</I>&gt;<i> . . .
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> I can access the Smart Card using the PKCS#11 interface and I'm able to get the certificate and sign it, etc. However, I cannot get the actual private key from the Smart Card.
+</I>&gt;<i> 
+</I>&gt;<i> Does anyone know how I can get around this problem?
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Thanks,
+</I>&gt;<i> George
+</I>&gt;<i> 
+</I>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20201214/d7757876/attachment-0001.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20201214/d7757876/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013263.html">private key not available for client_cert_cb
+</A></li>
+	<LI>Next message: <A HREF="013223.html">DH_compute_key ()  - replacement in 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13228">[ date ]</a>
+              <a href="thread.html#13228">[ thread ]</a>
+              <a href="subject.html#13228">[ subject ]</a>
+              <a href="author.html#13228">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

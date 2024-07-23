@@ -1,0 +1,329 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2022-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Updating%20RSA%20public%20key%20generation%20and%20signature%20verification%20from%0A%201.1.1%20to%203.0&In-Reply-To=%3CMWHPR12MB16312256585C489BB294D4F69E409%40MWHPR12MB1631.namprd12.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015422.html">
+   <LINK REL="Next"  HREF="015400.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Updating RSA public key generation and signature verification from 1.1.1 to 3.0</H1>
+    <B>GonzalezVillalobos, Diego</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Updating%20RSA%20public%20key%20generation%20and%20signature%20verification%20from%0A%201.1.1%20to%203.0&In-Reply-To=%3CMWHPR12MB16312256585C489BB294D4F69E409%40MWHPR12MB1631.namprd12.prod.outlook.com%3E"
+       TITLE="Updating RSA public key generation and signature verification from 1.1.1 to 3.0">Diego.GonzalezVillalobos at amd.com
+       </A><BR>
+    <I>Thu Sep  8 16:10:02 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015422.html">Problem with Asymetric, two-key encryption and Certificate Requests.
+</A></li>
+        <LI>Next message (by thread): <A HREF="015400.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15399">[ date ]</a>
+              <a href="thread.html#15399">[ thread ]</a>
+              <a href="subject.html#15399">[ subject ]</a>
+              <a href="author.html#15399">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>[AMD Official Use Only - General]
+
+Hello everyone,
+
+I am currently working on updating a signature verification function in C++ and I am a bit stuck. I am trying to replace the deprecated 1.1.1 functions to the appropriate 3.0 versions. The function takes in 2 certificate objects (parent and cert), which are not x509 certificates, but certificates the company had previously defined. Using the contents from parent we create an RSA public key and using the contents from cert we create the digest and grab the signature to verify.
+
+In the 1.1.1 version we were using the RSA Object and the rsa_set0_key function to create the RSA public key and then used RSA_public_decrypt to decrypt the signature and RSA_verify_PKCS1_PSS to verify it. This whole workflow is now deprecated.
+
+//OPENSSL 1.1.1 Code
+SEV_ERROR_CODE AMDCert::amd_cert_validate_sig(const amd_cert *cert,
+                                              const amd_cert *parent,
+                                              ePSP_DEVICE_TYPE device_type)
+{
+    SEV_ERROR_CODE cmd_ret = ERROR_INVALID_CERTIFICATE;
+    hmac_sha_256 sha_digest_256;
+    hmac_sha_512 sha_digest_384;
+    SHA_TYPE algo = SHA_TYPE_256;
+    uint8_t *sha_digest = NULL;
+    size_t sha_length = 0;
+
+    RSA *rsa_pub_key = NULL;
+    BIGNUM *modulus = NULL;
+    BIGNUM *pub_exp = NULL;
+    EVP_MD_CTX* md_ctx = NULL;
+    uint32_t sig_len = cert-&gt;modulus_size/8;
+
+    uint32_t digest_len = 0;
+    uint8_t decrypted[AMD_CERT_KEY_BYTES_4K] = {0}; // TODO wrong length
+    uint8_t signature[AMD_CERT_KEY_BYTES_4K] = {0};
+    uint32_t fixed_offset = offsetof(amd_cert, pub_exp);    // 64 bytes
+
+    do {
+        if (!cert || !parent) {
+            cmd_ret = ERROR_INVALID_PARAM;
+           break;
+        }
+
+        // Set SHA_TYPE to 256 bit or 384 bit depending on device_type
+        if (device_type == PSP_DEVICE_TYPE_NAPLES) {
+            algo = SHA_TYPE_256;
+            sha_digest = sha_digest_256;
+            sha_length = sizeof(hmac_sha_256);
+        }
+        else /*if (ROME/MILAN)*/ {
+            algo = SHA_TYPE_384;
+            sha_digest = sha_digest_384;
+            sha_length = sizeof(hmac_sha_512);
+        }
+
+        // Memzero all the buffers
+        memset(sha_digest, 0, sha_length);
+        memset(decrypted, 0, sizeof(decrypted));
+        memset(signature, 0, sizeof(signature));
+
+        // New up the RSA key
+        rsa_pub_key = RSA_new();
+
+        // Convert the parent to an RSA key to pass into RSA_verify
+        modulus = BN_lebin2bn((uint8_t *)&amp;parent-&gt;modulus, parent-&gt;modulus_size/8, NULL);  // n    // New's up BigNum
+        pub_exp = BN_lebin2bn((uint8_t *)&amp;parent-&gt;pub_exp, parent-&gt;pub_exp_size/8, NULL);   // e
+        if (RSA_set0_key(rsa_pub_key, modulus, pub_exp, NULL) != 1)
+            break;
+
+                             // Create digest from certificate
+        md_ctx = EVP_MD_CTX_create();
+        if (EVP_DigestInit(md_ctx, (algo == SHA_TYPE_256) ? EVP_sha256() : EVP_sha384()) &lt;= 0)
+            break;
+        if (EVP_DigestUpdate(md_ctx, cert, fixed_offset) &lt;= 0)     // Calls SHA256_UPDATE
+            break;
+        if (EVP_DigestUpdate(md_ctx, &amp;cert-&gt;pub_exp, cert-&gt;pub_exp_size/8) &lt;= 0)
+            break;
+        if (EVP_DigestUpdate(md_ctx, &amp;cert-&gt;modulus, cert-&gt;modulus_size/8) &lt;= 0)
+            break;
+        EVP_DigestFinal(md_ctx, sha_digest, &amp;digest_len);
+
+        // Swap the bytes of the signature
+        memcpy(signature, &amp;cert-&gt;sig, parent-&gt;modulus_size/8);
+        if (!sev::reverse_bytes(signature, parent-&gt;modulus_size/8))
+            break;
+
+        // Now we will verify the signature. Start by a RAW decrypt of the signature
+        if (RSA_public_decrypt(sig_len, signature, decrypted, rsa_pub_key, RSA_NO_PADDING) == -1)
+            break;
+
+        // Verify the data
+        // SLen of -2 means salt length is recovered from the signature
+        if (RSA_verify_PKCS1_PSS(rsa_pub_key, sha_digest,
+                                (algo == SHA_TYPE_256) ? EVP_sha256() : EVP_sha384(),
+                                decrypted, -2) != 1)
+        {
+            break;
+        }
+
+        cmd_ret = STATUS_SUCCESS;
+    } while (0);
+
+    // Free the keys and contexts
+    if (rsa_pub_key)
+        RSA_free(rsa_pub_key);
+
+    if (md_ctx)
+        EVP_MD_CTX_free(md_ctx);
+
+    return cmd_ret;
+}
+
+My current attempt to do this update is first creating an EVP_PKEY object which will now store the public key and inputting the same data from parent by using the EVP_PKEY_fromdata generation function. I build my OSSL_PARAMETERS using OSSL_PARAM_BLD to which I push the data from parent. Lastly for the verification I am using the EVP_DigestVerifyFinal procedure. I create the digest using EVP_DigestVerifyInit and EVP_DigestVerifyUpdate and passing in the same data from cert that we were using in the 1.1.1 version of the function. I have tried different approaches to both creating the key and the verification procedure, but I cannot seem to get it to work.
+
+// OPENSSL 3.0 code
+SEV_ERROR_CODE AMDCert::amd_cert_validate_sig(const amd_cert *cert,
+                                              const amd_cert *parent,
+                                              ePSP_DEVICE_TYPE device_type)
+{
+    SEV_ERROR_CODE cmd_ret = ERROR_INVALID_CERTIFICATE;
+    hmac_sha_256 sha_digest_256;
+    hmac_sha_512 sha_digest_384;
+    SHA_TYPE algo = SHA_TYPE_256;
+    uint8_t *sha_digest = NULL;
+    size_t sha_length = 0;
+
+    EVP_PKEY *rsa_pub_key = EVP_PKEY_new();
+    RSA *old_rsa_pub_key = NULL;
+    BIGNUM *modulus = NULL;
+    BIGNUM *pub_exp = NULL;
+    EVP_PKEY_CTX *key_gen_ctx = NULL;
+    uint32_t sig_len = cert-&gt;modulus_size/8;
+    EVP_MD_CTX* verify_md_ctx = NULL;
+    uint32_t digest_len = 0;
+
+    uint8_t signature[AMD_CERT_KEY_BYTES_4K] = {0};
+    uint32_t fixed_offset = offsetof(amd_cert, pub_exp);    // 64 bytes
+
+    do {
+        if (!cert || !parent) {
+            cmd_ret = ERROR_INVALID_PARAM;
+            break;
+        }
+
+        // Set SHA_TYPE to 256 bit or 384 bit depending on device_type
+        if (device_type == PSP_DEVICE_TYPE_NAPLES) {
+            algo = SHA_TYPE_256;
+            sha_digest = sha_digest_256;
+            sha_length = sizeof(hmac_sha_256);
+        }
+        else /*if (ROME/MILAN)*/ {
+            algo = SHA_TYPE_384;
+            sha_digest = sha_digest_384;
+            sha_length = sizeof(hmac_sha_512);
+        }
+
+        // Memzero all the buffers
+        memset(sha_digest, 0, sha_length);
+        memset(signature, 0, sizeof(signature));
+
+        //Convert the parent to an RSA key to pass into EVP_DigesetVerify
+        modulus = BN_lebin2bn((uint8_t *)&amp;parent-&gt;modulus, parent-&gt;modulus_size/8, NULL);  // n    // New's up BigNum
+        pub_exp = BN_lebin2bn((uint8_t *)&amp;parent-&gt;pub_exp, parent-&gt;pub_exp_size/8, NULL);   // e
+
+        // Creating parameter build
+        OSSL_PARAM_BLD *params_build = OSSL_PARAM_BLD_new();
+        if ( params_build == NULL ) {
+            cout &lt;&lt; &quot;Init fails &quot; &lt;&lt; endl;
+        }
+
+        // Push modulus
+        if ( !OSSL_PARAM_BLD_push_BN(params_build, &quot;n&quot;, modulus) ) {
+            cout &lt;&lt; &quot;Error: failed to push modulus into param build.&quot; &lt;&lt; endl;
+            break;
+        }
+
+        // Push pub_exp
+        if ( !OSSL_PARAM_BLD_push_BN(params_build, &quot;e&quot;, pub_exp) ) {
+            cout &lt;&lt; &quot;Error: failed to push exponent into param build.&quot; &lt;&lt; endl;
+            break;
+        }
+
+        // Build parameters
+        OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(params_build);
+        if ( params == NULL ) {
+            cout &lt;&lt; &quot;Error: building parameters.&quot; &lt;&lt; endl;
+            break;
+              }
+
+        // Free BLD struct
+        OSSL_PARAM_BLD_free(params_build);
+
+        // Create key_gen context
+        key_gen_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+
+        //EVP_PKEY_keygen_init(pctx);
+        if(EVP_PKEY_fromdata_init(key_gen_ctx) != 1) {
+            cout &lt;&lt; &quot;failed to initialize key creation.&quot; &lt;&lt; endl;
+            break;
+        }
+
+        // Generate rsa public key
+        if(EVP_PKEY_fromdata(key_gen_ctx, &amp;rsa_pub_key, EVP_PKEY_PUBLIC_KEY, params) != 1) {
+            cout &lt;&lt; &quot;key generation breaks&quot; &lt;&lt; endl;
+            break;
+        }
+
+        // Free PARAM structure
+        OSSL_PARAM_free(params);
+
+        // Swap the bytes of the signature
+        memcpy(signature, &amp;cert-&gt;sig, parent-&gt;modulus_size/8);
+        if (!sev::reverse_bytes(signature, parent-&gt;modulus_size/8))
+            break;
+
+        // Create digest context
+        verify_md_ctx = EVP_MD_CTX_create();
+
+
+        if (!verify_md_ctx) {
+            cout &lt;&lt; &quot;Error allocating pkey context &quot; &lt;&lt; endl;;
+            break;
+        }
+
+        if (EVP_DigestVerifyInit(verify_md_ctx, NULL, (algo == SHA_TYPE_256) ? EVP_sha256() : EVP_sha384(), NULL, rsa_pub_key) &lt;= 0) {
+            cout &lt;&lt; &quot;Init fails &quot; &lt;&lt; endl;
+            break;
+        }
+
+        if (EVP_DigestVerifyUpdate(verify_md_ctx, cert, fixed_offset) &lt;= 0)     // Calls SHA256_UPDATE
+            break;
+        if (EVP_DigestVerifyUpdate(verify_md_ctx, &amp;cert-&gt;pub_exp, cert-&gt;pub_exp_size/8) &lt;= 0)
+            break;
+        if (EVP_DigestVerifyUpdate(verify_md_ctx, &amp;cert-&gt;modulus, cert-&gt;modulus_size/8) &lt;= 0)
+            break;
+
+        // Get Verify return
+        int ret = EVP_DigestVerifyFinal(verify_md_ctx,signature,sig_len);
+        if (ret == 0) {
+            cout &lt;&lt; &quot;Verify digest fails&quot; &lt;&lt; endl;
+            break;
+        } else if (ret &lt; 0) {
+            cout &lt;&lt; &quot;Verify error&quot; &lt;&lt; endl;
+            break;
+        }
+
+        cmd_ret = STATUS_SUCCESS;
+    } while (0);
+
+    // Free the keys and contexts
+    if (rsa_pub_key)
+        EVP_PKEY_free(rsa_pub_key);
+    if (key_gen_ctx)
+        EVP_PKEY_CTX_free(key_gen_ctx);
+    if (verify_md_ctx)
+        EVP_MD_CTX_free(verify_md_ctx);
+
+    return cmd_ret;
+}
+
+Is this the correct way of creating RSA keys now? Where is my logic failing? Can the same type of procedure even be done on 3.0? Any advice would be really appreciated.
+
+Thank you in advance,
+
+Diego Gonzalez Villalobos
+Software System Designer I
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20220908/c9aa7b33/attachment-0001.htm">https://mta.openssl.org/pipermail/openssl-users/attachments/20220908/c9aa7b33/attachment-0001.htm</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015422.html">Problem with Asymetric, two-key encryption and Certificate Requests.
+</A></li>
+	<LI>Next message (by thread): <A HREF="015400.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15399">[ date ]</a>
+              <a href="thread.html#15399">[ thread ]</a>
+              <a href="subject.html#15399">[ subject ]</a>
+              <a href="author.html#15399">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

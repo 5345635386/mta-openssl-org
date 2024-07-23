@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Close TCP socket after SSL_clear()?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Close%20TCP%20socket%20after%20SSL_clear%28%29%3F&In-Reply-To=%3C010801d4a9f9%24e066c790%24a13456b0%24%40mcn.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009690.html">
+   <LINK REL="Next"  HREF="009694.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Close TCP socket after SSL_clear()?</H1>
+    <B>Charles Mills</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Close%20TCP%20socket%20after%20SSL_clear%28%29%3F&In-Reply-To=%3C010801d4a9f9%24e066c790%24a13456b0%24%40mcn.org%3E"
+       TITLE="[openssl-users] Close TCP socket after SSL_clear()?">charlesm at mcn.org
+       </A><BR>
+    <I>Fri Jan 11 22:06:17 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009690.html">[openssl-users] Close TCP socket after SSL_clear()?
+</A></li>
+        <LI>Next message: <A HREF="009694.html">[openssl-users] Close TCP socket after SSL_clear()?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9691">[ date ]</a>
+              <a href="thread.html#9691">[ thread ]</a>
+              <a href="subject.html#9691">[ subject ]</a>
+              <a href="author.html#9691">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i>        SSL_shutdown(connection) || SSL_shutdown(connection);
+</I>
+I like it! (Not!)
+
+I don't pretend to be a bits and bytes expert on TCP protocol. You can't be
+an expert on everything.
+
+So I will listen to expert advice. I know 99% of you all are 'nix guys and
+this is a Windows problem. I am seeing OTOH where my Windows doc says
+closesocket() does an abortive termination, and OTOH a discussion of a
+graceful closesocket() with SO_LINGER/SO_DONTLINGER.
+
+(1) This code is (at the application level) purely a receiver of data and
+(2) without the TLS layer in place it is hard to picture any meaningful data
+transfer and (3) we are in a session cleanup situation anyway -- so it seems
+to me that an abortive disconnect is perfectly fine. Am I wrong?
+
+Thanks for all of your help.
+
+Charles
+
+
+-----Original Message-----
+From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf Of
+Michael Wojcik
+Sent: Friday, January 11, 2019 12:48 PM
+To: <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>
+Subject: Re: [openssl-users] Close TCP socket after SSL_clear()?
+
+&gt;<i> From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf
+</I>Of Karl Denninger
+&gt;<i> Sent: Friday, January 11, 2019 13:04
+</I>
+&gt;<i>    if (!SSL_shutdown(connection)) {
+</I>&gt;<i>        SSL_shutdown(connection)
+</I>&gt;<i>    }
+</I>
+Or if you really want to baffle future maintainers:
+
+        SSL_shutdown(connection) || SSL_shutdown(connection);
+
+&gt;<i> The underlying handle is still open at the OS level after this, so on Unix
+</I>anyway you want
+&gt;<i> to notify the OS that the socket is invalid for further I/O and then close
+</I>it.
+&gt;<i> ...
+</I>&gt;<i>                    shutdown(slave_socket[x].fd, SHUT_RDWR);
+</I>&gt;<i>                    close(slave_socket[x].fd);
+</I>
+Maybe I'm missing something, but I don't see much advantage to calling
+shutdown(SHUT_RDRW) and then immediately calling close(). close will
+implicitly do what shutdown does, in the normal case, including trying to
+send unsent data and waiting (for a while) for any remaining ACKs.
+
+If there's unsent or un-ACK'd data, shutdown will attempt to send it until
+the TCP retransmit limit is reached; that's normally longer than the linger
+time for the socket, so shutdown could try harder, and by the same token
+block longer, than close. But the same effect can be achieved by setting a
+longer linger time for the socket and just calling close.
+
+Similarly, if linger has been disabled (by setting the SO_LINGER option
+appropriately), then close will just abort the connection (i.e. send an RST,
+rather than a FIN, and not wait for the corresponding FIN-ACK; or if the
+peer sent the FIN, send an RST rather than a FIN-ACK and not wait for the
+last ACK). But anyone who disables linger on a TLS connection gets what they
+deserve.
+
+shutdown is generally useful if:
+
+- You only want a half-close (which is rarely used, even when it would be
+useful, and isn't generally appropriate for a TLS connection).
+
+- You want a full close, but you want to be able to retrieve the error
+information from the socket if the close fails. In that case, use shutdown,
+followed by getsockopt(SO_ERROR) if shutdown returns an error, followed by
+close. But your code is ignoring the return value from shutdown and not
+using getsockopt(SO_ERROR).
+
+The real question is: will the application do anything differently if any
+remaining outbound data - which there shouldn't be because at this point
+we've tried to do a blocking SSL_shutdown - can't be sent, and the closing
+FIN / FIN-ACK / ACK handshake completed, within the default linger time? And
+if so, will the application do anything that can't be achieved by just
+increasing the linger time?
+
+I think it'd be nice if more non-trivial applications used
+shutdown(SHUT_RDWR) + getsockopt(SO_ERROR) + close, and reported the error
+(if there is one) for diagnostic purposes. But beyond that there isn't a lot
+most applications can do, and for most a simple close is probably going to
+be fine.
+
+But as I said I may have overlooked some good reason for this particular
+code pattern.
+
+--
+Michael Wojcik
+Distinguished Engineer, Micro Focus
+
+
+
+-- 
+openssl-users mailing list
+To unsubscribe: <A HREF="../../../mailman/listinfo/openssl-users.html">https://mta.openssl.org/mailman/listinfo/openssl-users</A>
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009690.html">[openssl-users] Close TCP socket after SSL_clear()?
+</A></li>
+	<LI>Next message: <A HREF="009694.html">[openssl-users] Close TCP socket after SSL_clear()?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9691">[ date ]</a>
+              <a href="thread.html#9691">[ thread ]</a>
+              <a href="subject.html#9691">[ subject ]</a>
+              <a href="author.html#9691">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

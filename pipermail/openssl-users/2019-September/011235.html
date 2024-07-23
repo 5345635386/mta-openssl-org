@@ -1,0 +1,187 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Crash%20in%20OpenSSL%20v1.0.1%20from%20dtls1_do_write%20OPENSSL_assert%28len%20%3D%3D%0A%20%28unsigned%20int%29ret%29%3B&In-Reply-To=%3C3a41866e-07d0-d78d-e9b4-10dc5f63fdfd%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011230.html">
+   <LINK REL="Next"  HREF="011240.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Crash%20in%20OpenSSL%20v1.0.1%20from%20dtls1_do_write%20OPENSSL_assert%28len%20%3D%3D%0A%20%28unsigned%20int%29ret%29%3B&In-Reply-To=%3C3a41866e-07d0-d78d-e9b4-10dc5f63fdfd%40openssl.org%3E"
+       TITLE="Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);">matt at openssl.org
+       </A><BR>
+    <I>Wed Sep 25 13:49:06 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011230.html">Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);
+</A></li>
+        <LI>Next message: <A HREF="011240.html">Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11235">[ date ]</a>
+              <a href="thread.html#11235">[ thread ]</a>
+              <a href="subject.html#11235">[ subject ]</a>
+              <a href="author.html#11235">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+
+On 24/09/2019 14:11, Ian Sinclair wrote:
+&gt;<i> I'm working with Asterisk PBX code which uses openSSL v1.0.2 (from Centos6). On
+</I>&gt;<i> one site we're getting a crash from dtls1_do_write and as far as I can tell it's
+</I>&gt;<i> from the assertion coded:
+</I>&gt;<i> 
+</I>&gt;<i> &#160; /* bad if this assert fails, only part of the handshake
+</I>&gt;<i> &#160; &#160;* message got sent. &#160;but why would this happen? */
+</I>&gt;<i> &#160; OPENSSL_assert(len == (unsigned int)ret);
+</I>&gt;<i> 
+</I>&gt;<i> My question is the same as some previous author - why would this happen?
+</I>
+I've taken a look at the code in this area to try and figure out a reason.
+
+I note that the code before this looks like this:
+
+        ret = dtls1_write_bytes(s, type, &amp;s-&gt;init_buf-&gt;data[s-&gt;init_off],
+                                len);
+        if (ret &lt; 0) {
+		....omitted...
+        } else {
+
+            /*
+             * bad if this assert fails, only part of the handshake message
+             * got sent.  but why would this happen?
+             */
+            OPENSSL_assert(len == (unsigned int)ret);
+
+Most significantly I notice that this doesn't seem to handle the ret == 0 case -
+which is normally used to indicate an error. So looking at dtls1_write_bytes we
+should check whether there are any cases where it could return 0. Well that
+function doesn't actually do very much except call do_dtls1_write() and return
+the result of that.
+
+There are a few possible points where that function could return a value:
+
+1) Returns the result of ssl3_write_pending()
+2) Returns the result of ssl_dispatch_alert(). Following the logic of that we
+find that it ends up returning the result of a recursive do_dtls1_write() call -
+so we can ignore this one.
+3) If len == 0 and !create_empty_fragment then we return 0. If that is the case
+then len == 0 and ret == 0 so the assertion would not be hit, so we can ignore this.
+4) if create_empty_fragment is true we return wr-&gt;length. But there are no calls
+of do_dtls1_write where create_empty_fragment is true anywhere in the code. This
+is actually dead code (we should remove this). We can ignore this.
+5) On error we return -1, which we can ignore.
+
+So it seems do_dtls1_write() will only return 0 if ssl3_write_pending() does.
+
+Looking at that function there are 3 possible points where it can return:
+
+1) On error it returns -1, so we can ignore that.
+2) In some circumstances it can return s-&gt;wpend_ret. wpend_return is set in
+do_dtls1_write to the value of len, so the only way it could be 0 is if len is,
+which would not cause the assertion to fail so we can ignore this.
+3) In other circumstances it returns the result of a BIO_write() call
+
+So the only way I can see for a 0 return to come back is if BIO_write() returns
+that. Looking at the implementation of BIO_write() it will return 0 if:
+
+- the BIO is NULL. But there is a check for this in ssl3_write_pending() so we
+know this will never be the case.
+- If a BIO callback has been set (via BIO_set_callback()) then it will return
+the result from that
+- Otherwise the return value is the result of a write call from the underlying
+BIO implementation.
+
+In DTLS the underlying BIO implementation is usually a BIO_s_datagram(). That
+write function will return the value from a system call to send or sendto. The
+man pages indicate this returns -1 on error, or otherwise the number of bytes
+sent - so I don't see how we could ever get 0 here.
+
+So, the summary of all of that is, I think we could get a situation where the
+assertion is triggered if:
+
+1) You are using BIO_set_callback() and the callback you set returns 0
+2) You are using some source/sink BIO other than BIO_s_datagram() and it
+sometimes returns 0 from its write call.
+3) You are using a filter BIO and that returns 0 during a write call
+
+Other possibilities that spring to mind are if you are using a custom BIO that
+doesn't behave well and returns a positive value from its write call that is not
+equal to the number of bytes it was asked to write.
+
+&gt;<i> 
+</I>&gt;<i> Is there any meaningful way I can debug this? Some flag I can set that will show
+</I>&gt;<i> the DTLS packets to try to find a cause? Some way to get rid of the assertion so
+</I>&gt;<i> that the failure doesn't take down the whole system, because currently the
+</I>&gt;<i> assertion causes a reboot?
+</I>
+In later releases I notice that this &quot;hard&quot; assertion has been converted to a
+soft assertion - i.e. it only crashes in a debug build. Otherwise it just
+returns -1 to indicate an error. So the equivalent of changing the code to look
+like this in a production build:
+
+            /*
+             * bad if this assert fails, only part of the handshake message
+             * got sent.  but why would this happen?
+             */
+            if (len != (unsigned int)ret)
+                return -1;
+
+
+&gt;<i> It's happening on an end customer site so building a
+</I>&gt;<i> debug load isn't particularly viable, but if that's the only option tell me how.
+</I>&gt;<i> 
+</I>&gt;<i> Is this a known problem that is only fixed as a non-security fix in a later
+</I>&gt;<i> release?
+</I>
+It's not a know problem as far as I can remember. But on the other hand there
+have been a lot of DTLS bug fixes that have gone in between 1.0.2 and 1.1.1.
+
+Note that 1.0.2 is approaching EOL (at the end of this year), so is only
+receiving security fixes. Since any fix we would apply doesn't sound like a
+security fix it wouldn't get backported to 1.0.2.
+
+&gt;<i> We are current for the release, I believe, with v1.0.1e 58.el6_10.
+</I>
+I'm slightly confused here you're talking about 1.0.1e but above you said 1.02
+above.
+
+Matt
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011230.html">Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);
+</A></li>
+	<LI>Next message: <A HREF="011240.html">Crash in OpenSSL v1.0.1 from dtls1_do_write OPENSSL_assert(len == (unsigned int)ret);
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11235">[ date ]</a>
+              <a href="thread.html#11235">[ thread ]</a>
+              <a href="subject.html#11235">[ subject ]</a>
+              <a href="author.html#11235">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

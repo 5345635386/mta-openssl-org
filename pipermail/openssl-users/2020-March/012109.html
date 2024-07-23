@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> resumption problem
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20resumption%20problem&In-Reply-To=%3C20200327210747.GC41308%40straasha.imrryr.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012108.html">
+   <LINK REL="Next"  HREF="012110.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>resumption problem</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20resumption%20problem&In-Reply-To=%3C20200327210747.GC41308%40straasha.imrryr.org%3E"
+       TITLE="resumption problem">openssl-users at dukhovni.org
+       </A><BR>
+    <I>Fri Mar 27 21:07:47 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012108.html">resumption problem
+</A></li>
+        <LI>Next message: <A HREF="012110.html">resumption problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12109">[ date ]</a>
+              <a href="thread.html#12109">[ thread ]</a>
+              <a href="subject.html#12109">[ subject ]</a>
+              <a href="author.html#12109">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Fri, Mar 27, 2020 at 08:20:55PM +0000, Jeremy Harris wrote:
+
+&gt;<i> &gt; Right, you're running out of space by trying to send too many
+</I>&gt;<i> &gt; CA names.  It is better to have this fail, so you can figure
+</I>&gt;<i> &gt; what is trying to dump your entire trusted CA list (of names)
+</I>&gt;<i> &gt; to the server, than to actually have that silently &quot;work&quot;.
+</I>&gt;<i> 
+</I>&gt;<i> It's /etc/pki/tls/certs/ca-bundle.crt (on Centos 8) and
+</I>&gt;<i> it's being loaded using SSL_CTX_set_client_CA_list()
+</I>&gt;<i> into the client, supposedly to be the acceptable CAs
+</I>&gt;<i> for the cert sent by the server.
+</I>
+That function should only affect the server -&gt; client direction.
+Briefly, in OpenSSL 1.1.1 it affected both the client and server
+directions, but this was fixed in OpenSSL 1.1.1a.
+
+If the distro started with 1.1.1 and only backported security fixes, you
+could be running an OpenSSL version with the unintentional bidirectional
+setting.
+
+Another possibility is that your system-wide openssl.cnf file has a
+&quot;RequestCAFile&quot; or &quot;ClientCAFile&quot; setting.  Both unfortunately set not
+only the server-&gt;client direction, but also the client-&gt;server
+direction.  This may be a bug (oversight), the second of these
+should not touch the bidirectional list.
+
+  &quot;ssl/ssl_conf.c&quot; line 500:
+
+    static int cmd_RequestCAFile(SSL_CONF_CTX *cctx, const char *value)
+    {
+        if (cctx-&gt;canames == NULL)
+            cctx-&gt;canames = sk_X509_NAME_new_null();
+        if (cctx-&gt;canames == NULL)
+            return 0;
+        return SSL_add_file_cert_subjects_to_stack(cctx-&gt;canames, value);
+    }
+
+    static int cmd_ClientCAFile(SSL_CONF_CTX *cctx, const char *value)
+    {
+        return cmd_RequestCAFile(cctx, value);
+    }
+
+  &quot;ssl/ssl_conf.c&quot; line 883:
+
+    int SSL_CONF_CTX_finish(SSL_CONF_CTX *cctx)
+    {
+        ...
+
+        if (cctx-&gt;canames) {
+            if (cctx-&gt;ssl)
+                SSL_set0_CA_list(cctx-&gt;ssl, cctx-&gt;canames);
+            else if (cctx-&gt;ctx)
+                SSL_CTX_set0_CA_list(cctx-&gt;ctx, cctx-&gt;canames);
+            else
+                sk_X509_NAME_pop_free(cctx-&gt;canames, X509_NAME_free);
+            cctx-&gt;canames = NULL;
+        }
+        return 1;
+    }
+
+Can you confirm whether any such directive is present in your
+system-wide openssl.cnf (possibly via .include)?
+
+&gt;<i> &gt;  Perhaps your &quot;openssl.cnf&quot; (Linux distro mistake?) causes the
+</I>&gt;<i> &gt;  damage for all applications even without explicit code to that end
+</I>&gt;<i> &gt;  in Exim?  Or you're calling something to make it happen.
+</I>&gt;<i> 
+</I>&gt;<i> The Exim config is saying to use that file, so I do have a workaround
+</I>&gt;<i> point there.
+</I>
+It is actually not easy to avoid using the system-wide config.
+It is loaded by default during library initialization, and
+you need custom initialization calls to avoid loading it.
+
+&gt;<i> However, the question is: what is [1] the proper fix?  We want to
+</I>&gt;<i> accept &quot;the usual, pretty big, set of well-known CAs&quot;.  Is that an
+</I>&gt;<i> incorrect way of telling OpenSSL that list?
+</I>
+It makes some sense to send a CA list to clients, but ideally one that
+is not too large.  In Postfix I recommend a small or no CAfile (from
+which the CAlist is initialized), and the bulk of the trust store
+configured via a CApath (which is not used to send CA names to clients).
+
+Most clients (real MTAs, not random Java apps) handle an empty CA list
+just fine, and use the (at most) one client cert they have.
+
+&gt;<i> And how come it only fails under resumption and when a client-cert is
+</I>&gt;<i> also used?
+</I>
+Here, I am not sure, but perhaps this is because the extension is only
+valid with TLS 1.3, and on resumption we already know the server
+protocol version.  On initial handshakes the protocol might be
+TLS 1.2, and perhaps as a result the list is not sent???
+
+&gt;<i> 1]  We also need to code to be compatible across a wide range
+</I>&gt;<i> of OpenSSL versions.  Minimising #ifdeffery is a factor.
+</I>
+Understood, I'm in the same boat with Postfix.
+
+-- 
+    Viktor.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012108.html">resumption problem
+</A></li>
+	<LI>Next message: <A HREF="012110.html">resumption problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12109">[ date ]</a>
+              <a href="thread.html#12109">[ thread ]</a>
+              <a href="subject.html#12109">[ subject ]</a>
+              <a href="author.html#12109">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

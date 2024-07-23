@@ -1,0 +1,132 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Server application hangs on SS_read, even when client disconnects
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CDM6PR18MB27004208346F575FFCD51A10F9E60%40DM6PR18MB2700.namprd18.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013134.html">
+   <LINK REL="Next"  HREF="013136.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Server application hangs on SS_read, even when client disconnects</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CDM6PR18MB27004208346F575FFCD51A10F9E60%40DM6PR18MB2700.namprd18.prod.outlook.com%3E"
+       TITLE="Server application hangs on SS_read, even when client disconnects">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Fri Nov 13 14:42:10 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013134.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+        <LI>Next message: <A HREF="013136.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13135">[ date ]</a>
+              <a href="thread.html#13135">[ thread ]</a>
+              <a href="subject.html#13135">[ subject ]</a>
+              <a href="author.html#13135">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; On Behalf Of Brice Andr&#233;
+</I>&gt;<i> Sent: Friday, 13 November, 2020 05:06
+</I>
+&gt;<i> ... it seems that in some rare execution cases, the server performs a SSL_read,
+</I>&gt;<i> the client disconnects in the meantime, and the server never detects the
+</I>&gt;<i> disconnection and remains stuck in the SSL_read operation.
+</I>
+...
+
+&gt;<i> #0  0x00007f836575d210 in __read_nocancel () from /lib/x86_64-linux-gnu/libpthread.so.0
+</I>&gt;<i> #1  0x00007f8365c8ccec in ?? () from /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1
+</I>&gt;<i> #2  0x00007f8365c8772b in BIO_read () from /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1
+</I>
+So OpenSSL is in a blocking read of the socket descriptor.
+
+&gt;<i> tcp        0      0 <A HREF="http://5.196.111.132:5413">http://5.196.111.132:5413</A>      <A HREF="http://85.27.92.8:25856">http://85.27.92.8:25856</A>        ESTABLISHED 19218/./MabeeServer
+</I>&gt;<i> tcp        0      0 <A HREF="http://5.196.111.132:5412">http://5.196.111.132:5412</A>      <A HREF="http://85.27.92.8:26305">http://85.27.92.8:26305</A>        ESTABLISHED 19218/./MabeeServer
+</I>
+&gt;<i> From this log, I can see that I have two established connections with remote
+</I>&gt;<i> client machine on IP 109.133.193.70. Note that it's normal to have two connexions
+</I>&gt;<i> because my client-server protocol relies on two distinct TCP connexions.
+</I>
+So the client has not, in fact, disconnected.
+
+When a system closes one end of a TCP connection, the stack will send a TCP packet
+with either the FIN or the RST flag set. (Which one you get depends on whether the
+stack on the closing side was holding data for the conversation which the application
+hadn't read.)
+
+The sockets are still in ESTABLISHED state; therefore, no FIN or RST has been
+received by the local stack.
+
+There are various possibilities:
+
+- The client system has not in fact closed its end of the conversation. Sometimes
+this happens for reasons that aren't immediately apparent; for example, if the
+client forked and allowed the descriptor for the conversation socket to be inherited
+by the child, and the child still has it open.
+
+- The client system shut down suddenly (crashed) and so couldn't send the FIN/RST.
+
+- There was a failure in network connectivity between the two systems, and consequently
+the FIN/RST couldn't be received by the local system.
+
+- The connection is in a state where the peer can't send the FIN/RST, for example
+because the local side's receive window is zero. That shouldn't be the case, since
+OpenSSL is (apparently) blocked in a receive on the connection. but as I don't have
+the complete picture I can't rule it out.
+
+&gt;<i> This let me think that the connexion on which the SSL_read is listening is
+</I>&gt;<i> definitively dead (no more TCP keepalive)
+</I>
+&quot;definitely dead&quot; doesn't have any meaning in TCP. That's not one of the TCP states,
+or part of the other TCP or IP metadata associated with the local port (which is
+what matters).
+
+Do you have keepalives enabled?
+
+&gt;<i> and that, for a reason I do not understand, the SSL_read keeps blocked into it.
+</I>
+The reason is simple: The connection is still established, but there's no data to
+receive. The question isn't why SSL_read is blocking; it's why you think the
+connection is gone, but the stack thinks otherwise.
+
+&gt;<i> Note that the normal behavior of my application is : client connects, server
+</I>&gt;<i> daemon forks a new instance,
+</I>
+Does the server parent process close its copy of the conversation socket?
+
+--
+Michael Wojcik
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013134.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+	<LI>Next message: <A HREF="013136.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13135">[ date ]</a>
+              <a href="thread.html#13135">[ thread ]</a>
+              <a href="subject.html#13135">[ subject ]</a>
+              <a href="author.html#13135">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

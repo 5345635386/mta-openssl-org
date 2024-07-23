@@ -1,0 +1,178 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C8aa099cd-cb86-190c-f054-ff32ac826706%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012877.html">
+   <LINK REL="Next"  HREF="012882.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C8aa099cd-cb86-190c-f054-ff32ac826706%40measurement-factory.com%3E"
+       TITLE="SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Aug 19 19:35:54 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012877.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+        <LI>Next message: <A HREF="012882.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12878">[ date ]</a>
+              <a href="thread.html#12878">[ thread ]</a>
+              <a href="subject.html#12878">[ subject ]</a>
+              <a href="author.html#12878">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 8/19/20 5:29 AM, Matt Caswell wrote:
+
+&gt;<i> We should really have a proper callback for this purpose. PRs welcome!
+</I>&gt;<i> (Doesn't help you right now though).
+</I>
+Thank you for a prompt, thoughtful, and useful response. I believe that
+we are on the same page as far as async API overall intentions, and I am
+also very glad to hear that the OpenSSL team may welcome an addition of
+a proper callback to address Squid's use case. I know Squid needs are
+not unique. I do not yet know whether I can contribute (or facilitate
+contribution of) such an enhancement, but this green light is meaningful
+progress already!
+
+
+&gt;&gt;<i> &quot;Somewhat counter-intuitively, the OpenSSL async API is meant for
+</I>&gt;&gt;<i> activities that can work correctly _without_ becoming asynchronous (i.e.
+</I>&gt;&gt;<i> without being paused to temporary give way to other activities)&quot;
+</I>
+&gt;<i> I have no idea what you mean by this. 
+</I>
+Sorry for not detailing this accusation. I was worried that my email was
+already too long/verbose... I will detail it below.
+
+
+&gt;<i> The whole point of ASYNC_pause_job() is to temporarily give way to
+</I>&gt;<i> other activities.
+</I>
+Yes, giving way to other activities is the whole point of the async API
+optimization. Unfortunately, being only an optimization, the API is not
+enough when the callback MUST &quot;give way to other activities&quot;. AFAICT,
+OpenSSL does not guarantee that ASYNC_pause_job() in a callback will
+actually &quot;give way to other activities&quot; because OpenSSL does guarantee
+that some engine or OpenSSL native code does not hold a
+ASYNC_block_pause() &quot;lock&quot; while calling the callback.
+
+The engine code that async API supports well may look like this[1]:
+
+   myengine()
+   {
+       while (!something_happened())
+           ASYNC_pause_job(); // application MAY get control here
+
+       ... use something ...
+   }
+
+The callback code that async API does not support looks like this:
+
+    mycallback()
+    {
+        if (!something_happened())
+            ASYNC_pause_job(); // application MUST get control here
+
+        assert(something_happened());
+        ... use something ...
+    }
+
+Please note that replacing &quot;if&quot; with &quot;while&quot; in mycallback() would make
+the compiled code identical with myengine() but would not solve the
+problem: Instead of the failed assertion, the callback would get into an
+infinite loop...
+
+The callback _relies_ on the application making progress (e.g., fetching
+the missing intermediate certificates or declaring a fetch failure
+before resuming SSL_connect()). This callback cannot work correctly
+without the application actually getting control. That is why the
+pausing call comments are different: MAY vs. MUST.
+
+Does this clarify what I meant? Do you agree that OpenSSL async API is
+not suitable for callbacks that _require_ ASYNC_pause_job() to return
+control to the application?
+
+[1] This myengine() example is inspired by your explanation at
+<A HREF="https://mta.openssl.org/pipermail/openssl-dev/2015-October/003031.html">https://mta.openssl.org/pipermail/openssl-dev/2015-October/003031.html</A>
+
+
+&gt;<i> ASYNC_block_pause() ... does not appear in the library code
+</I>
+True, but it did appear there in the past, right? I am looking at commit
+625146d as an example. Those calls were removed more than a year later
+in 75e2c87 AFAICT, but I see no guarantee that they will not reappear again.
+
+And even if OpenSSL now has a policy against using ASYNC_block_pause()
+internally, or a policy against holding an ASYNC_block_pause() &quot;lock&quot;
+while calling any callback, some custom engine might do that at the
+&quot;wrong&quot; for the above mycallback() moment, right?
+
+If you think that fears about something inside OpenSSL/engines
+preventing our callback from returning control to the application are
+unfounded, then using async API may be the best long-term solution for
+Squid. Short-term, it does not work &quot;as is&quot; because OpenSSL STACKSIZE
+appears to be too small (leading to weird crashes that disappear if we
+increase STACKSIZE from 32768 to 524288 bytes), but perhaps we can
+somehow hack around that.
+
+
+&gt;<i> One possibility that springs to mind (which is also an ugly hack) is to
+</I>&gt;<i> defer the validation of the certificates. So, you have a verify callback
+</I>&gt;<i> that always says &quot;ok&quot;. But any further reads on the underlying BIO
+</I>&gt;<i> always return with &quot;retry&quot; until such time as any intermediate
+</I>&gt;<i> certificates have been fetched and the chain has been verified &quot;for
+</I>&gt;<i> real&quot;. The main problem I can see with this approach is there is no easy
+</I>&gt;<i> way to send the right alert back to the server in the event of failure.
+</I>
+We were also concerned that X509_verify_cert() is not enough to fully
+mimic the existing OpenSSL certificate validation procedure because the
+internal OpenSSL ssl_verify_cert_chain() does not just call
+X509_verify_cert(). It also does some DANE-related manipulations, for
+example. Are those fears unfounded? In other words, is calling
+X509_verify_cert() directly always enough to make the right certificate
+validation decision?
+
+
+Thanks a lot,
+
+Alex.
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012877.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+	<LI>Next message: <A HREF="012882.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12878">[ date ]</a>
+              <a href="thread.html#12878">[ thread ]</a>
+              <a href="subject.html#12878">[ subject ]</a>
+              <a href="author.html#12878">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

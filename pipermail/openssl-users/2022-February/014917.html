@@ -1,0 +1,153 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Need additional control over async stack allocation
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2022-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Need%20additional%20control%20over%20async%20stack%20allocation&In-Reply-To=%3C2E00C434-AE88-4B59-B3EB-6DC6A16588F3%40freeradius.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014915.html">
+   <LINK REL="Next"  HREF="014910.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Need additional control over async stack allocation</H1>
+    <B>Arran Cudbard-Bell</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Need%20additional%20control%20over%20async%20stack%20allocation&In-Reply-To=%3C2E00C434-AE88-4B59-B3EB-6DC6A16588F3%40freeradius.org%3E"
+       TITLE="Need additional control over async stack allocation">a.cudbardb at freeradius.org
+       </A><BR>
+    <I>Thu Feb 24 15:38:52 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="014915.html">Need additional control over async stack allocation
+</A></li>
+        <LI>Next message (by thread): <A HREF="014910.html">error with cipher EVP_des_ede3_cbc in openssl 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14917">[ date ]</a>
+              <a href="thread.html#14917">[ thread ]</a>
+              <a href="subject.html#14917">[ subject ]</a>
+              <a href="author.html#14917">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I'd really appreciate review/feedback.  I know this might seem like a theoretical issue, but we're seeing real
+world problems arising from how the stack memory is being allocated.
+
+We use a custom allocator to wrap talloc.  Talloc calls the system malloc and requests an allocation of
+the talloc chunk header size + the memory requested.  Talloc returns a pointer to the memory directly
+after its header.
+
+The fact we're using talloc is not the issue, but it is useful in detecting buffer overflows because on free
+talloc will check the integrity of its header via a magic number.
+
+When talloc chunks are used for stack memory by the ASYNC_* API, and are freed, talloc asserts as
+the magic number in the header has been altered.
+
+This is a strong indication of a stack overrun, likely resulting from the fact that either makecontext assumes
+the memory will be page aligned (and it's not), or the stack size being allocated is simply too small.
+
+If the current PR is not acceptable please indicate an alternative solution.  I thought it'd be easiest to have
+OpenSSL punt on the problem, and leave it up to the application to allocate the stack correctly for a given
+platform, but if you wanted something less open ended, some alternatives could be add a configuration option
+to change the default stack size for the ASYNC_* API and allow the user to provide an aligned memory
+allocation function in addition to malloc and realloc.
+
+I also see that OpenSSL is moving towards library contexts so global allocators may no longer be
+appropriate.  Let me know if that's an issue here and I'll move the code to using allocators bound to library
+contexts.
+
+-Arran
+
+&gt;<i> On Feb 23, 2022, at 4:29 PM, Arran Cudbard-Bell &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">a.cudbardb at freeradius.org</A>&gt; wrote:
+</I>&gt;<i> 
+</I>&gt;<i> PR is now available here: <A HREF="https://github.com/openssl/openssl/pull/17762">https://github.com/openssl/openssl/pull/17762</A>
+</I>&gt;<i> 
+</I>&gt;<i> -Arran
+</I>&gt;<i> 
+</I>&gt;&gt;<i> On Feb 22, 2022, at 11:10 AM, Arran Cudbard-Bell &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">a.cudbardb at freeradius.org</A>&gt; wrote:
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> In our application we use the OpenSSL ASYNC_* API to jump out of verification and session load/store callbacks.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> On the POSIX side, when creating a new context OpenSSL calls the standard OPENSSL_malloc and
+</I>&gt;&gt;<i> OPENSSL_free functions to allocate memory for the stack passed into makecontext.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> <A HREF="https://github.com/openssl/openssl/blob/1c0eede9827b0962f1d752fa4ab5d436fa039da4/crypto/async/arch/async_posix.c">https://github.com/openssl/openssl/blob/1c0eede9827b0962f1d752fa4ab5d436fa039da4/crypto/async/arch/async_posix.c</A>
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> There are several issues with this approach:
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> 1.  On some systems stack memory must be page aligned.  The user provided allocation functions
+</I>&gt;&gt;<i>    don't know the context in which the memory is being requested so can't ensure this.
+</I>&gt;&gt;<i> 2.  glibc recommends the stack be allocated with mmap and set to executable to allow trampoline
+</I>&gt;&gt;<i>    functions to work correctly (unsure if this is relevant).
+</I>&gt;&gt;<i>    <A HREF="https://www.gnu.org/software/libc/manual/html_node/System-V-contexts.html">https://www.gnu.org/software/libc/manual/html_node/System-V-contexts.html</A>
+</I>&gt;&gt;<i> 3. Using heap memory for the stack means there's no guard page.  Overflowing the stack appears
+</I>&gt;&gt;<i>    to cause silent memory corruption on both macOS and Linux.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> The stack size is also currently fixed and requires OpenSSL recompilation to change.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> I'd like to make the stack allocation and free functions configurable.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> Ideally the malloc function would have a signature similar to this:
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> 	void *(*stack_alloc)(size_t *len);
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> and free would be
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> 	void (*stack_free)(void *stack);
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> The idea being that the allocation function returns the memory it allocated for the stack, and the size of the stack via *len.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> If user stack alloc/free functions are not configured then we'd fall back to the standard OPENSSL_malloc() and OPENSSL_free()
+</I>&gt;&gt;<i> functions with a static stack size.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> For our particular use case we're planning to have stack_alloc create a new thread.  We'll then return the stack allocated
+</I>&gt;&gt;<i> for that thread, which we believe in most cases fixes the issues described above.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> The free function will then signal/join the thread.
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> -Arran
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> Arran Cudbard-Bell &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">a.cudbardb at freeradius.org</A>&gt;
+</I>&gt;&gt;<i> FreeRADIUS Development Team
+</I>&gt;&gt;<i> 
+</I>&gt;&gt;<i> FD31 3077 42EC 7FCD 32FE 5EE2 56CF 27F9 30A8 CAA2
+</I>&gt;&gt;<i> 
+</I>&gt;<i> 
+</I>
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: signature.asc
+Type: application/pgp-signature
+Size: 833 bytes
+Desc: Message signed with OpenPGP
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20220224/028cc620/attachment.sig">https://mta.openssl.org/pipermail/openssl-users/attachments/20220224/028cc620/attachment.sig</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="014915.html">Need additional control over async stack allocation
+</A></li>
+	<LI>Next message (by thread): <A HREF="014910.html">error with cipher EVP_des_ede3_cbc in openssl 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14917">[ date ]</a>
+              <a href="thread.html#14917">[ thread ]</a>
+              <a href="subject.html#14917">[ subject ]</a>
+              <a href="author.html#14917">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Support for retrieving hash algorithm from RSA signature before/during verification
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2023-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Support%20for%20retrieving%20hash%20algorithm%20from%20RSA%20signature%0A%20before/during%20verification&In-Reply-To=%3CCAKZyAsOW2ZAk8NhV1E%3D%2Bk4Bu0_-e7kWM9zPREQU0LCfhfhtvFQ%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016253.html">
+   <LINK REL="Next"  HREF="016255.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Support for retrieving hash algorithm from RSA signature before/during verification</H1>
+    <B>Atul Singh</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Support%20for%20retrieving%20hash%20algorithm%20from%20RSA%20signature%0A%20before/during%20verification&In-Reply-To=%3CCAKZyAsOW2ZAk8NhV1E%3D%2Bk4Bu0_-e7kWM9zPREQU0LCfhfhtvFQ%40mail.gmail.com%3E"
+       TITLE="Support for retrieving hash algorithm from RSA signature before/during verification">singh.atulks at gmail.com
+       </A><BR>
+    <I>Tue Apr 25 06:43:02 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="016253.html">Support for retrieving hash algorithm from RSA signature before/during verification
+</A></li>
+        <LI>Next message (by thread): <A HREF="016255.html">1.1.1u release
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16259">[ date ]</a>
+              <a href="thread.html#16259">[ thread ]</a>
+              <a href="subject.html#16259">[ subject ]</a>
+              <a href="author.html#16259">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I found a solution to this problem. Just in case if someone finds this
+later, I am using  EVP_PKEY_verify_recover, d2i_X509_SIG and
+X509_SIG_get0  to retrieve the Hash algorithm from the signature.
+
+My test code:
+
+int
+do_pk1_verifyrecover(EVP_PKEY * pkey, unsigned char * sig, size_t siglen,
+                unsigned char * m, size_t mlen)
+{
+    int ret;
+    EVP_PKEY_CTX * ctx;
+
+    ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    EVP_PKEY_verify_recover_init(ctx);
+    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING);
+    ret = EVP_PKEY_verify_recover(ctx, m, &amp;mlen, sig, siglen);
+
+    // If the signature was not PKCS1 padded, an error should happen here
+    if (ret &lt;= 0) {
+        printf(&quot;Sign failed with error %s\n&quot;,
+               ERR_error_string(ERR_get_error(), NULL));
+    } else {
+        _print_buf(&quot;Recovered Message&quot;, m, mlen);
+    }
+
+    // Cleanup
+    if (ctx)
+        EVP_PKEY_CTX_free(ctx);
+
+    return ret;
+}
+
+int
+get_sig_algo_from_pkcs1_enc(const unsigned char * encoded_msg, size_t msglen)
+{
+
+    int ret;
+    X509_SIG * sig;
+    const X509_ALGOR * algo = NULL;
+    const ASN1_OCTET_STRING * digest = NULL;
+
+    sig = d2i_X509_SIG(NULL, &amp;encoded_msg, msglen);
+    X509_SIG_get0(sig, &amp;algo, &amp;digest);
+    ret = OBJ_obj2nid(algo-&gt;algorithm);
+
+    if (ret == NID_undef) {
+        printf(&quot;Error getting algo NID from algo object&quot;);
+        ret = -1;
+    }
+
+    _print_algo_name(algo);
+
+    // Cleanup
+    if (sig)
+        X509_SIG_free(sig);
+
+    return ret;
+}
+
+main()
+...
+    // 3. Recover message
+    // After decryption, data will be == or &lt; siglen
+    // Allocate siglen bytes to be safe
+    encoded_msg = malloc(siglen);
+    msglen = siglen;
+    if (do_pk1_verifyrecover(pkey, sig, siglen, encoded_msg, msglen) &lt; 0){
+    ret = -1;
+    goto cleanup;
+    }
+
+
+    // 4. Retrieve Hash Algo from the recovered PKCS1 encoded message
+    // Nvm about whether signature was pkcs1 or not because
+    // if not previous setup would have generated an error.
+    sig_algo_nid = get_sig_algo_from_pkcs1_enc(encoded_msg, msglen);
+    md = EVP_get_digestbynid(sig_algo_nid);
+    if (!md) {
+    ret = -1;
+    printf(&quot;Error: Unrecognized md in signature\n&quot;);
+    goto cleanup;
+    }
+
+
+    // 5. Verify using the retrieved hash algo in previous step
+    if (do_verify(pkey, md, sig, siglen) &lt; 0){
+    ret = -1;
+    goto cleanup;
+
+    }
+
+
+
+On Mon, Apr 24, 2023 at 3:46&#8239;PM Atul Singh &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">singh.atulks at gmail.com</A>&gt; wrote:
+&gt;<i>
+</I>&gt;<i> RSASSA-PKCS1-v1_5 signature scheme encodes the AlgorithmIdentifier of
+</I>&gt;<i> Hash Function in the message data before passing it through the
+</I>&gt;<i> encryption[1]. So, technically one doesn't need to know the Hash
+</I>&gt;<i> Function beforehand for verification purposes -- it can be decoded
+</I>&gt;<i> right out of the decrypted octets.
+</I>&gt;<i>
+</I>&gt;<i> Does openssl provide a way to perform verification without the
+</I>&gt;<i> application supplying the Hash Function for RSASSA-PKCS1-v1_5
+</I>&gt;<i> signatures? I have played around with EVP_DigestVerifyInit and
+</I>&gt;<i> friends, but it doesn't seem to be possible -- The Hash Function is
+</I>&gt;<i> required at the init context stage itself and there doesn't seem to be
+</I>&gt;<i> any way around it[2].
+</I>&gt;<i>
+</I>&gt;<i> I also did not see anything obvious in rsa.h that could just return
+</I>&gt;<i> the AlgorithmIdentifier that can be used for EVP_DigestVerifyInit
+</I>&gt;<i> later.
+</I>&gt;<i>
+</I>&gt;<i> The reason I am asking this question is that IKEv2 leaves it to the
+</I>&gt;<i> implementation to choose their Authentication method unannounced[3].
+</I>&gt;<i> If an IKE peer chooses RSA Signature as their authentication method,
+</I>&gt;<i> it can then go on to use any of the Hash Functions supported by RSA
+</I>&gt;<i> (RFC5996 only recommends making SHA1 default). This is causing a lot
+</I>&gt;<i> of incompatibility issues between vendors. Technically, one could try
+</I>&gt;<i> all possible algorithms one by one but that means doing 4 passes for
+</I>&gt;<i> SHA1, SHA256, SHA384 and SHA512 (assuming MD2 and MD5 are not in use
+</I>&gt;<i> anymore).
+</I>&gt;<i>
+</I>&gt;<i> Regards,
+</I>&gt;<i> Atul
+</I>&gt;<i>
+</I>&gt;<i> [1] <A HREF="https://datatracker.ietf.org/doc/html/rfc3447#section-9.2">https://datatracker.ietf.org/doc/html/rfc3447#section-9.2</A>
+</I>&gt;<i> [2] <A HREF="https://www.openssl.org/docs/man1.1.1/man3/EVP_DigestInit.html">https://www.openssl.org/docs/man1.1.1/man3/EVP_DigestInit.html</A>
+</I>&gt;<i> [2] <A HREF="https://datatracker.ietf.org/doc/html/rfc5996#section-3.8">https://datatracker.ietf.org/doc/html/rfc5996#section-3.8</A>
+</I></PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="016253.html">Support for retrieving hash algorithm from RSA signature before/during verification
+</A></li>
+	<LI>Next message (by thread): <A HREF="016255.html">1.1.1u release
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16259">[ date ]</a>
+              <a href="thread.html#16259">[ thread ]</a>
+              <a href="subject.html#16259">[ subject ]</a>
+              <a href="author.html#16259">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

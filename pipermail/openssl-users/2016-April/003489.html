@@ -1,0 +1,242 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Block Ciphers in XTS mode (AES-XTS) [SOLVED - almost ?]
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Block%20Ciphers%20in%20XTS%20mode%20%28AES-XTS%29%20%5BSOLVED%20-%0A%20almost%20%3F%5D&In-Reply-To=%3C5705785D.8060706%40openca.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003484.html">
+   <LINK REL="Next"  HREF="003487.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Block Ciphers in XTS mode (AES-XTS) [SOLVED - almost ?]</H1>
+    <B>Dr. Pala</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Block%20Ciphers%20in%20XTS%20mode%20%28AES-XTS%29%20%5BSOLVED%20-%0A%20almost%20%3F%5D&In-Reply-To=%3C5705785D.8060706%40openca.org%3E"
+       TITLE="[openssl-users] Block Ciphers in XTS mode (AES-XTS) [SOLVED - almost ?]">director at openca.org
+       </A><BR>
+    <I>Wed Apr  6 20:58:05 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003484.html">[openssl-users] Block Ciphers in XTS mode (AES-XTS)
+</A></li>
+        <LI>Next message: <A HREF="003487.html">[openssl-users] ECC private key length
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3489">[ date ]</a>
+              <a href="thread.html#3489">[ thread ]</a>
+              <a href="subject.html#3489">[ subject ]</a>
+              <a href="author.html#3489">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all,
+
+well.. I did dig a little bit into the implementation code.. I wish who 
+wrote the code would have put some comments to understand how to use the 
+cipher properly.. I hope I did get it right. If anybody is interested in 
+the code-tracking, here's some details:
+
+    // Tracking down XTS code in OSSL
+    //
+    // crypto/evp/e_evp.c:
+    //  EVP_AES_XTS_CTX (@line 85)
+    //   aes_xts_ctrl (supports EVP_CTRL_COPY &amp; EVP_CTRL_INIT only)
+    (@line 1000)
+    //   aes_xts_init_key (@line 1026)
+    //   aes_xts_cipher (@line 1088) -&gt; CRYPTO_xts128_encrypt
+    //   define: BLOCK_CIPHER_custom (@line 1119)
+    //
+    // crypto/modes/modes.h: [TODO: check tweak, scratch]
+    //  XTS128_CONTEXT (@line 144) -&gt; struct xts128_context
+    //  CRYPTO_xts128_encrypt (@line 146)
+    //
+    // crypto/modes/xts128.c:
+    //   CRYPTO_xts128_encrypt (@line 61)
+    //
+    // crypto/modes/modes_lcl.h:
+    //   struct xts128_context (@line 120)
+    //
+
+Now, for the interesting part, checking the code I noticed the use of a 
+flag that checks for the size of the data to be encrypted that, for FIPS 
+implementation, should not exceed 2^20 * block-size (in disk encryption 
+that would be the size of the block, I suppose). Anyhow, that inspired 
+me to try to see if, since there is no CRTL to set the size of the 
+block, the implementation assumes that the size of the block is actually 
+passed as the size of the data for each EVP_EncryptUpdate (or 
+EVP_DecryptUpdate)... that seems to be the case. The test code that I 
+generated is capable of decrypting the data at &quot;block&quot; boundaries (code 
+follows).
+
+Although I hoped for a more sophisticated and less error-prone 
+interface, I guess I can work with this (but I hope someone would take 
+charge of adding a little more of complexity to help with the details - 
+maybe that work can also help CTR mode as well to be easier to use for 
+random-access decryption).
+
+Here's an initial (very simple) test implementation:
+
+    // Init the CTX
+    ctx = EVP_CIPHER_CTX_new();
+
+    // Set cipher type and mode
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_xts(), NULL, key, iv)
+
+    // Total bytes to encrypt
+    n_ops = 0;
+    next_op_size = 0;
+    remains = clear_len;
+
+    enc_buf_curr = enc_buf;
+    clear_buf_curr = clear_buf;
+
+    // Encrypt plaintext
+    while (remains &gt; 0) {
+
+       // Gets the size of the next chunk to be encrypted
+       next_op_size = (block_size &lt; remains ? block_size : remains);
+
+       // Performs the encryption
+       EVP_EncryptUpdate(ctx, enc_buf_curr, &amp;tmp_len, clear_buf_curr,
+    next_op_size);
+
+       // Updates the number of ops
+       n_ops++;
+
+       // Updates the remaining data size to encrypt
+       remains -= block_size;
+
+       // Updates the pointer to the next enc buffer space
+       enc_buf_curr += tmp_len;
+
+       // Updates the pointer to the next clear buffer space
+       clear_buf_curr += block_size;
+    }
+
+    // Finalize the Encryption
+    EVP_EncryptFinal_ex(ctx, &amp;enc_buf[ret_len], &amp;tmp_len);
+
+    // Now we can output the cyphertext (encrypted message)
+    printf(&quot;Ciphertext %d:\n&quot;, ret_len);
+    BIO_dump_fp(stdout, (char *)enc_buf, ret_len);
+    printf(&quot;\n&quot;);
+
+    // Let's free the OpenSSL CTX structure
+    EVP_CIPHER_CTX_free(ctx);
+
+Although this works, I noticed that the same data in different blocks 
+result in the same ciphertext (really bad!). For example, with a block 
+size of 64bytes (I know it is very small, but bear with me) and the 
+following clear text input:
+
+      char * text =
+         // 128bits per row
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;
+         &quot;0123456789ABCDEF&quot;;
+
+The output is as follows:
+
+    Encrypted Data:
+    0000 - bb 56 4d ed dc 56 7c 3d-f8 c5 9d 58 34 d6 68 94 .VM..V|=...X4.h.
+    0010 - f8 10 03 59 f0 a7 bb 79-e0 9c a3 33 bf b9 48 2d ...Y...y...3..H-
+    0020 - 0f 23 c7 56 a8 b0 9c bf-aa a1 0e 4f 11 8b 18 14 .#.V.......O....
+    0030 - 93 aa ca 02 ea 33 2f 92-b1 40 a2 01 c2 87 3f cc .....3/<A HREF="../../../mailman/listinfo/openssl-users.html">.. at ....</A>?.
+    0040 - bb 56 4d ed dc 56 7c 3d-f8 c5 9d 58 34 d6 68 94 .VM..V|=...X4.h.
+    0050 - f8 10 03 59 f0 a7 bb 79-e0 9c a3 33 bf b9 48 2d ...Y...y...3..H-
+    0060 - 0f 23 c7 56 a8 b0 9c bf-aa a1 0e 4f 11 8b 18 14 .#.V.......O....
+    0070 - 93 aa ca 02 ea 33 2f 92-b1 40 a2 01 c2 87 3f cc .....3/<A HREF="../../../mailman/listinfo/openssl-users.html">.. at ....</A>?.
+    0080 - bb 56 4d ed dc 56 7c 3d-f8 c5 9d 58 34 d6 68 94 .VM..V|=...X4.h.
+    0090 - f8 10 03 59 f0 a7 bb 79-e0 9c a3 33 bf b9 48 2d ...Y...y...3..H-
+    00a0 - 0f 23 c7 56 a8 b0 9c bf-aa a1 0e 4f 11 8b 18 14 .#.V.......O....
+    00b0 - 93 aa ca 02 ea 33 2f 92-b1 40 a2 01 c2 87 3f cc .....3/<A HREF="../../../mailman/listinfo/openssl-users.html">.. at ....</A>?.
+    00c0 - bb 56 4d ed dc 56 7c 3d-f8 c5 9d 58 34 d6 68 94 .VM..V|=...X4.h.
+    00d0 - f8 10 03 59 f0 a7 bb 79-e0 9c a3 33 bf b9 48 2d ...Y...y...3..H-
+    00e0 - 0f 23 c7 56 a8 b0 9c bf-aa a1 0e 4f 11 8b 18 14 .#.V.......O....
+    00f0 - 93 aa ca 02 ea 33 2f 92-b1 40 a2 01 c2 87 3f cc .....3/<A HREF="../../../mailman/listinfo/openssl-users.html">.. at ....</A>?.
+
+Which, for what I know if XTS (that is very little, I admit), this 
+should not be the case.. am I correct ? I was under the impression that 
+the encryption should be tied to the position in the file (or Disk) - 
+i.e., the block number. If so, does anybody know what I am actually 
+missing here ? Am I supposed to, somehow, modify the plaintext before 
+encrypting it (e.g., XOR with the block number ?).
+
+Thanks,
+Max
+
+P.S.: I am cross-posting the message also to dev as this might have 
+better chances to get an answer there... ?
+
+
+On 4/6/16 10:54 AM, Dr. Pala wrote:
+&gt;<i> Hi all,
+</I>&gt;<i>
+</I>&gt;<i> I am trying to solve a particular problem related to provide random 
+</I>&gt;<i> access to encrypted files. AFAIK, I have two options. The first is to 
+</I>&gt;<i> use CRT mode (read only) and the second is to use XTS (read and write).
+</I>&gt;<i>
+</I>&gt;<i> Since I have never used the XTS mode before, does anybody have 
+</I>&gt;<i> experience in using the XTS support in OpenSSL ? Do you have any 
+</I>&gt;<i> particular recommendations for key re-usage in this case (i.e., shall 
+</I>&gt;<i> I use one key per file or can I re-use the same key for different 
+</I>&gt;<i> files) ?
+</I>&gt;<i>
+</I>&gt;<i> Any examples that can guide me through the implementation effort ?
+</I>&gt;<i>
+</I>&gt;<i> Thanks,
+</I>&gt;<i> Max
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> -- 
+</I>&gt;<i> Massimiliano Pala, PhD
+</I>&gt;<i> Director at OpenCA Labs
+</I>&gt;<i> twitter: @openca
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20160406/39b4b75c/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20160406/39b4b75c/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003484.html">[openssl-users] Block Ciphers in XTS mode (AES-XTS)
+</A></li>
+	<LI>Next message: <A HREF="003487.html">[openssl-users] ECC private key length
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3489">[ date ]</a>
+              <a href="thread.html#3489">[ thread ]</a>
+              <a href="subject.html#3489">[ subject ]</a>
+              <a href="author.html#3489">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

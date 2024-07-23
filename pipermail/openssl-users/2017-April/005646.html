@@ -1,0 +1,149 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] SSL_shutdown return error when close in init
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2017-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SSL_shutdown%20return%20error%20when%20close%20in%20init&In-Reply-To=%3CBC6016DA3A27864486295F6D844656F18C2B00D0%40irsmsx105.ger.corp.intel.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005645.html">
+   <LINK REL="Next"  HREF="005647.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] SSL_shutdown return error when close in init</H1>
+    <B>Linsell, StevenX</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SSL_shutdown%20return%20error%20when%20close%20in%20init&In-Reply-To=%3CBC6016DA3A27864486295F6D844656F18C2B00D0%40irsmsx105.ger.corp.intel.com%3E"
+       TITLE="[openssl-users] SSL_shutdown return error when close in init">stevenx.linsell at intel.com
+       </A><BR>
+    <I>Thu Apr 20 23:35:46 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005645.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+        <LI>Next message: <A HREF="005647.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5646">[ date ]</a>
+              <a href="thread.html#5646">[ thread ]</a>
+              <a href="subject.html#5646">[ subject ]</a>
+              <a href="author.html#5646">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 20/04/2017, Bohn, Jakob  wrote:
+&gt;<i>Let me clarify: The idea was not to change the synchronization structure,
+</I>&gt;<i>but to set a flag or otherwise (asynchronously or in a small critical
+</I>&gt;<i>section) change the state such that when the communication async
+</I>&gt;<i>operations resume, they will proceed directly to a failure state
+</I>&gt;<i>skipping as much of the processing and transmission as possible.
+</I>
+&gt;<i>For example if it was waiting for a &quot;hello&quot; from the other end,
+</I>&gt;<i>when that &quot;hello&quot; arrives, it would not process the bytes in that
+</I>&gt;<i>hello, but respond as if it received a bad hello (with
+</I>&gt;<i>&quot;aborted/closed&quot; rather than &quot;invalid hello&quot; as the error/alert
+</I>&gt;<i>code).  It would not proceed to e.g. validate incoming public keys,
+</I>&gt;<i>send public keys, generate nonces, derive keys etc.
+</I>
+So am I correct in thinking you are asking for an 'abort' mechanism for
+the async job? Effectively you would set a flag on the async job,
+then call the SSL_do_handshake again, and when it switched back into
+the async job (fibre) it would detect it was being aborted and return
+up the stack with a failure. You do still need to call the SSL_do_handshake
+that one time so that the fibre can run to completion and everything
+gets tidied up correctly though.
+
+I discussed doing this last year with Matt. At the time I couldn't justify
+the change as I couldn't come up with a scenario where it didn't just
+make sense to keep calling the function until the asynchronous operation
+completed. The only scenario I did come up with was if the hardware
+crypto device underneath stopped responding (so will never come back).
+In that case having an abort mechanism allows the application to 
+eventually time out, set the abort flag, make the function call and then 
+cause the async job to fail and come back up the stack. 
+We decided that if I wanted to pursue that abort functionality
+I should implement it as an ENGINE message that would pass the 
+ASYNC_WAIT_CTX of the connection. The engine would then need to
+ensure the ASYNC_WAIT_CTX's custom field had a structure that 
+included an abort flag. The engine could then keep self contained
+the mechanism for setting the abort flag and dealing with checking
+the flag when switching back into the async job (assuming we
+are only pausing the job from within the engine).
+I was going to implement a prototype that did that but it's something
+that is still on my list of things to try out.
+
+&gt;<i>This serves two purposes: To make the &quot;SSL_shutdown&quot; call &quot;just work&quot;
+</I>&gt;<i>from an application perspective, and to minimize security exposure
+</I>&gt;<i>after the call has been made (e.g. in case some application level
+</I>&gt;<i>code decides the other end is probably malicious).
+</I>
+Actually I'd worry about the abort solution from a security stand point.
+The trouble is if you are going to abort the connection down in the 
+crypto layer then effectively you are creating a new failure path and
+potentially changing behaviour seen at the client.
+You'd need to be very careful down there to ensure you are not 
+creating any kind of oracle that can be exploited.
+
+The current behaviour of keep calling SSL_do_handshake and then fail
+after the asynchronous operation completes will look exactly the same 
+as the synchronous operation to the client on the other end. The only
+difference being that the asynchronous connection will look like a 
+particularly slow connection due to the latency introduced by the
+asynchronous behavior (depending on server load). They both execute
+ to the same point in the handshake before the failure can be dealt with.
+
+I do agree it would be much nicer to minimize the logic changes
+at the application level but I'm not convinced yet that an abort 
+mechanism is the way to go.
+
+Steve Linsell                   Intel Shannon DCG/CID Software Development Team
+<A HREF="../../../mailman/listinfo/openssl-users.html">Stevenx.Linsell at intel.com</A>
+
+--------------------------------------------------------------
+Intel Research and Development Ireland Limited
+Registered in Ireland
+Registered Office: Collinstown Industrial Park, Leixlip, County Kildare
+Registered Number: 308263
+
+
+This e-mail and any attachments may contain confidential material for the sole
+use of the intended recipient(s). Any review or distribution by others is
+strictly prohibited. If you are not the intended recipient, please contact the
+sender and delete all copies.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005645.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+	<LI>Next message: <A HREF="005647.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5646">[ date ]</a>
+              <a href="thread.html#5646">[ thread ]</a>
+              <a href="subject.html#5646">[ subject ]</a>
+              <a href="author.html#5646">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

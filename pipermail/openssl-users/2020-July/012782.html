@@ -1,0 +1,151 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Wrong HMAC in the implementation of ECIES IEEE1363a
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Wrong%20HMAC%20in%20the%20implementation%20of%20ECIES%20IEEE1363a&In-Reply-To=%3Cf3fa2a05-847e-12a9-5d39-faaecf128991%40cnit.it%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012781.html">
+   <LINK REL="Next"  HREF="012784.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Wrong HMAC in the implementation of ECIES IEEE1363a</H1>
+    <B>Luca Di Mauro</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Wrong%20HMAC%20in%20the%20implementation%20of%20ECIES%20IEEE1363a&In-Reply-To=%3Cf3fa2a05-847e-12a9-5d39-faaecf128991%40cnit.it%3E"
+       TITLE="Wrong HMAC in the implementation of ECIES IEEE1363a">luca.dimauro at cnit.it
+       </A><BR>
+    <I>Wed Jul 22 09:11:53 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012781.html">&quot;rsa-&gt;meth-&gt;rsa_sign&quot; method in Openssl 1.1.1g
+</A></li>
+        <LI>Next message: <A HREF="012784.html">Using the library to encrypt a RSA private key compatible with Web Crypto API (PBKDF2)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12782">[ date ]</a>
+              <a href="thread.html#12782">[ thread ]</a>
+              <a href="subject.html#12782">[ subject ]</a>
+              <a href="author.html#12782">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi guys,
+I have to implement the ECIES scheme as specified at 
+<A HREF="https://wiki.plugtests.net/ITS-CMS6/images/4/4a/1609.2-consolidated-v4-d8-clean.pdf">https://wiki.plugtests.net/ITS-CMS6/images/4/4a/1609.2-consolidated-v4-d8-clean.pdf</A> 
+paragraph 5.3.5, with the KDF and encryption function specified here 
+<A HREF="https://www.etsi.org/deliver/etsi_ts/102900_102999/102941/01.03.01_60/ts_102941v010301p.pdf">https://www.etsi.org/deliver/etsi_ts/102900_102999/102941/01.03.01_60/ts_102941v010301p.pdf</A> 
+at annex E.
+
+I wrote an implementation, but the HMAC seems to be wrong.
+Here I compute the shared secret and the HMAC value with:
+// Computing shared secret using ECSVDP-DHC
+EC_KEY_set_flags(osslEphKey, EC_FLAG_COFACTOR_ECDH);
+ECDH_compute_key(K, sizeof(K), osslEncPubKey, osslEphKey, &amp;(this-&gt;etsiKdf));
+free(osslEncPubKey);
+free(osslEphKey);
+// Setting Ke value (the left-most 16 byte of K)
+std::memcpy(Ke, K, Ke_KEY_LENGTH);
+// Setting Km value (the remaining 256 bits of K)
+memcpy(Km, K+Ke_KEY_LENGTH, Km_KEY_LENGTH);
+/* Encrypting &quot;aesKey&quot;: C = aesKey XOR Ke */
+for(inti=0; i&lt;AES_KEY_SIZE; i++) {
+C[i] = aesKeyBuffer[i]^ Ke[i];
+}
+// Computing the tag with HMAC (we'll retain the leftmost 16 octets)
+if(HMAC(EVP_sha256(), Km, sizeof(Km), C, sizeof(C), hmacResult, 
+&amp;hmacLength) == NULL) {
+throwNoesCryptoException(&quot;Cannot perform HMAC&quot;);
+}
+
+Here :
+ &#160;&#160;&#160; &quot;osslEncPubKey&quot; and &quot;osslEphKey&quot; are, respectively, the encryption 
+public key of receiver and the just created ephemeral key;
+ &#160;&#160;&#160; &quot;K&quot; is a byte array containing the result of KDF function;
+ &#160;&#160;&#160; &quot;Ke&quot; and &quot;Km&quot; the keys used to compute the other encrypted or 
+signed parts;
+ &#160;&#160;&#160; &quot;aesKeyBuffer&quot; a byte array containing the AES key used to encrypt 
+with AES-CCM;
+
+The &quot;etsiKdf&quot; function called by ECDH_compute_key is:
+void*noes::securityManager::NoesCrypto::etsiKdf(constvoid*in, 
+size_tinLength, void*out, size_t*outLength) {// TODO FIXME Check me
+/* counter 1..2^32
+* CB=big endian counter on 32 bits
+* SHA256(in||CB)
+* counter++, and we do again while we need to generate stream
+*/
+void*ret= NULL;
+intcounter= 1;
+unsignedcharCB[4];
+unsignedcharHB[EVP_MAX_MD_SIZE];
+unsignedintHB_len;
+intoutputedlen= 0,
+remains= *outLength;
+EVP_MD_CTX*ctx= NULL;
+ctx= EVP_MD_CTX_create();
+while(remains&gt; 0) {
+// counter++
+CB[0] = counter&gt;&gt; 24;
+CB[1] = (counter&gt;&gt; 16) &amp; 0xff;
+CB[2] = (counter&gt;&gt; 8) &amp; 0xff;
+CB[3] = counter&amp; 0xff;
+EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+EVP_DigestUpdate(ctx, in, inLength);
+EVP_DigestUpdate(ctx, CB, sizeof(CB));
+EVP_DigestFinal_ex(ctx, HB, &amp;HB_len);
+if(remains&gt; HB_len) {
+memcpy((void*)out+outputedlen, HB, HB_len);
+outputedlen+= HB_len;
+remains-= HB_len;
+}
+else{
+memcpy((void*)out+outputedlen, HB, remains);
+outputedlen+= remains;
+remains-= remains;
+}
+counter++;
+}
+ret= out;
+std::cout&lt;&lt;&quot;\nKDF output length &quot;&lt;&lt;*outLength&lt;&lt;std::endl;
+EVP_MD_CTX_destroy(ctx);
+returnret;
+}
+
+
+Can you help me to find the bug?
+
+Luca
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20200722/a6018a0a/attachment-0001.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20200722/a6018a0a/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012781.html">&quot;rsa-&gt;meth-&gt;rsa_sign&quot; method in Openssl 1.1.1g
+</A></li>
+	<LI>Next message: <A HREF="012784.html">Using the library to encrypt a RSA private key compatible with Web Crypto API (PBKDF2)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12782">[ date ]</a>
+              <a href="thread.html#12782">[ thread ]</a>
+              <a href="subject.html#12782">[ subject ]</a>
+              <a href="author.html#12782">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

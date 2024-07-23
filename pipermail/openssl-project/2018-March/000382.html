@@ -1,0 +1,129 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-project] DRBGs, threads and locking
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-project/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20%5Bopenssl-project%5D%20DRBGs%2C%20threads%20and%20locking&In-Reply-To=%3Cf7e254e0-4cbb-4c44-b07f-9c64f722566a%40default%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000380.html">
+   <LINK REL="Next"  HREF="000384.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-project] DRBGs, threads and locking</H1>
+    <B>Paul Dale</B> 
+    <A HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20%5Bopenssl-project%5D%20DRBGs%2C%20threads%20and%20locking&In-Reply-To=%3Cf7e254e0-4cbb-4c44-b07f-9c64f722566a%40default%3E"
+       TITLE="[openssl-project] DRBGs, threads and locking">paul.dale at oracle.com
+       </A><BR>
+    <I>Wed Mar 14 03:42:10 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000380.html">[openssl-project] DRBGs, threads and locking
+</A></li>
+        <LI>Next message: <A HREF="000384.html">[openssl-project] DRBGs, threads and locking
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#382">[ date ]</a>
+              <a href="thread.html#382">[ thread ]</a>
+              <a href="subject.html#382">[ subject ]</a>
+              <a href="author.html#382">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>We did a performance analysis for Oracle&#8217;s equivalent of Nginx, OTD, about two years ago.  We were looking at the number of connections per second that could be established and the limiting factor was locking in ssleay_rand_bytes.  Approximately a third of the CPU and over 90% of the lock wait time was there from memory.  For this kind of workload (many threads, many connections) a non-locking RNG would have been an improvement.  I&#8217;ll see if I can find the analyses and then find out what I can release.
+
+This was using 1.0.2 not 1.1 so things might have changed.
+
+
+Pauli
+-- 
+Oracle
+Dr Paul Dale | Cryptographer | Network Security &amp; Encryption 
+Phone +61 7 3031 7217
+Oracle Australia
+
+From: Tim Hudson [mailto:<A HREF="../../../mailman/listinfo/openssl-project.html">tjh at cryptsoft.com</A>] 
+Sent: Wednesday, 14 March 2018 1:15 PM
+To: <A HREF="../../../mailman/listinfo/openssl-project.html">openssl-project at openssl.org</A>
+Subject: Re: [openssl-project] DRBGs, threads and locking
+
+We have to keep in mind what threats we care about and their practicality.&#160;
+The security of a DRBG is dependent on both the secrecy of the seed material provided and the security of the algorithm in terms of its output not leaking information that materially leaks the internal state in a manner that enables it to be discovered or reversed in a manner to enable determination of previous or future outputs.
+
+For some of the arguments used to date there appears to be an assumption that there is a practical difference between a broken DRBG algorithm such that it is not such a security issue if we separate out the DRBG instances on a per SSL connection.
+In real terms if a DRBG is broken and its state is able to be determined remotely there is no practical difference in separating DRBG instances - they are all equally vulnerable in the same manner.&#160;
+In the case of the DualEC-DRBG this was clear - and no one I've seen has ever suggested that you were safer if you had separate instances of a broken algorithm for a DRBG - it makes no practical difference to the security at all.
+Sure there is a slight technical difference - but from a security perspective there is no difference - you are susceptible to the same attack - so the minor technical difference offers no actual meaningful security value - and everyone that has referenced this to date has also indicated that they don't think that there is actually any real practical value to the difference - it has been more of a &quot;it cannot harm&quot; sort of comment.&#160;
+
+In more general terms we need to have a clear view on what we think about our thread model - what is considered inside the scope of what we care to address - and what is frankly outside the scope (for our view).&#160;
+
+&#8226; We don't consider attacks from the same process against itself within our threat model.&#160;
+&#8226; Correspondingly we don't consider attacks from one thread against another thread without our threat model.
+&#8226; We don't consider privileged user attacks against the user in our threat model (i.e. root can read the memory of the process on most Unix-like systems).&#160;
+&#8226; We also don't actually consider a need to protect all secret information from every possible other bug that might leak arbitrary parts of memory. We could. But we don't. And if we did we would need to protect both the seeding material for the DRBG and its internal state and potentially its output. We don't do that - because that isn't within our threat model.
+
+Typical applications share an SSL_CTX between multiple SSL instances and we maintain the session cache against the SSL_CTX. This may be in a single process (thread) or shared across multiple threads - or even shared across multiple prcesses (which is simply the same as being in a single process from our perspective where the &quot;magic&quot; to coordinate the session id cache between processes is left to the developer/user).&#160;
+
+In a FIPS context, every DRBG has requirements on its inputs (seeding) and on maintaining a continuous RNG test (block-based compare for non-repeating outputs at a block level).&#160;
+All of these would be a per-instance requirement on the DRBG. They have to be factored in.
+
+There is also the argument that locking is bad and fewer locks are better - and that argument needs to be backed up by looking at the overall status - which particular application model are we concerned about? Have we measured it? Have we figured out where the bottlenecks are? Have we worked through optimising the actual areas of performance impact? Or are we just prematurely optimising? Excessive locking will have an impact for certain application models - but I don't think anyone is suggesting that what we had previously was excessive - and given the significant performance impact of the recent changes which went unmeasured and unaddressed I think it is clear we haven't been measuring performance related items for the DRBG at all to date - so there wasn't any &quot;science&quot; behind the choices made.
+
+Simple, clear, well documented code with good tests and known architectural assumptions is what we are trying to achieve - and my sense from the conversations on this topic to date was that we don't have a consensus as to what problem we are actually trying to solve - so the design approach shifts, and shifts again - all of which are the authors of the PRs responding to what is (in my view at least) conflicting suggestions based on different assumptions.
+
+That is what I put the -1 on the the PR - to have this discussion - and agree on what we are trying to solve - and also agree on what we are not trying to solve. And perhaps we can actually document some of our &quot;threat model&quot; - as I'm sure we have different views on that as well.
+
+I don't think we should have per-SSL DRBGs - it offers no meaningful security value. We could have a per-SSL_CTX - but I'm not sure that is needed. We could have a per-thread - but again that is unclear if we actually need that either.
+My thoughts are per-SSL_CTX might make the most sense based on my understanding of the high-performance server contexts (in various web servers and custom servers).&#160;
+You can make a reasonable argument that we are sharing many security related things between SSL_CTXs already so this is the right place.&#160;
+
+And if we cannot reach a consensus because we cannot get to a shared view then perhaps it needs to be configurable for the user.
+
+Tim.
+
+
+On Wed, Mar 14, 2018 at 12:10 PM, Salz, Rich &lt;<A HREF="../../../mailman/listinfo/openssl-project.html">rsalz at akamai.com</A>&gt; wrote:
+&gt;<i>&#160; &#160; Either that or just always use the per-thread DRBG for the current
+</I>&#160; &#160; thread, and don't bother to do per-SSL at all.
+
+There is appeal to isolating each SSL connection so that an adversary can't use information it has about *it's* connection to attack another.&#160; Granted, this might not be practical, but still...
+
+_______________________________________________
+openssl-project mailing list
+<A HREF="../../../mailman/listinfo/openssl-project.html">openssl-project at openssl.org</A>
+<A HREF="../../../mailman/listinfo/openssl-project.html">https://mta.openssl.org/mailman/listinfo/openssl-project</A>
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000380.html">[openssl-project] DRBGs, threads and locking
+</A></li>
+	<LI>Next message: <A HREF="000384.html">[openssl-project] DRBGs, threads and locking
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#382">[ date ]</a>
+              <a href="thread.html#382">[ thread ]</a>
+              <a href="subject.html#382">[ subject ]</a>
+              <a href="author.html#382">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-project.html">More information about the openssl-project
+mailing list</a><br>
+</body></html>

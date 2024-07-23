@@ -1,0 +1,302 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> OpenSSL version 3.3.0 published
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2024-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20OpenSSL%20version%203.3.0%20published&In-Reply-To=%3CCAJbOq17U2DJQdBoK_tw82%3DZ34io-uhCM--RrxpMhFj83kRmxdA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017147.html">
+   <LINK REL="Next"  HREF="017149.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>OpenSSL version 3.3.0 published</H1>
+    <B>Neil Horman</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20OpenSSL%20version%203.3.0%20published&In-Reply-To=%3CCAJbOq17U2DJQdBoK_tw82%3DZ34io-uhCM--RrxpMhFj83kRmxdA%40mail.gmail.com%3E"
+       TITLE="OpenSSL version 3.3.0 published">nhorman at openssl.org
+       </A><BR>
+    <I>Wed May 15 22:34:13 UTC 2024</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="017147.html">OpenSSL version 3.3.0 published
+</A></li>
+        <LI>Next message (by thread): <A HREF="017149.html">OpenSSL version 3.3.0 published
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17148">[ date ]</a>
+              <a href="thread.html#17148">[ thread ]</a>
+              <a href="subject.html#17148">[ subject ]</a>
+              <a href="author.html#17148">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>You are correct, the files you reference (most of them in fact) get built
+into separate objects in the event the build flags are different for shared
+and static libraries, and should be unrelated to the issue you are seeing
+
+As for the undefined symbols, thats definitely a mystery.  most notably,
+the symbols referenced are internal.  That is to say they shouldn't be
+exported in the symbol table for libssl.so (though a quick look with
+objectdump shows they are, which may be a separate issue)
+
+Looking at the sources, I can see what _might_ be happening
+
+cert_comp_tests.c includes &quot;../ssl/ssl_local.h&quot;
+if quic is enabled (i.e. OPENSSL_NO_QUIC is undefined), ssl_local.h
+includes quic/quic_local.h
+quic_local.h includes internal/quic_txp.h
+quic_txp.h includes internal/quic_stream_map.h
+quic_stream_map.h defines a static inline function
+named ossl_quic_stream_recv_get_final_size which calls
+ossl_quic_rxfc_get_final_size, which in turn
+calls ossl_quic_rxfc_get_final_size
+
+I'm guessing the other symbols have simmilar patterns.
+
+As to why its happening my first guess would be that more recent compilers
+like gcc and clang do lazy symbol resolution, only resolving a subordonate
+symbol, when its calling parent is found to be used.  Given
+ossl_quic_stream_recv_get_final_size isn't called anywhere in
+comp_stream_test.c, the compiler disposes of the symbol prior to any need
+to resolve its called symbols, and so everything is ok.
+
+conversely (again, I'm guessing here) the solaris 5.10 compiler likely take
+a more bulldozer-ish approach, leaving everything in the object file and
+only stripping symbols after all resolutions are complete, leading to the
+missing symbols error, despite its not being needed.
+
+As to what to do about this...I'm unsure.  The quick hack I would imagine
+would be to move the definition of ossl_quic_stream_recv_get_final_size
+into a c file (likely quic_stream_map.c) and just declare a prototype in
+the quic_stream_map.h header, so as to avoid the unneeded symbol
+resolution.  You would have to lather rinse  repeat with the other missing
+symbols of course.
+
+As to your prior question about how long the ability to support SunOS will
+last, well, unfortunately I don't think any of us can say.  I believe the
+platoform you are building on is on our unadpoted platform list:
+<A HREF="https://www.openssl.org/policies/general-supplemental/platforms.html">https://www.openssl.org/policies/general-supplemental/platforms.html</A>
+
+And while we endeavor to keep openssl building on as many platforms as
+possible, its not feasible to cover all the currently
+unmaintained platforms.  You do have some agency here however. If you are
+willing and interested, you could volunteer to be a community platform
+maintainer for your target platform.  This would entail you building
+openssl on your adopted platform, and running the test suite routinely,
+reporting bugs and fixing errors as they occur.  Its not a small amount of
+work, but it would be a significant contribution toward ensuring that
+openssl stays viable on the targets you need.
+
+Regards
+Neil
+
+
+
+On Wed, May 15, 2024 at 4:12&#8239;PM Dennis Clarke &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">dclarke at blastwave.org</A>&gt; wrote:
+
+&gt;<i> On 5/13/24 03:34, Matt Caswell wrote:
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt; On 13/05/2024 02:42, Neil Horman wrote:
+</I>&gt;<i> &gt;&gt; We added support for RCU locks in 3.3 which required the use of
+</I>&gt;<i> &gt;&gt; atomics (or emulated atomic where they couldn't be supported), but
+</I>&gt;<i> &gt;&gt; those were in libcrypro not liberal
+</I>&gt;<i> &gt;&gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt; Right - its supposed to fallback to emulated atomic calls where atomics
+</I>&gt;<i> &gt; aren't available on a particular platform.
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt; Some platforms have some atomics support but you have to link in a
+</I>&gt;<i> &gt; separate atomics library to get it to work. You might try adding
+</I>&gt;<i> &gt; &quot;-latomic&quot; to Configure command line and see if that helps at all.
+</I>&gt;<i> &gt;
+</I>&gt;<i> Well first the good news : managed to get past the need for C11 atomics
+</I>&gt;<i> with the bundled libatomic.so.1 that the Oracle people provide in the
+</I>&gt;<i> dev tools.
+</I>&gt;<i>
+</I>&gt;<i>       So that works now.  Yay.
+</I>&gt;<i>
+</I>&gt;<i> Now comes the next horrible hurdle to jump and that seems to be called
+</I>&gt;<i> the quic protocol goodness.  For the record I am able to get a good
+</I>&gt;<i> result if I go with &quot;no-quic&quot; in the config :
+</I>&gt;<i>
+</I>&gt;<i> hubble $ $PERL ./Configure solaris64-sparcv9-cc \
+</I>&gt;<i>  &gt; --prefix=/opt/bw no-asm no-engine shared zlib-dynamic \
+</I>&gt;<i>  &gt; no-quic enable-weak-ssl-ciphers -DPEDANTIC 2&gt;&amp;1
+</I>&gt;<i> Configuring OpenSSL version 3.3.0 for target solaris64-sparcv9-cc
+</I>&gt;<i> Using os-specific seed configuration
+</I>&gt;<i> Created configdata.pm
+</I>&gt;<i> Running configdata.pm
+</I>&gt;<i> Created Makefile.in
+</I>&gt;<i> Created Makefile
+</I>&gt;<i> Created include/openssl/configuration.h
+</I>&gt;<i>
+</I>&gt;<i> **********************************************************************
+</I>&gt;<i> ***                                                                ***
+</I>&gt;<i> ***   OpenSSL has been successfully configured                     ***
+</I>&gt;<i> ***                                                                ***
+</I>&gt;<i> ***   If you encounter a problem while building, please open an    ***
+</I>&gt;<i> ***   issue on GitHub &lt;<A HREF="https://github.com/openssl/openssl/issues">https://github.com/openssl/openssl/issues</A>&gt;  ***
+</I>&gt;<i> ***   and include the output from the following command:           ***
+</I>&gt;<i> ***                                                                ***
+</I>&gt;<i> ***       perl configdata.pm --dump                                ***
+</I>&gt;<i> ***                                                                ***
+</I>&gt;<i> ***   (If you are new to OpenSSL, you might want to consult the    ***
+</I>&gt;<i> ***   'Troubleshooting' section in the INSTALL.md file first)      ***
+</I>&gt;<i> ***                                                                ***
+</I>&gt;<i> **********************************************************************
+</I>&gt;<i> hubble $
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> That all builds neatly on this old platform and all the testsuite looks
+</I>&gt;<i> to be sweet :
+</I>&gt;<i>
+</I>&gt;<i> .
+</I>&gt;<i> .
+</I>&gt;<i> .
+</I>&gt;<i> All tests successful.
+</I>&gt;<i> Files=312, Tests=3182, 6723 wallclock secs (25.17 usr  3.15 sys +
+</I>&gt;<i> 6375.57 cusr 171.52 csys = 6575.41 CPU)
+</I>&gt;<i> Result: PASS
+</I>&gt;<i> `test' is up to date.
+</I>&gt;<i>
+</I>&gt;<i> So that is cute.
+</I>&gt;<i>
+</I>&gt;<i> However, if I leave in the &quot;quic&quot;-ness then I eventually land on this
+</I>&gt;<i> weird linking problem :
+</I>&gt;<i>
+</I>&gt;<i> Undefined                       first referenced
+</I>&gt;<i>   symbol                             in file
+</I>&gt;<i> ossl_quic_rxfc_get_final_size
+</I>&gt;<i>  test/cert_comp_test-bin-cert_comp_test.o
+</I>&gt;<i> ossl_quic_sstream_get_final_size
+</I>&gt;<i> test/cert_comp_test-bin-cert_comp_test.o
+</I>&gt;<i> ossl_quic_vlint_decode_unchecked
+</I>&gt;<i> test/cert_comp_test-bin-cert_comp_test.o
+</I>&gt;<i> ld: fatal: symbol referencing errors. No output written to
+</I>&gt;<i> test/cert_comp_test
+</I>&gt;<i> *** Error code 2
+</I>&gt;<i> make: Fatal error: Command failed for target `test/cert_comp_test'
+</I>&gt;<i> Current working directory
+</I>&gt;<i> /opt/bw/build/openssl-3.3.0_SunOS_5.10_SPARC64.004
+</I>&gt;<i> *** Error code 1
+</I>&gt;<i> make: Fatal error: Command failed for target `build_sw'
+</I>&gt;<i>
+</I>&gt;<i> These files refer to the above symbols :
+</I>&gt;<i>
+</I>&gt;<i> 1) headers
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl        4670 Apr  9 12:12
+</I>&gt;<i> ./include/internal/packet_quic.h
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       10769 Apr  9 12:12
+</I>&gt;<i> ./include/internal/quic_fc.h
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       17692 Apr  9 12:12
+</I>&gt;<i> ./include/internal/quic_stream.h
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       34987 Apr  9 12:12
+</I>&gt;<i> ./include/internal/quic_stream_map.h
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl        4212 Apr  9 12:12
+</I>&gt;<i> ./include/internal/quic_vlint.h
+</I>&gt;<i>
+</I>&gt;<i> 2) C sources
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl        2060 Apr  9 12:12 ./crypto/quic_vlint.c
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl      121348 Apr  9 12:12
+</I>&gt;<i> ./ssl/quic/quic_impl.c
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       12010 Apr  9 12:12
+</I>&gt;<i> ./ssl/quic/quic_sstream.c
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       26592 Apr  9 12:12
+</I>&gt;<i> ./ssl/quic/quic_stream_map.c
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl       17658 Apr  9 12:12
+</I>&gt;<i> ./ssl/quic/quic_tserver.c
+</I>&gt;<i> -rw-r--r--   1 dclarke  devl      114209 Apr  9 12:12 ./ssl/quic/quic_txp.c
+</I>&gt;<i>
+</I>&gt;<i> Looking into my compile logs I see that quic_vlint.c gets processed into
+</I>&gt;<i> three output objects :
+</I>&gt;<i>
+</I>&gt;<i> {CC foo} -c -o crypto/libcrypto-lib-quic_vlint.o   crypto/quic_vlint.c
+</I>&gt;<i> {CC foo} -c -o crypto/libcrypto-shlib-quic_vlint.o crypto/quic_vlint.c
+</I>&gt;<i> {CC foo} -c -o crypto/libssl-shlib-quic_vlint.o    crypto/quic_vlint.c
+</I>&gt;<i>
+</I>&gt;<i> I see that quic_impl.c gets processed into two output objects :
+</I>&gt;<i>
+</I>&gt;<i> {CC foo} -c -o ssl/quic/libssl-lib-quic_impl.o     ssl/quic/quic_impl.c
+</I>&gt;<i> {CC foo} -c -o ssl/quic/libssl-shlib-quic_impl.o   ssl/quic/quic_impl.c
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Similarly we see that quic_sstream.c results in two objects also :
+</I>&gt;<i>
+</I>&gt;<i>      output object file                      input source
+</I>&gt;<i>      ------------------------------------------------------------------
+</I>&gt;<i>      ssl/quic/libssl-lib-quic_sstream.o      ssl/quic/quic_sstream.c
+</I>&gt;<i>      ssl/quic/libssl-shlib-quic_sstream.o    ssl/quic/quic_sstream.c
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Next I see quic_stream_map.c results in two object files :
+</I>&gt;<i>
+</I>&gt;<i>      output object file                      input source
+</I>&gt;<i>      ------------------------------------------------------------------
+</I>&gt;<i>      ssl/quic/libssl-lib-quic_stream_map.o   ssl/quic/quic_stream_map.c
+</I>&gt;<i>      ssl/quic/libssl-shlib-quic_stream_map.o ssl/quic/quic_stream_map.c
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Same situation again for quic_tserver.c :
+</I>&gt;<i>
+</I>&gt;<i>      output object file                      input source
+</I>&gt;<i>      ------------------------------------------------------------------
+</I>&gt;<i>      ssl/quic/libssl-lib-quic_tserver.o      ssl/quic/quic_tserver.c
+</I>&gt;<i>      ssl/quic/libssl-shlib-quic_tserver.o    ssl/quic/quic_tserver.c
+</I>&gt;<i>
+</I>&gt;<i> Lastly we see quic_txp.c gives us two objects also :
+</I>&gt;<i>
+</I>&gt;<i>      output object file                      input source
+</I>&gt;<i>      ------------------------------------------------------------------
+</I>&gt;<i>      ssl/quic/libssl-lib-quic_txp.o          ssl/quic/quic_txp.c
+</I>&gt;<i>      ssl/quic/libssl-shlib-quic_txp.o        ssl/quic/quic_txp.c
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Looking at the above I can only guess that we are creating objects to
+</I>&gt;<i> be linked later into a shared lib as well as object to be tossed into
+</I>&gt;<i> a static lib AR type foo.a result. Just a guess.
+</I>&gt;<i>
+</I>&gt;<i> None of the above seem involved with the stuff in the test directory and
+</I>&gt;<i> clearly not a test/cert_comp_test-bin-cert_comp_test.o object file.
+</I>&gt;<i>
+</I>&gt;<i> So ... what is going on here ?
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> --
+</I>&gt;<i> Dennis Clarke
+</I>&gt;<i> RISC-V/SPARC/PPC/ARM/CISC
+</I>&gt;<i> UNIX and Linux spoken
+</I>&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20240515/329c2894/attachment-0001.htm">https://mta.openssl.org/pipermail/openssl-users/attachments/20240515/329c2894/attachment-0001.htm</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="017147.html">OpenSSL version 3.3.0 published
+</A></li>
+	<LI>Next message (by thread): <A HREF="017149.html">OpenSSL version 3.3.0 published
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17148">[ date ]</a>
+              <a href="thread.html#17148">[ thread ]</a>
+              <a href="subject.html#17148">[ subject ]</a>
+              <a href="author.html#17148">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,206 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> SOLVED: Force use of engine all the time
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SOLVED%3A%20Force%20use%20of%20engine%20all%20the%20time&In-Reply-To=%3CXnsAB008ADD72B82fgotham%40195.159.176.226%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011491.html">
+   <LINK REL="Next"  HREF="011493.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>SOLVED: Force use of engine all the time</H1>
+    <B>Frederick Gotham</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SOLVED%3A%20Force%20use%20of%20engine%20all%20the%20time&In-Reply-To=%3CXnsAB008ADD72B82fgotham%40195.159.176.226%3E"
+       TITLE="SOLVED: Force use of engine all the time">cauldwell.thomas at gmail.com
+       </A><BR>
+    <I>Thu Nov  7 13:39:03 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011491.html">Latest idea to force usage of custom engine
+</A></li>
+        <LI>Next message: <A HREF="011493.html">SOLVED: Force use of engine all the time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11492">[ date ]</a>
+              <a href="thread.html#11492">[ thread ]</a>
+              <a href="subject.html#11492">[ subject ]</a>
+              <a href="author.html#11492">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+I know I've called this &quot;solved&quot;, but I've achieved my objective about 98% 
+so there's only a little bit left to go.
+
+My changes to the source code for LibOpenSSL are confined to the file 
+&quot;rand_lib.c&quot;.
+
+Firstly, I've added the following code:
+
+#include &lt;assert.h&gt;
+#include &lt;sys/stat.h&gt; 
+#include &lt;fcntl.h&gt;
+
+static int Dummy__seed(const void *buf, int num) { (void)buf; (void)num; 
+return 1; }
+
+static void Dummy__cleanup(void) { /* Do Nothing */ return; }
+
+static int Dummy__add(const void *buf, int num, double randomness) { 
+(void)buf; (void)num; (void)randomness; return 1; }
+
+static int Dummy__status(void) { /* Do Nothing */ return 1; }
+
+static void Do_Whatever_Needs_Done_For_TPM2(void)
+{
+	CRYPTO_THREAD_write_lock(rand_meth_lock);
+	CRYPTO_THREAD_write_lock(rand_engine_lock);
+
+	/* Initialize the dynamic engine loader */
+	ENGINE_load_dynamic();
+
+	ENGINE *tpm2_engine;
+ 
+	/* If the first fails, try the second one */
+	(tpm2_engine = ENGINE_by_id(&quot;tpm2tss&quot;)) || (tpm2_engine = 
+ENGINE_by_id(&quot;libtpm2tss&quot;));
+	
+	if ( NULL == tpm2_engine )
+	{
+		assert( 0 == &quot;Do_Whatever_Needs_Done_For_TPM2: NULL == 
+ENGINE_by_id&quot; );
+		abort();
+	}
+
+#   define TPM2TSS_SET_TCTI  (ENGINE_CMD_BASE + 1)
+	
+    if ( 0 == ENGINE_ctrl(tpm2_engine, TPM2TSS_SET_TCTI, 0, &quot;device&quot;, 
+NULL) )
+    {
+		assert( 0 == &quot;Do_Whatever_Needs_Done_For_TPM2: 0 == 
+ENGINE_ctrl(tcti:device)&quot; );
+		abort();
+    }	
+    
+	int const init_res = ENGINE_init(tpm2_engine);
+	
+	if ( 0 == init_res )
+	{
+		assert( 0 == &quot;Do_Whatever_Needs_Done_For_TPM2: 0 == 
+ENGINE_init&quot; );
+		abort();
+	}
+		
+	RAND_METHOD const *const p_rm = ENGINE_get_RAND(tpm2_engine);
+
+	if ( NULL == p_rm )
+	{
+		assert( 0 == &quot;Do_Whatever_Needs_Done_For_TPM2: NULL == 
+ENGINE_get_RAND&quot; );
+		abort();
+	}
+	
+	static RAND_METHOD funcptrs = {
+		Dummy__seed,          /* seed() */
+		0,							/* bytes() */
+		Dummy__cleanup,       /* cleanup() */
+		Dummy__add,           /* add() */
+		0,			                /* pseudorand() */
+		Dummy__status         /* status() */
+	};
+	
+	funcptrs.bytes = p_rm-&gt;bytes;  //rand_meth.bytes;
+	funcptrs.pseudorand = p_rm-&gt;bytes;  //rand_meth.pseudorand;
+	funct_ref = tpm2_engine;
+	default_RAND_meth = &funcptrs;
+	rand_meth = funcptrs;  /* Even set the Drbg func pointers */
+
+	/* DON'T DO THIS - - - ENGINE_set_default(tpm2_engine, 
+ENGINE_METHOD_RAND); */
+	
+	CRYPTO_THREAD_unlock(rand_meth_lock);
+	CRYPTO_THREAD_unlock(rand_engine_lock);
+}
+
+
+And then I add one line to the funciton &quot;do_rand_init&quot;:
+
+    Do_Whatever_Needs_Done_For_TPM2();
+
+So my device starts up just fine, and the first thing I notice is that it 
+takes a little longer to boot up (maybe because it takes a long longer to 
+get random numbers from hardware?).
+
+So, when I do the following at the command line:
+
+    openssl rand -hex 128
+
+It sometimes gives me back 128 bytes immediately, although sometimes it 
+gives this:
+
+ERROR:tcti:src/tss2-tcti/tcti-device.c:319:Tss2_Tcti_Device_Init() Failed 
+to open device file /dev/tpm0: Device or resource busy
+WARNING:esys:src/tss2-esys/esys_tcti_default.c:83:tcti_from_init() TCTI 
+init for function 0x7f6528b376f6 failed with a000a
+WARNING:esys:src/tss2-esys/esys_tcti_default.c:113:tcti_from_info() Could 
+not initialize TCTI named: tcti-device
+ERROR:esys:src/tss2-esys/esys_tcti_default.c:150:tcti_from_file() Could 
+not initialize TCTI file: libtss2-tcti-default.so
+WARNING:esys:src/tss2-esys/esys_tcti_default.c:137:tcti_from_file() Could 
+not load TCTI file: libtss2-tcti-tabrmd.so
+
+In order to try get around this problem of more than one thread (or 
+process) acessing /dev/tpm0 simultaneously, I added a global named mutex 
+to my code, and while it does improve things, it doesn't irradicate the 
+problem completely.
+
+I don't think any code other than &quot;libcrypto.so&quot; is using the TPM2, and so 
+I don't know why I'm getting &quot;device or resource busy&quot; (considering I'm 
+using a global named mutex)&quot;. I see that there's also a TPM2 tcti called 
+&quot;abrmd&quot;, and I'm not sure if this purpose is exactly what it's for.
+
+Any ideas?
+
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011491.html">Latest idea to force usage of custom engine
+</A></li>
+	<LI>Next message: <A HREF="011493.html">SOLVED: Force use of engine all the time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11492">[ date ]</a>
+              <a href="thread.html#11492">[ thread ]</a>
+              <a href="subject.html#11492">[ subject ]</a>
+              <a href="author.html#11492">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Questions / SSL_accept errors (soliciting client certificates)
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2024-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Questions%20/%20SSL_accept%20errors%20%28soliciting%20client%20certificates%29&In-Reply-To=%3CZhWB7Sq3CStLtoev%40chardros.imrryr.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017089.html">
+   <LINK REL="Next"  HREF="017092.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Questions / SSL_accept errors (soliciting client certificates)</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Questions%20/%20SSL_accept%20errors%20%28soliciting%20client%20certificates%29&In-Reply-To=%3CZhWB7Sq3CStLtoev%40chardros.imrryr.org%3E"
+       TITLE="Questions / SSL_accept errors (soliciting client certificates)">openssl-users at dukhovni.org
+       </A><BR>
+    <I>Tue Apr  9 17:59:09 UTC 2024</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="017089.html">SSL_accept errors
+</A></li>
+        <LI>Next message (by thread): <A HREF="017092.html">Questions / SSL_accept errors (soliciting client certificates)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17091">[ date ]</a>
+              <a href="thread.html#17091">[ thread ]</a>
+              <a href="subject.html#17091">[ subject ]</a>
+              <a href="author.html#17091">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Tue, Apr 09, 2024 at 08:44:41AM -0700, Doug Hardie wrote:
+
+&gt;<i> When using client certificates, how does SSL_accept validate the
+</I>&gt;<i> provided certificate?
+</I>
+By building a certificate chain to a local trust-anchor using the
+server's configured trust store, and any untrusted intermediate
+certificates presented by the remote client.
+
+Note that verification of client certificates DOES NOT typically include
+any &quot;identity&quot; checks, rather only the trustworthiness of the chain is
+verified.  It is up to the server application to perform access control
+on the requested resources based on whatever information the server
+independently gleams from the certificate during or after the TLS
+handshake.
+
+&gt;<i> If verify_callback is used, is the client certificate validated before
+</I>&gt;<i> the callback is called?
+</I>
+No, if all goes well, the callbacks (one per chain certificate) are
+made *as part of* validation, with the &quot;ok&quot; parameter set to &quot;1&quot; if
+there's no (new?) problem to report at the level in question.
+
+If the callback returns a non-zero value, the handshake continues, if
+zero it is aborted.  A callback that is purely diagnostic should return
+the input &quot;ok&quot; value.  If the callback wants to either abort an
+otherwise &quot;ok&quot; handshake, or ignore a particular problem, it can return
+1 under appropriate conditions even if &quot;ok&quot; was zero.
+
+Note that returning &quot;ok&quot; equal to one does not reset the verification
+status for the chain, which can be tested, for e.g. success, via:
+
+    SSL_get_verify_result(ssl) == X509_V_OK
+
+this works even on resumption, because the original validation status is
+part of the saved/resumed session.
+
+The callback can (with great care to not ignore any important error
+conditions) reset the validation result for less critical conditions,
+but then it is necessary to either abort the handshake on the import
+conditions, or save away state that an earlier problem was not
+ignorable, and reset the error to that, rather than to X509_V_OK.
+
+See X509_STORE_CTX_set_error(3), but tread cautiously, there be dragons.
+
+On Tue, Apr 09, 2024 at 08:43:39AM -0700, Doug Hardie wrote:
+
+&gt;<i> The server requires client certificates.  If I use
+</I>&gt;<i> openssl s_client and give it the proper certificate, I see one
+</I>&gt;<i> connection that makes the request and returns the response.
+</I>
+The &quot;s_client&quot; application is liberal in what it accepts:
+
+    - Without non-default options, the handshake completes (with some
+      addtional noise) even if the server certificate fails to verufy.
+
+    - It presents the specified client certificate even if the server
+      does not solicit its issuer CA (or ultimate trust anchor) in its
+      certificate request message, which lists the acceptable CAs.
+
+    - There may of course be subtle differences in various extensions
+      used, the SNI extension may be important, the others typically
+      less so.
+
+    - Your s_client may be dated, and the issue may only manifest with
+      bleeding edge client capabilities, though again your s_client is
+      likely not that old (1.1.1, supports TLS 1.3) and you rarely need
+      more.
+
+Speculatively, the second item is the most likely source of issues.
+
+
+&gt;<i> However, if I use one of the various clients to make the same request,
+</I>&gt;<i> the results are quite different.  There are a number of connections
+</I>&gt;<i> made that fail and then finally they make the proper connection and
+</I>&gt;<i> everything works.  The time it takes to get through all of that is
+</I>&gt;<i> quite long - around 5 seconds.  The server is recording the following
+</I>&gt;<i> errors from SSL_accept:
+</I>&gt;<i> 
+</I>&gt;<i> 	Connection 1 - session id context uninitialized
+</I>&gt;<i> 	Connection 2 - session id context uninitialized
+</I>&gt;<i> 	Connection 3 - sslv3 alert certificate unknown
+</I>&gt;<i> 	Connection 4 - sslv3 alert certificate unknown
+</I>
+Who's sending/receiving the alerts?  The server would typically report
+*received* alerts, and it is then perhaps the client that is failing to
+validate the server certificate, but without a clear context, it is
+difficult to say what happened.
+
+As for session id contexts, your server code needs to set one in order
+to support resumption properly, one more difference between s_client
+and other clients, is that s_client always starts with no saved
+sessions.
+
+The Postfix SMTP server has:
+
+     /*                                                                                                                                                                           * The session_id_context identifies the service that created a session.                                                                                                     * This information is used to distinguish between multiple TLS-based                                                                                                        * servers running on the same server. We use the name of the mail system.                                                                                                   */                                                                                                                                                                        static const char server_session_id_context[] = &quot;Postfix/TLS&quot;;
+    ...
+    SSL_CTX_set_session_id_context(server_ctx,                                                                                                                                                                 (void *) &amp;server_session_id_context,                                                                                                                                        sizeof(server_session_id_context));
+
+&gt;<i> and then Connection 5 sees the proper client certificate, authenticates and produces output.
+</I>
+Perhaps the client is no longer attempting resumption?
+
+&gt;<i> How can I figure out what is causing these multiple connections and
+</I>&gt;<i> the resulting errors.  I have tcpdump and ssldump output but nothing
+</I>&gt;<i> there gives me any ideas.
+</I>
+The ssldump software is abandoned, use &quot;tcpdump&quot; + &quot;&quot;tshark&quot;, as explained in:
+ 
+     <A HREF="https://marc.info/?l=postfix-users&amp;m=166005488423800&amp;w=2">https://marc.info/?l=postfix-users&amp;m=166005488423800&amp;w=2</A>
+
+
+&gt;<i> I can provide either of those if needed, but they are large.
+</I>
+
+With &quot;tcpdump&quot;, after capturing a bunch of traffic, you extract just a
+particular connection of interest, details in the post linked above.
+You can then analyse it with &quot;tshark&quot; (same link).
+
+&gt;<i> Unfortunately I have not figured out how to get ssldump to decode the
+</I>&gt;<i> application data.  As best as I can tell, the negotiated cipher cannot
+</I>&gt;<i> be handled by ssldump.
+</I>
+Delete &quot;ssldump&quot; you're better off without it.
+
+&gt;<i> The clients each have the same 2 client certificates.  They ask which
+</I>&gt;<i> one to use, but perhaps they are trying both?
+</I>
+A given handshake can only try one client certificate as part of the
+normal handshake.  THere's also post-handshake authenticaiton (PHA) in
+TLS 1.3, but you probably don't have server code for that.
+
+That the clients are putting up a dialogue does strengthen the
+plausibility of the server's client certificate request being part of
+the problem.  You may need to carefully tune your server's list of
+solicited client CAs.  See the docs for SSL_CTX_set_client_CA_list(3).
+Less is more (ideally just one if there's only one CA issuing the
+desired certificates).
+
+And finally, but importantly, what exactly is your use case?  How does
+the server expect to benefit from (make access and authorisation
+decisions based on) client certificates?
+
+-- 
+    Viktor.
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="017089.html">SSL_accept errors
+</A></li>
+	<LI>Next message (by thread): <A HREF="017092.html">Questions / SSL_accept errors (soliciting client certificates)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17091">[ date ]</a>
+              <a href="thread.html#17091">[ thread ]</a>
+              <a href="subject.html#17091">[ subject ]</a>
+              <a href="author.html#17091">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

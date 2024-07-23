@@ -1,0 +1,264 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> OpenSSL 1.1.1b tests fail on Solaris - solution and possible fix
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20OpenSSL%201.1.1b%20tests%20fail%20on%20Solaris%20-%20solution%20and%20possible%20fix&In-Reply-To=%3CDM6PR07MB4650CB4252BD619D92AF95DDF5080%40DM6PR07MB4650.namprd07.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010469.html">
+   <LINK REL="Next"  HREF="010473.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>OpenSSL 1.1.1b tests fail on Solaris - solution and possible fix</H1>
+    <B>John Unsworth</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20OpenSSL%201.1.1b%20tests%20fail%20on%20Solaris%20-%20solution%20and%20possible%20fix&In-Reply-To=%3CDM6PR07MB4650CB4252BD619D92AF95DDF5080%40DM6PR07MB4650.namprd07.prod.outlook.com%3E"
+       TITLE="OpenSSL 1.1.1b tests fail on Solaris - solution and possible fix">John.Unsworth at synchronoss.com
+       </A><BR>
+    <I>Tue May 14 09:29:23 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010469.html">creating certificate only structure -- CMS_sign
+</A></li>
+        <LI>Next message: <A HREF="010473.html">OpenSSL 1.1.1b tests fail on Solaris - solution and possible fix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10466">[ date ]</a>
+              <a href="thread.html#10466">[ thread ]</a>
+              <a href="subject.html#10466">[ subject ]</a>
+              <a href="author.html#10466">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Because of the #pragma weak directive the functions are defined multiple times in both libcrypto.a and libssl.a:
+
+libcrypto.a
+
+Many UNDEF:
+ct_log.o
+[47]    |                   0|                   0|FUNC |WEAK |0    |UNDEF  |OPENSSL_sk_new_null
+... and more
+
+One definition from stack.c as you'd expect:
+stack.o
+[33]	|                1232|                  20|FUNC |WEAK |2    |2      |OPENSSL_sk_new_null
+
+libssl.a has multiple instances also, all UNDEF:
+d1_srtp.o
+[43]	|                   0|                   0|FUNC |WEAK |0    |UNDEF  |OPENSSL_sk_new_null
+s3_lib.o
+[107]	|                   0|                   0|FUNC |WEAK |0    |UNDEF  |OPENSSL_sk_new_null
+and so on.
+
+&gt;<i>From the linker docs:
+</I>B.2.17.1 #pragma weak name
+In the form #pragma weak name, the directive makes name a weak symbol. The linker will not complain if it does not find a symbol definition for name. It also does not complain about multiple weak definitions of the symbol. The linker simply takes the first one it encounters.
+
+So when linking with libcrypto.a and libssl.a the first definition is taken which is UNDEF in both cases leading to the error.
+This can be fixed in libcrypto.a by making stack.o, lh_stats.o and lhash.o the first files included. It could also be fixed by not defining those pragmas when compiling stack.c, lh_stats.c and lhash.c because they will then be GLOB instead of WEAK and will override all the WEAK definitions.
+
+However there is no suitable fix for libssl.a because those files are not part of that library.
+
+Doing that means that executables that link libcrypto.a before libssl.s are built correctly. However if the link is libssl.a followed by libcrypto.a the UNDEF symbols from libssl.a are still used.
+
+In the shared libraries I see:
+
+libcrypto.so only instance:
+[3537]	|             2409672|                  20|FUNC |LOCL |2    |10     |OPENSSL_sk_new_null
+
+Shared libssl.so also one instance:
+[2091]	|                   0|                   0|FUNC |WEAK |0    |UNDEF  |OPENSSL_sk_new_null
+
+and it seems that the linker will resolve those correctly.
+
+So it seems to me that the only clean solution is to not define those pragmas when compiling stack.c, lh_stats.c and lhash.c by including a suitable define in the makefiles when building the libraries that is used in safestack.h and lhash.h to omit them.
+
+I see there is also
+# elif defined(__SUNPRO_C)
+#pragma weak getisax
+in crypto\sparcv9cap.c
+so maybe that needs consideration too.
+
+Regards,
+John.
+
+-----Original Message-----
+From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; On Behalf Of John Unsworth
+Sent: 10 May 2019 16:23
+To: <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>
+Subject: RE: OpenSSL 1.1.1b tests fail on Solaris - solution
+
+CAUTION: This email originated from outside of Synchronoss.
+
+
+This seems to be caused by the ongoing saga documented in issues 6912 and 8102. These functions were declared as weak in 1.1.1b.
+
+safestack.h
+#  pragma weak OPENSSL_sk_num
+#  pragma weak OPENSSL_sk_value
+#  pragma weak OPENSSL_sk_new
+#  pragma weak OPENSSL_sk_new_null
+...
+
+lhash.h
+#  pragma weak OPENSSL_LH_new
+#  pragma weak OPENSSL_LH_free
+#  pragma weak OPENSSL_LH_insert
+#  pragma weak OPENSSL_LH_delete
+...
+
+Removing these lines allows all the tests to work. I am building static libraries (no-shared) which is presumably why it works for some people out of the box if they are using shared libraries.
+
+Please advise as to the way forward. I note that one other user (see 8102) has reported this too:
+
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;<i>
+</I>rammishr commented on Mar 26
+Hi,
+Sorry if this should have been posted separately.
+
+When i build openssl1.1.1b on solaris , it is successful. But while verifying the version &quot; openssl version&quot; it fails with below error.
+ld.so.1: openssl: fatal: relocation error: file /vobs_tools/prgs/src/openssl/solaris64/bin/openssl: symbol OPENSSL_sk_new_null: referenced symbol not found Killed
+
+The same machine works fine for openssl1.1.1.
+So, in 1.1.1b I can observe that OPENSSL_sk_new_null has been defined as below in safestack.h.
+pragma weak OPENSSL_sk_new_null
+Can this be related ? Am I missing anything while Configure ?
+&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;
+
+Regards,
+John.
+
+-----Original Message-----
+From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; On Behalf Of John Unsworth
+Sent: 09 May 2019 10:13
+To: <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>
+Subject: RE: OpenSSL 1.1.1b tests fail on Solaris
+
+CAUTION: This email originated from outside of Synchronoss.
+
+
+This looks like the problem:
+
+ld.so.1: sanitytest: fatal: relocation error: file ../../test/sanitytest: symbol OPENSSL_sk_new_null: referenced symbol not found ../../util/shlib_wrap.sh ../../test/sanitytest =&gt; 137 not ok 1 - running sanitytest
+
+#   Failed test 'running sanitytest'
+#   at /home/metabld/OpenSSL/openssl-1.1.1b/test/../util/perl/OpenSSL/Test/Simple.pm line 77.
+# Looks like you failed 1 test of 1.
+Dubious, test returned 1 (wstat 256, 0x100) Failed 1/1 subtests
+
+This results in the same error:
+sol-mds-build-01 $ cd apps
+sol-mds-build-01 $ ./openssl version
+ld.so.1: openssl: fatal: relocation error: file openssl: symbol OPENSSL_sk_new_null: referenced symbol not found
+
+I have built static libraries.
+
+John
+
+-----Original Message-----
+From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; On Behalf Of Matt Caswell
+Sent: 09 May 2019 09:38
+To: <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>
+Subject: Re: OpenSSL 1.1.1b tests fail on Solaris
+
+CAUTION: This email originated from outside of Synchronoss.
+
+
+What is the output from:
+
+$ make V=1 TESTS=test_sanity test
+
+Matt
+
+On 08/05/2019 19:22, John Unsworth wrote:
+&gt;<i> I have build OpenSSL 1.1.1b 64 bit on Solaris SunOS 5.10 
+</I>&gt;<i> Generic_Virtual sun4v sparc SUNW,T5140.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> ./Configure -lrt solaris64-sparcv9-cc no-shared -m64 -xcode=pic32 
+</I>&gt;<i> -xldscope=hidden
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> It builds fine but all the tests fail, with or without no-asm. Can 
+</I>&gt;<i> anyone help please? Here is the start of the test run:
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> $ make test
+</I>&gt;<i>
+</I>&gt;<i> make depend &amp;&amp; make _tests
+</I>&gt;<i>
+</I>&gt;<i> ( cd test; \
+</I>&gt;<i>
+</I>&gt;<i>   mkdir -p test-runs; \
+</I>&gt;<i>
+</I>&gt;<i>   SRCTOP=../. \
+</I>&gt;<i>
+</I>&gt;<i>   BLDTOP=../. \
+</I>&gt;<i>
+</I>&gt;<i>   RESULT_D=test-runs \
+</I>&gt;<i>
+</I>&gt;<i>  PERL=&quot;/opt/perl-5.26.1/bin/perl&quot; \
+</I>&gt;<i>
+</I>&gt;<i>   EXE_EXT= \
+</I>&gt;<i>
+</I>&gt;<i>   OPENSSL_ENGINES=`cd .././engines 2&gt;/dev/null &amp;&amp; pwd` \
+</I>&gt;<i>
+</I>&gt;<i>   OPENSSL_DEBUG_MEMORY=on \
+</I>&gt;<i>
+</I>&gt;<i>     /opt/perl-5.26.1/bin/perl .././test/run_tests.pl  )
+</I>&gt;<i>
+</I>&gt;<i> ../test/recipes/01-test_abort.t .................... ok
+</I>&gt;<i>
+</I>&gt;<i> ../test/recipes/01-test_sanity.t ................... Dubious, test 
+</I>&gt;<i> returned 1 (wstat 256, 0x100)
+</I>&gt;<i>
+</I>&gt;<i> Failed 1/1 subtests
+</I>&gt;<i>
+</I>&gt;<i> Regards,
+</I>&gt;<i>
+</I>&gt;<i> John.
+</I>&gt;<i>
+</I></PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010469.html">creating certificate only structure -- CMS_sign
+</A></li>
+	<LI>Next message: <A HREF="010473.html">OpenSSL 1.1.1b tests fail on Solaris - solution and possible fix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10466">[ date ]</a>
+              <a href="thread.html#10466">[ thread ]</a>
+              <a href="subject.html#10466">[ subject ]</a>
+              <a href="author.html#10466">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

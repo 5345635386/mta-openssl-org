@@ -1,0 +1,693 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> How to plug an external encryption to CMS_SignerInfo signing?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20How%20to%20plug%20an%20external%20encryption%20to%20CMS_SignerInfo%20signing%3F&In-Reply-To=%3CCALas-ij8%2BvrS15Rux0N1e%2BAf6oaknvvz%2BqMUGkFZpYKL%3DfrDaA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013048.html">
+   <LINK REL="Next"  HREF="013044.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>How to plug an external encryption to CMS_SignerInfo signing?</H1>
+    <B>Francesco Pretto</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20How%20to%20plug%20an%20external%20encryption%20to%20CMS_SignerInfo%20signing%3F&In-Reply-To=%3CCALas-ij8%2BvrS15Rux0N1e%2BAf6oaknvvz%2BqMUGkFZpYKL%3DfrDaA%40mail.gmail.com%3E"
+       TITLE="How to plug an external encryption to CMS_SignerInfo signing?">ceztko at gmail.com
+       </A><BR>
+    <I>Sat Oct 24 10:05:41 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013048.html">CAPI engine seems to break server validation
+</A></li>
+        <LI>Next message: <A HREF="013044.html">How to plug an external encryption to CMS_SignerInfo signing?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13043">[ date ]</a>
+              <a href="thread.html#13043">[ thread ]</a>
+              <a href="subject.html#13043">[ subject ]</a>
+              <a href="author.html#13043">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+I'm trying to create a CMS context for subsequent export using
+CMS_sign(). I add a signer using CMS_add1_signer() that allows me to
+specify a X509 certificate and a hash function. I would like the CMS
+context to perform hash computation and ANS1 structure filling, but I
+want to delegate encryption to an external service, for example an
+hardware encryption token (I'm assuming this is a very common use
+case). At this point I'm in a stalemate since CMS_add1_signer() asks
+me for a private EVP_PKEY that is compatible with the public key
+present in the X509 certificate. No other function seems to exist to
+create a CMS_SignerInfo by providing an external mechanism for
+encryption.
+
+My hacky solution was to add a signer CMS_add1_signer() supplying the
+public key stored in the X509 certificate in the place of the private
+one. This passes internal checks of the function and allows me to
+subsequently handle (manually) all the ANS1 structure filling and hash
+computations. This is barely doable with public openssl API and still
+requires a big rip-off of private openssl code (attached as a
+standalone C++ class, if it can be useful for someone).
+
+My question is: is there an easier mechanism to plug a separate
+encryption method when creating the CMS_SignerInfo structure and have
+openssl do all the other dirty work for me? If so, is it possible to
+do with openssl 1.1.0/1.1.1?
+
+Cheers,
+Francesco
+-------------- next part --------------
+&#65279;#pragma once
+
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;functional&gt;
+
+#include &lt;openssl/ssl.h&gt;
+#include &lt;openssl/cms.h&gt;
+
+namespace en
+{
+    using EncryptionService = std::function&lt;std::vector&lt;char&gt;(std::string_view)&gt;;
+
+    class CmsContext
+    {
+    public:
+        /** Load 12 certificate + private key from file
+         */
+        CmsContext(const std::string_view&amp; certfile, const std::string_view&amp; password);
+        /** Load P12 certificate + private key from buffer
+         */
+        CmsContext(const char* certbytes, size_t size, const std::string_view&amp; password);
+        /** Load X509 certificate and provide an external encryption service
+         */
+        CmsContext(const std::string_view &amp;cert, const EncryptionService&amp; encrypt);
+        ~CmsContext();
+    public:
+        void AppendData(const std::string_view&amp; data);
+        std::vector&lt;char&gt; EncodeCMS();
+        void Reset();
+    private:
+        enum class CertType
+        {
+            X509Buffer,
+            P12File,
+            P12Buffer,
+        };
+    private:
+        CmsContext(CertType type, const std::string_view&amp; cert,
+            const std::string_view&amp; password, const EncryptionService&amp; signer);
+        void loadP12FromFile(const std::string_view&amp; certfile, const std::string_view&amp; password);
+        void loadP12FromBuffer(const std::string_view&amp; buffer, const std::string_view&amp; password);
+        void loadX509Certificate(const std::string_view&amp; cert);
+        void clearSignature();
+        void reset();
+    private:
+        X509* m_cert;
+        EVP_PKEY* m_privKey;
+        EncryptionService m_encrypt;
+        CMS_ContentInfo* m_cms;
+        BIO* m_databio;
+        BIO* m_out;
+    };
+}
+-------------- next part --------------
+&#65279;#include &quot;CmsContext.h&quot;
+#include &lt;fstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;openssl/asn1t.h&gt;
+#include &lt;openssl/pkcs12.h&gt;
+
+using namespace std;
+using namespace en;
+
+// The following flags allow for streaming and editing of the attributes
+#define CMS_FLAGS CMS_DETACHED | CMS_BINARY | CMS_PARTIAL | CMS_STREAM
+
+// The following is using for reordering attributes during serialization
+// in the signining operation
+DECLARE_ASN1_ITEM(CMS_Attributes_Sign);
+
+// This is a recreation of X509_SIG structure
+struct X509_Signature
+{
+    X509_ALGOR* algor;
+    ASN1_OCTET_STRING* digest;
+};
+
+static const ASN1_OBJECT* GetASN1Object(X509_ALGOR* alg);
+static X509_ALGOR* GetDigestAlgorithm(CMS_SignerInfo* si);
+static STACK_OF(X509_ATTRIBUTE)* GetSignedAttributesCopy(CMS_SignerInfo* si);
+
+// All the following static functions include software developed by
+// the OpenSSL Project for use in the OpenSSL Toolkit(<A HREF="http://www.openssl.org/">http://www.openssl.org/</A>)
+// License: <A HREF="https://www.openssl.org/source/license-openssl-ssleay.txt">https://www.openssl.org/source/license-openssl-ssleay.txt</A>
+static void cms_SignedData_final(CMS_ContentInfo* cms, BIO* chain, const EncryptionService&amp; encrypt);
+static void cms_SignerInfo_content_sign(CMS_ContentInfo* cms, CMS_SignerInfo* si,
+    BIO* chain, const EncryptionService&amp; signer);
+static void CMS_SignerInfo_sign2(CMS_SignerInfo* si, const EncryptionService&amp; encrypt);
+static int cms_DigestAlgorithm_find_ctx(EVP_MD_CTX* mctx, BIO* chain, X509_ALGOR* mdalg);
+static int cms_add1_signingTime(CMS_SignerInfo* si, ASN1_TIME* t);
+static void encode_pkcs1(X509_ALGOR* digestAlg,
+    const unsigned char* m, unsigned int m_len,
+    unsigned char** out, unsigned int* out_len);
+static const ASN1_ITEM* X509_Signature_it();
+
+CmsContext::CmsContext(const std::string_view&amp; certfile, const std::string_view&amp; password) :
+    CmsContext(CertType::P12File, certfile, password, { })
+{
+}
+
+CmsContext::CmsContext(const char* certbytes, size_t size, const std::string_view&amp; password) :
+    CmsContext(CertType::P12Buffer, { certbytes, size }, password, { })
+{
+}
+
+CmsContext::CmsContext(const string_view&amp; cert, const EncryptionService&amp; signer) :
+    CmsContext(CertType::X509Buffer, cert, { }, signer)
+{
+}
+
+CmsContext::CmsContext(CertType type, const std::string_view&amp; cert,
+    const std::string_view&amp; password, const EncryptionService&amp; signer) :
+    m_cert(nullptr),
+    m_privKey(nullptr),
+    m_encrypt(signer),
+    m_cms(nullptr),
+    m_databio(nullptr),
+    m_out(nullptr)
+{
+    try
+    {
+        switch (type)
+        {
+        case CertType::X509Buffer:
+            loadX509Certificate(cert);
+            break;
+        case CertType::P12File:
+            loadP12FromFile(cert, password);
+            break;
+        case CertType::P12Buffer:
+            loadP12FromBuffer(cert, password);
+            break;
+        default:
+            throw runtime_error(&quot;Unsupported&quot;);
+        }
+
+        reset();
+    }
+    catch (...)
+    {
+        this-&gt;~CmsContext();
+        throw;
+    }
+}
+
+CmsContext::~CmsContext()
+{
+    if (m_privKey != nullptr)
+    {
+        EVP_PKEY_free(m_privKey);
+        m_privKey = nullptr;
+    }
+
+    if (m_cert != nullptr)
+    {
+        X509_free(m_cert);
+        m_cert = nullptr;
+    }
+
+    clearSignature();
+}
+
+void CmsContext::AppendData(const string_view&amp; data)
+{
+    if (m_out != nullptr)
+        throw runtime_error(&quot;The signer must be reset before appening new data&quot;);
+
+    auto mem = BIO_new_mem_buf(data.data(), (int)data.length());
+    if (mem == nullptr)
+        throw runtime_error(&quot;Out of memory&quot;);
+
+    // Append data to the internal CMS buffer and elaborate
+    // See also CMS_final implementation for reference
+    if (!SMIME_crlf_copy(mem, m_databio, CMS_FLAGS))
+        throw runtime_error(&quot;SMIME_crlf_copy&quot;);
+    (void)BIO_flush(m_databio);
+}
+
+vector&lt;char&gt; CmsContext::EncodeCMS()
+{
+    if (m_out != nullptr)
+        goto exit;
+
+    if (m_privKey == nullptr)
+        cms_SignedData_final(m_cms, m_databio, m_encrypt); // Sign with external encryption
+    else
+        CMS_dataFinal(m_cms, m_databio);
+
+    m_out = BIO_new(BIO_s_mem());
+    if (m_out == nullptr)
+        throw runtime_error(&quot;BIO_new: Out of memory&quot;);
+
+    // Output CMS as DER format
+    i2d_CMS_bio(m_out, m_cms);
+
+exit:
+    char* sign;
+    size_t length = (size_t)BIO_get_mem_data(m_out, &amp;sign);
+    return vector&lt;char&gt;(sign, sign + length);
+}
+
+void CmsContext::Reset()
+{
+    clearSignature();
+    reset();
+}
+
+void CmsContext::loadP12FromFile(const string_view&amp; filename, const string_view&amp; password)
+{
+    int rc;
+    PKCS12* p12 = nullptr;
+    STACK_OF(X509)* ca = nullptr;
+    FILE* fp = nullptr;
+
+    auto clean = [&amp;]()
+    {
+        fclose(fp);
+        PKCS12_free(p12);
+        sk_X509_pop_free(ca, X509_free);
+    };
+
+    try
+    {
+        fp = fopen(filename.data(), &quot;rb&quot;);
+        if (fp == NULL)
+            throw runtime_error(&quot;Can't open file&quot;);
+
+        p12 = d2i_PKCS12_fp(fp, NULL);
+        if (p12 == NULL)
+        {
+            fclose(fp);
+            throw runtime_error(&quot;Can't create PKCS12 certificate&quot;);
+        }
+
+        rc = PKCS12_parse(p12, password.data(), &amp;m_privKey, &amp;m_cert, &amp;ca);
+        if (!rc)
+            throw runtime_error(&quot;Can't parse PKCS12 certificate&quot;);
+    }
+    catch (...)
+    {
+        clean();
+        return;
+    }
+
+    clean();
+}
+
+void CmsContext::loadP12FromBuffer(const string_view&amp; buffer, const string_view&amp; password)
+{
+    int rc;
+    PKCS12* p12 = nullptr;
+    STACK_OF(X509)* ca = nullptr;
+    BIO* mem = nullptr;
+
+    auto clean = [&amp;]()
+    {
+        sk_X509_pop_free(ca, X509_free);
+        PKCS12_free(p12);
+        BIO_free(mem);
+    };
+
+    try
+    {
+        mem = BIO_new_mem_buf(buffer.data(), (int)buffer.size());
+        if (mem == nullptr)
+            throw runtime_error(&quot;Out of memory&quot;);
+
+        auto p12 = d2i_PKCS12_bio(mem, NULL);
+        if (p12 == NULL)
+            throw runtime_error(&quot;Can't create PKCS12 certificate&quot;);
+
+        rc = PKCS12_parse(p12, password.data(), &amp;m_privKey, &amp;m_cert, &amp;ca);
+        if (!rc)
+            throw runtime_error(&quot;Can't parse PKCS12 certificate&quot;);
+    }
+    catch (...)
+    {
+        clean();
+        return;
+    }
+
+    clean();
+}
+
+void CmsContext::loadX509Certificate(const string_view&amp; cert)
+{
+    auto in = (const unsigned char*)cert.data();
+    m_cert = d2i_X509(nullptr, &amp;in, (int)cert.length());
+    if (m_cert == nullptr)
+        throw runtime_error(&quot;Out of memory&quot;);
+}
+
+void CmsContext::clearSignature()
+{
+    if (m_cms != nullptr)
+    {
+        CMS_ContentInfo_free(m_cms);
+        m_cms = nullptr;
+    }
+
+    if (m_databio != nullptr)
+    {
+        BIO_free(m_databio);
+        m_databio = nullptr;
+    }
+
+    if (m_out != nullptr)
+    {
+        BIO_free(m_out);
+        m_out = nullptr;
+    }
+}
+
+void CmsContext::reset()
+{
+    // By default CMS_sign uses SHA1, so create a partial context with streaming enabled
+    m_cms = CMS_sign(nullptr, nullptr, nullptr, nullptr, CMS_FLAGS);
+    if (m_cms == nullptr)
+        throw runtime_error(&quot;Out of memory&quot;);
+
+    // Set a signer with a SHA56 digest. Since CMS_PARTIAL is *not* passed,
+    // the CMS structure is sealed
+    // TODO: Add configurable hash function, sha256-384-512
+    auto sign_md = EVP_get_digestbyname(&quot;sha256&quot;);
+
+    CMS_SignerInfo* signer;
+    if (m_privKey == nullptr)
+    {
+        // Fake private key using public key from certificate
+        // This allows to pass internal checks of CMS_add1_signer
+        // since parameter &quot;pk&quot; can't be nullptr
+        auto pubKey = X509_get0_pubkey(m_cert);
+        signer = CMS_add1_signer(m_cms, m_cert, pubKey, sign_md, 0);
+    }
+    else
+    {
+        signer = CMS_add1_signer(m_cms, m_cert, m_privKey, sign_md, 0);
+    }
+
+    if (signer == nullptr)
+        throw runtime_error(&quot;CMS_add1_signer&quot;);
+
+    if (false)
+    {
+        // TODO: Add configurable date setting
+        struct tm timeinfo { };
+        auto time = mktime(&amp;timeinfo);
+        auto ans1time = X509_time_adj(nullptr, 0, &amp;time);
+        cms_add1_signingTime(signer, ans1time);
+    }
+
+    // Initialize the internal cms buffer for streaming
+    // See also CMS_final implementation for reference
+    m_databio = CMS_dataInit(m_cms, nullptr);
+    if (m_databio == nullptr)
+        throw runtime_error(&quot;CMS_dataInit&quot;);
+}
+
+// Ripped from cms_DigestAlgorithm_find_ctx in crypto/cms/cms_lib.c
+int cms_DigestAlgorithm_find_ctx(EVP_MD_CTX* mctx, BIO* chain,
+    X509_ALGOR* mdalg)
+{
+    int nid;
+    auto mdoid = GetASN1Object(mdalg);
+    nid = OBJ_obj2nid(mdoid);
+    // Look for digest type to match signature
+    for (;;)
+    {
+        EVP_MD_CTX* mtmp;
+        chain = BIO_find_type(chain, BIO_TYPE_MD);
+        if (chain == nullptr)
+            throw runtime_error(&quot;CMS_NO_MATCHING_DIGEST&quot;);
+
+        BIO_get_md_ctx(chain, &amp;mtmp);
+        if (EVP_MD_CTX_type(mtmp) == nid
+            // Workaround for broken implementations that use signature
+            // algorithm OID instead of digest.
+            || EVP_MD_pkey_type(EVP_MD_CTX_md(mtmp)) == nid)
+        {
+            return EVP_MD_CTX_copy_ex(mctx, mtmp);
+        }
+
+        chain = BIO_next(chain);
+    }
+}
+
+// Ripped from cms_SignedData_final in crypto/cms/cms_lib.c
+void cms_SignedData_final(CMS_ContentInfo* cms, BIO* chain, const EncryptionService&amp; encrypt)
+{
+    STACK_OF(CMS_SignerInfo)* sinfos;
+    CMS_SignerInfo* si;
+    int i;
+    sinfos = CMS_get0_SignerInfos(cms);
+    for (i = 0; i &lt; sk_CMS_SignerInfo_num(sinfos); i++) {
+        si = sk_CMS_SignerInfo_value(sinfos, i);
+        cms_SignerInfo_content_sign(cms, si, chain, encrypt);
+    }
+}
+
+// Ripped from cms_SignerInfo_content_sign in crypto/cms/cms_sd.c
+void cms_SignerInfo_content_sign(CMS_ContentInfo* cms,
+    CMS_SignerInfo* si, BIO* chain, const EncryptionService&amp; encrypt)
+{
+    EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+    if (!cms_DigestAlgorithm_find_ctx(mctx, chain, GetDigestAlgorithm(si)))
+        goto err;
+
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hashlen;
+    if (EVP_DigestFinal_ex(mctx, hash, &amp;hashlen) &lt;= 0)
+        goto err;
+
+    if (!CMS_signed_add1_attr_by_NID(si, NID_pkcs9_messageDigest,
+        V_ASN1_OCTET_STRING, hash, hashlen))
+        goto err;
+
+    ASN1_OBJECT* ctype = OBJ_nid2obj(NID_pkcs7_data);
+    if (CMS_signed_add1_attr_by_NID(si, NID_pkcs9_contentType,
+        V_ASN1_OBJECT, ctype, -1) &lt;= 0)
+        goto err;
+
+    CMS_SignerInfo_sign2(si, encrypt);
+    return;
+err:
+    throw runtime_error(&quot;Error while computing the MessageDigest&quot;);
+}
+
+// Ripped from CMS_SignerInfo_sign in crypto/cms/cms_sd.c
+void CMS_SignerInfo_sign2(CMS_SignerInfo* si, const EncryptionService&amp; encrypt)
+{
+    EVP_MD_CTX* mctx = CMS_SignerInfo_get0_md_ctx(si);
+    STACK_OF(X509_ATTRIBUTE)* signedAttrs = nullptr;
+    unsigned char* buf = nullptr;
+    unsigned len;
+    unsigned encodedLen;
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    vector&lt;char&gt; signedhash;
+    if (CMS_signed_get_attr_by_NID(si, NID_pkcs9_signingTime, -1) &lt; 0)
+    {
+        if (!cms_add1_signingTime(si, nullptr))
+            goto err;
+    }
+
+    auto sign_md = EVP_get_digestbyname(&quot;sha256&quot;);
+    if (EVP_DigestInit(mctx, sign_md) &lt;= 0)
+        goto err;
+
+    // Prepare the DER structure to sign, reordering attributes
+    signedAttrs = GetSignedAttributesCopy(si);
+    len = (unsigned)ASN1_item_i2d((ASN1_VALUE*)signedAttrs, &amp;buf,
+        ASN1_ITEM_rptr(CMS_Attributes_Sign));
+    sk_X509_ATTRIBUTE_free(signedAttrs);
+    if (!buf)
+        goto err;
+
+    // Compute the hash to be signed
+    if (EVP_DigestUpdate(mctx, buf, len) &lt;= 0)
+        goto err;
+    if (EVP_DigestFinal(mctx, hash, &amp;len) &lt;= 0)
+        goto err;
+
+    EVP_MD_CTX_reset(mctx);
+
+    // We also need to encode the digest in ANS1 structure
+    OPENSSL_free(buf);
+    encode_pkcs1(GetDigestAlgorithm(si), hash, len, &amp;buf, &amp;encodedLen);
+
+    // Encrypt the hash with the external encryption service
+    signedhash = encrypt({(const char *)buf, encodedLen });
+    OPENSSL_free(buf);
+    buf = (unsigned char*)OPENSSL_malloc(signedhash.size());
+    if (buf == nullptr)
+        goto err;
+
+    std::memcpy(buf, signedhash.data(), signedhash.size());
+    auto signature = CMS_SignerInfo_get0_signature(si);
+
+    ASN1_STRING_set0(signature, buf, (int)signedhash.size());
+    return;
+err:
+    OPENSSL_free(buf);
+    EVP_MD_CTX_reset(mctx);
+    throw runtime_error(&quot;Error while computing the MessageDigest&quot;);
+}
+
+// Ripped from cms_add1_signingTime in crypto/cms/cms_sd.c
+int cms_add1_signingTime(CMS_SignerInfo* si, ASN1_TIME* t)
+{
+    ASN1_TIME* tt;
+    int r = 0;
+
+    if (t != nullptr)
+        tt = t;
+    else
+        tt = X509_gmtime_adj(nullptr, 0);
+
+    if (tt == nullptr)
+        goto merr;
+
+    if (CMS_signed_add1_attr_by_NID(si, NID_pkcs9_signingTime,
+        tt-&gt;type, tt, -1) &lt;= 0)
+        goto merr;
+
+    r = 1;
+merr:
+    if (t == nullptr)
+        ASN1_TIME_free(tt);
+
+    return r;
+}
+
+/* Ripped from crypto/rsa/rsa_sign.c
+ * encode_pkcs1 encodes a DigestInfo prefix of hash |type| and digest |m|, as
+ * described in EMSA-PKCS1-v1_5-ENCODE, RFC 3447 section 9.2 step 2. This
+ * encodes the DigestInfo (T and tLen) but does not add the padding.
+ *
+ * On success, it returns one and sets |*out| to a newly allocated buffer
+ * containing the result and |*out_len| to its length. The caller must free
+ * |*out| with |OPENSSL_free|. Otherwise, it returns zero.
+ */
+void encode_pkcs1(X509_ALGOR* digestAlg,
+    const unsigned char* m, unsigned m_len,
+    unsigned char** out, unsigned* out_len)
+{
+    X509_Signature sig;
+    X509_ALGOR algor{ };
+    ASN1_TYPE parameter{ };
+    ASN1_OCTET_STRING digest{ };
+    unsigned char* buf = nullptr;
+    int len;
+
+    sig.algor = digestAlg;
+    sig.algor = &algor;
+    sig.algor-&gt;algorithm = (ASN1_OBJECT*)GetASN1Object(digestAlg);
+    parameter.type = V_ASN1_NULL;
+    parameter.value.ptr = NULL;
+    sig.algor-&gt;parameter = &parameter;
+
+    sig.digest = &digest;
+    sig.digest-&gt;data = (unsigned char*)m;
+    sig.digest-&gt;length = m_len;
+
+    // This is the expansion of IMPLEMENT_ASN1_FUNCTIONS
+    // NOTE: buf must be a local null pointer otherwise
+    // the function will try to reuse the memory
+    len = ASN1_item_i2d((ASN1_VALUE*)&amp;sig, &amp;buf, ASN1_ITEM_rptr(X509_Signature));
+    if (len &lt; 0)
+        throw runtime_error(&quot;EncodeDigestPKCS1: Out of memory&quot;);
+
+    *out = buf;
+    *out_len = (unsigned)len;
+}
+
+const ASN1_OBJECT* GetASN1Object(X509_ALGOR* alg)
+{
+    const ASN1_OBJECT* obj;
+    X509_ALGOR_get0(&amp;obj, nullptr, nullptr, alg);
+    return obj;
+}
+
+X509_ALGOR* GetDigestAlgorithm(CMS_SignerInfo* si)
+{
+    EVP_PKEY* pkey;
+    X509* cert;
+    X509_ALGOR* digestAlgorithm;
+    X509_ALGOR* signingAlgorithm;
+    CMS_SignerInfo_get0_algs(si, &amp;pkey, &amp;cert, &amp;digestAlgorithm, &amp;signingAlgorithm);
+    return digestAlgorithm;
+}
+
+STACK_OF(X509_ATTRIBUTE)* GetSignedAttributesCopy(CMS_SignerInfo* si)
+{
+    STACK_OF(X509_ATTRIBUTE)* ret = nullptr;
+    int count = CMS_signed_get_attr_count(si);
+    for (int i = 0; i &lt; count; i++)
+    {
+        auto attr = CMS_signed_get_attr(si, i);
+        if (X509at_add1_attr(&amp;ret, attr) == nullptr)
+            goto Error;
+    }
+
+    return ret;
+Error:
+    sk_X509_ATTRIBUTE_free(ret);
+    throw runtime_error(&quot;GetSignedAttributes: Out of memory&quot;);
+}
+
+// Used for reordering of signed attributes in ANS1 serialization
+ASN1_ITEM_TEMPLATE(CMS_Attributes_Sign) =
+        ASN1_EX_TEMPLATE_TYPE(ASN1_TFLG_SET_ORDER, 0, CMS_ATTRIBUTES, X509_ATTRIBUTE)
+ASN1_ITEM_TEMPLATE_END(CMS_Attributes_Sign)
+
+// Used for the serialization of a digest for signing
+ASN1_SEQUENCE(X509_Signature) = {
+        ASN1_SIMPLE(X509_Signature, algor, X509_ALGOR),
+        ASN1_SIMPLE(X509_Signature, digest, ASN1_OCTET_STRING)
+} ASN1_SEQUENCE_END(X509_Signature);
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013048.html">CAPI engine seems to break server validation
+</A></li>
+	<LI>Next message: <A HREF="013044.html">How to plug an external encryption to CMS_SignerInfo signing?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13043">[ date ]</a>
+              <a href="thread.html#13043">[ thread ]</a>
+              <a href="subject.html#13043">[ subject ]</a>
+              <a href="author.html#13043">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

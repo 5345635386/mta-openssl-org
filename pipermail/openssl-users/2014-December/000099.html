@@ -1,0 +1,165 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] OpenSSL performance issue
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2014-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20OpenSSL%20performance%20issue&In-Reply-To=%3C549407F2.6040204%40wisemo.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000093.html">
+   <LINK REL="Next"  HREF="000100.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] OpenSSL performance issue</H1>
+    <B>Jakob Bohm</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20OpenSSL%20performance%20issue&In-Reply-To=%3C549407F2.6040204%40wisemo.com%3E"
+       TITLE="[openssl-users] OpenSSL performance issue">jb-openssl at wisemo.com
+       </A><BR>
+    <I>Fri Dec 19 11:11:46 UTC 2014</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000093.html">[openssl-users] OpenSSL performance issue
+</A></li>
+        <LI>Next message: <A HREF="000100.html">[openssl-users] OpenSSL performance issue
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#99">[ date ]</a>
+              <a href="thread.html#99">[ thread ]</a>
+              <a href="subject.html#99">[ subject ]</a>
+              <a href="author.html#99">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 19/12/2014 00:10, Prabhat Puroshottam wrote:
+&gt;<i> I am trying to summarize the problem again, since the previous
+</I>&gt;<i> mail seems confusing to some of you. It might help you quickly understand
+</I>&gt;<i> the problem I am facing:
+</I>&gt;<i>
+</I>&gt;<i> We have a product, where Client connects to Server (Proxy Server in my
+</I>&gt;<i> earlier mail). Client is implemented in C and uses OpenSSL, while Server is
+</I>&gt;<i> implemented using Java code with BufferedInputStream and
+</I>&gt;<i> BufferedOutputStream. The following are my observations:
+</I>&gt;<i>
+</I>&gt;<i> 1. There is &quot;inordinate&quot; delay during connection establishment.
+</I>&gt;<i> 2. Using ssldump it was found that SSL handshake response from Server is
+</I>&gt;<i>      taking most of the time. Rest of the application data transfer and
+</I>&gt;<i>      processing hardly takes fraction of a second. The response from SSL
+</I>&gt;<i>      handshake by Server comes after anywhere between 2 to 13 seconds
+</I>&gt;<i>      after initial response sent by Client.
+</I>&gt;<i> 3. Subsequent analysis of the code showed that it was the first Buffered
+</I>&gt;<i>     Read/Write which was taking &quot;inordinate&quot; amount of time.
+</I>&gt;<i> 4. Understanding that first Buffered Read/Write was hung on SSL connection
+</I>&gt;<i>      completion, I introduced SSLConnect::startHandshake() so that I can
+</I>&gt;<i>      explicitly see where is the problem. It was observed that now
+</I>&gt;<i>      startHandshake() blocked for as much time as first Read/Write did.
+</I>&gt;<i>      Further none of the Read/Write calls block, and returned data almost
+</I>&gt;<i>      immediately.
+</I>&gt;<i>
+</I>&gt;<i> I would like to understand why startHandshake() is taking so long. I
+</I>&gt;<i> understand that it is a asynchronous call, but still the time delay is too much
+</I>&gt;<i> IMO. Is it something to do with the socket configuration/cipher/encryption
+</I>&gt;<i> used? Using ssldump I found there was absolutely no data transfer
+</I>&gt;<i> between the sending of client's hello request and subsequent response
+</I>&gt;<i> from server, so apparently all the time startHandshake() is busy doing
+</I>&gt;<i> something or may be nothing - what I have no idea. FWIW, this is not a
+</I>&gt;<i> network latency issue, 1) all the boxes are on the same network, 2) all
+</I>&gt;<i> other data transfers combined takes less than 0.4s.
+</I>&gt;<i>
+</I>&gt;<i> Can somebody kindly suggest what might be wrong or what can be done to
+</I>&gt;<i> fix this? Could it be some Socket or SSL setting, encryption/cipher used, or
+</I>&gt;<i> something else?
+</I>&gt;<i>
+</I> From the traces in your previous questions, and the answers you have 
+already
+given, I guess this is what happens:
+
+1. The difference is in how long the Java code spends during the initial key
+   exchange.
+
+2. The SSL code in the proxy, (but not the one in your own server) is 
+configured
+   to support Ephemeral Diffie-Hellman (DHE) handshake, which is safer, but
+   potentially slower.  The slowness of DHE happens only during the 
+handshake,
+   because the data transmission part is the same.  For example
+   RSA_AES256_SHA256 and DHE_RSA_AES_SHA256 use the same transmission
+   phase, but different handshakes.  The safety of DHE is that it 
+protects you
+   if someone &quot;tapes&quot; the encrypted connection and later steal the private
+   key of the proxy/server.
+
+3. The slowest part of doing a DHE exchange is choosing a (non-secret) 
+prime,
+  which can be used again and again for many connections.  This is only done
+  by the server end of a TLS/SSL connection.  The prime (and a few related
+  numbers is known as the &quot;DH group parameters&quot;.
+
+4. If you were to enable DHE in an OpenSSL based server/proxy, the standard
+  solution is to choose the non-secret prime during server startup, 
+before any
+  connection arrives.  Some programs even choose it while configuring the
+  server program, storing the prime in a file.
+
+5. From the long time spent by the Java code generating its ServerHello, I
+  suspect it is generating the prime during the handshake, and choosing a
+  new prime for each connection, thus wasting a lot of time.
+
+6. Maybe there is a way to tell the Java SSL library to generate the DH
+  group parameters for needed key lengths (1024, 2048 or whatever you
+  need) during proxy startup, so it is ready by the time the client 
+connects.
+
+7. If you upgrade to OpenSSL 1.0.1 or later (remember to only use the
+  latest letter-suffix security update of whatever version), you could also
+  use an ECDHE_RSA_xxx crypto mode, these don't currently allow the
+  server/proxy to generate their own group parameters, but force you
+  to choose from a short list of parameters generated by professional
+  spying agencies such as the NSA (the &quot;NIST curves&quot;) or someone else
+  (the &quot;X9.62 curves&quot;, the &quot;SECG curves&quot; and the &quot;WTLS curves&quot;).  So
+  your computers don't spend time generating the parameters, and
+  you just have to trust the professionals who chose them for you.
+
+
+Enjoy
+
+Jakob
+-- 
+Jakob Bohm, CIO, Partner, WiseMo A/S.  <A HREF="http://www.wisemo.com">http://www.wisemo.com</A>
+Transformervej 29, 2860 S&#248;borg, Denmark.  Direct +45 31 13 16 10
+This public discussion message is non-binding and may contain errors.
+WiseMo - Remote Service Management for PCs, Phones and Embedded
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.opensslfoundation.net/pipermail/openssl-users/attachments/20141219/6fbe42c7/attachment.html">http://mta.opensslfoundation.net/pipermail/openssl-users/attachments/20141219/6fbe42c7/attachment.html</A>&gt;
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000093.html">[openssl-users] OpenSSL performance issue
+</A></li>
+	<LI>Next message: <A HREF="000100.html">[openssl-users] OpenSSL performance issue
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#99">[ date ]</a>
+              <a href="thread.html#99">[ thread ]</a>
+              <a href="subject.html#99">[ subject ]</a>
+              <a href="author.html#99">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://mta.opensslfoundation.net/mailman/listinfo/openssl-users">More information about the openssl-users
+mailing list</a><br>
+</body></html>

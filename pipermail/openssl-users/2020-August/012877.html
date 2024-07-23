@@ -1,0 +1,155 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C9bad0c98-e55e-17fe-fc4d-c73f32f32676%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012875.html">
+   <LINK REL="Next"  HREF="012878.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_ERROR_WANT_TIME%3A%20Pause%20SSL_connect%20to%20fetch%20intermediate%0A%20certificates&In-Reply-To=%3C9bad0c98-e55e-17fe-fc4d-c73f32f32676%40openssl.org%3E"
+       TITLE="SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates">matt at openssl.org
+       </A><BR>
+    <I>Wed Aug 19 09:29:19 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012875.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+        <LI>Next message: <A HREF="012878.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12877">[ date ]</a>
+              <a href="thread.html#12877">[ thread ]</a>
+              <a href="subject.html#12877">[ subject ]</a>
+              <a href="author.html#12877">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+
+On 18/08/2020 22:31, Alex Rousskov wrote:
+&gt;<i> As you know, OpenSSL provides the certificate verification callback that
+</I>&gt;<i> can discover that the origin certificate chain is incomplete. An
+</I>&gt;<i> application using threads or blocking I/O can probably &quot;pause&quot; its
+</I>&gt;<i> verification callback execution, fetch the intermediate certificates,
+</I>&gt;<i> and then complete validation before happily returning to the
+</I>&gt;<i> SSL_connect() caller. Life is easy when you can use threads or block
+</I>&gt;<i> thousands of concurrent transactions!
+</I>
+I suspect this is the way most people do it.
+
+&gt;<i> What can we do? How can we pause the SSL_connect() progress after the
+</I>&gt;<i> origin certificate is fetched but before it is validated?
+</I>
+We should really have a proper callback for this purpose. PRs welcome!
+(Doesn't help you right now though).
+
+
+&gt;<i> I am aware of the ASYNC_pause_job() and related async APIs in OpenSSL.
+</I>&gt;<i> If I interpret related documentation, discussions, and our test results
+</I>&gt;<i> correctly, that API is not meant as the correct answer for our problem.
+</I>&gt;<i> Today, abusing that API will probably work. Tomorrow,
+</I>&gt;<i> internal/unpredictable OpenSSL changes might break our Squid
+</I>&gt;<i> enhancements beyond repair as detailed below.
+</I>&gt;<i> 
+</I>&gt;<i> Somewhat counter-intuitively, the OpenSSL async API is meant for
+</I>&gt;<i> activities that can work correctly _without_ becoming asynchronous (i.e.
+</I>&gt;<i> without being paused to temporary give way to other activities). Squid
+</I>&gt;<i> cannot fetch the missing intermediate certificates without pausing TLS
+</I>&gt;<i> negotiations with the server...
+</I>&gt;<i> 
+</I>&gt;<i> The async API was added to support custom OpenSSL engines, not
+</I>&gt;<i> application callbacks. The API does not guarantee that an
+</I>&gt;<i> ASYNC_pause_job() will actually pause processing and return to the
+</I>&gt;<i> SSL_connect() caller! That will only happen if OpenSSL internal code
+</I>&gt;<i> does not call ASYNC_block_pause(), effectively converting all subsequent
+</I>&gt;<i> ASYNC_pause_job() calls into a no-op. That pause-nullification was added
+</I>&gt;<i> to work around deadlocks, but it effectively places the API off limits
+</I>&gt;<i> to user-level code that cannot control the timing of those
+</I>&gt;<i> ASYNC_block_pause() calls.
+</I>
+The async API is meant for any scenario where user code may want to
+perform async processing. Its design is NOT restricted to engines -
+although that is certainly where it is normally used. However there are
+no assumptions made anywhere that it will be exclusively restricted to
+engines.
+
+ASYNC_block_pause() is intended as a user level API, and a quick search
+of the  codebase reveals that the only place we use it internally is in
+our tests - it does not appear in the library code. The intention is
+that you should be able to rely on being inside a job in any callbacks,
+if you've started the connection inside one.
+
+&quot;Somewhat counter-intuitively, the OpenSSL async API is meant for
+activities that can work correctly _without_ becoming asynchronous (i.e.
+without being paused to temporary give way to other activities)&quot;
+
+I have no idea what you mean by this. The whole point of
+ASYNC_pause_job() is to temporarily give way to other activities.
+
+One issue you might encounter with the ASYNC APIs is that they are not
+available on some less-common platforms. Basically anything without
+setcontext/swapcontext support (e.g. IIRC I think android may fall into
+this category).
+
+&gt;<i> Can you think of another trick?
+</I>
+One possibility that springs to mind (which is also an ugly hack) is to
+defer the validation of the certificates. So, you have a verify callback
+that always says &quot;ok&quot;. But any further reads on the underlying BIO
+always return with &quot;retry&quot; until such time as any intermediate
+certificates have been fetched and the chain has been verified &quot;for
+real&quot;. The main problem I can see with this approach is there is no easy
+way to send the right alert back to the server in the event of failure.
+
+
+&gt;<i> P.S. Squid does not support BoringSSL, but BoringSSL's
+</I>&gt;<i> SSL_ERROR_WANT_CERTIFICATE_VERIFY result of the certificate validation
+</I>&gt;<i> callback seemingly addresses our use case. I do not know whether OpenSSL
+</I>&gt;<i> decision makers would be open to adding something along those lines and
+</I>&gt;<i> decided to ask for existing solutions here before proposing adding
+</I>&gt;<i> SSL_ERROR_WANT_TIME :-).
+</I>
+I'd definitely be open to adding it - although it wouldn't be backported
+to a stable branch.
+
+Matt
+
+
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012875.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+	<LI>Next message: <A HREF="012878.html">SSL_ERROR_WANT_TIME: Pause SSL_connect to fetch intermediate certificates
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12877">[ date ]</a>
+              <a href="thread.html#12877">[ thread ]</a>
+              <a href="subject.html#12877">[ subject ]</a>
+              <a href="author.html#12877">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,217 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Authentication over ECDHE
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2018-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Authentication%20over%20ECDHE&In-Reply-To=%3C38b97114-0c66-40ed-f631-58aa20940a3a%40gmx.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009509.html">
+   <LINK REL="Next"  HREF="009558.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Authentication over ECDHE</H1>
+    <B>C.Wehrmeyer</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Authentication%20over%20ECDHE&In-Reply-To=%3C38b97114-0c66-40ed-f631-58aa20940a3a%40gmx.de%3E"
+       TITLE="[openssl-users] Authentication over ECDHE">c.wehrmeyer at gmx.de
+       </A><BR>
+    <I>Sat Dec 29 13:19:47 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009509.html">[openssl-users] Authentication over ECDHE
+</A></li>
+        <LI>Next message: <A HREF="009558.html">[openssl-users] Authentication over ECDHE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9557">[ date ]</a>
+              <a href="thread.html#9557">[ thread ]</a>
+              <a href="subject.html#9557">[ subject ]</a>
+              <a href="author.html#9557">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I don't have access to the actual testing environments until Wednesday 
+next year, so I've had to create a private account.
+
+ &gt; Which version of OpenSSL is this? (I don't remember if you said this
+ &gt; already).
+
+I'm not entirely sure, but I *think* it's 1.1.0.
+
+=====================================================================
+
+OK, so I've been reading the mails before going to sleep and spent some 
+time thinking and researching about this, and I've come to a conclusion: 
+OpenSSL is a goddamn mess, SSL_clear() is pretty much superfluous, and 
+as such shouldn't exist.
+
+Why? Well, to quote Viktor here:
+
+ &gt; DO NOT reuse the same SSL handle for multiple connections,
+
+And that is fricking bullshit. Not the quote itself or the suggestion - 
+it's unlikely you had anything to do with the actual code - but the way 
+things have been thought through (or rather, have not been thought 
+through) by the library devs. I've written highly scalable libraries in 
+the past before, and one thing you always want to do there is to trim 
+fat. And &quot;object allocation and initialisation&quot; is something that you 
+very much want to trim fat of, not only for obvious reasons such as 
+malloc() and free() (or whatever OpenSSL uses as wrappers) being 
+complexity monsters, but also for cache reasons (loading different cache 
+line hurts performance). That's why you usually have functions like 
+XXX_clear() or XXX_reset(), which do exactly that - prepare an object 
+for another usage. memset() (or the OpenSSL equivalent of a secure 
+memset) your allocated resources. I don't really see the problem here.
+
+Now add to that the fact that OpenSSL has been moving towards making its 
+structures opaque, thus falling into the same trap that Microsoft has 
+with COM and DirectX, and you can kind of see why, if you can't really 
+determine anymore WHERE your object is going to be stored, you at least 
+want to keep reusing it. This is not PHP, where people allocate memory 
+all willy-nilly, or C++, where people don't even have shame anymore to 
+use std::vector&lt;std::strings&gt; str_array instead of good old static const 
+char*const str_array[] while expecting things to be made faster by 
+invisible memory pools (and horribly failing at it), but C, where you 
+want to think about each step quite carefully.
+
+Then OpenSSL even provides an SSL_clear function which is advertised 
+like this:
+
+ &gt; SSL_clear - reset SSL object to allow another connection
+
+, and then, only later, in a big warning block, decides to tell the 
+reader that this function only works when the stars align quite 
+correctly and you've sacrificed at least two virgins, because:
+
+ &gt; The reset operation however keeps several settings of the last
+ &gt; sessions
+
+Then, as the documentation suggests, I read the entry for SSL_get_session:
+
+ &gt; The ssl session contains all information required to re-establish the
+ &gt; connection without a full handshake for SSL versions up to and
+ &gt; including TLSv1.2. In TLSv1.3 the same is true, but sessions are
+ &gt; established after the main handshake has occurred.
+
+And at this point it all falls apart. From my understanding OpenSSL 
+keeps a session cache for servers so that key exchanges and protocol 
+handshakes can be avoided. Problem is, *we're using ECDHE, where the 
+last E stands for &quot;ephemeral&quot;*. In simple English: throw away the keys 
+after you're done, we want to have forward secrecy. And then OpenSSL 
+keeps a fresh copy of those for everyone who happened to be logged on at 
+this point. Heartbleed apparently wasn't enough of a warning. Oh, but 
+lets move everything to the heap so that it's more secure there now.
+
+I don't want to reuse a session with ephemeral keys; I want to reuse an 
+object that is supposed to already have resources allocated for doing 
+its job, as is indicated by the documentation of this function except 
+for a small note at the end that tells you that the devs didn't really 
+think about what &quot;ephemeral&quot; means.
+
+Creating a new SSL object (EVEN FROM AN EXISTING SSL_CTX object) entails:
+
+- allocating the memory for the object itself on the heap (via 
+OPENSSL_zalloc)
+- creating and managing a new lock for the object, and who knows for 
+much more subobjects
+- creating a duplicate of the cipher suite stack (which isn't even a 
+flat copy, but something that can cause the code to call OPENSSL_malloc 
+*twice* in the worst case)
+- creating a duplicate of the certificates (which I don't even use, but 
+that doesn't stop the code of ssl_cert_dup() to call OPENSSL_zalloc *in 
+its very first line!*)
+- setting up a bunch of callbacks
+- copying 32 bytes for a sid_ctx
+- creating an X509_VERIFY_PARAM object (*which calls OPENSSL_zalloc 
+again*) as well as creating a deep copy of the SSL_CTX's parameter via 
+X509_VERIFY_PARAM_inherit(), with Thor knows how many copies hidden in 
+all those *set* and *deep_copy* routines
+- copying EC point formats from the context - deep again, of course, at 
+least that's what OPENSSL_memdup() makes me think
+- copying supported group informations, and of course deep again!
+- deep-copying an ALPN object
+- SSL_clear()-ing the object (no, really!)
+- deep-copying a CRYPTO_EX_DATA object via CRYPTO_new_ex_data ... at 
+this point, is anyone surprised here that timing attacks against crypto 
+are *still* so successful? Because I'm not. Not at all.
+
+I didn't bother looking up what freeing entails - it's obvious to anyone 
+at this point that OpenSSL is a severe victim of feature creep, that its 
+memory allocation scheme is a mess, and long story short: I will NOT 
+free a perfectly fine object just because of incompetent devs' chutzpah 
+expecting their users to allocate memory dynamically en mass for no 
+goddamn reason whenever a new connection comes in. Fix your goddamn code.
+
+And don't give me any &quot;trust us, we're experienced programmers&quot; 
+bullshit. I've *seen* ssl/record/ssl3_record.c:
+
+ &gt; static const unsigned char ssl3_pad_1[48] = {
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+ &gt;     0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36
+ &gt; };
+ &gt; static const unsigned char ssl3_pad_2[48] = {
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+ &gt;     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c
+ &gt; };
+
+What's wrong with that, you ask? Let me show you how I'd have done that:
+
+ &gt; static const unsigned char ssl3_pad_1[] =
+ &gt; {
+ &gt;     &quot;66666666&quot;
+ &gt;     &quot;66666666&quot;
+ &gt;     &quot;66666666&quot;
+ &gt;     &quot;66666666&quot;
+ &gt;     &quot;66666666&quot;
+ &gt;     &quot;66666666&quot;
+ &gt; };
+ &gt;
+ &gt; static const unsigned char*ssl3_pad_2[] =
+ &gt; {
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt;     &quot;\\\\\\\\\\\\\\\\&quot;
+ &gt; };
+
+So, no. I don't trust anyone. Especially not this mess of a code.
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009509.html">[openssl-users] Authentication over ECDHE
+</A></li>
+	<LI>Next message: <A HREF="009558.html">[openssl-users] Authentication over ECDHE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9557">[ date ]</a>
+              <a href="thread.html#9557">[ thread ]</a>
+              <a href="subject.html#9557">[ subject ]</a>
+              <a href="author.html#9557">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

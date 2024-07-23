@@ -1,0 +1,140 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Question
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2023-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Question&In-Reply-To=%3C1a9d652f-7332-4a26-9bd3-e07a647a4790%40vollmann.ch%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016596.html">
+   <LINK REL="Next"  HREF="016591.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Question</H1>
+    <B>Detlef Vollmann</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Question&In-Reply-To=%3C1a9d652f-7332-4a26-9bd3-e07a647a4790%40vollmann.ch%3E"
+       TITLE="Question">dv at vollmann.ch
+       </A><BR>
+    <I>Mon Aug 14 20:18:06 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="016596.html">Question
+</A></li>
+        <LI>Next message (by thread): <A HREF="016591.html">ARM 64 bit + OpenSSL provider not loaded
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16606">[ date ]</a>
+              <a href="thread.html#16606">[ thread ]</a>
+              <a href="subject.html#16606">[ subject ]</a>
+              <a href="author.html#16606">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 8/10/23 16:25, Todd Short via openssl-users wrote:
+&gt;<i> Short answer: No, the OpenSSL library is not able to do this AS-IS.
+</I>&gt;<i> 
+</I>&gt;<i> Long answer:
+</I>&gt;<i> 
+</I>&gt;<i> 1) This would require serialization/deserialization of the SSL structure, which is opaque. The process is similar to how the SSL_SESSION is serialized in ssl/ssl_asn1.c, but is much more complicated. It requires internal knowledge of the handshake process and the SSL data structure. It can be done in a separate source file (i.e. there&#8217;s very little integration required with the rest of the system), but it&#8217;s fragile. I have done this in another job, and it took a while (months) to get right.
+</I>
++1
+
+My case is a bit different: we use DTLS, with reply attack not being
+a problem due to sequence numbers in the application protocol.
+
+And we have many DTLS (IoT) clients that only do a handshake at startup
+and they should not notice if the server goes down.
+So the idea is a UDP load balancer that redirects the packets
+to a newly started server when the old server goes down.
+
+The new server reads the session data from a store that's written
+on each new connection.
+This session data contains the serialized SSL_SESSION and also
+the full hello message from the client and the server random.
+
+The new server, when it receives a packet from a client it doesn't
+have a DTLS session yet, reads the data from the store, injects
+the (stored) ClientHello with included session id (this is DTLS 1.2),
+so the resumption path is taken by OpenSSL (SSL_CTX_sess_set_get_cb).
+It then overwrites the server random in the following info callback.
+Then OpenSSL sends a ServerHello, which is eaten, and at this point
+the session is set to connected, which is the point where all the
+internal state must be set correctly.
+It's actually a pretty short function:
+
+int setSslConnected(SSL *s)
+{
+     PACKET p = {NULL, 0};
+     int st = tls_process_change_cipher_spec(s, &amp;p);
+
+     // fix state
+     s-&gt;rwstate = 1;
+     s-&gt;statem.state = MSG_FLOW_FINISHED;
+     s-&gt;statem.write_state = WRITE_STATE_PRE_WORK;
+     s-&gt;statem.write_state_work = WORK_FINISHED_STOP;
+     s-&gt;statem.read_state = READ_STATE_BODY;
+     s-&gt;statem.read_state_work = WORK_FINISHED_STOP;
+     s-&gt;statem.hand_state = TLS_ST_OK;
+     s-&gt;statem.request_state = TLS_ST_BEFORE;
+     s-&gt;statem.in_init = 0;
+     s-&gt;statem.read_state_first_init = 0;
+     s-&gt;statem.in_handshake = 0;
+     s-&gt;statem.cleanuphand = 0;
+     s-&gt;statem.enc_write_state = ENC_WRITE_STATE_VALID;
+     s-&gt;statem.enc_read_state = ENC_READ_STATE_VALID;
+
+     // more fixes
+     s-&gt;s3.change_cipher_spec = 0;
+     s-&gt;d1-&gt;handshake_write_seq = 0;
+     s-&gt;d1-&gt;next_handshake_write_seq = 0;
+     s-&gt;d1-&gt;handshake_read_seq = 0;
+     dtls1_stop_timer(s);
+     s-&gt;rlayer.d-&gt;bitmap.map = 1;
+     ssl_free_wbio_buffer(s);
+
+     return st;
+}
+
+But all this is internal OpenSSL data and may change with any
+new version.
+
+Finally the server sequence number must be set using some heuristic
+specific for the application.
+
+For now this is just a proof of concept (but it works)
+and management doesn't have decided yet if they really want this.
+
+In case management actually wants something like this,
+would OpenSSL be interested in a patch that provides such a
+functionality (in a clean way of course)?
+
+   Detlef
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="016596.html">Question
+</A></li>
+	<LI>Next message (by thread): <A HREF="016591.html">ARM 64 bit + OpenSSL provider not loaded
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16606">[ date ]</a>
+              <a href="thread.html#16606">[ thread ]</a>
+              <a href="subject.html#16606">[ subject ]</a>
+              <a href="author.html#16606">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,137 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> SSL_read() fails when using manually managed buffers
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2023-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_read%28%29%20fails%20when%20using%20manually%20managed%20buffers&In-Reply-To=%3C6e143eee-f2ae-90a8-db62-17d87799dbfa%40digadd.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015780.html">
+   <LINK REL="Next"  HREF="015775.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>SSL_read() fails when using manually managed buffers</H1>
+    <B>Christian Schmidt</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20SSL_read%28%29%20fails%20when%20using%20manually%20managed%20buffers&In-Reply-To=%3C6e143eee-f2ae-90a8-db62-17d87799dbfa%40digadd.de%3E"
+       TITLE="SSL_read() fails when using manually managed buffers">schmidt at digadd.de
+       </A><BR>
+    <I>Wed Jan  4 16:24:55 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015780.html">SSL_read() fails when using manually managed buffers
+</A></li>
+        <LI>Next message (by thread): <A HREF="015775.html">&#8203;OpenSSL v1.1.1s - Segmenation fault on older Linux (ARM)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15777">[ date ]</a>
+              <a href="thread.html#15777">[ thread ]</a>
+              <a href="subject.html#15777">[ subject ]</a>
+              <a href="author.html#15777">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi Christian,
+
+On 04/01/2023 16:55, Christian Mazakas wrote:
+&gt;<i> Hey everyone,
+</I>&gt;<i> 
+</I>&gt;<i> I'm trying to get libssl to work without using any built-in I/O so for this,
+</I>&gt;<i> I'm using manually managed BIO pairs.
+</I>&gt;<i> 
+</I>&gt;<i> It seems like I can get a TLS Client Hello written to a user-provided buffer
+</I>&gt;<i> but I'm having trouble getting the server to parse this data and generate
+</I>&gt;<i> its own Server Hello in response.
+</I>&gt;<i> 
+</I>&gt;<i> I have a Compiler Explorer link that demonstrates my issue here:
+</I>&gt;<i> <A HREF="https://godbolt.org/z/ncxezWfqG">https://godbolt.org/z/ncxezWfqG</A> &lt;<A HREF="https://godbolt.org/z/ncxezWfqG">https://godbolt.org/z/ncxezWfqG</A>&gt;
+</I>&gt;<i> 
+</I>&gt;<i> Is there something plainly obvious that I'm missing? I've been scouring the
+</I>&gt;<i> docs so I'm wondering if there's something easy I missed.
+</I>
+Since I am doing something similar (I am wrapping all of my sockets, 
+some of which may be encrypted using openssl, others not, through one 
+select() statement and thus can't hand off the sockets to openssl 
+directly), you'll want something like
+
+...
+             result = SSL_read_ex (session-&gt;cryptoparams-&gt;ssl,
+                                   (void *) buffer_data_start 
+(&amp;session-&gt;ibuf),
+                                   buffer_data_space (&amp;session-&gt;ibuf),
+                                   &amp;rsize);
+             if (result) {
+                 log_msg (V_DEBUG3, &quot;crypto: read %zu bytes&quot;, rsize);
+                 // ...
+             } else {
+                 error = SSL_get_error (session-&gt;cryptoparams-&gt;ssl, result);
+                 switch (error) {
+                 // Not enough data
+                 case SSL_ERROR_WANT_READ:
+                 case SSL_ERROR_WANT_WRITE:
+// I am handling writes from server to client outside this; it's part of 
+a loop
+                     return 0;
+                 // Intended shutdown of TLS session
+                 case SSL_ERROR_ZERO_RETURN:
+                     log_msg (V_INFO, &quot;crypto: TLS session closed&quot;);
+                     SSL_shutdown (session-&gt;cryptoparams-&gt;ssl);
+                     return 1;
+                 // read error: shutdown
+                 default:
+                     log_msg (V_ERROR, &quot;crypto: failed to read: %s&quot;,
+                              SSL_reason_error_string (error));
+                     SSL_shutdown (session-&gt;cryptoparams-&gt;ssl);
+                     return -1;
+                 }
+             }
+...
+
+I am manually handling the SSL_accept() for the server with state 
+tracking though, with similar error checking &amp; handling. I left some 
+references to my internal data structures and functions in and hope they 
+are self explaining.
+
+If you remove the direct I/O handling from openssl, you need to handle 
+the SSL handshake data exchange, too, and won't be able to only act on 
+the decrypted data, as data needs to be exchanged between client and 
+server with potentially extra round trips, which will result in the 
+SSL_ERROR_WANT_* which are not terminal errors, but you'll need to act 
+on them. The 16,3,1 is a good start though as it's a TLS 1.0 handshake, 
+which SHOULD be used up to and including TLS 1.3.
+
+Good luck,
+Christian
+
+&gt;<i> - Christian
+</I>
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015780.html">SSL_read() fails when using manually managed buffers
+</A></li>
+	<LI>Next message (by thread): <A HREF="015775.html">&#8203;OpenSSL v1.1.1s - Segmenation fault on older Linux (ARM)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15777">[ date ]</a>
+              <a href="thread.html#15777">[ thread ]</a>
+              <a href="subject.html#15777">[ subject ]</a>
+              <a href="author.html#15777">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

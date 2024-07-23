@@ -1,0 +1,152 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Cert hot-reloading
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Cert%20hot-reloading&In-Reply-To=%3C20200830232847.GH44511%40straasha.imrryr.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012906.html">
+   <LINK REL="Next"  HREF="012908.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Cert hot-reloading</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Cert%20hot-reloading&In-Reply-To=%3C20200830232847.GH44511%40straasha.imrryr.org%3E"
+       TITLE="Cert hot-reloading">openssl-users at dukhovni.org
+       </A><BR>
+    <I>Sun Aug 30 23:28:47 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012906.html">Cert hot-reloading
+</A></li>
+        <LI>Next message: <A HREF="012908.html">Cert hot-reloading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12907">[ date ]</a>
+              <a href="thread.html#12907">[ thread ]</a>
+              <a href="subject.html#12907">[ subject ]</a>
+              <a href="author.html#12907">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Sun, Aug 30, 2020 at 05:45:41PM -0500, David Arnold wrote:
+
+&gt;<i> If you prefer this mailing list over github issues, I still want to ask 
+</I>&gt;<i> for comments on:
+</I>&gt;<i> 
+</I>&gt;<i> Certificate hot-reloading #12753
+</I>&gt;<i> &lt;<A HREF="https://github.com/openssl/openssl/issues/12753">https://github.com/openssl/openssl/issues/12753</A>&gt;
+</I>&gt;<i> 
+</I>&gt;<i> Specifically, my impression is that this topic has died down a bit and 
+</I>&gt;<i> from the linked mailing list threads, in my eye, no concrete conclusion 
+</I>&gt;<i> was drawn.
+</I>&gt;<i> 
+</I>&gt;<i> I'm not sure how to rank this motion in the context of OpenSSL
+</I>&gt;<i> development, but I guess OpenSSL is used to producing ripple effects,
+</I>&gt;<i> so the man-hour argument might be a genuinely valid one.
+</I>&gt;<i> 
+</I>&gt;<i> Please inform my research about this issue with your comments!
+</I>
+This is a worthwhile topic.  It has a few interesting aspects:
+
+    1.  Automatic key+cert reloads upon updates of key+cert chain PEM
+        files.  This can be tricky when processes start privileged,
+        load the certs and then drop privs, and are no longer able
+        to reopen the key + cert chain file.
+
+        - Here, for POSIX systems I'd go with an approach where
+          it is the containing directory that is restricted to
+          root or similar, and the actual cert files are group
+          and or world readable.  The process can then keep
+          the directory file descriptor open, and then openat(2)
+          to periodically check the cert file, reloading when
+          the metadata changes.
+
+        - With non-POSIX systems, or applications that don't
+          drop privs, the openat(2) is not needed, and one
+          just checks the cert chain periodically.
+
+        - Another option is to use passphrase-protected keys,
+          and load the secret passphrase at process start from
+          a separate read-protected file, while the actual
+          private key + cert chain file is world readable,
+          with the access control via protecting the passphrase
+          file.
+
+        - In all cases, it is important to keep both the private
+          key and the cert in the same file, and open it just
+          once to read both, avoiding races in which the key
+          and cert are read in a way that results in one or
+          the other being stale.
+
+    2.  Having somehow obtained a new key + cert chain, one
+        now wants to non-disruptively apply them to running
+        servers.  Here there are two potential approaches:
+
+        - Hot plug a new pointer into an existing SSL_CTX structure.
+          While the update itself could be made atomic, the readers
+          of such pointers might read them more than once to separately
+          extract the key and the cert chain, without checking that
+          they're using the same pointer for both operations.
+
+          This is bound to be fragile, though not necessarily
+          impossible.
+
+        - Build a new SSL_CTX, and use it to accept *new* connections,
+          while existing connections use whatever SSL_CTX they started
+          with.  I believe this can work well, because &quot;SSL&quot; handles
+          increment the reference count of the associated SSL_CTX
+          when they're created, and decrement it when destroyed.
+
+          So when you create a replacement SSL_CTX, you can just
+          SSL_CTX_free() the old, and it will only actually
+          be deleted when the last SSL connection tied to that
+          SSL_CTX is destroyed.
+
+          It is true that typical SSL_CTX construction is modestly
+          expensive (loading CA stores and the like) but some of
+          that could be handled by sharing and reference-counting
+          the stores.
+
+So my preferred approach would be to create a new SSL_CTX, and get new
+connections using that.  Now in a multi-threaded server, it could be a
+bit tricky to ensure that the SSL_CTX_free() does not happen before all
+threads reading the pointer to the latest SSL_CTX see the new pointer
+installed.  Something equivalent to RCU may be needed to ensure that the
+free only happens after the new pointer is visible in all threads.
+
+Designs addressing various parts of this would be cool, provided they're
+well thought out, and not just single-use-case quick hacks.
+
+-- 
+    Viktor.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012906.html">Cert hot-reloading
+</A></li>
+	<LI>Next message: <A HREF="012908.html">Cert hot-reloading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12907">[ date ]</a>
+              <a href="thread.html#12907">[ thread ]</a>
+              <a href="subject.html#12907">[ subject ]</a>
+              <a href="author.html#12907">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

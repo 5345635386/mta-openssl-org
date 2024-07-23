@@ -1,0 +1,140 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Server application hangs on SS_read, even when client disconnects
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CDM6PR18MB27001F78829B9724B7819C70F9E60%40DM6PR18MB2700.namprd18.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013136.html">
+   <LINK REL="Next"  HREF="013139.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Server application hangs on SS_read, even when client disconnects</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CDM6PR18MB27001F78829B9724B7819C70F9E60%40DM6PR18MB2700.namprd18.prod.outlook.com%3E"
+       TITLE="Server application hangs on SS_read, even when client disconnects">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Fri Nov 13 17:50:18 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013136.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+        <LI>Next message: <A HREF="013139.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13137">[ date ]</a>
+              <a href="thread.html#13137">[ thread ]</a>
+              <a href="subject.html#13137">[ subject ]</a>
+              <a href="author.html#13137">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: Brice Andr&#233; &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">brice at famille-andre.be</A>&gt;
+</I>&gt;<i> Sent: Friday, 13 November, 2020 09:13
+</I>
+&gt;<i> &quot;Does the server parent process close its copy of the conversation socket?&quot;
+</I>&gt;<i> I checked in my code, but it seems that no. Is it needed?
+</I>
+You'll want to do it, for a few reasons:
+
+- You'll be leaking descriptors in the server, and eventually it will hit its limit.
+- If the child process dies without cleanly closing its end of the conversation,
+the parent will still have an open descriptor for the socket, so the network stack
+won't terminate the TCP connection.
+- A related problem: If the child just closes its socket without calling shutdown,
+no FIN will be sent to the client system (because the parent still has its copy of
+the socket open). The client system will have the connection in one of the termination
+states (FIN_WAIT, maybe? I don't have my references handy) until it times out.
+- A bug in the parent process might cause it to operate on the connected socket,
+causing unexpected traffic on the connection.
+- All such sockets will be inherited by future child processes, and one of them might
+erroneously perform some operation on one of them. Obviously there could also be a
+security issue with this, depending on what your application does.
+
+Basically, when a descriptor is &quot;handed off&quot; to a child process by forking, you
+generally want to close it in the parent, unless it's used for parent-child
+communication. (There are some cases where the parent wants to keep it open for
+some reason, but they're rare.)
+
+On a similar note, if you exec a different program in the child process (I wasn't
+sure from your description), it's a good idea for the parent to set the FD_CLOEXEC
+option (with fcntl) on its listening socket and any other descriptors that shouldn't
+be passed along to child processes. You could close these manually in the child
+process between the fork and exec, but FD_CLOEXEC is often easier to maintain.
+
+For some applications, you might just dup2 the socket over descriptor 0 or
+descriptor 3, depending on whether the child needs access to stdio, and then close
+everything higher.
+
+Closing descriptors not needed by the child process is a good idea even if you
+don't exec, since it can prevent various problems and vulnerabilities that result
+from certain classes of bugs. It's a defensive measure.
+
+The best source for this sort of recommendation, in my opinion, remains W. Richard
+Stevens' /Advanced Programming in the UNIX Environment/. The book is old, and Linux
+isn't UNIX, but I don't know of any better explanation of how and why to do things
+in a UNIX-like OS.
+
+And my favorite source of TCP/IP information is Stevens' /TCP/IP Illustrated/.
+
+&gt;<i> May it explain my problem?
+</I>
+In this case, I don't offhand see how it does, but I may be overlooking something.
+
+&gt;<i> I suppose that, if for some reason, the communication with the client is lost
+</I>&gt;<i> (crash of client, loss of network, etc.) and keepalive is not enabled, this may
+</I>&gt;<i> fully explain my problem ?
+</I>
+It would give you those symptoms, yes.
+
+&gt;<i> If yes, do you have an idea of why keepalive is not enabled?
+</I>
+The Host Requirements RFC mandates that it be disabled by default. I think the
+primary reasoning for that was to avoid re-establishing virtual circuits (e.g.
+dial-up connections) for long-running connections that had long idle periods.
+
+Linux may well have a kernel tunable or similar to enable TCP keepalive by
+default, but it seems to be switched off on your system. You'd have to consult
+the documentation for your distribution, I think.
+
+By default (again per the Host Requirements RFC), it takes quite a long time for
+TCP keepalive to detect a broken connection. It doesn't start probing until the
+connection has been idle for 2 hours, and then you have to wait for the TCP
+retransmit timer times the retransmit count to be exhausted - typically over 10
+minutes. Again, some OSes let you change these defaults, and some let you change
+them on an individual connection.
+
+--
+Michael Wojcik
+
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013136.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+	<LI>Next message: <A HREF="013139.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13137">[ date ]</a>
+              <a href="thread.html#13137">[ thread ]</a>
+              <a href="subject.html#13137">[ subject ]</a>
+              <a href="author.html#13137">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

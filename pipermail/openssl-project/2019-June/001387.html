@@ -1,0 +1,227 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> OSSL_PARAMs
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-project/2019-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20OSSL_PARAMs&In-Reply-To=%3C87k1e0zrnr.wl-levitte%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001388.html">
+   <LINK REL="Next"  HREF="001390.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>OSSL_PARAMs</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20OSSL_PARAMs&In-Reply-To=%3C87k1e0zrnr.wl-levitte%40openssl.org%3E"
+       TITLE="OSSL_PARAMs">levitte at openssl.org
+       </A><BR>
+    <I>Wed Jun  5 02:34:32 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001388.html">OSSL_PARAMs
+</A></li>
+        <LI>Next message: <A HREF="001390.html">OSSL_PARAMs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1387">[ date ]</a>
+              <a href="thread.html#1387">[ thread ]</a>
+              <a href="subject.html#1387">[ subject ]</a>
+              <a href="author.html#1387">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Aside from the discussion below, if there's one thing I would like to
+change, it the double indirection for the _PTR data types.  The data
+types could still be used to indicate that the value isn't short
+lived, but could possibly change names to something like
+OSSL_PARAM_UTF8_CSTRING and OSSL_PARAM_OCTET_CSTRING (C for Constant).
+
+On Wed, 05 Jun 2019 01:18:56 +0200,
+Dr Paul Dale wrote:
+&gt;<i> Shane&#8217;s major complaints are about the indirection the OSSL_PARAM structure forces &#8212; for integers
+</I>&gt;<i> and return lengths and the necessity of allocating additional memory in parallel with the
+</I>&gt;<i> OSSL_PARAM.
+</I>&gt;<i> 
+</I>&gt;<i> The extra indirection was intended to support const arrays of OSSL_PARAM, which turn out to be a
+</I>&gt;<i> rarity because they aren&#8217;t thread safe.
+</I>
+The reason why we have this issue is our base C language version
+choice.  C90 doesn't allow this construct:
+
+    int foo(whatever)
+    {
+        int haha = 0;
+        const OSSL_PARAM params[] = {
+            { 'foo', OSSL_PARAM_INTEGER, &amp;haha, sizeof(haha), NULL },
+            { NULL, 0, NULL, 0, NULL }
+        };
+
+        ...
+    }
+
+Because the compiler for that language version isn't allowed to emit
+code to use '&amp;haha' in an inititializer.  Newer C language versions
+allow this.
+
+So while this is an issue for *us*, it isn't necessarily an issue for
+our users, all depending on what C language version they use.
+
+&gt;<i> With most OSSL_PARAM structure being dynamically created,
+</I>&gt;<i> the need for the indirection seems redundant.  E.g. could the return length be moved into
+</I>&gt;<i> OSSL_PARAM?  I think so.
+</I>
+The design was not only to be able to have nice compile time
+initialization, but also to be able to pass the array as 'const
+OSSL_PARAM *', i.e. an indication to the recipient that the array
+itself should never be modified (less chance of compromise).  Maybe
+that's overly paranoid, but that was a line of thinking.
+
+&gt;<i> Moving integral values into the structure is more difficult because BIGNUMs will always need to be
+</I>&gt;<i> references.  Allocating additional memory will still be required.  I&#8217;ve got three obvious
+</I>&gt;<i> solutions:
+</I>&gt;<i> 
+</I>&gt;<i> 1. include a void * in the OSSL_PARAM structure that needs to be freed when the structure is
+</I>&gt;<i> destroyed or
+</I>
+It's actually perfectly possible to do this today.  We already have
+this pointer, it's called 'data'.
+
+&gt;<i> 2. have a block of data in the OSSL_PARAM structure that can be used for native types
+</I>&gt;<i> (OSSL_UNION_ALIGN works perfectly for this) or
+</I>
+My major concern with that, apart from having to modify the OSSL_PARAM
+items themselves&#184; is that some time in the future, we will want to add
+another native type that's larger, which means we modify the size of a
+OSSL_PARAM.  It's a public structure, so that can't be treated
+lightly.
+
+Also, with a union of native types, we're losing uniformity on MSB
+first platforms.  Having an exact 1:1 integer size match will be
+crucial, and that complicates the code quite a bit...  not to mention
+that we have a compatibility problem as soon as one end has a new
+native type in the union and the other doesn't.
+(one would imagine that simply using uintmax_t would cover all integer
+sizes apart from BIGNUM, but the potential size change of that type
+with newer compilers make such a choice precarious)
+
+&gt;<i> 3. add a flag field to the OSSL_PARAM to indicate that the referenced value needs to be freed.
+</I>
+By whom?  The owner of the array should be in complete control of
+what's needed already, so should be able to know what needs being
+deallocated or not.
+
+If you're thinking that the receiving side should free certain values,
+then you need to pass a pointer to the routine to be used to free the
+value rather than just a flag.
+
+&gt;<i> The memory allocation comes to the for when reading e.g. a file and extracting data &#8212; either the
+</I>&gt;<i> reader needs a lot of local variables to hold everything or it has to allocated for each.  The
+</I>&gt;<i> file&#8217;s data is transient in memory.
+</I>&gt;<i> 
+</I>&gt;<i> For the most part, the receiver side APIs seem reasonable.  It is the owning side that has the
+</I>&gt;<i> complications.
+</I>&gt;<i> 
+</I>&gt;<i> I think I might be able come up with some owner side routines that assist here but allowing
+</I>&gt;<i> changes to the params structure would be far easier.
+</I>&gt;<i> 
+</I>&gt;<i> I kind of like using the OSSL_PARAM arrays as a replacement for string ctrl functions if not ctrl
+</I>&gt;<i> as well (subject to backward compatibility concerns).
+</I>&gt;<i> 
+</I>&gt;<i> Pauli
+</I>&gt;<i> -- 
+</I>&gt;<i> Dr Paul Dale | Cryptographer | Network Security &amp; Encryption 
+</I>&gt;<i> Phone +61 7 3031 7217
+</I>&gt;<i> Oracle Australia
+</I>&gt;<i> 
+</I>&gt;<i>     On 4 Jun 2019, at 11:26 pm, Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-project.html">levitte at openssl.org</A>&gt; wrote:
+</I>&gt;<i>    
+</I>&gt;<i>     On Tue, 04 Jun 2019 14:57:00 +0200,
+</I>&gt;<i>     Salz, Rich wrote:
+</I>&gt;<i> 
+</I>&gt;<i>               Part of the idea was that this would be a means of communication
+</I>&gt;<i>        
+</I>&gt;<i>            between application and provider, just like controls are with
+</I>&gt;<i>            libcrypto sub-systems.
+</I>&gt;<i> 
+</I>&gt;<i>         I can probably find the email thread (or maybe it was a GitHub
+</I>&gt;<i>         comment on my proposal for params), where you said, quite
+</I>&gt;<i>         definitively, that this was *not* a general-purpose mechanism but
+</I>&gt;<i>         rather a way to expose the necessary internals for opaque objects
+</I>&gt;<i>         like RSA keys.
+</I>&gt;<i> 
+</I>&gt;<i>     Either I misunderstood what you said at the time, or you misunderstood
+</I>&gt;<i>     what I said...  there's definitely a disconnect here somewhere.
+</I>&gt;<i>    
+</I>&gt;<i>     What I wonder is why it should be exclusively only one of those
+</I>&gt;<i>     options?
+</I>&gt;<i>    
+</I>&gt;<i>     Either way, the OSSL_PARAM is defined publically and openly (i.e.
+</I>&gt;<i>     non-opaque), and we currently have the following functions in the
+</I>&gt;<i>     public API:
+</I>&gt;<i>    
+</I>&gt;<i>        EVP_MD_CTX_set_params
+</I>&gt;<i>        EVP_MD_CTX_get_params
+</I>&gt;<i>        OSSL_PROVIDER_get_params
+</I>&gt;<i>    
+</I>&gt;<i>     I fully expect that more will come.  I have a branch where I've
+</I>&gt;<i>     EVP_MAC_CTX_set_params, for example, and I wouldn't be surprised if
+</I>&gt;<i>     EVP_CIPHER_CTX_set_params and EVP_CIPHER_CTX_get_params appear before
+</I>&gt;<i>     long (I'm actually rather surprised they haven't already), and I'm
+</I>&gt;<i>     absolutely sure we will see similar functions for asymmetric
+</I>&gt;<i>     algorithms.
+</I>&gt;<i> 
+</I>&gt;<i>         What changed your mind?
+</I>&gt;<i>        
+</I>&gt;<i>         Perhaps not surprisingly, I agree with Shane's assessment and am
+</I>&gt;<i>         strongly opposed to the project foisting this on everyone at this
+</I>&gt;<i>         time.  @DavidBen, your thoughts?
+</I>&gt;<i> 
+</I>&gt;<i>     Maybe we're reading differently, I didn't see Shane being opposed to
+</I>&gt;<i>     parameter passing in this way per se, just the exact form of the
+</I>&gt;<i>     OSSL_PARAM structure, which is different.
+</I>&gt;<i>    
+</I>&gt;<i>     Cheers,
+</I>&gt;<i>     Richard
+</I>&gt;<i>    
+</I>&gt;<i>     --
+</I>&gt;<i>     Richard Levitte         <A HREF="../../../mailman/listinfo/openssl-project.html">levitte at openssl.org</A>
+</I>&gt;<i>     OpenSSL Project         <A HREF="http://www.openssl.org/~levitte/">http://www.openssl.org/~levitte/</A>
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>-- 
+Richard Levitte         <A HREF="../../../mailman/listinfo/openssl-project.html">levitte at openssl.org</A>
+OpenSSL Project         <A HREF="http://www.openssl.org/~levitte/">http://www.openssl.org/~levitte/</A>
+</PRE>
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001388.html">OSSL_PARAMs
+</A></li>
+	<LI>Next message: <A HREF="001390.html">OSSL_PARAMs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1387">[ date ]</a>
+              <a href="thread.html#1387">[ thread ]</a>
+              <a href="subject.html#1387">[ subject ]</a>
+              <a href="author.html#1387">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-project.html">More information about the openssl-project
+mailing list</a><br>
+</body></html>

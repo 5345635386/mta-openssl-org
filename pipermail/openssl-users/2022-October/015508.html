@@ -1,0 +1,173 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> PKCS#7 Signing: How to get repeatable output for signing the same data
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2022-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20PKCS%237%20Signing%3A%20How%20to%20get%20repeatable%20output%20for%20signing%20the%20same%20data&In-Reply-To=%3C2d1aa7ca-6093-ffd2-8793-f1bba315f20e%40bastelfreak.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015519.html">
+   <LINK REL="Next"  HREF="015510.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>PKCS#7 Signing: How to get repeatable output for signing the same data</H1>
+    <B>Tim Meusel</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20PKCS%237%20Signing%3A%20How%20to%20get%20repeatable%20output%20for%20signing%20the%20same%20data&In-Reply-To=%3C2d1aa7ca-6093-ffd2-8793-f1bba315f20e%40bastelfreak.de%3E"
+       TITLE="PKCS#7 Signing: How to get repeatable output for signing the same data">openssl at bastelfreak.de
+       </A><BR>
+    <I>Mon Oct 17 08:28:45 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015519.html">Build openssl on windows 10 using cygwin
+</A></li>
+        <LI>Next message (by thread): <A HREF="015510.html">PKCS#7 Signing: How to get repeatable output for signing the same data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15508">[ date ]</a>
+              <a href="thread.html#15508">[ thread ]</a>
+              <a href="subject.html#15508">[ subject ]</a>
+              <a href="author.html#15508">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi!
+I maintain a Ruby script that does PKCS#7 signing and afterwards some 
+enryption with AES-128-CFB. A trimmed down version:
+
+certpath = '/tmp/cert.pem'
+keypath = '/tmp/key/pem'
+data = 'teststring'
+key  = OpenSSL::PKey::RSA.new(File.read(keypath), '1234')
+cert = OpenSSL::X509::Certificate.new(File.read(certpath))
+signed = OpenSSL::PKCS7::sign(cert, key, data, [], OpenSSL::PKCS7::BINARY)
+cipher = OpenSSL::Cipher::new(&quot;AES-128-CFB&quot;)
+iv_len = cipher.iv_len
+key_len = cipher.key_len
+fqdn_rand = Digest::SHA256.hexdigest([destination,data.length].join(':'))
+iv_seed, key_seed = fqdn_rand.partition(/.{32}/)[1,2]
+iv = iv_seed.unpack('a2'*key_len).map{|x| x.hex}.pack('c'*key_len)
+key = key_seed.unpack('a2'*key_len).map{|x| x.hex}.pack('c'*key_len)
+cipher.encrypt
+cipher.iv=(iv)
+cipher.key=(key)
+OpenSSL::PKCS7::encrypt([target], signed.to_der, cipher, 
+OpenSSL::PKCS7::BINARY).to_s
+
+I pulled the AES encryption into a testscript and that's indeed 
+repeatable (script at the end of the email). I did some tests and 
+noticed that the initial signing doesn't produce repeatable output:
+
+signed = OpenSSL::PKCS7::sign(cert, key, data, [], OpenSSL::PKCS7::BINARY)
+
+I did some googling and that told me the signing date/timestamp is part 
+of the output, which would explain why it doesn't produce the same 
+output when I run it twice. Now to my actual questions:
+* Is the different output caused by a changing signing time and/or 
+something else?
+* Do you know if I can pass the signingtime to manipulate it?
+
+I know that this isn't a Ruby mailinglist, but the ruby-openssl bindings 
+and the documentation are generated from the C code and were not very 
+helpful (for people not knowing C/not knowing a lot about 
+OpenSSL/PKCS#7). Maybe you've some thoughts.
+
+Why am I doing this?
+
+Roughly explained, the script is executed every 30 minutes for a lot of 
+content, then the previous PKCS#7 output is pulled from a database, 
+compared, and if the new script output is different, the DB is updated. 
+This is stupid in many ways, but I cannot change that short-term. As a 
+workarond, we would like to update the script to produce repeatable 
+output. I know that this weakens the security, but we need to reduce the 
+database load from the many reoccurring updates.
+
+my AES testing:
+
+<A HREF="../../../mailman/listinfo/openssl-users.html">root at puppet</A> ~ # ruby openssl.rb
+encrypted: [&quot;38b5cefb&quot;]
+decrypted: test
+encrypted: [&quot;38b5cefb&quot;]
+decrypted: test
+<A HREF="../../../mailman/listinfo/openssl-users.html">root at puppet</A> ~ # cat openssl.rb
+#!/usr/bin/env ruby
+
+require 'openssl'
+
+def encrypt(content)
+   cipher = OpenSSL::Cipher::new(&quot;AES-128-CFB&quot;)
+   cipher.encrypt
+   iv =&quot;00000000000000000000000000000001&quot;.unpack('a2'*16).map{|x| 
+x.hex}.pack('c'*16)
+   cipher.iv=(iv)
+   key = &quot;7ffb8032dff33aef9aa92e9ac96239d3&quot;.unpack('a2'*16).map{|x| 
+x.hex}.pack('c'*16)
+   cipher.key=(key)
+   output = cipher.update(content)
+   output &lt;&lt; cipher.final
+   puts &quot;encrypted: #{output.unpack('H*')}\n&quot;
+   puts &quot;decrypted: #{decrypt(output, iv, key)}\n&quot;
+end
+
+def decrypt(content, iv, key)
+   cipher = OpenSSL::Cipher::new(&quot;AES-128-CFB&quot;)
+   cipher.decrypt
+   cipher.iv=(iv)
+   cipher.key=(key)
+   output = cipher.update(content)
+   output &lt;&lt; cipher.final
+   output
+end
+encrypt 'test'
+encrypt 'test'
+<A HREF="../../../mailman/listinfo/openssl-users.html">root at puppet</A> ~ #
+
+The complete original code:
+<A HREF="https://github.com/binford2k/binford2k-node_encrypt/blob/main/lib/puppet_x/binford2k/node_encrypt.rb#L11-L55">https://github.com/binford2k/binford2k-node_encrypt/blob/main/lib/puppet_x/binford2k/node_encrypt.rb#L11-L55</A>
+My WIP patch: 
+<A HREF="https://github.com/binford2k/binford2k-node_encrypt/compare/main...bastelfreak:binford2k-node_encrypt:49675?expand=1">https://github.com/binford2k/binford2k-node_encrypt/compare/main...bastelfreak:binford2k-node_encrypt:49675?expand=1</A>
+
+Cheers, Tim
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: OpenPGP_signature
+Type: application/pgp-signature
+Size: 495 bytes
+Desc: OpenPGP digital signature
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20221017/0c1827b5/attachment.sig">https://mta.openssl.org/pipermail/openssl-users/attachments/20221017/0c1827b5/attachment.sig</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015519.html">Build openssl on windows 10 using cygwin
+</A></li>
+	<LI>Next message (by thread): <A HREF="015510.html">PKCS#7 Signing: How to get repeatable output for signing the same data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15508">[ date ]</a>
+              <a href="thread.html#15508">[ thread ]</a>
+              <a href="subject.html#15508">[ subject ]</a>
+              <a href="author.html#15508">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

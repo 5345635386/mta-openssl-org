@@ -1,0 +1,379 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] PKCS7_sign conflict with PKCS7_decrypt?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20PKCS7_sign%20conflict%20with%20PKCS7_decrypt%3F&In-Reply-To=%3C008401d1e749%248d021d90%24a70658b0%24%40carroll.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004102.html">
+   <LINK REL="Next"  HREF="004090.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] PKCS7_sign conflict with PKCS7_decrypt?</H1>
+    <B>Jim Carroll</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20PKCS7_sign%20conflict%20with%20PKCS7_decrypt%3F&In-Reply-To=%3C008401d1e749%248d021d90%24a70658b0%24%40carroll.com%3E"
+       TITLE="[openssl-users] PKCS7_sign conflict with PKCS7_decrypt?">jim at carroll.com
+       </A><BR>
+    <I>Tue Jul 26 14:25:24 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004102.html">[openssl-users] How to properly build OpenSSL with certificates inside certs directory
+</A></li>
+        <LI>Next message: <A HREF="004090.html">[openssl-users] PKCS7_sign conflict with PKCS7_decrypt?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4088">[ date ]</a>
+              <a href="thread.html#4088">[ thread ]</a>
+              <a href="subject.html#4088">[ subject ]</a>
+              <a href="author.html#4088">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Running into trouble -- any attempt to PKCS7_decrypt() S/MIME content that
+was created with PKCS7_sign()+PKCS7_encrypt() yields an empty result set.  I
+have the distinct impression I'm doing something dumb -- but several days of
+debugging I'm completely stuck.
+
+I've created an MVCE and included it below. The code was built and run on
+Windows 8.1 Pro, Visual C++ 2008 Express, using OpenSSL 1.1.0-pre6-dev
+(32-bit build).
+
+Interesting point -- If I remove the PKCS7_sign() code, I have no problem
+encrypting and decrypting the content. I strongly suspect my issue has
+something todo with S/MIME headers interfering with encryption or
+decryption.  But that theory would suggest there's a bug in OpenSSL's S/MIME
+handling. I find that hard to swallow -- more likely I'm missing some sort
+of required flag.
+
+One more point -- I understand Sign-then-Encrypt has weaknesses and may not
+be recommended (<A HREF="http://world.std.com/~dtd/sign_encrypt/sign_encrypt7.html">http://world.std.com/~dtd/sign_encrypt/sign_encrypt7.html</A>).
+The reason I'm even trying to debug this is to complete the port of an
+M2Crypto unittest to OpenSSL 1.1.0, which means the procedure works
+acceptably under OpenSSL 0.9.8.
+
+Any assistance would be greatly appreciated
+
+
+---------------- Here is the output from running the code
+
+&gt;&gt;&gt;<i> Version OpenSSL 1.1.0-pre6-dev  xx XXX xxxx (0x10100006)
+</I>&gt;&gt;&gt;<i> Generate keys and certs
+</I>Generating a 1024 bit RSA private key
+...............++++++
+.............................................++++++
+writing new private key to 'signer_key.pem'
+-----
+Generating a 1024 bit RSA private key
+......................++++++
+.........................++++++
+writing new private key to 'recipient_key.pem'
+-----
+&gt;&gt;&gt;<i> Read keys and certs
+</I>&gt;&gt;&gt;<i> Create recipient cert stack (for encryption)
+</I>&gt;&gt;&gt;<i> Sign
+</I>&gt;&gt;&gt;<i> Generate signed S/MIME
+</I>&gt;&gt;&gt;<i> Encrypt
+</I>&gt;&gt;&gt;<i> Generate encrypted S/MIME
+</I>&gt;&gt;&gt;<i> Convert S/MIME to PKCS7
+</I>&gt;&gt;&gt;<i> Decrypt PKCS7
+</I>decrypted text =&gt; len -1 ''
+mismatched response size
+
+
+
+
+---------------- MVCE CODE
+
+#include &quot;stdafx.h&quot;
+
+#include &lt;string.h&gt;
+
+#pragma warning(disable:4996)
+#include &lt;openssl/applink.c&gt;
+#include &lt;openssl/bio.h&gt;
+#include &lt;openssl/err.h&gt;
+#include &lt;openssl/pem.h&gt;
+#include &lt;openssl/x509.h&gt;
+
+#pragma comment(lib, &quot;libcrypto&quot;)
+
+EVP_PKEY *load_key(const char fname[]);
+X509 *load_cert(const char fname[]);
+
+int _tmain(int argc, _TCHAR* argv[]) {
+    BIO *mem, *bcont;
+    EVP_PKEY *signer_pkey, *rcpt_pkey;
+    PKCS7 *p7;
+    STACK_OF(X509) *rcpt_stack;
+    X509 *signer_cert, *rcpt_cert;
+    char cleartext[] = &quot;some text to manipulate&quot;;
+    char text[128];
+    const EVP_CIPHER *cipher = EVP_des_ede3_cbc();
+    int len, rc;
+
+    printf(&quot;&gt;&gt;&gt; Version %s (0x%lx)\n&quot;, OPENSSL_VERSION_TEXT, 
+            OPENSSL_VERSION_NUMBER);
+
+    printf(&quot;&gt;&gt;&gt; Generate keys and certs\n&quot;);
+
+    if ((rc = system(&quot;openssl req -new -x509 -nodes &quot;
+        &quot;-subj /C=US/ST=STATE/CN=localhost/emailAddress=<A HREF="../../../mailman/listinfo/openssl-users.html">signer at example.com</A> &quot;
+        &quot;-newkey rsa:1024 -keyout signer_key.pem -out signer_cert.pem&quot;))) {
+        printf(&quot;error %d generating signer cert&quot;, rc);
+        return -1;
+        }
+    if ((rc = system(&quot;openssl req -new -x509 -nodes &quot;
+        &quot;-subj
+/C=US/ST=STATE/CN=localhost/emailAddress=<A HREF="../../../mailman/listinfo/openssl-users.html">recipient at example.com</A> &quot;
+        &quot;-newkey rsa:1024 -keyout recipient_key.pem -out
+recipient_cert.pem&quot;))) {
+        printf(&quot;error %d generating recipient cert&quot;, rc);
+        return -1;
+        }
+
+    printf(&quot;&gt;&gt;&gt; Read keys and certs\n&quot;);
+
+    if (!(signer_pkey = load_key(&quot;signer_key.pem&quot;)) ||
+        !(signer_cert = load_cert(&quot;signer_cert.pem&quot;)) ||
+        !(rcpt_pkey = load_key(&quot;recipient_key.pem&quot;)) ||
+        !(rcpt_cert = load_cert(&quot;recipient_cert.pem&quot;)))
+        return -1;
+
+    printf(&quot;&gt;&gt;&gt; Create recipient cert stack (for encryption)\n&quot;);
+
+    if (!(rcpt_stack = sk_X509_new_null()) || 
+        !sk_X509_push(rcpt_stack, rcpt_cert)) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+
+    printf(&quot;&gt;&gt;&gt; Sign\n&quot;);
+
+    if (!(mem = BIO_new_mem_buf(cleartext, sizeof(cleartext))) ||
+        !(p7 = PKCS7_sign(signer_cert, signer_pkey, NULL, mem, 0))) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+    BIO_free(mem);
+
+    printf(&quot;&gt;&gt;&gt; Generate signed S/MIME\n&quot;);
+
+    if (!(mem = BIO_new(BIO_s_mem())) ||
+        !SMIME_write_PKCS7(mem, p7, NULL, 0)) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+    PKCS7_free(p7);
+
+    printf(&quot;&gt;&gt;&gt; Encrypt\n&quot;);
+
+    BIO_set_mem_eof_return(mem, 0);
+    if (!(p7 = PKCS7_encrypt(rcpt_stack, mem, cipher, 0))) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+    BIO_free(mem);
+
+    printf(&quot;&gt;&gt;&gt; Generate encrypted S/MIME\n&quot;);
+
+    if (!(mem = BIO_new(BIO_s_mem())) ||
+        !SMIME_write_PKCS7(mem, p7, NULL, 0)) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+    PKCS7_free(p7);
+
+    printf(&quot;&gt;&gt;&gt; Convert S/MIME to PKCS7\n&quot;);
+
+    BIO_set_mem_eof_return(mem, 0);
+    if (!(p7 = SMIME_read_PKCS7(mem, &amp;bcont))) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+    BIO_free(mem);
+
+    printf(&quot;&gt;&gt;&gt; Decrypt PKCS7\n&quot;);
+
+    if (!(mem = BIO_new(BIO_s_mem())) ||
+        !PKCS7_decrypt(p7, rcpt_pkey, rcpt_cert, mem, 0)) {
+        ERR_print_errors_fp(stdout);
+        return -1;
+        }
+
+    len = BIO_read(mem, text, sizeof(text));
+    printf(&quot;decrypted text =&gt; len %d '%s'\n&quot;, len, len &gt; 0 ? text : &quot;&quot;);
+    if (len != strlen(cleartext))
+        printf(&quot;mismatched response size\n&quot;);
+    else if (strcmp(cleartext, text) != 0)
+        printf(&quot;mismatched content\n&quot;);
+
+    return 0;
+    }
+
+EVP_PKEY *load_key(const char fname[]) {
+    BIO *bio = NULL;
+    EVP_PKEY *key = NULL;
+    if (!(bio = BIO_new_file(fname, &quot;r&quot;)) ||
+        !(key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL))) {
+        printf(&quot;error reading keyfile: %s\n&quot;, fname);
+        ERR_print_errors_fp(stdout);
+        }
+    BIO_free(bio);
+    return key;
+    }
+
+X509 *load_cert(const char fname[]) {
+    BIO *bio = NULL;
+    X509 *cert = NULL;
+    if (!(bio = BIO_new_file(fname, &quot;r&quot;)) ||
+        !(cert = PEM_read_bio_X509(bio, NULL, NULL, NULL))) {
+        printf(&quot;error reading certfile: %s\n&quot;, fname);
+        ERR_print_errors_fp(stdout);
+        }
+    BIO_free(bio);
+    return cert;
+    }
+
+
+begin 666 smime.p7s
+M,( &amp;&quot;2J&amp;2(;W#0$'`J&quot; ,( &quot;`0$Q&quot;S )!@4K#@,&quot;&amp;@4`,( &amp;&quot;2J&amp;2(;W#0$'
+M`0``H((.$3&quot;&quot;!#8P@@,&gt;H ,&quot;`0(&quot;`0$P#08)*H9(AO&lt;-`0$%!0`P;S$+, D&amp;
+M`U4$!A,&quot;4T4Q%# 2!@-5! H3&quot;T%D9%1R=7-T($%&quot;,28P) 8#500+$QU!9&amp;14
+M&lt;G5S=&quot;!%&gt;'1E&lt;FYA;&quot;!45% @3F5T=V]R:S$B,&quot; &amp;`U4$`Q,9061D5')U&lt;W0@
+M17AT97)<A HREF="../../../mailman/listinfo/openssl-users.html">N86P at 0T</A>$@4F]O=# &gt;%PTP,# U,S Q,#0X,SA:%PTR,# U,S Q,#0X
+M,SA:,&amp;\Q&quot;S )!@-5! 83`E-%,10P$@8#500*$PM!9&amp;14&lt;G5S=&quot;!!0C$F,&quot;0&amp;
+M`U4$&quot;Q,=061D5')U&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">W0 at 17AT97</A>)<A HREF="../../../mailman/listinfo/openssl-users.html">N86P at 5</A>%10($YE='=O&lt;FLQ(C @!@-5! ,3
+M&amp;4%D9%1R=7-T($5X=&amp;5R;F%L($-!(%)O;W0P@@$B, T&amp;&quot;2J&amp;2(;W#0$!`04`
+M`X(!#P`P@@$*`H(!`0&quot;W]QHSYO(`!&quot;TYX$Y;[1^\; _-M?HCML[&gt;FQ$SEZ0I
+M3'V3G[U*O)/M`QKCC\_E;5!:UI&lt;IE%J L$EZVRZ5_;C*OS&lt;X+1X^D4&amp;M&lt;%;'
+M\$\_Z#*&gt;=,K(D%3IQE\/&gt;)V:0#P.K&amp;&amp;J7A2/GH&gt;A:E#&lt;UYI.KP6SIG&amp;4G'&amp;S
+M4&amp; *QQ.=. &gt;&amp;`JCIJ&amp;DF&amp;)&quot;K3+!/(ZLZ3X38W\Z?X6EON]=&quot;UVM$Y,&gt;M[FU!
+M7W):&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">0 at WLWEEI</A>%<A HREF="../../../mailman/listinfo/openssl-users.html">F at E</A>#?W`&quot;\-PI)RVM X&lt;ML4J$7$72I]M[36Q.ZLS1-$M\DK
+MW4,`)?IAN6EJ6&quot;,1MZ&lt;SCU9U6?7-*==&amp;MPHK9;;30F\5LKA[^^_I75/5-%HG
+M`@,!``&amp;C@=PP@=DP'08#51T.!!8$%*V]F'HTM&quot;;W^L0F5.\#O&gt; DRU0:, L&amp;
+M`U4=#P0$`P(!!C /!@-5'1,!`?\$!3 #`0'_,(&amp;9!@-5'2,$@9$<A HREF="../../../mailman/listinfo/openssl-users.html">P at 8Z</A> %*V]
+MF'HTM&quot;;W^L0F5.\#O&gt; DRU0:H7.D&lt;3!O,0LP&quot;08#500&amp;$P)313$4,!(&amp;`U4$
+M&quot;A,+061D5')U&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">W0 at 04</A>(Q)C D!@-5! L3'4%D9%1R=7-T($5X=&amp;5R;F%L(%14
+M4&quot;!.971W;W)K,2(P( 8#500#$QE!9&amp;14&lt;G5S=&quot;!%&gt;'1E&lt;FYA;&quot;!#02!2;V]T
+M@@$!, T&amp;&quot;2J&amp;2(;W#0$!!04``X(!`0&quot;PF^&quot;%)&lt;+6(^(/E@:2G4&amp;8G-F$&gt;8'9
+M'EL4!R,V98^PV'&gt;[K$%L1V&quot;#4;#Y,CWG_/8F$\&gt; %J6_6OR'SWAYB2&amp;:XDP'
+M&quot;H8UO/+&gt;4&lt;32EK?&lt;?D[N&lt;/T&lt;.&gt;L,`E$4+8Z]%N#!WT9UYR2M[/1&quot;M(63&lt;!!G
+MNIT&amp;-4H8TRMZS%%&quot;H7ICT&gt;:[H&lt;4KPC:^$PWFO6-^&gt;7NG&quot;0U JVK=CXK#]O:,
+M&amp;D(%4=1%]9^G8B%H%2!#/)GG?+TDV*F1%W.(/U8;<A HREF="../../../mailman/listinfo/openssl-users.html">,3 at 8M</A>'$/FLW(#IZ.+AOA
+MC)B#RQ\Q\<A HREF="../../../mailman/listinfo/openssl-users.html">41,Q at 1S279</A>@#\?XO1&gt; :R[IS$P.6IIY#R *+M6&gt;8R8&gt;59*4V((7
+M6GO0O,&gt;/3H8$,(($KS&quot;&quot;`Y&gt;@`P(!`@(1`. <A HREF="../../../mailman/listinfo/openssl-users.html">CRQ42 at U.</A>)K6%N&gt;E1G:R$P#08)
+M*H9(AO&lt;-`0$+!0`P;S$+, D&amp;`U4$!A,&quot;4T4Q%# 2!@-5! H3&quot;T%D9%1R=7-T
+M($%&quot;,28P) 8#500+$QU!9&amp;14&lt;G5S=&quot;!%&gt;'1E&lt;FYA;&quot;!45% @3F5T=V]R:S$B
+M,&quot; &amp;`U4$`Q,9061D5')U&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">W0 at 17AT97</A>)<A HREF="../../../mailman/listinfo/openssl-users.html">N86P at 0T</A>$@4F]O=# &gt;%PTQ-#$R,C(P
+M,# P,#!:%PTR,# U,S Q,#0X,SA:,(&amp;;,0LP&quot;08#500&amp;$P)'0C$;,!D&amp;`U4$
+M&quot;!,21W)E871E&lt;B!-86YC:&amp;5S=&amp;5R,1 P#@8#500'$P=386QF;W)D,1HP&amp; 8#
+M500*$Q%#3TU/1$\@0T$@3&amp;EM:71E9#%!,#\&amp;`U4$`Q,X0T]-3T1/(%-(02TR
+<A HREF="../../../mailman/listinfo/openssl-users.html">M-38 at 0VQI96YT</A>($%U=&AE;G1I8V%T:6]N(&amp;%N9&quot;!396-U&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">F4 at 16UA</A>:<A HREF="../../../mailman/listinfo/openssl-users.html">6P at 0T</A>$P
+M@@$B, T&amp;&quot;2J&amp;2(;W#0$!`04``X(!#P`P@@$*`H(!`0&quot;)L0W:&gt;E,93G!2';Q6
+<A HREF="../../../mailman/listinfo/openssl-users.html">MI at 8FM</A>[A)X);G4:OQ\%H3216CM(P;8+QZ44*G&gt;8RD(M\784Z1U78C&quot;A332@)_
+MMAT)@&amp;ZE!#W9NKL6_J&amp;'J2Y#4D,6?*\R4,BF3UKI&quot;-C/DR6&lt;&gt;XCH,&amp;3FI/A6
+M@/TJ)!0S%YFL1.5IBZ-&amp;!DO&quot;,]3I0)\&amp;L+&amp;LDT&quot;<A HREF="../../../mailman/listinfo/openssl-users.html">YM0B3.IPJ4Z,0VST at 83Q5</A>
+M`X[93G8E`B$I^J-\&lt;79/[N%?@&gt;G[5(#;PWLU4K&gt;$WB(]+# M,7]9O5(WL#-I
+M+4/K^M:E\9=W9U&amp;,V&gt;XGZ[RE!SAVC*2I./_?C/4#K$F^RO=SF3H/,JN&lt;E3H3
+M/0Y&amp;.E=T85&quot;^QD _R^3BGZ(A`@,!``&amp;C@@$7,((!$S ?!@-5'2,$&amp;# 6@!2M
+MO9AZ-+0F]_K$)E3O`[W@),M4&amp;C =!@-5'0X$%@04DF%<A HREF="../../../mailman/listinfo/openssl-users.html">K at N</A>&amp;BH*I/[&amp;?QPJ/W
+MM( `P&gt;PP#@8#51T/`0'_! 0#`@&amp;&amp;,!(&amp;`U4=$P$!_P0(, 8!`?\&quot;`0`P'08#
+M51TE!!8P% 8(*P8!!04'`P(&amp;&quot;&quot;L&amp;`04%!P,$,!$&amp;`U4=( 0*, @P!@8$51T@
+M`#!$!@-5'1\$/3 [,#<A HREF="../../../mailman/listinfo/openssl-users.html">F at -Z</A> UAC-H='1P.B\O8W)L+G5S97)T&lt;G5S=&quot;YC;VTO
+M061D5')U&lt;W1%&gt;'1E&lt;FYA;$-!4F]O=&quot;YC&lt;FPP-08(*P8!!04'`0$$*3 G,&quot;4&amp;
+M&quot;&quot;L&amp;`04%!S !AAEH='1P.B\O;V-S&lt;&quot;YU&lt;V5R=')U&lt;W0N8V]M, T&amp;&quot;2J&amp;2(;W
+M#0$!&quot;P4``X(!`0`;*FZL5&lt;$ZJXC%V.W-5?.J:V$KP D0(YD/Q69J;['UM+5W
+M7@\&quot;80#??07^$K.D@( `_/L=6VIR`@I!O 6ZP5C5)L+JU4V$^_Z&quot;F,]8&amp;^,B
+M8YQ2^+L%-JM]6*7&gt;JSMCY=K5&lt;^_LX/M[XJ/_\$(CG,JVC4T^Y$L8`[*H+=38
+MNT)+D&amp;F%$-NF-S3H&gt;^ !$*6&lt;RCK'GT^(-&amp;Z*9= :BKNIW,K*-M'T_,)D*36O
+MUK&amp;G&lt;1'2`T.QCSZ:[)XR4_1VDLJ&amp;- &gt;Y+,KF'$K8F0W!AN*0DOM:0FHC(1#I
+M9&lt;?UU;M^ZHR%( )BZM$Z!RQ9Q9DS\CB)Y;;I%GH?&gt;13V2A :)OI\BON;,((%
+M(#&quot;&quot;! B@`P(!`@(1`-4+#]T2278FC)\!=Y87SN8P#08)*H9(AO&lt;-`0$+!0`P
+<A HREF="../../../mailman/listinfo/openssl-users.html">M at 9LQ</A>&quot;S )!@-5! 83`D=&quot;,1LP&amp;08#500($Q)'&lt;F5A=&amp;5R($UA;F-H97-T97(Q
+M$# .!@-5! &lt;3!U-A;&amp;9O&lt;F0Q&amp;C 8!@-5! H3$4-/34]$3R!#02!,:6UI=&amp;5D
+M,4$P/P8#500#$SA#3TU/1$\@4TA!+3(U-B!#;&EE;<A HREF="../../../mailman/listinfo/openssl-users.html">G0 at 075T</A>:&amp;5N=&amp;EC871I
+M;<A HREF="../../../mailman/listinfo/openssl-users.html">VX at 86YD</A>(%-E8W5R92!%;6%I;&quot;!#03 &gt;%PTQ-C Q,3,P,# P,#!:%PTQ-S Q
+M,3(R,S4Y-3E:,&quot; Q'C &lt;!@DJADB&amp;]PT!&quot;0$6#VII;4!C87)R;VQL+F-O;3&quot;&quot;
+M`2(P#08)*H9(AO&lt;-`0$!!0`#@@$/`#&quot;&quot;`0H&quot;@@$!`-K\XS'GF('[$TPZLMT=
+MY]ID(<A HREF="../../../mailman/listinfo/openssl-users.html">UGI at 9</A>^?K.$F3&amp;?)JS.0Q&quot;6)OD@;8S&lt;+1#[2QFG.S045&lt;BKJ-D6O9FQ\
+M&lt;*2_A$&amp;HWT6R`S' 7$&lt;4M7HIO_&quot;<A HREF="../../../mailman/listinfo/openssl-users.html">G at U</A>#-`1,6W2HZ`,L53(EL?:P_[H%Y/6VB
+MJU\01/0U&lt;U7T/&quot;K$+CFK\&gt;HV/H^&quot;EPS!W)_L#3&lt;&quot;[3T(BZ3LDTHN&quot;#(\B5A1
+M^VO2XN77=+Z\+IU=@1UR!40:,&lt;7&amp;)5,P,O1STRE:UFFYLS65=GVT*:ZY[YK9
+M':(_+75)?UCOJQ: M-%=9XH&lt;_VNPXG^;7/:6&quot;2-DDFNH3JMIBVKH$1G/E$ 9
+MD8XE&lt;3&gt;#8^@.89*P$#)O+'$&quot;`P$``:.&quot;`=&lt;P@@'3,!\&amp;`U4=(P08,!: %))A
+M:X+AHJ&quot;J3^QG\&lt;*C][2 `,'L,!T&amp;`U4=#@06!!0P:UC0J,N&lt;!7&gt;SB(9&lt;*/G'
+MV*_ SS .!@-5'0\!`?\$! ,&quot;!: P# 8#51T3`0'_! (P`# =!@-5'24$%C 4
+M!@@K!@$%!0&lt;#! 8(*P8!!04'`P(<A HREF="../../../mailman/listinfo/openssl-users.html">P1 at 8</A>#51T@!#\P/3 [!@PK!@$$`;(Q`0(!
+M`P4P*S I!@@K!@$%!0&lt;&quot;`18=:'1T&lt;',Z+R]S96-U&lt;F4N8V]M;V1O+FYE=&quot;]#
+M4%,P708#51T?!%8P5#!2H%&quot;@3H9,:'1T&lt;#HO+V-R;&quot;YC;VUO9&amp;]C82YC;VTO
+M0T]-3T1/4TA!,C4V0VQI96YT075T:&amp;5N=&amp;EC871I;VYA;F1396-U&lt;F5%;6%I
+M;$-!+F-R;#&quot;!D 8(*P8!!04'`0$$@<A HREF="../../../mailman/listinfo/openssl-users.html">8,P at 8</A> P6 8(*P8!!04', *&amp;3&amp;AT=' Z
+M+R]C&lt;G0N8V]M;V1O8V$N8V]M+T-/34]$3U-(03(U-D-L:65N=$%U=&AE;G1I
+M8V%T:6]N86YD4V5C=7)E16UA:6Q#02YC&lt;G0P) 8(*P8!!04', &amp;&amp;&amp;&amp;AT=' Z
+M+R]O8W-P+F-O;6]D;V-A+F-O;3 :!@-5'1$$$S <A HREF="../../../mailman/listinfo/openssl-users.html">1 at 0</A>]J:6U 8V%R&lt;F]L;&quot;YC
+M;VTP#08)*H9(AO&lt;-`0$+!0`#@@$!`&amp;7_YE!&quot;6I-N&gt;DE*'QH34=CM%+[K`1M]
+M]CL[U/FRY5[^LX&gt;0V\F[3S&amp;JAG&gt;8?S4(\8%YC7&quot;@FZN?&amp;[XNG;*71FB1VC5\
+M[<A HREF="../../../mailman/listinfo/openssl-users.html">C at 1T1</A>/1VFB^.U_DY &quot;31W;:;K&quot;NZ]K)Q3#HO(@&amp;45E,YCJ!NY$AC!C\IGQ:
+M2/NGP&quot;_K'85*^(.K.&amp;Q*INS)?2E26GN'Y^%<A HREF="../../../mailman/listinfo/openssl-users.html">BLAID at HA</A>&lt;[DL&amp;']YY*Z 9#&amp;;V
+MFJ3HYV^Y[HF)FFH-]D/]&lt;5G):'.LJD*&quot;]IJWI4,'-BQ;060E4[7[NKAN!^P\
+MBTU&T;&amp;8EQ; '\I'[_^.1-;+K'J.:_]/&amp;2]<A HREF="../../../mailman/listinfo/openssl-users.html">A0 at L9SC</A>^8NO*8S_4,&gt;&quot;4TRIOH
+MI'J&gt;$[1$P4TQ@@0C,(($'P(!`3&quot;!L3&quot;!FS$+, D&amp;`U4$!A,&quot;1T(Q&amp;S 9!@-5
+M! @3$D=R96%T97(@36%N8VAE&lt;W1E&lt;C$0, X&amp;`U4$!Q,'4V%L9F]R9#$:,!@&amp;
+M`U4$&quot;A,10T]-3T1/($-!($QI;6ET960Q03 _!@-5! ,3.$-/34]$3R!32$$M
+M,C4V($-L:65N=&quot;!!=71H96YT:6-A=&EO;B!A;<A HREF="../../../mailman/listinfo/openssl-users.html">F0 at 4V5C</A>=7)E($5M86EL($-!
+M`A$`U0L/W1))=B:,GP%WEA?.YC )!@4K#@,&quot;&amp;@4`H((&quot;1C 8!@DJADB&amp;]PT!
+M&quot;0,Q&quot;P8)*H9(AO&lt;-`0&lt;!,!P&amp;&quot;2J&amp;2(;W#0$)!3$/%PTQ-C W,C8Q-#(U,C-:
+M,&quot;,&amp;&quot;2J&amp;2(;W#0$)!#$6!!0&lt;';A(TR 3G49706:]&gt;ZML&quot;&amp;UX$#!;!@DJADB&amp;
+M]PT!&quot;0\Q3C!,, H&amp;&quot;&quot;J&amp;2(;W#0,', X&amp;&quot;&quot;J&amp;2(;W#0,&quot;`@(`@# -!@@JADB&amp;
+M]PT#`@(!0# '!@4K#@,&quot;!S -!@@JADB&amp;]PT#`@(!*# '!@4K#@,&quot;&amp;C&quot;!<A HREF="../../../mailman/listinfo/openssl-users.html">P at 8</A>)
+M*P8!! &amp;&quot;-Q $,8&amp;T,(&amp;Q,(&amp;;,0LP&quot;08#500&amp;$P)'0C$;,!D&amp;`U4$&quot;!,21W)E
+M871E&lt;B!-86YC:&amp;5S=&amp;5R,1 P#@8#500'$P=386QF;W)D,1HP&amp; 8#500*$Q%#
+M3TU/1$\@0T$@3&amp;EM:71E9#%!,#\&amp;`U4$`Q,X0T]-3T1/(%-(<A HREF="../../../mailman/listinfo/openssl-users.html">02TR-38 at 0VQI</A>
+M96YT($%U=&AE;G1I8V%T:6]N(&amp;%N9&quot;!396-U&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">F4 at 16UA</A>:<A HREF="../../../mailman/listinfo/openssl-users.html">6P at 0T</A>$&quot;$0#5&quot;P_=
+M$DEV)HR?`7&gt;6%\[F,('$!@LJADB&amp;]PT!&quot;1 &quot;&quot;S&amp;!M*&quot;!L3&quot;!FS$+, D&amp;`U4$
+M!A,&quot;1T(Q&amp;S 9!@-5! @3$D=R96%T97(@36%N8VAE&lt;W1E&lt;C$0, X&amp;`U4$!Q,'
+M4V%L9F]R9#$:,!@&amp;`U4$&quot;A,10T]-3T1/($-!($QI;6ET960Q03 _!@-5! ,3
+M.$-/34]$3R!32$$M,C4V($-L:65N=&quot;!!=71H96YT:6-A=&EO;B!A;<A HREF="../../../mailman/listinfo/openssl-users.html">F0 at 4V5C</A>
+M=7)E($5M86EL($-!`A$`U0L/W1))=B:,GP%WEA?.YC -!@DJADB&amp;]PT!`0$%
+M``2&quot;`0`X8UMHRZC;[0?$\65.4:_VF*Q!OS&gt;;K_S5KA&lt;$]<A HREF="../../../mailman/listinfo/openssl-users.html">28 at A8</A>'M]4H.7L/?
+M`<A HREF="../../../mailman/listinfo/openssl-users.html">GQ_N at F</A>,M4&quot;G&quot;CB#1&quot;LUS$1?/$!)@2@#]H,SFZ72ZEH;Y-_)J[SU+1NPB:5N
+<A HREF="../../../mailman/listinfo/openssl-users.html">MK at U6X</A>&gt;_F#0&lt;6B VE018PGQZ?#:7L\@H&amp;XI.2/9U[9CZ]R(-$DVN'-_B]7.R&lt;
+MI$Z:&lt;$'?Q[0`O0/!@=2XEW/USH\\&quot;5&amp;2:'Q2!PUIO^RUSRFV\*MV'AXOSA+L
+<A HREF="../../../mailman/listinfo/openssl-users.html">MD at RN</A>,GS$V#E25?E_$CC_H3'J1'<A HREF="../../../mailman/listinfo/openssl-users.html">0WTQP at OE</A> #PTG#%SUU&quot;&quot; ;<A HREF="../../../mailman/listinfo/openssl-users.html">UR at FP</A>*]L=AD#
+J&quot;DEXEF5L^$[[QP8HW3A8=CT;+Q33&amp;2G#&quot;-WT4: 4RIU3,=3^````````
+`
+end
+
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004102.html">[openssl-users] How to properly build OpenSSL with certificates inside certs directory
+</A></li>
+	<LI>Next message: <A HREF="004090.html">[openssl-users] PKCS7_sign conflict with PKCS7_decrypt?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4088">[ date ]</a>
+              <a href="thread.html#4088">[ thread ]</a>
+              <a href="subject.html#4088">[ subject ]</a>
+              <a href="author.html#4088">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

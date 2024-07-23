@@ -1,0 +1,206 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Mysterious hang with openssl and asan on ubuntu 18.04
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Mysterious%20hang%20with%20openssl%20and%20asan%20on%20ubuntu%2018.04&In-Reply-To=%3CCAPF-yOZY6VHJb2SsqqW1KiPE%2BG67u1ZxCJ6p5V6__1Ogtjm_Jg%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011880.html">
+   <LINK REL="Next"  HREF="011885.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Mysterious hang with openssl and asan on ubuntu 18.04</H1>
+    <B>Dan Kegel</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Mysterious%20hang%20with%20openssl%20and%20asan%20on%20ubuntu%2018.04&In-Reply-To=%3CCAPF-yOZY6VHJb2SsqqW1KiPE%2BG67u1ZxCJ6p5V6__1Ogtjm_Jg%40mail.gmail.com%3E"
+       TITLE="Mysterious hang with openssl and asan on ubuntu 18.04">dank at kegel.com
+       </A><BR>
+    <I>Mon Feb 24 06:07:32 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011880.html">v3_crl_reason - getting acess to the various CRL reasons
+</A></li>
+        <LI>Next message: <A HREF="011885.html">aes_cbc_hmac_sha1 implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11884">[ date ]</a>
+              <a href="thread.html#11884">[ thread ]</a>
+              <a href="subject.html#11884">[ subject ]</a>
+              <a href="author.html#11884">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi folks.
+
+The project I'm working on exhibits a hang in one test case when
+dealing with openssl connections, usually on 8 core machines,
+when built with address sanitizer enabled.  This is mature,
+theoretically well-debugged production code.  With help from c-reduce,
+I minimized the rather complex test case to 108 lines of C
+linked to openssl.  The hang occurs only on Ubuntu 18.04, not
+on ubuntu 19.10 or 20.04 beta.   Before I go trying to run c-reduce
+on openssl, I thought I'd run the so-far minimal reproducer by folks
+here and see if anyone can think of a change between openssl 1.1.1 and
+1.1.13
+(well, to be exact, ubuntu's 1.1.1-1ubuntu2.1~18.04.5 and 1.1.1d-2ubuntu3)
+that might account for this.
+
+The following script reproduces the hang reliably for me in under a minute
+(sometimes under a second):
+
+#!/bin/sh
+set -ex
+gcc -g -O2 -fsanitize=address -pthread bug.i -lssl -o bug
+export ASAN_OPTIONS=detect_stack_use_after_return=1
+export LSAN_OPTIONS=verbosity=1
+for iter in $(seq 1 1000)
+do
+  ./bug
+done
+echo &quot;No hang found.&quot;
+
+where bug.i contains:
+
+-- snip --
+static int readers = 40;
+static int once_control = 0;
+static int test_secs = 1;
+
+typedef int pid_t;
+struct timeval {
+  long tv_sec;
+  long tv_usec;
+};
+struct timespec {
+  long tv_sec;
+  long tv_nsec;
+};
+typedef unsigned long int pthread_t;
+enum __itimer_which {
+  ITIMER_REAL,
+};
+struct itimerval {
+  struct timeval it_interval;
+  struct timeval it_value;
+};
+typedef int sig_atomic_t;
+typedef void(*__sighandler_t);
+struct sigaction {
+  struct {
+    __sighandler_t sa_handler;
+  } __sigaction_handler;
+};
+
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_method_st SSL_METHOD;
+static SSL_CTX *context;
+
+static struct timespec start_time;
+static struct timespec goal_end_time;
+static volatile sig_atomic_t keep_on_chugging = 1;
+
+void do_once() {
+  const struct ssl_method_st *p = 0;
+  SSL_CTX *context = SSL_CTX_new(p);
+}
+
+void thread_main(void *v) { }
+
+void do_work() {
+  pthread_t net_5;
+  pthread_once(&amp;once_control, do_once);
+  pthread_create(&amp;net_5, 0, thread_main, 0);
+}
+
+static _Bool is_time_to_quit(void) {
+  struct timespec now_time;
+  clock_gettime(0, &amp;now_time);
+  long long remaining_nsecs =
+      (goal_end_time.tv_sec - now_time.tv_sec) * 1000000000ULL;
+  remaining_nsecs += goal_end_time.tv_nsec - now_time.tv_nsec;
+  if (remaining_nsecs &lt; 0) return 1;
+  return 0;
+}
+
+static void set_flag_for_exit(int signo) {
+  if (is_time_to_quit()) keep_on_chugging = 0;
+}
+
+static void set_timer(void) {
+  struct itimerval iv = {{0}, {0}};
+  iv.it_value.tv_usec = 3000;
+  iv.it_interval.tv_usec = 3000;
+  if (setitimer(ITIMER_REAL, &amp;iv, ((void *)0)) &lt; 0)
+    abort();
+  if (is_time_to_quit()) exit(0);
+}
+
+static void create_children(void) {
+  int i;
+  struct sigaction act;
+  memset(&amp;act, 0, sizeof(act));
+  act.__sigaction_handler.sa_handler = set_flag_for_exit;
+  sigaction(14, &amp;act, ((void *)0));
+  act.__sigaction_handler.sa_handler = ((__sighandler_t)1);
+  pid_t pid;
+  for (i = 0; i &lt; readers; i++) {
+    if (i &lt; readers) {
+      if ((pid = fork()) &lt; 0)
+        abort();
+      if (pid == 0) {
+        set_timer();
+        do_work();
+        _exit(0);
+      }
+    }
+  }
+}
+
+static int reap_children(void) {
+  int i;
+  int status;
+  for (i = 0; i &lt; readers; i++) wait(&amp;status);
+}
+
+int main(int argc, char *argv[]) {
+  clock_gettime(0, &amp;start_time);
+  goal_end_time = start_time;
+  goal_end_time.tv_sec += test_secs;
+
+  create_children();
+  reap_children();
+}
+
+-- snip --
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20200223/a0fe0cb3/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20200223/a0fe0cb3/attachment-0001.html</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011880.html">v3_crl_reason - getting acess to the various CRL reasons
+</A></li>
+	<LI>Next message: <A HREF="011885.html">aes_cbc_hmac_sha1 implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11884">[ date ]</a>
+              <a href="thread.html#11884">[ thread ]</a>
+              <a href="subject.html#11884">[ subject ]</a>
+              <a href="author.html#11884">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

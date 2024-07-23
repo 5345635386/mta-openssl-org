@@ -1,0 +1,119 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> problems with too many ssl_read and ssl_write errors
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2021-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20problems%20with%20too%20many%20ssl_read%20and%20ssl_write%20errors&In-Reply-To=%3CDM6PR18MB27006FA8A1415387FC67D444F9C09%40DM6PR18MB2700.namprd18.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014118.html">
+   <LINK REL="Next"  HREF="014142.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>problems with too many ssl_read and ssl_write errors</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20problems%20with%20too%20many%20ssl_read%20and%20ssl_write%20errors&In-Reply-To=%3CDM6PR18MB27006FA8A1415387FC67D444F9C09%40DM6PR18MB2700.namprd18.prod.outlook.com%3E"
+       TITLE="problems with too many ssl_read and ssl_write errors">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Thu Aug 19 22:22:27 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014118.html">problems with too many ssl_read and ssl_write errors
+</A></li>
+        <LI>Next message: <A HREF="014142.html">problems with too many ssl_read and ssl_write errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14125">[ date ]</a>
+              <a href="thread.html#14125">[ thread ]</a>
+              <a href="subject.html#14125">[ subject ]</a>
+              <a href="author.html#14125">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: openssl-users &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>&gt; On Behalf Of David Bowers via openssl-users
+</I>&gt;<i> Sent: Wednesday, 18 August, 2021 16:38
+</I>
+I don't think this is OpenSSL-related, but at this point it's not clear what the issue is.
+
+&gt;<i> . After maybe a few hours/days we see the clients dropping connections.&#160; The logs
+</I>&gt;<i> indicate the SSL_Read or SSL_Write on the Server fails for a client with SSL_Error
+</I>&gt;<i> number 5 (SSL_ERROR_SYSCALL) and the equivalent Windows error of WSATimeOut.&#160; We
+</I>&gt;<i> then observe the WSAECONNRESET as the Client closed connection.&#160; We see this
+</I>&gt;<i> behavior for multiple sites.
+</I>
+I assume this is a Server-edition version of Windows and you're not trying to support that kind of connection load on a desktop edition.
+
+What's set in the Registry under HKLM\SYSTEM\CurrentControlSet\Services\TCPIP\Parameters? In particular I'd be suspicious of SynAttackProtect and NetworkThrottlingIndex (which shouldn't be set on Server, but you never know).
+
+Many online references will suggest altering settings that affect the ephemeral-port space, such as TcpTimedWaitDelay, but those are irrelevant on the server side (since the connection tuples will use the server port, not an ephemeral port, for the server side).
+
+Many of the settings under the TCPIP/Performance key are undocumented. This page describes a number of them:
+
+<A HREF="https://forums.alliedmods.net/showpost.php?s=5fedba9ea66557ccea3bfee9e192aaf4&amp;p=1744400&amp;postcount=1">https://forums.alliedmods.net/showpost.php?s=5fedba9ea66557ccea3bfee9e192aaf4&amp;p=1744400&amp;postcount=1</A>
+
+It also discusses a number of netsh commands for TCP/IP tuning.
+
+&gt;<i> . The number of Clients disconnected starts increasing and we see the logs in the
+</I>&gt;<i> Client where the server refuses any more connections form Clients (10061-
+</I>&gt;<i> WSAECONNREFUSED) There is nothing to indicate this state in the server logs. Our
+</I>&gt;<i> theory is the backlog is filled and Server refusing further connections. 
+</I>
+That's possible. Windows, unlike BSD-based stacks, sends an RST when the listen queue is full. (BSD-based stacks simply discard the inbound SYN, which is a better choice for a number of reasons. Windows did this wrong and stubbornly refuses to change.)
+
+You say you're specifying a backlog of 500 in the call to listen(). Microsoft recommends just passing SOMAXCONN and letting the provider set a &quot;suitable&quot; value. Worth trying.
+
+But this appears to be a secondary issue. The primary one seems to be that for whatever reason you get an increasing number of conversation failures, and then the client's aggressive retry behavior means you get a cascade of connection flooding until the listen queues are full. The clients ought to be changed to use random backoff or another strategy that avoids flooding the server, but at this point that seems to be addressing a symptom rather than the underlying problem.
+
+&gt;<i> . We are trying to find why we get the SSL_Read/SSL_Write Error as it a Blocking
+</I>&gt;<i> socket. We cannot use to a non-blocking socket due to platform and application
+</I>&gt;<i> limitation
+</I>
+You said you're specifically getting SSL_ERROR_SYSCALL from SSL_read and SSL_write. That has nothing to do with whether the socket is in blocking mode -- system calls on blocking sockets can certainly return errors. I don't understand this question.
+
+There are any number of reasons why the server's ability to handle this load might be compromised. Network congestion, bufferbloat, load on the CPU or NIC (particularly if TCP offload is enabled to the NIC), contention for DMA, other application I/O, .... Years ago, I had one customer who had similar problems which turned out to be due to intermittent failures in a bad DRAM module in the server. Distributed computing is inherently fragile.
+
+But in my experience, this sort of problem is most often due to one or more of:
+
+- Application-logic errors or design issues. Are you multiplexing all these blocking sockets, or running a thread per conversation, or something else?
+
+- Middlebox problems. Routers, load balancers, firewall appliances, and so forth frequently cause issues.
+
+- Application firewalls and other &quot;anti-malware&quot; software (much of which is rubbish) running on the server.
+
+WSAETIMEDOUT on a send operation, assuming OpenSSL didn't need to do a receive under the covers for TLS-protocol reasons, could mean that a client app isn't doing its receives and consequently its receive window has filled; or it could mean that something is interfering with the delivery of network traffic in one direction or the other.
+
+WSAETIMEDOUT on a receive, though, again assuming OpenSSL didn't need to send under the covers, implies that something set a receive timeout on the socket, or that a keepalive wasn't responded to in the required time. Are you setting a receive timeout (typically with SO_RCVTIMEO)? Are you setting SO_KEEPALIVE? What about SO_KEEPALIVE_VALS? If you're not setting SO_KEEPALIVE_VALS, what are KeepAliveTime and KeepAliveInterval set to in the Registry? (See the MSDN docs for SO_KEEPALIVE.)
+
+Has the system administrator analyzed the Windows event logs and the network statistics? Has anyone looked at network traces when the problem is occurring?
+
+-- 
+Michael Wojcik
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014118.html">problems with too many ssl_read and ssl_write errors
+</A></li>
+	<LI>Next message: <A HREF="014142.html">problems with too many ssl_read and ssl_write errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14125">[ date ]</a>
+              <a href="thread.html#14125">[ thread ]</a>
+              <a href="subject.html#14125">[ subject ]</a>
+              <a href="author.html#14125">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

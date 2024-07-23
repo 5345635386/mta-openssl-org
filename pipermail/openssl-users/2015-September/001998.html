@@ -1,0 +1,237 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] SOLVED --- ASN.1: Parsing a 'context-specific' class (or app/private class)
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SOLVED%20---%20ASN.1%3A%20Parsing%20a%20%27context-specific%27%0A%20class%20%28or%20app/private%20class%29&In-Reply-To=%3C55E703AA.2010805%40openca.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001996.html">
+   <LINK REL="Next"  HREF="001999.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] SOLVED --- ASN.1: Parsing a 'context-specific' class (or app/private class)</H1>
+    <B>Massimiliano Pala</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SOLVED%20---%20ASN.1%3A%20Parsing%20a%20%27context-specific%27%0A%20class%20%28or%20app/private%20class%29&In-Reply-To=%3C55E703AA.2010805%40openca.org%3E"
+       TITLE="[openssl-users] SOLVED --- ASN.1: Parsing a 'context-specific' class (or app/private class)">director at openca.org
+       </A><BR>
+    <I>Wed Sep  2 14:11:54 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001996.html">[openssl-users] ASN.1: Parsing a 'private' class
+</A></li>
+        <LI>Next message: <A HREF="001999.html">[openssl-users] SOLVED --- ASN.1: Parsing a 'context-specific' class (or app/private class)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1998">[ date ]</a>
+              <a href="thread.html#1998">[ thread ]</a>
+              <a href="subject.html#1998">[ subject ]</a>
+              <a href="author.html#1998">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all,
+
+since someone asked, here's my solution (if someone knows of a better 
+one, please let me know).
+
+The problem that I tried to solve is how to parse the CRYTPLIB-specific 
+envelope for signatures. In particular, the example reported in my 
+original e-mail was a DSA signature. The main issue here was how to 
+parse a context-specific 0-tagged value inside the structure. Here's the 
+parsing:
+
+         0:d=0  hl=2 l=  98 cons: SEQUENCE
+         2:d=1  hl=2 l=   1 prim:  INTEGER           :03
+         5:d=1  hl=2 l=  20 prim:  cont [ 0 ]
+        27:d=1  hl=2 l=   9 cons:  SEQUENCE
+        29:d=2  hl=2 l=   5 prim:   OBJECT            :sha1
+        36:d=2  hl=2 l=   0 prim:   NULL
+        38:d=1  hl=2 l=  11 cons:  SEQUENCE
+        40:d=2  hl=2 l=   7 prim:   OBJECT :dsaEncryption
+        49:d=2  hl=2 l=   0 prim:   NULL
+        51:d=1  hl=2 l=  47 prim:  OCTET STRING
+
+Since I could not find any ASN1 macro that would allow me to specify the 
+field after the INTEGER (offset 5, class context-specific (0x80), no tag 
+(0x0), and length 20), so I defined a new ASN1_ITEM type that uses the 
+d2i_ASN1_bytes()/i2d_ASN1_bytes() for parsing or generating the value:
+
+    *typedef ASN1_OCTET_STRING CRYPTLIB_KEYID;*
+         // Defines the CRYPTLIB_KEYID as a string (keyID)
+
+    ASN1_VALUE *cryptlib_keyid_d2i_func(ASN1_VALUE **a, const unsigned
+    char **in, long length) {
+
+         ASN1_VALUE * ret = NULL;
+             // Return Value
+
+         // Parse the key identifier
+         ret = (ASN1_VALUE *)d2i_ASN1_bytes(NULL, in, length, 0,
+    V_ASN1_CONTEXT_SPECIFIC);
+
+         // Assigns the value (if the pointer to the structure was passed)
+         if (a != NULL) *a = ret;
+
+         // Returns the parsed value
+         return ret;
+    }
+
+    int cryptlib_keyid_i2d_func(ASN1_VALUE *a, unsigned char **in) {
+         // Generates the DER from the passed value
+         return i2d_ASN1_bytes((ASN1_STRING *)a, in, 0, 0x80);
+    }
+
+    // Definition of the callbacks for the compat type
+    static ASN1_COMPAT_FUNCS cryptlib_keyid_pf = {
+             (ASN1_new_func *)ASN1_OCTET_STRING_new,
+             (ASN1_free_func *)ASN1_OCTET_STRING_free,
+    *cryptlib_keyid_d2i_func*,
+    *cryptlib_keyid_i2d_func*
+    };
+
+    ASN1_ITEM_start(*CRYPTLIB_KEYID*)
+       ASN1_ITYPE_COMPAT, V_ASN1_OCTET_STRING, NULL, 0,
+    &amp;cryptlib_keyid_pf, sizeof(*CRYPTLIB_KEYID*), &quot;*CRYPTLIB_KEYID*&quot;
+    ASN1_ITEM_end(*CRYPTLIB_KEYID*)
+
+    DECLARE_ASN1_FUNCTIONS(*CRYPTLIB_KEYID*);
+    IMPLEMENT_ASN1_FUNCTIONS(*CRYPTLIB_KEYID*);
+
+This allowed me to define the CRYPTLIB_SIG by using the usual macros:
+
+    typedef struct sig_t {
+         ASN1_INTEGER *version;
+    *CRYPTLIB_KEYID* *keyId;
+         X509_ALGOR *hashAlgorithm;
+         X509_ALGOR *sigAlgorithm;
+         ASN1_OCTET_STRING *value;
+    } CRYPTLIB_SIG;
+
+    ASN1_SEQUENCE(CRYPTLIB_SIG) = {
+             ASN1_SIMPLE(CRYPTLIB_SIG, version, ASN1_INTEGER),
+             ASN1_SIMPLE(CRYPTLIB_SIG, keyId, *CRYPTLIB_KEYID*),
+             ASN1_SIMPLE(CRYPTLIB_SIG, hashAlgorithm, X509_ALGOR),
+             ASN1_SIMPLE(CRYPTLIB_SIG, sigAlgorithm, X509_ALGOR),
+             ASN1_SIMPLE(CRYPTLIB_SIG, value, ASN1_OCTET_STRING)
+    } ASN1_SEQUENCE_END(CRYPTLIB_SIG)
+
+    DECLARE_ASN1_FUNCTIONS(CRYPTLIB_SIG)
+    IMPLEMENT_ASN1_FUNCTIONS(CRYPTLIB_SIG)
+
+Maybe a little hackerish solution... but this is the easiest I could 
+think of. Does anybody have a better solution ?
+
+Also, is there anybody who knows how to use the new ADB macros? Or is 
+there any documentation on how to use them? That would be really useful 
+to have...
+
+Cheers,
+Max
+
+P.S.: The contents of the 'value' field in CRYPTLIB_SIG can be simply 
+parsed by using the appropriate key-parsing function. In the example, 
+you can use the d2i_DSA_SIG()/i2d_DSA_SIG() for parsing the actual DSA 
+signatures.
+
+P.P.S: Parsing application or private classes should require minimum 
+changes (e.g., changing the class value from 0x80 to 0xC0 should allow 
+to parse/generate private fields).
+
+On 9/1/15 3:48 PM, Sec_Aficiondado wrote:
+&gt;<i> Hi Massimiliano,
+</I>&gt;<i>
+</I>&gt;<i> Please do share it here on the list. There might not be an immediate need for it, but you'll save a couple of days to the next poor soul that ventures down the same path :)
+</I>&gt;<i>
+</I>&gt;<i> Your solution will be indexed and pop right up on search engines in the future.
+</I>&gt;<i>
+</I>&gt;<i> Thanks!
+</I>&gt;<i> Sent from my mobile
+</I>&gt;<i>
+</I>&gt;&gt;<i> On Aug 31, 2015, at 7:10 PM, Massimiliano Pala &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">director at openca.org</A>&gt; wrote:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Hi all,
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> I actually figured it out, if anybody is curious about the solution for parsing this CRYPTLIB signature envelope (in this case DSA) - write to me directly, I will be happy to share the solution.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Cheers,
+</I>&gt;&gt;<i> Max
+</I>&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> On 8/29/15 6:56 PM, Massimiliano Pala wrote:
+</I>&gt;&gt;&gt;<i> Hi all,
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> I am trying to parse a sequence that has, after an integer, a 'private' (xclass) item. I was wondering what is the right templates / macros to be able to generate the ASN1 functions with the usual macro. An example of the structure I have to parse (B64 - DER), is the following:
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> MGICAQOAFGZKq8/wIYS7Iueq6NuaC3ESPqUKMAkGBSsOAwIaBQAwCwYHKoZIzjgEAQUABC8wLQIVAJTJ6W2QjBIbVQdAtLbPO3y1wazHAhRsXivNO/Eg4GMEgcmEx8OgsIxGzQ==
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> [ you can paste it into <A HREF="http://www.lapo.it/asn1js/">http://www.lapo.it/asn1js/</A> to get useful info. ]
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> The field that is giving me issues is the 2nd field in the sequence - offest 5, length 20 (i.e., after SEQUENCE (2 bytes) + INTEGER (3 bytes) and then the 20bytes field that I want to parse). The type is 0x80 - context specific. By using the ASN1_get_object() function, I get the correct size (20), the tag (0), and the xclass (128). Now, how do I go in order to generate the useful ASN1 function with teh usual macros ? Here's an example (besides the second field) for what I am trying to do:
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> ASN1_SEQUENCE(TYPE) = {
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     ASN1_SIMPLE(TYPE, field1, ASN1_INTEGER),
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     XXXXXXX(TYPE, field2, YYYYY),                      &lt;&lt;-- What shall be used here ? What Macro ?
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     ASN1_SEQUENCE_OF(TYPE, field3, ASN1_OBJECT),
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     ASN1_SEQUENCE_OF(TYPE, field3, ASN1_OBJECT),
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     ASN1_SIMPLE(TYPE, field3, ASN1_OCTET_STRING)       &lt;&lt;-- This might be wrong as well - just noticed it is a very
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> } ASN1_SEQUENCE_END(TYPE)                                    weird encoding (octet-string that encapsulates a sequence of integers)
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Is there a way to have the macros do the work (e.g., shall I use other macros - template? - to define the field somehow) ? Or shall I just write my own d2i_ and i2d_ functions ?
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Please let me know,
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Cheers,
+</I>&gt;&gt;&gt;<i> Max
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> _______________________________________________
+</I>&gt;&gt;&gt;<i> openssl-users mailing list
+</I>&gt;&gt;&gt;<i> To unsubscribe: <A HREF="../../../mailman/listinfo/openssl-users.html">https://mta.openssl.org/mailman/listinfo/openssl-users</A>
+</I>&gt;&gt;<i> _______________________________________________
+</I>&gt;&gt;<i> openssl-users mailing list
+</I>&gt;&gt;<i> To unsubscribe: <A HREF="../../../mailman/listinfo/openssl-users.html">https://mta.openssl.org/mailman/listinfo/openssl-users</A>
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> openssl-users mailing list
+</I>&gt;<i> To unsubscribe: <A HREF="../../../mailman/listinfo/openssl-users.html">https://mta.openssl.org/mailman/listinfo/openssl-users</A>
+</I>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20150902/f4725f6e/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20150902/f4725f6e/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001996.html">[openssl-users] ASN.1: Parsing a 'private' class
+</A></li>
+	<LI>Next message: <A HREF="001999.html">[openssl-users] SOLVED --- ASN.1: Parsing a 'context-specific' class (or app/private class)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1998">[ date ]</a>
+              <a href="thread.html#1998">[ thread ]</a>
+              <a href="subject.html#1998">[ subject ]</a>
+              <a href="author.html#1998">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,135 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> X509_verify_cert() rejects all trusted certs with &quot;default&quot; X509_VERIFY_PARAM
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20X509_verify_cert%28%29%20rejects%20all%20trusted%20certs%20with%20%22default%22%0A%20X509_VERIFY_PARAM&In-Reply-To=%3C1D5ACC3B-7D04-4CAA-A642-FC61D65E7552%40sharp.fm%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013815.html">
+   <LINK REL="Next"  HREF="013807.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>X509_verify_cert() rejects all trusted certs with &quot;default&quot; X509_VERIFY_PARAM</H1>
+    <B>Graham Leggett</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20X509_verify_cert%28%29%20rejects%20all%20trusted%20certs%20with%20%22default%22%0A%20X509_VERIFY_PARAM&In-Reply-To=%3C1D5ACC3B-7D04-4CAA-A642-FC61D65E7552%40sharp.fm%3E"
+       TITLE="X509_verify_cert() rejects all trusted certs with &quot;default&quot; X509_VERIFY_PARAM">minfrin at sharp.fm
+       </A><BR>
+    <I>Fri May 28 11:30:14 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013815.html">ODP: CSR creation using pkcs11 dynamic engine
+</A></li>
+        <LI>Next message: <A HREF="013807.html">X509_verify_cert() rejects all trusted certs with &quot;default&quot; X509_VERIFY_PARAM
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13806">[ date ]</a>
+              <a href="thread.html#13806">[ thread ]</a>
+              <a href="subject.html#13806">[ subject ]</a>
+              <a href="author.html#13806">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all,
+
+While running code that calls X509_verify_cert(), the trusted root certificates (&#8220;BEGIN TRUSTED CERTIFICATE&#8221;) loaded into the verification are failing verification with &#8220;certificate rejected&#8221;:
+
+2: CN=GlobalSign Root CA,OU=Root CA,O=GlobalSign nv-sa,C=BE: verify failed: certificate rejected
+
+The code path we&#8217;re following looks like this:
+
+  * frame #0: 0x000000010060b808 libcrypto.3.dylib`obj_trust(id=910, x=0x000000010096da70, flags=8) at x509_trs.c:271:17
+    frame #1: 0x000000010060b672 libcrypto.3.dylib`X509_check_trust(x=0x000000010096da70, id=0, flags=0) at x509_trs.c:72:16
+    frame #2: 0x000000010061207b libcrypto.3.dylib`check_trust(ctx=0x00000001009fe5b0, num_untrusted=2) at x509_vfy.c:776:17
+    frame #3: 0x0000000100610e7e libcrypto.3.dylib`build_chain(ctx=0x00000001009fe5b0) at x509_vfy.c:3124:37
+    frame #4: 0x000000010060d655 libcrypto.3.dylib`verify_chain(ctx=0x00000001009fe5b0) at x509_vfy.c:216:15
+    frame #5: 0x000000010060d27b libcrypto.3.dylib`X509_verify_cert(ctx=0x00000001009fe5b0) at x509_vfy.c:295:15
+
+In X509_check_trust() we get to this line of code which appears to ask &#8220;trust roots with NID_anyExtendedKeyUsage&quot;:
+
+<A HREF="https://github.com/openssl/openssl/blob/master/crypto/x509/x509_trs.c#L72">https://github.com/openssl/openssl/blob/master/crypto/x509/x509_trs.c#L72</A>
+
+int X509_check_trust(X509 *x, int id, int flags)
+{
+    X509_TRUST *pt;
+    int idx;
+
+    /* We get this as a default value */
+    if (id == X509_TRUST_DEFAULT)
+        return obj_trust(NID_anyExtendedKeyUsage, x,
+                         flags | X509_TRUST_DO_SS_COMPAT);
+
+This leads us to this code here:
+
+<A HREF="https://github.com/openssl/openssl/blob/master/crypto/x509/x509_trs.c#L268">https://github.com/openssl/openssl/blob/master/crypto/x509/x509_trs.c#L268</A>
+
+
+        for (i = 0; i &lt; sk_ASN1_OBJECT_num(ax-&gt;trust); i++) {
+            ASN1_OBJECT *obj = sk_ASN1_OBJECT_value(ax-&gt;trust, i);
+            int nid = OBJ_obj2nid(obj);
+
+            if (nid == id || (nid == NID_anyExtendedKeyUsage &amp;&amp;
+                (flags &amp; X509_TRUST_OK_ANY_EKU)))
+                return X509_TRUST_TRUSTED;
+        }
+
+We iterate through the above loop twice for our root certificate, once with a nid of:
+
+(lldb) print OBJ_nid2sn(nid)
+(const char *) $2 = 0x000000010067b13d &#8220;emailProtection&quot;
+
+and a second time with a nid of:
+
+(lldb) print OBJ_nid2sn(nid)
+(const char *) $3 = 0x000000010067b0d2 &#8220;serverAuth&quot;
+
+Neither &#8220;emailProtection&#8221; nor &#8220;serverAuth&#8221; are equal to &#8220;anyExtendedKeyUsage&#8221;, and so we drop to this line which triggers the rejection of our root certificate:
+
+        return X509_TRUST_REJECTED;
+
+I am lost - I can fully understand what the code is doing, but I can&#8217;t see why openssl only trusts certs with &#8220;anyExtendedKeyUsage&#8221;.
+
+Can anyone explain why openssl would reject this certificate?
+
+I am using the &#8220;default&#8221; X509_VERIFY_PARAM.
+
+Alas the source code apps/verify.c makes no attempt to set the trust parameter, and the docs for X509_VERIFY_PARAM_set_trust() say &quot;sets the trust setting in param to trust&#8221; but doesn&#8217;t explain what possible values there are for &#8220;trust&#8221; or their effect.
+
+Regards,
+Graham
+&#8212;
+
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013815.html">ODP: CSR creation using pkcs11 dynamic engine
+</A></li>
+	<LI>Next message: <A HREF="013807.html">X509_verify_cert() rejects all trusted certs with &quot;default&quot; X509_VERIFY_PARAM
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13806">[ date ]</a>
+              <a href="thread.html#13806">[ thread ]</a>
+              <a href="subject.html#13806">[ subject ]</a>
+              <a href="author.html#13806">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,122 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Can a linux service work as both TLS client and server?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Can%20a%20linux%20service%20work%20as%20both%20TLS%20client%20and%20server%3F&In-Reply-To=%3CDM5PR18MB0987871D4A460E0E92AD65F4F9730%40DM5PR18MB0987.namprd18.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011573.html">
+   <LINK REL="Next"  HREF="011575.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Can a linux service work as both TLS client and server?</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Can%20a%20linux%20service%20work%20as%20both%20TLS%20client%20and%20server%3F&In-Reply-To=%3CDM5PR18MB0987871D4A460E0E92AD65F4F9730%40DM5PR18MB0987.namprd18.prod.outlook.com%3E"
+       TITLE="Can a linux service work as both TLS client and server?">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Sat Nov 16 02:04:24 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011573.html">Can a linux service work as both TLS client and server?
+</A></li>
+        <LI>Next message: <A HREF="011575.html">Can a linux service work as both TLS client and server?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11574">[ date ]</a>
+              <a href="thread.html#11574">[ thread ]</a>
+              <a href="subject.html#11574">[ subject ]</a>
+              <a href="author.html#11574">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf Of Kristen Webb
+</I>&gt;<i> Sent: Friday, November 15, 2019 18:27
+</I>&gt;<i>
+</I>&gt;<i> So I have no way to decide if my forked/spawned process should SSL_connect
+</I>&gt;<i> or SSL_accept.
+</I>&gt;<i>
+</I>&gt;<i> For example, I cannot see how this can be done with Apple's network framework
+</I>&gt;<i> (at least not yet).  It appears to be so high level as to not allow me
+</I>&gt;<i> to process a TCP packet within a TLS style connection.
+</I>
+It's not entirely clear to me what you're trying to do. Is this a fair description?
+
+1. You have a process (which happens to be running on Linux and is a &quot;service&quot;, though that's not a specific thing on Linux) which is accepting TCP connections. In technical terms, it's doing TCP passive opens: it has a stream socket bound to a port, in LISTENING state, and it calls accept on that socket. (Whether you multiplex that, or use non-blocking accept, or just block in accept until it's ready is irrelevant.)
+
+2. When you get a conversation (i.e. ESTABLISHED state) socket from accept, you want to perform one of two actions:
+
+2.1. If the peer intends to act as a TLS client, you want to call SSL_accept to create the TLS tunnel. That is, you'll do a passive TLS open, which is what normal TLS applications would do following a passive TCP open.
+
+2.2. If the peer intends to act as a TLS server, you want to call SSL_connect, performing the active TLS open even though you did a passive TCP open. This is weird, frankly; but there's nothing it TCP or TLS to prevent it.
+
+2.3. However, you don't know what the peer intends to do yet.
+
+
+There's no deterministic way of solving this. You only have one piece of information at this point: the conversation's 5-tuple address (address family, local IP address, local port, remote IP address, remote port). Conventionally, a TCP server (i.e. a process that does passive opens) which handles different client behaviors will establish the client's intent from either the local port or the initial transmission from the client. The former is out of the question, since the whole point of this exercise is to multiplex different behaviors on the same local port.
+
+So, your program needs information from the client to figure out what to do. Offhand I see only one way to resolve this: you need to interpose logic between OpenSSL and the actual communications endpoint. OpenSSL has a standard mechanism for this: the BIO pair.
+
+You'll want to do something along these lines.
+
+1. Determine how long you'll wait for an initial transmission from the client. You have to have some timeout here, because if the client's doing a passive TLS open it will wait for data from you. But then the FPL theorem says in general a distributed system has to employ timeouts anyway if it wants to guarantee completion. We're just making that requirement a bit more concrete. Let's say you'll wait for a configurable number of seconds, and default to, oh, 5s.
+
+3. Rather than creating a socket BIO around your conversation socket as a normal OpenSSL application would, you create a BIO pair. One half of the pair will be the external BIO; you'll transfer data between that BIO and the socket. The other half of the pair will be the internal BIO, and that will be the one associated with OpenSSL operations. Create your SSL object and associate it with the internal BIO.
+
+4. Wait for your conversation socket to become readable, for your timeout period.
+
+4.1. If the socket becomes readable, do a conventional recv (or read, or the system call of your choice) on it. Handle errors and conversation termination as necessary. Mark the conversation as passive (you're the server, doing the TLS accept) in your own conversation information. Write the data to the external BIO.
+
+4.2. If the socket does not become readable, mark the conversation as active and perform the SSL_connect on the internal BIO.
+
+5. From this point on you want OpenSSL to operate on the internal BIO, while copying data between the socket and the extternal BIO. So start a thread that does the following:
+
+5.1. Check to see if the socket is readable. If so, receive data (do error and termination handling) and write it to the external BIO. (If the external BIO's buffer is full, you may have to buffer the data somewhere else, or just yield your timeslice and hope the conversation-processing thread gets its act together.)
+
+5.2. Check to see if the external BIO is readable. (See the OpenSSL man page for BIO_make_bio_pair for more information.) If so, read data from it and write to the socket. You can check the socket for writability first if you want to avoid blocking. (For a maximally-robust solution this all could get somewhat complicated; using a decent set of abstractions would be a goodd plan.)
+
+5.3. If neither is readable, go to sleep. You can use poll() or similar here to sleep with a timeout on the socket becoming readable. Unfortunately you can't trivially multiplex on a BIO, as its internal descriptor (if it even has one) isn't exposed by the public API. You *could* set a callback on the external BIO that writes a trigger byte to a control pipe that you add to the poll set, if you want to get fancy. (As I said, this can get complicated.)
+
+6. Meanwhile, your conversation thread goes off and does its conversation stuff, using the SSL object you created before.
+
+
+Actually, having written all that, it occurs to me there's an easier approach. When you get the conversation socket, wait for the timeout period for it to become readable. If it does, mark the conversation as passive; if it doesn't, mark it as active. Start your conversation logic. The first thing that should do is look at that active/passive flag and do an SSL_connect or an SSL_accept. You don't need the BIO pair because you don't care about what the data before OpenSSL reads it or before its sent to the peer; you just care whether there *is* data from the peer, within the timeout window at the beginning of the conversation.
+
+The BIO-pair arrangement is useful if you need to intervene more extensively at the layer between OpenSSL and the network endpoint for some reason, e.g. to do sophisticated buffering or to communicate using some non-BIO-compatible interface.
+
+--
+Michael Wojcik
+Distinguished Engineer, Micro Focus
+
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011573.html">Can a linux service work as both TLS client and server?
+</A></li>
+	<LI>Next message: <A HREF="011575.html">Can a linux service work as both TLS client and server?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11574">[ date ]</a>
+              <a href="thread.html#11574">[ thread ]</a>
+              <a href="subject.html#11574">[ subject ]</a>
+              <a href="author.html#11574">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

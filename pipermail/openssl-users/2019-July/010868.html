@@ -1,0 +1,300 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> RSA digital signature verification failure with openssl 1.1.0j
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20RSA%20digital%20signature%20verification%20failure%20with%20openssl%201.1.0j&In-Reply-To=%3C1563334191660-0.post%40n7.nabble.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010893.html">
+   <LINK REL="Next"  HREF="010869.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>RSA digital signature verification failure with openssl 1.1.0j</H1>
+    <B>Ying</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20RSA%20digital%20signature%20verification%20failure%20with%20openssl%201.1.0j&In-Reply-To=%3C1563334191660-0.post%40n7.nabble.com%3E"
+       TITLE="RSA digital signature verification failure with openssl 1.1.0j">ydong at astri.org
+       </A><BR>
+    <I>Wed Jul 17 03:29:51 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010893.html">Errors building 1.1.1 on RHEL 7
+</A></li>
+        <LI>Next message: <A HREF="010869.html">RSA digital signature verification failure with openssl 1.1.0j
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10868">[ date ]</a>
+              <a href="thread.html#10868">[ thread ]</a>
+              <a href="subject.html#10868">[ subject ]</a>
+              <a href="author.html#10868">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I am working on the upgrade my program written 4 years before with updated
+openssl version 1.1.0j from 1.0.1e. There are so many changes between the
+two versions. I updated my code with 1.1.0 API, but it failed and I cannot
+figure out the reason. 
+
+The RSA key pair and message signature are generated with openssl command
+line as follows,
+
+key generation and cert generation
+$openssl req -new -keyout private/userkey.pem -out usercert-req.pem -config
+./openssl.cnf
+$openssl ca -in usercert-req.pem -out newcerts/usercert.pem -days 180
+-config ./openssl.cnf
+
+Sign.
+openssl dgst -sha256 -sign userkey.pem -out signature.binary msg 
+openssl dgst -hex -sha256 -sign userkey.pem -out signature.hex msg 
+
+
+//get public key from cert
+openssl x509 -pubkey -noout -in usercert.pem  &gt; pubkey.pem
+
+Verify
+openssl dgst -sha256 -verify pubkey.pem -signature signature.binary msg
+
+The result is verification OK
+
+But I have to use the API to verify the signature in hex format, and the
+result is verification failure. Can anyone help me to figure out the
+problem.  The code first loads the certification and retrieve the public key
+from certificate into EVP_PKEY, and then translate the hex digest (messasge)
+to binary format, and use
+EVP_DigestVerifyInitial/EVP_DigestVerifyUpdate/EVP_DigestVerifyFinal to
+verify the signature.
+
+It works in openssl 1.01e, and I tried to update the related functions in
+the 1.1.0version, it still fails. Am I missing something in the new version?
+
+This is the C code I am using:
+
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;openssl/x509.h&gt;
+#include &lt;openssl/pem.h&gt;
+
+#include &lt;openssl/crypto.h&gt;
+#include &lt;openssl/evp.h&gt;
+#include &lt;openssl/engine.h&gt;
+#include &lt;openssl/conf.h&gt;
+#include &lt;openssl/comp.h&gt;
+
+#include &lt;openssl/sha.h&gt;
+#include &lt;openssl/objects.h&gt;
+#include &lt;openssl/rsa.h&gt;
+#include &lt;openssl/ssl.h&gt;
+#include &lt;openssl/err.h&gt;
+
+int hex_to_bin(char ch)
+{
+	if ((ch &gt;= '0') &amp;&amp; (ch &lt;= '9'))
+		return ch - '0';
+	if ((ch &gt;= 'a') &amp;&amp; (ch &lt;= 'f'))
+		return ch - 'a' + 0x0A;
+	if ((ch &gt;= 'A') &amp;&amp; (ch &lt;= 'F'))
+		return ch - 'A' + 0x0A;
+	return -1;
+}
+
+
+int hex2bin(unsigned char *dst, const char *src, unsigned count)
+{
+	while (count--) {
+		int hi = hex_to_bin(*src++);
+		int lo = hex_to_bin(*src++);
+
+		if ((hi &lt; 0) || (lo &lt; 0))
+			return -1;
+
+		*dst++ = (hi &lt;&lt; 4) | lo;
+	}
+	return 0;
+}
+
+
+int main() {
+
+	FILE *fp;
+	X509 *x509 = NULL;
+	EVP_PKEY *pkey = NULL;
+	unsigned char *sigbuf = NULL;
+	unsigned char md[32];
+	unsigned char *digest = NULL;
+	
+	unsigned int i, siglen = 0;
+
+	siglen = 128;
+
+	char line[siglen * 2 + 3];
+	char *buf;
+	int num = 0; //number of license
+
+
+	const char cert_filestr[] = &quot;./cert.pem&quot;;
+	const char license_filename_str[] = &quot;./signature&quot;;
+	const char digest_filename_str[] = &quot;./digest&quot;;
+
+	//****************************************
+	//load certificate and get pub key
+	//*******************************************
+	//OpenSSL_add_all_algorithms();
+	//ERR_load_crypto_strings();
+
+
+	fp = fopen(cert_filestr, &quot;r&quot;);
+	if (!fp) {
+		printf(&quot;Error opening certificate file \n&quot;);
+		return -1;
+	}
+	x509 = PEM_read_X509(fp, NULL, NULL, NULL);
+	fclose(fp);
+
+	pkey = X509_get_pubkey(x509);
+	if(!pkey){
+		printf(&quot;Fail to create pkey!&quot;);
+		return -1;
+	}	
+
+	//*****************************************************
+	//
+	//load license.info (digest)
+	//
+	//****************************************************
+
+	fp =fopen(digest_filename_str, &quot;r&quot;);
+	if(!fp)
+	{	
+	  printf(&quot;Error opening digest file\n&quot;);
+	  return -1;
+	}
+	
+	digest = (unsigned char*)malloc(64+10);
+	digest = fgets(line, sizeof(line), fp);
+	fclose(fp);
+
+
+
+	//*************************************************
+	//
+	//load license.key (signature)
+	//
+	//
+	//********************************************
+	fp = fopen(license_filename_str, &quot;r&quot;);
+	if (!fp) {
+		printf(&quot;Error opening license file \n&quot;);
+		return -1;
+	}
+
+	//**********************************
+	//change the sigature format from Hex to Binary
+	//****************************************
+	fp = fopen(license_filename_str, &quot;r&quot;);
+
+	unsigned int len = siglen ;
+	sigbuf = (unsigned char*)malloc(len);
+	
+
+	if((buf = fgets(line, sizeof(line), fp)) != NULL) 
+       {
+
+		printf(&quot;*************Retrieved line of length %d :\n&quot;, (int)strlen(buf));
+		printf(&quot;*************signature**********\n%s&quot;, buf);		
+		hex2bin(sigbuf , buf, siglen);
+		
+	}
+	fclose(fp);
+
+
+	//**************************************************
+	//
+	//verify signature
+	//
+	//
+	//******************************************************	
+
+	EVP_MD_CTX *ctx = EVP_MD_CTX_create();
+	i=0;
+	if (!EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey)) {
+
+		printf(&quot;Error setting context\n&quot;);
+		ERR_print_errors_fp(stderr);
+
+		return -1;
+	}
+
+	if (!EVP_DigestVerifyUpdate(ctx, digest,67)) {
+		ERR_print_errors_fp(stderr);
+		return -1;
+	}
+
+	i = EVP_DigestVerifyFinal(ctx, sigbuf, 128);
+	if (i &lt;= 0) {
+		printf(&quot;Verification Failure!\n&quot;);
+		ERR_print_errors_fp(stderr);
+		return -1;
+	}
+
+
+	X509_free(x509);
+	free(sigbuf);
+	
+
+	return 0;
+
+}
+
+
+
+
+
+
+--
+Sent from: <A HREF="http://openssl.6102.n7.nabble.com/OpenSSL-User-f3.html">http://openssl.6102.n7.nabble.com/OpenSSL-User-f3.html</A>
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010893.html">Errors building 1.1.1 on RHEL 7
+</A></li>
+	<LI>Next message: <A HREF="010869.html">RSA digital signature verification failure with openssl 1.1.0j
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10868">[ date ]</a>
+              <a href="thread.html#10868">[ thread ]</a>
+              <a href="subject.html#10868">[ subject ]</a>
+              <a href="author.html#10868">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

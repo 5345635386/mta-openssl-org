@@ -1,0 +1,433 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Establishing connection errors
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Establishing%20connection%20errors&In-Reply-To=%3CSN6PR10MB2653242D42F91415511AD08AC78E9%40SN6PR10MB2653.namprd10.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014566.html">
+   <LINK REL="Next"  HREF="014561.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Establishing connection errors</H1>
+    <B>Jason Schultz</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Establishing%20connection%20errors&In-Reply-To=%3CSN6PR10MB2653242D42F91415511AD08AC78E9%40SN6PR10MB2653.namprd10.prod.outlook.com%3E"
+       TITLE="Establishing connection errors">jetson23 at hotmail.com
+       </A><BR>
+    <I>Fri Nov  5 13:04:19 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014566.html">ASN1 &lt;-&gt; DER encoding with application tag
+</A></li>
+        <LI>Next message: <A HREF="014561.html">Establishing connection errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14560">[ date ]</a>
+              <a href="thread.html#14560">[ thread ]</a>
+              <a href="subject.html#14560">[ subject ]</a>
+              <a href="author.html#14560">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I know I've been raising a lot of issues this week, because of varying reasons, but I've hit another one that seems like either an OpenSSL problem, or something new/different I need to do with OpenSSL 3.0 in connection establishment.
+
+To recap, I'm using two non-default library contexts, one for FIPS, one for non-FIPS. There is an open issue in github regarding the call to SSL_CTX_build_cert_chain(), but since the purpose of that call is to have the server not include the root certificate when sending the chain, I have left that out of my code for now, in order to continue testing. It shouldn't affect what I'm trying to do.
+
+As far as connection set up, based on whether or not the user wants FIPS (not using FIPS for this test), I call:
+
+ctx = SSL_CTX_new_ex(non_fips_libctx, NULL, TLS_method());
+
+...to set up my SSL_CTX. My understanding is that all SSL objects, etc., created based on that SSL_CTX will use the appropriate library context/providers. So beyond the providers and library context setup and using SSL_CTX_new_ex(), I haven't changed any code to establish TLS connections. I've tried to establish connections using both RSA and ECDSA certificates/keys, self-signed, or a server cert that's part of a chain. I'm just establishing a connection to myself, not between two systems, just to try to get something working. I'll post all of the handshake messages at the end of this message, but here are the error messages I get when the client side receives the server certificate (in this case it's a self signed RSA certificate):
+
+211105074132.795:info_cb:SSL_connect error in SSLv3/TLS read server certificate
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL on SSL_do_handshake
+   Socket: 20  SSL flag: 2  HS role: 0
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:0308010C:digital envelope routines::unsupported
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:0580006C:x509 certificate routines::unable to get certs public key
+
+Some of those errors are pretty generic, but when searching the 3.0 source for the &quot;unable to get certs public key&quot; error, some familiar functions pop up, for example, here:
+
+int X509_self_signed(X509 *cert, int verify_signature)
+{
+    EVP_PKEY *pkey;
+
+    if ((pkey = X509_get0_pubkey(cert)) == NULL) { /* handles cert == NULL */
+        ERR_raise(ERR_LIB_X509, X509_R_UNABLE_TO_GET_CERTS_PUBLIC_KEY);
+        return -1;
+    }
+    if (!ossl_x509v3_cache_extensions(cert))
+        return -1;
+    if ((cert-&gt;ex_flags &amp; EXFLAG_SS) == 0)
+        return 0;
+    if (!verify_signature)
+        return 1;
+    return X509_verify(cert, pkey);
+}
+
+and here:
+
+/* Copy any missing public key parameters up the chain towards pkey */
+int X509_get_pubkey_parameters(EVP_PKEY *pkey, STACK_OF(X509) *chain)
+{
+    EVP_PKEY *ktmp = NULL, *ktmp2;
+    int i, j;
+
+    if (pkey != NULL &amp;&amp; !EVP_PKEY_missing_parameters(pkey))
+        return 1;
+
+    for (i = 0; i &lt; sk_X509_num(chain); i++) {
+        ktmp = X509_get0_pubkey(sk_X509_value(chain, i));
+        if (ktmp == NULL) {
+            ERR_raise(ERR_LIB_X509, X509_R_UNABLE_TO_GET_CERTS_PUBLIC_KEY);
+            return 0;
+        }
+        if (!EVP_PKEY_missing_parameters(ktmp))
+            break;
+        ktmp = NULL;
+    }
+....
+
+&gt;<i>From issue #16966, we know the X509_get_pubkey() call can have issues with library contexts. I don't know the internals of OpenSSL enough to know if this is a similar issue.
+</I>
+I can open an Issue in github if Matt, Tomas, or others think it's appropriate.
+
+Thanks,
+
+Jason
+
+PS: Here is the full handshake capture (there are a few logs from my application mixed in):
+
+211105074132.786:info_cb:0x89c330 SSL_accept:before SSL initialization
+211105074132.786:SSLEvent(4): Matching session table found for port/addr 2110/10.61.152.77
+211105074132.786:info_cb:SSL_accept error in before SSL initialization
+211105074132.786:SSL_process_hs: SSL_ERROR_WANT_READ on SSL_do_handshake
+Socket: 21  SSL flag: 1  HS role: 1
+Socket should be put back on read list to be polled again
+211105074132.786:AllocateTcpRecvBuffers(4):call InsertWaitObject() for socket 20 returned: 0
+211105074132.786:info_cb:0x8ae0b0 SSL_connect:before SSL initialization
+211105074132.787:msg_cb:0x8ae0b0 &gt;&gt;&gt; TLS 1.0  [length 0005]
+211105074132.787:    16 03 01 00 d8
+211105074132.787:msg_cb:0x8ae0b0 &gt;&gt;&gt; TLS 1.3 Handshake [length 00d8], ClientHello
+211105074132.787:    01 00 00 d4 03 03 56 75 bc 18 87 5e 91 9e 1b 6f
+   211105074132.787: 41 19 ca 8c dd d6 bf 69 12 d5 6f e2 6e 0d b9 20
+   211105074132.787: 3e 37 a8 4f cd fd 20 33 b9 c1 c8 2b d8 ac 06 10
+   211105074132.787: f6 70 e1 f5 60 73 ca ae b7 77 87 0c 44 b5 30 68
+   211105074132.787: f7 8b 77 b6 c8 5b 18 00 04 13 05 00 ff 01 00 00
+   211105074132.787: 87 00 0b 00 04 03 00 01 02 00 0a 00 16 00 14 00
+   211105074132.787: 1d 00 17 00 1e 00 19 00 18 01 00 01 01 01 02 01
+   211105074132.787: 03 01 04 00 23 00 00 00 16 00 00 00 17 00 00 00
+   211105074132.787: 0d 00 1e 00 1c 04 03 05 03 06 03 08 07 08 08 08
+   211105074132.787: 09 08 0a 08 0b 08 04 08 05 08 06 04 01 05 01 06
+   211105074132.787: 01 00 2b 00 03 02 03 04 00 2d 00 02 01 01 00 33
+   211105074132.787: 00 26 00 24 00 1d 00 20 94 c6 a3 4f af 1c 63 5f
+   211105074132.787: d9 f1 df ba dc 0c e9 3c eb bc 62 5b 34 b8 8c 7a
+   211105074132.787: aa 09 d9 c0 94 9c 1d 27
+211105074132.787:info_cb:0x8ae0b0 SSL_connect:SSLv3/TLS write client hello
+211105074132.787:info_cb:SSL_connect error in SSLv3/TLS write client hello
+211105074132.787:SSL_process_hs: SSL_ERROR_WANT_READ on SSL_do_handshake
+Socket: 20  SSL flag: 2  HS role: 0
+Socket should be put back on read list to be polled again
+211105074132.787:msg_cb:0x89c330 &lt;&lt;&lt; TLS 1.0  [length 0005]
+211105074132.787:    16 03 01 00 d8
+211105074132.787:info_cb:0x89c330 SSL_accept:before SSL initialization
+211105074132.787:msg_cb:0x89c330 &lt;&lt;&lt; TLS 1.3 Handshake [length 00d8], ClientHello
+211105074132.787:    01 00 00 d4 03 03 56 75 bc 18 87 5e 91 9e 1b 6f
+   211105074132.787: 41 19 ca 8c dd d6 bf 69 12 d5 6f e2 6e 0d b9 20
+   211105074132.787: 3e 37 a8 4f cd fd 20 33 b9 c1 c8 2b d8 ac 06 10
+   211105074132.787: f6 70 e1 f5 60 73 ca ae b7 77 87 0c 44 b5 30 68
+   211105074132.787: f7 8b 77 b6 c8 5b 18 00 04 13 05 00 ff 01 00 00
+   211105074132.787: 87 00 0b 00 04 03 00 01 02 00 0a 00 16 00 14 00
+   211105074132.787: 1d 00 17 00 1e 00 19 00 18 01 00 01 01 01 02 01
+   211105074132.787: 03 01 04 00 23 00 00 00 16 00 00 00 17 00 00 00
+   211105074132.787: 0d 00 1e 00 1c 04 03 05 03 06 03 08 07 08 08 08
+   211105074132.787: 09 08 0a 08 0b 08 04 08 05 08 06 04 01 05 01 06
+   211105074132.787: 01 00 2b 00 03 02 03 04 00 2d 00 02 01 01 00 33
+   211105074132.787: 00 26 00 24 00 1d 00 20 94 c6 a3 4f af 1c 63 5f
+   211105074132.787: d9 f1 df ba dc 0c e9 3c eb bc 62 5b 34 b8 8c 7a
+   211105074132.787: aa 09 d9 c0 94 9c 1d 27
+211105074132.787:info_cb:0x89c330 SSL_accept:SSLv3/TLS read client hello
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.788:    16 03 03 00 7a
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 Handshake [length 007a], ServerHello
+211105074132.788:    02 00 00 76 03 03 ba 87 52 ab b2 58 ff 3b 3f 83
+   211105074132.788: b5 c3 f2 b2 0d 76 17 9e fc bd d4 c1 3a ca b2 47
+   211105074132.788: ab 1a 3b 9e d5 19 20 33 b9 c1 c8 2b d8 ac 06 10
+   211105074132.788: f6 70 e1 f5 60 73 ca ae b7 77 87 0c 44 b5 30 68
+   211105074132.788: f7 8b 77 b6 c8 5b 18 13 05 00 00 2e 00 2b 00 02
+   211105074132.788: 03 04 00 33 00 24 00 1d 00 20 53 8b 9e 0b e4 d6
+   211105074132.788: b4 1a e7 c3 7b f9 fe bb 03 3b 7d 0d 0b f6 7c e5
+   211105074132.788: 1f 06 af f9 c6 84 06 82 4d 4b
+211105074132.788:info_cb:0x89c330 SSL_accept:SSLv3/TLS write server hello
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.788:    14 03 03 00 01
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 ChangeCipherSpec [length 0001]
+211105074132.788:    01
+211105074132.788:info_cb:0x89c330 SSL_accept:SSLv3/TLS write change cipher spec
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.788:    17 03 03 00 0f
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0001]
+211105074132.788:    16
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 Handshake [length 0006]???
+211105074132.788:    08 00 00 02 00 00
+211105074132.788:info_cb:0x89c330 SSL_accept:TLSv1.3 write encrypted extensions
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.788:    17 03 03 04 27
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0001]
+211105074132.788:    16
+211105074132.788:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 Handshake [length 041e], Certificate
+211105074132.788:    0b 00 04 1a 00 00 04 16 00 04 11 30 82 04 0d 30
+   211105074132.788: 82 02 f5 a0 03 02 01 02 02 14 66 6c a2 5e 97 19
+   211105074132.788: 34 13 28 2c a9 2a 60 80 09 91 ef 8d 8e 20 30 0d
+   211105074132.788: 06 09 2a 86 48 86 f7 0d 01 01 0b 05 00 30 81 95
+   211105074132.789: 31 0b 30 09 06 03 55 04 06 13 02 55 53 31 12 30
+   211105074132.789: 10 06 03 55 04 08 0c 09 4d 69 6e 6e 65 73 6f 74
+   211105074132.789: 61 31 14 30 12 06 03 55 04 07 0c 0b 4d 69 6e 6e
+   211105074132.789: 65 61 70 6f 6c 69 73 31 0f 30 0d 06 03 55 04 0a
+   211105074132.789: 0c 06 55 6e 69 73 79 73 31 0d 30 0b 06 03 55 04
+   211105074132.789: 0b 0c 04 43 6f 6d 6d 31 13 30 11 06 03 55 04 03
+   211105074132.789: 0c 0a 43 4f 4d 44 45 56 74 65 73 74 31 27 30 25
+   211105074132.789: 06 09 2a 86 48 86 f7 0d 01 09 01 16 18 4a 61 73
+   211105074132.789: 6f 6e 2e 53 63 68 75 6c 74 7a 40 75 6e 69 73 79
+   211105074132.789: 73 2e 63 6f 6d 30 1e 17 0d 32 31 31 30 33 31 32
+   211105074132.789: 30 32 38 33 35 5a 17 0d 32 32 31 30 33 31 32 30
+   211105074132.789: 32 38 33 35 5a 30 81 95 31 0b 30 09 06 03 55 04
+   211105074132.789: 06 13 02 55 53 31 12 30 10 06 03 55 04 08 0c 09
+   211105074132.789: 4d 69 6e 6e 65 73 6f 74 61 31 14 30 12 06 03 55
+   211105074132.789: 04 07 0c 0b 4d 69 6e 6e 65 61 70 6f 6c 69 73 31
+   211105074132.789: 0f 30 0d 06 03 55 04 0a 0c 06 55 6e 69 73 79 73
+   211105074132.789: 31 0d 30 0b 06 03 55 04 0b 0c 04 43 6f 6d 6d 31
+   211105074132.789: 13 30 11 06 03 55 04 03 0c 0a 43 4f 4d 44 45 56
+   211105074132.789: 74 65 73 74 31 27 30 25 06 09 2a 86 48 86 f7 0d
+   211105074132.789: 01 09 01 16 18 4a 61 73 6f 6e 2e 53 63 68 75 6c
+   211105074132.789: 74 7a 40 75 6e 69 73 79 73 2e 63 6f 6d 30 82 01
+   211105074132.789: 22 30 0d 06 09 2a 86 48 86 f7 0d 01 01 01 05 00
+   211105074132.789: 03 82 01 0f 00 30 82 01 0a 02 82 01 01 00 a7 dd
+   211105074132.789: 1a c6 b1 ef 08 35 9a 32 81 07 f9 e0 15 b9 5d 04
+   211105074132.789: 0a bc 4b 3b 22 8e bb a1 4b 76 36 8a 10 ce 88 1e
+   211105074132.789: 84 9f ed 00 73 81 08 6d b9 45 69 a7 45 04 54 eb
+   211105074132.789: 4c d6 2b c1 52 20 43 1b 07 27 ac 1f 9d a4 2e 79
+   211105074132.789: 3d ad 95 d7 a0 3f 4d 12 83 23 da 50 de 34 32 6e
+   211105074132.789: 51 b9 27 08 a4 a6 5a 3d 87 0a d7 83 e8 42 22 5c
+   211105074132.789: 34 69 2c 95 7e 33 65 ae bc a2 dd 0f 2f 09 9e 52
+   211105074132.789: c0 1d 78 50 74 62 6f 9e 5a 9d 16 d8 4e dd 6e 64
+   211105074132.789: 76 6d 9b 01 20 a9 b6 d3 0f c4 2c f6 77 14 d8 f0
+   211105074132.789: 00 6e 73 81 91 7b b0 09 be 0a 18 71 09 2c 97 44
+   211105074132.789: fc 72 b8 67 cf 55 34 9d 1e 2f 11 b5 2a ae c3 d1
+   211105074132.789: b2 12 aa 2d bc 5c 56 c2 d3 24 c0 a2 90 f1 07 ef
+   211105074132.789: 13 3b 5a 7d 4a 47 03 6c b4 c1 0c 44 e3 9a af 39
+   211105074132.789: 08 c4 f4 db 34 82 ae ad e5 5a 81 a5 25 ce bf 93
+   211105074132.789: 49 51 06 86 c7 c9 2c fe 5d 13 ce da 4a f1 ca 61
+   211105074132.789: 2d 33 9b 7d 70 52 70 e0 bc 70 e9 ec 88 eb 02 03
+   211105074132.789: 01 00 01 a3 53 30 51 30 1d 06 03 55 1d 0e 04 16
+   211105074132.789: 04 14 39 a0 af a0 32 9d 5b ad 9b 87 2e c6 13 fa
+   211105074132.789: 65 ad c3 04 4e f5 30 1f 06 03 55 1d 23 04 18 30
+   211105074132.789: 16 80 14 39 a0 af a0 32 9d 5b ad 9b 87 2e c6 13
+   211105074132.789: fa 65 ad c3 04 4e f5 30 0f 06 03 55 1d 13 01 01
+   211105074132.789: ff 04 05 30 03 01 01 ff 30 0d 06 09 2a 86 48 86
+   211105074132.789: f7 0d 01 01 0b 05 00 03 82 01 01 00 47 05 f1 3f
+   211105074132.789: a8 e1 33 25 68 01 7a 88 ab 6e 67 60 e8 4c 99 8f
+   211105074132.789: 8a 9f 3b 79 47 6b d4 71 6e 2c fe ce 32 6c 16 67
+   211105074132.789: 7d e5 59 11 fe 22 db 50 1e e8 7f d4 23 3b 7b e3
+   211105074132.789: 22 ae ae 94 40 22 2e 79 1c 02 05 a2 98 24 ea ea
+   211105074132.789: f2 da 0d 47 6d 82 ef 55 42 a1 83 e7 79 e4 1a 9f
+   211105074132.789: 09 32 93 d4 b7 87 1d 59 0f 58 53 1b 36 97 b5 01
+   211105074132.789: 2c 26 28 3b 04 65 c9 2e a4 a3 e0 7b 83 a7 66 93
+   211105074132.789: 0b b0 9a c2 07 7f 09 21 51 60 f3 b3 da ca ac ce
+   211105074132.789: 40 48 e4 f2 9d b1 d8 04 55 52 41 c6 54 eb fb a1
+   211105074132.789: fe 80 7a c6 ef a4 21 18 2b 71 b8 1e c3 b9 72 e1
+   211105074132.789: c2 05 3a 48 58 89 46 2b 9c 02 00 66 81 52 4a 56
+   211105074132.789: e0 cb be 43 87 df 36 ff 6a 34 1e 46 20 39 6e 2d
+   211105074132.789: f7 c2 8f 4a 36 d6 71 ab ca fb b2 bd 48 d8 2c c3
+   211105074132.789: fc e2 29 ac d7 ba 54 c7 77 7a c5 1e 88 f3 20 9f
+   211105074132.789: 9e e7 d3 d9 e3 63 e4 da 62 05 e3 df 36 cf 71 aa
+   211105074132.789: 48 67 80 b4 96 32 42 a3 b5 fc b4 23 00 00
+211105074132.789:info_cb:0x89c330 SSL_accept:SSLv3/TLS write certificate
+211105074132.792:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.792:    17 03 03 01 11
+211105074132.792:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0001]
+211105074132.792:    16
+211105074132.792:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 Handshake [length 0108], CertificateVerify
+211105074132.792:    0f 00 01 04 08 04 01 00 4e 9c f9 bc 16 71 41 ac
+   211105074132.792: 66 b7 e7 f7 51 e7 3e 8d 80 29 74 03 5e 59 70 3e
+   211105074132.792: 1f a5 68 51 65 72 8e ad 11 33 68 df 6f f8 f4 b1
+   211105074132.792: 8c 2c 21 00 c6 8b a0 e0 95 8f 4b 75 c2 ba ac 69
+   211105074132.792: 46 e2 6d 65 74 72 c4 d9 53 47 4a 6c 26 f8 57 be
+   211105074132.792: 97 92 ee 88 35 91 ca 30 62 75 4b bb 83 84 58 d6
+   211105074132.792: fb 7e 88 53 a2 e2 f5 d9 08 8e 34 7a aa cb 38 64
+   211105074132.792: 7d 69 45 e3 fa c2 54 27 00 c2 5e a6 a3 d4 be ff
+   211105074132.792: ea f5 c0 70 2b 55 d0 cc f1 33 b6 02 c3 dc fa 60
+   211105074132.792: 1e bd 2a ca 6d 38 6f 5c 8f 76 d8 66 ba fa 37 61
+   211105074132.792: 29 d3 a5 be 2a b5 1b fb e9 af 18 47 6f 82 45 d1
+   211105074132.792: 61 93 40 cb 34 b3 93 12 0b 08 5f 81 6c 5d da a2
+   211105074132.792: 57 f6 a6 4a 43 66 c9 04 b9 24 47 7a e5 ec a9 90
+   211105074132.793: db eb 3e 5c d3 b2 f6 76 ce 4e c0 fd c6 24 a6 92
+   211105074132.793: 0e ce 00 26 e2 c9 b3 7a 5c 73 56 9b 0a 56 28 69
+   211105074132.793: db bd a6 28 f1 52 d7 f7 49 85 ce bd e4 4e 15 2f
+   211105074132.793: 1a 9d 69 ea 99 ca b3 7f
+211105074132.793:info_cb:0x89c330 SSL_accept:TLSv1.3 write server certificate verify
+211105074132.793:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0005]
+211105074132.793:    17 03 03 00 2d
+211105074132.793:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.2  [length 0001]
+211105074132.793:    16
+211105074132.793:msg_cb:0x89c330 &gt;&gt;&gt; TLS 1.3 Handshake [length 0024], Finished
+211105074132.793:    14 00 00 20 da e7 97 80 09 f1 02 4f 43 a1 d3 44
+   211105074132.793: 40 b5 8e d8 4d ea e5 b2 87 a5 e7 33 ca ff a8 0d
+   211105074132.793: 60 78 c7 13
+211105074132.793:info_cb:0x89c330 SSL_accept:SSLv3/TLS write finished
+211105074132.793:info_cb:0x89c330 SSL_accept:TLSv1.3 early data
+211105074132.793:info_cb:SSL_accept error in TLSv1.3 early data
+211105074132.793:SSL_process_hs: SSL_ERROR_WANT_READ on SSL_do_handshake
+Socket: 21  SSL flag: 1  HS role: 1
+Socket should be put back on read list to be polled again
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.2  [length 0005]
+211105074132.793:    16 03 03 00 7a
+211105074132.793:info_cb:0x8ae0b0 SSL_connect:SSLv3/TLS write client hello
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.3 Handshake [length 007a], ServerHello
+211105074132.793:    02 00 00 76 03 03 ba 87 52 ab b2 58 ff 3b 3f 83
+   211105074132.793: b5 c3 f2 b2 0d 76 17 9e fc bd d4 c1 3a ca b2 47
+   211105074132.793: ab 1a 3b 9e d5 19 20 33 b9 c1 c8 2b d8 ac 06 10
+   211105074132.793: f6 70 e1 f5 60 73 ca ae b7 77 87 0c 44 b5 30 68
+   211105074132.793: f7 8b 77 b6 c8 5b 18 13 05 00 00 2e 00 2b 00 02
+   211105074132.793: 03 04 00 33 00 24 00 1d 00 20 53 8b 9e 0b e4 d6
+   211105074132.793: b4 1a e7 c3 7b f9 fe bb 03 3b 7d 0d 0b f6 7c e5
+   211105074132.793: 1f 06 af f9 c6 84 06 82 4d 4b
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.2  [length 0005]
+211105074132.793:    14 03 03 00 01
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.2  [length 0005]
+211105074132.793:    17 03 03 00 0f
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.3  [length 0001]
+211105074132.793:    16
+211105074132.793:info_cb:0x8ae0b0 SSL_connect:SSLv3/TLS read server hello
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.3 Handshake [length 0006]???
+211105074132.793:    08 00 00 02 00 00
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.2  [length 0005]
+211105074132.793:    17 03 03 04 27
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.3  [length 0001]
+211105074132.793:    16
+211105074132.793:info_cb:0x8ae0b0 SSL_connect:TLSv1.3 read encrypted extensions
+211105074132.793:msg_cb:0x8ae0b0 &lt;&lt;&lt; TLS 1.3 Handshake [length 041e], Certificate
+211105074132.793:    0b 00 04 1a 00 00 04 16 00 04 11 30 82 04 0d 30
+   211105074132.793: 82 02 f5 a0 03 02 01 02 02 14 66 6c a2 5e 97 19
+   211105074132.793: 34 13 28 2c a9 2a 60 80 09 91 ef 8d 8e 20 30 0d
+   211105074132.793: 06 09 2a 86 48 86 f7 0d 01 01 0b 05 00 30 81 95
+   211105074132.793: 31 0b 30 09 06 03 55 04 06 13 02 55 53 31 12 30
+   211105074132.793: 10 06 03 55 04 08 0c 09 4d 69 6e 6e 65 73 6f 74
+   211105074132.793: 61 31 14 30 12 06 03 55 04 07 0c 0b 4d 69 6e 6e
+   211105074132.793: 65 61 70 6f 6c 69 73 31 0f 30 0d 06 03 55 04 0a
+   211105074132.793: 0c 06 55 6e 69 73 79 73 31 0d 30 0b 06 03 55 04
+   211105074132.793: 0b 0c 04 43 6f 6d 6d 31 13 30 11 06 03 55 04 03
+   211105074132.793: 0c 0a 43 4f 4d 44 45 56 74 65 73 74 31 27 30 25
+   211105074132.793: 06 09 2a 86 48 86 f7 0d 01 09 01 16 18 4a 61 73
+   211105074132.793: 6f 6e 2e 53 63 68 75 6c 74 7a 40 75 6e 69 73 79
+   211105074132.793: 73 2e 63 6f 6d 30 1e 17 0d 32 31 31 30 33 31 32
+   211105074132.793: 30 32 38 33 35 5a 17 0d 32 32 31 30 33 31 32 30
+   211105074132.793: 32 38 33 35 5a 30 81 95 31 0b 30 09 06 03 55 04
+   211105074132.793: 06 13 02 55 53 31 12 30 10 06 03 55 04 08 0c 09
+   211105074132.793: 4d 69 6e 6e 65 73 6f 74 61 31 14 30 12 06 03 55
+   211105074132.793: 04 07 0c 0b 4d 69 6e 6e 65 61 70 6f 6c 69 73 31
+   211105074132.793: 0f 30 0d 06 03 55 04 0a 0c 06 55 6e 69 73 79 73
+   211105074132.793: 31 0d 30 0b 06 03 55 04 0b 0c 04 43 6f 6d 6d 31
+   211105074132.793: 13 30 11 06 03 55 04 03 0c 0a 43 4f 4d 44 45 56
+   211105074132.793: 74 65 73 74 31 27 30 25 06 09 2a 86 48 86 f7 0d
+   211105074132.793: 01 09 01 16 18 4a 61 73 6f 6e 2e 53 63 68 75 6c
+   211105074132.793: 74 7a 40 75 6e 69 73 79 73 2e 63 6f 6d 30 82 01
+   211105074132.794: 22 30 0d 06 09 2a 86 48 86 f7 0d 01 01 01 05 00
+   211105074132.794: 03 82 01 0f 00 30 82 01 0a 02 82 01 01 00 a7 dd
+   211105074132.794: 1a c6 b1 ef 08 35 9a 32 81 07 f9 e0 15 b9 5d 04
+   211105074132.794: 0a bc 4b 3b 22 8e bb a1 4b 76 36 8a 10 ce 88 1e
+   211105074132.794: 84 9f ed 00 73 81 08 6d b9 45 69 a7 45 04 54 eb
+   211105074132.794: 4c d6 2b c1 52 20 43 1b 07 27 ac 1f 9d a4 2e 79
+   211105074132.794: 3d ad 95 d7 a0 3f 4d 12 83 23 da 50 de 34 32 6e
+   211105074132.794: 51 b9 27 08 a4 a6 5a 3d 87 0a d7 83 e8 42 22 5c
+   211105074132.794: 34 69 2c 95 7e 33 65 ae bc a2 dd 0f 2f 09 9e 52
+   211105074132.794: c0 1d 78 50 74 62 6f 9e 5a 9d 16 d8 4e dd 6e 64
+   211105074132.794: 76 6d 9b 01 20 a9 b6 d3 0f c4 2c f6 77 14 d8 f0
+   211105074132.794: 00 6e 73 81 91 7b b0 09 be 0a 18 71 09 2c 97 44
+   211105074132.794: fc 72 b8 67 cf 55 34 9d 1e 2f 11 b5 2a ae c3 d1
+   211105074132.794: b2 12 aa 2d bc 5c 56 c2 d3 24 c0 a2 90 f1 07 ef
+   211105074132.794: 13 3b 5a 7d 4a 47 03 6c b4 c1 0c 44 e3 9a af 39
+   211105074132.794: 08 c4 f4 db 34 82 ae ad e5 5a 81 a5 25 ce bf 93
+   211105074132.794: 49 51 06 86 c7 c9 2c fe 5d 13 ce da 4a f1 ca 61
+   211105074132.794: 2d 33 9b 7d 70 52 70 e0 bc 70 e9 ec 88 eb 02 03
+   211105074132.794: 01 00 01 a3 53 30 51 30 1d 06 03 55 1d 0e 04 16
+   211105074132.794: 04 14 39 a0 af a0 32 9d 5b ad 9b 87 2e c6 13 fa
+   211105074132.794: 65 ad c3 04 4e f5 30 1f 06 03 55 1d 23 04 18 30
+   211105074132.794: 16 80 14 39 a0 af a0 32 9d 5b ad 9b 87 2e c6 13
+   211105074132.794: fa 65 ad c3 04 4e f5 30 0f 06 03 55 1d 13 01 01
+   211105074132.794: ff 04 05 30 03 01 01 ff 30 0d 06 09 2a 86 48 86
+   211105074132.794: f7 0d 01 01 0b 05 00 03 82 01 01 00 47 05 f1 3f
+   211105074132.794: a8 e1 33 25 68 01 7a 88 ab 6e 67 60 e8 4c 99 8f
+   211105074132.794: 8a 9f 3b 79 47 6b d4 71 6e 2c fe ce 32 6c 16 67
+   211105074132.794: 7d e5 59 11 fe 22 db 50 1e e8 7f d4 23 3b 7b e3
+   211105074132.794: 22 ae ae 94 40 22 2e 79 1c 02 05 a2 98 24 ea ea
+   211105074132.794: f2 da 0d 47 6d 82 ef 55 42 a1 83 e7 79 e4 1a 9f
+   211105074132.794: 09 32 93 d4 b7 87 1d 59 0f 58 53 1b 36 97 b5 01
+   211105074132.794: 2c 26 28 3b 04 65 c9 2e a4 a3 e0 7b 83 a7 66 93
+   211105074132.794: 0b b0 9a c2 07 7f 09 21 51 60 f3 b3 da ca ac ce
+   211105074132.794: 40 48 e4 f2 9d b1 d8 04 55 52 41 c6 54 eb fb a1
+   211105074132.794: fe 80 7a c6 ef a4 21 18 2b 71 b8 1e c3 b9 72 e1
+   211105074132.794: c2 05 3a 48 58 89 46 2b 9c 02 00 66 81 52 4a 56
+   211105074132.794: e0 cb be 43 87 df 36 ff 6a 34 1e 46 20 39 6e 2d
+   211105074132.794: f7 c2 8f 4a 36 d6 71 ab ca fb b2 bd 48 d8 2c c3
+   211105074132.794: fc e2 29 ac d7 ba 54 c7 77 7a c5 1e 88 f3 20 9f
+   211105074132.794: 9e e7 d3 d9 e3 63 e4 da 62 05 e3 df 36 cf 71 aa
+   211105074132.794: 48 67 80 b4 96 32 42 a3 b5 fc b4 23 00 00
+211105074132.795:info_cb:SSL_connect error in SSLv3/TLS read server certificate
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL on SSL_do_handshake
+   Socket: 20  SSL flag: 2  HS role: 0
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:0308010C:digital envelope routines::unsupported
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:03000072:digital envelope routines::decode error
+211105074132.795:SSL_process_hs: SSL_ERROR_SSL ERR_get_error error string:
+   error:0580006C:x509 certificate routines::unable to get certs public key
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20211105/84b7fc08/attachment-0001.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20211105/84b7fc08/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014566.html">ASN1 &lt;-&gt; DER encoding with application tag
+</A></li>
+	<LI>Next message: <A HREF="014561.html">Establishing connection errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14560">[ date ]</a>
+              <a href="thread.html#14560">[ thread ]</a>
+              <a href="subject.html#14560">[ subject ]</a>
+              <a href="author.html#14560">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

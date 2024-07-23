@@ -1,0 +1,153 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Using keylog_callback with LD_PRELOAD
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Using%20keylog_callback%20with%20LD_PRELOAD&In-Reply-To=%3Cf8317196-61a7-43f0-bf94-a9800f03466c%40mtasv.net%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013851.html">
+   <LINK REL="Next"  HREF="013853.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Using keylog_callback with LD_PRELOAD</H1>
+    <B>Kevin Grigorenko</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Using%20keylog_callback%20with%20LD_PRELOAD&In-Reply-To=%3Cf8317196-61a7-43f0-bf94-a9800f03466c%40mtasv.net%3E"
+       TITLE="Using keylog_callback with LD_PRELOAD">kevin at myplaceonline.com
+       </A><BR>
+    <I>Fri Jun 11 20:48:50 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013851.html">enforce ALPN overlap?
+</A></li>
+        <LI>Next message: <A HREF="013853.html">openssl verify question
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13852">[ date ]</a>
+              <a href="thread.html#13852">[ thread ]</a>
+              <a href="subject.html#13852">[ subject ]</a>
+              <a href="author.html#13852">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, I want to use keylog_callback with LD_PRELOAD (i.e. without modifying
+ the program to call 
+SSL_CTX_set_keylog_callback). For testing, I'm using curl compiled with
+ openssl. First, let's confirm curl is using 
+SSL_CTX_set_keylog_callback only if there's an SSLKEYLOGFILE by using
+ ltrace. With the envar, 
+SSL_CTX_set_keylog_callback is called:
+
+$ SSLKEYLOGFILE=/tmp/tls.log ltrace -e SSL_CTX_set_keylog_callback curl
+ <A HREF="https://www.openssl.org/robots.txt">https://www.openssl.org/robots.txt</A>
+libcurl.so.4-&gt;SSL_CTX_set_keylog_callback(0x55afd55bc0c0, 0x7f497df43fa0, 0,
+ 0) = 1
+User-agent: *
+Disallow: /source/old
+Disallow: err404.html
++++ exited (status 0) +++
+
+This prints data to /tmp/tls.log as expected. Without the envar,
+ SSL_CTX_set_keylog_callback isn't called as expected:
+
+$ ltrace -e SSL_CTX_set_keylog_callback curl
+ <A HREF="https://www.openssl.org/robots.txt">https://www.openssl.org/robots.txt</A>
+User-agent: *
+Disallow: /source/old
+Disallow: err404.html
++++ exited (status 0) +++
+
+Next, I downloaded openssl and compiled it locally and wrote the following
+ program that hooks into SSL_CTX_new to 
+directly set keylog_callback before calling the real SSL_CTX_new. The
+ callback function simply writes the data to stderr:
+
+#define _GNU_SOURCE
+#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;dlfcn.h&gt;
+#include &lt;ssl/ssl_local.h&gt;
+
+static void keylog_callback(const SSL *ssl, const char *line) {
+ &#160; fprintf(stderr, &quot;%s\n&quot;, line);
+}
+
+SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth) {
+ &#160; SSL_CTX* (*real_SSL_CTX_new)(const SSL_METHOD *meth) = dlsym(RTLD_NEXT,
+ &quot;SSL_CTX_new&quot;);
+ &#160; if (!real_SSL_CTX_new) {
+ &#160;&#160;&#160; fprintf(stderr, &quot;Could not find real SSL_CTX_new\n&quot;);
+ &#160;&#160;&#160; exit(1);
+ &#160; }
+ &#160; #ifdef DEBUG
+ &#160; fprintf(stderr, &quot;Calling real SSL_CTX_new\n&quot;);
+ &#160; #endif
+ &#160; SSL_CTX *ctx = real_SSL_CTX_new(meth);
+ &#160; if (ctx != NULL) {
+ &#160;&#160;&#160; ctx-&gt;keylog_callback = keylog_callback;
+ &#160;&#160;&#160; fprintf(stderr, &quot;[%s:%d:%s] Set custom keylog_callback to %p\n&quot;,
+ __FILE__, __LINE__, __func__, ctx-&gt;keylog_callback);
+ &#160; }
+ &#160; #ifdef DEBUG
+ &#160; fprintf(stderr, &quot;Return ctx %p\n&quot;, ctx);
+ &#160; #endif
+ &#160; return ctx;
+}
+
+Compile the shared library:
+
+gcc -g -Wall -o openssl_keylogfile.so -shared -fPIC keylogfile.c -lcrypto
+ -lssl -I/usr/local/src/openssl 
+-I/usr/local/src/openssl/include -DDEBUG
+
+Finally, run curl again with this shared library (and obviously without
+ SSLKEYLOGFILE so that curl doesn't call 
+SSL_CTX_set_keylog_callback and override the above function pointer). It
+ prints that it has set keylog_callback but 
+keylog_callback is never called:
+
+$ LD_PRELOAD=/work/openssl/openssl_sslkeylogfile/openssl_keylogfile.so curl
+ <A HREF="https://www.openssl.org/robots.txt">https://www.openssl.org/robots.txt</A>
+Calling real SSL_CTX_new
+[keylogfile.c:23:SSL_CTX_new] Set custom keylog_callback to 0x7fd1aa7bf139
+Return ctx 0x55809c1310c0
+User-agent: *
+Disallow: /source/old
+Disallow: err404.html
+
+Any ideas?
+
+Thanks,
+
+-- 
+Kevin Grigorenko
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013851.html">enforce ALPN overlap?
+</A></li>
+	<LI>Next message: <A HREF="013853.html">openssl verify question
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13852">[ date ]</a>
+              <a href="thread.html#13852">[ thread ]</a>
+              <a href="subject.html#13852">[ subject ]</a>
+              <a href="author.html#13852">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

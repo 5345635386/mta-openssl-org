@@ -1,0 +1,251 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> BIO_read fails when performing DTLS handshake
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2019-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20BIO_read%20fails%20when%20performing%20DTLS%20handshake&In-Reply-To=%3C2b72244c-7179-5f82-1ae5-13d1af453849%40gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011112.html">
+   <LINK REL="Next"  HREF="011116.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>BIO_read fails when performing DTLS handshake</H1>
+    <B>Matthew</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20BIO_read%20fails%20when%20performing%20DTLS%20handshake&In-Reply-To=%3C2b72244c-7179-5f82-1ae5-13d1af453849%40gmail.com%3E"
+       TITLE="BIO_read fails when performing DTLS handshake">matthew.goulart at gmail.com
+       </A><BR>
+    <I>Sat Aug 31 03:05:50 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011112.html">SSL_get_certificate
+</A></li>
+        <LI>Next message: <A HREF="011116.html">BIO_read fails when performing DTLS handshake
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11115">[ date ]</a>
+              <a href="thread.html#11115">[ thread ]</a>
+              <a href="subject.html#11115">[ subject ]</a>
+              <a href="author.html#11115">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello everyone!
+
+This is my first &quot;post&quot; to the mailing list.
+
+I have been working on an OSSL wrapper for C# for several months, and am 
+currently implementing the DTLS portion. I've succeeded in establishing 
+a DTLS session with cookie exchange, sending and receiving data, and 
+gracefully closing the connection.
+
+I've appended a snippet of the C# for those who may be curious.
+
+Once I got the ugly bits working, I started chipping away at building a 
+nice API. This is where my problem started.
+
+I've spend hours debugging and I think I've hit the limit of my 
+abilities. I have 2 unit tests in C# (at the end of this mail). The 
+first one (BasicDtlsTest) is a strightforward echo of one client's data. 
+The second (BasicListenerTest) is essentially the same, only wrapped in 
+a friendlier API.
+
+Specifically, my problem is that the second unit test fails to reply to 
+a ClientHello /with/ a cookie (it successfully send the 
+HelloVerifyRequest with the cookie). I have traced the problem to where 
+I /think/ things go wrong. I followed the call stack starting from 
+SSL_do_handshake.
+
+SSL_do_handshake -&gt; ossl_statem_accept -&gt; state_machine -&gt; 
+read_state_machine -&gt; dtls_get_message -&gt; dtls_get_reassembled_message 
+-&gt; dtls1_read_bytes -&gt; dtls1_get_record -&gt; ssl3_read_n.
+
+I stepped through both the /working/ unit test and the /non-working/ one 
+in order to find differences in the result. What I have found is that, 
+in ssl3_read_n, the call to BIO_read (line 300 in rec_layer_s3.c) 
+returns -1.
+
+ret = BIO_read(s-&gt;rbio, pkt + len + left, max - left);
+
+At this line, pkt is a char[8], len and left = 0 and max = 16717
+
+I'm curious as to why the &quot;data&quot; argument is not a pointer to a buffer, 
+but rather the result of an addition. Maybe my C isnt strong enough...
+
+Going even further down the stack, I finally end up at the bottom:
+
+static int mem_read(BIO *b, char *out, int outl)
+
+And this is where the -1 that is a thorn in my side originates:
+
+ret = (outl &gt;= 0 &amp;&amp; (size_t)outl &gt; bm-&gt;length) ? (int)bm-&gt;length : outl;
+
+At this line, (size_t)outl is 16717 and bm-&gt;length is 0, so ret = 
+(int)bm-&gt;length. Then, a little further:
+
+if ((out != NULL) &amp;&amp; (ret &gt; 0)) { memcpy(out, bm-&gt;data, ret); bm-&gt;length 
+-= ret; bm-&gt;max -= ret; bm-&gt;data += ret; } else if (bm-&gt;length == 0) { 
+ret = b-&gt;num; if (ret != 0) BIO_set_retry_read(b); } return ret;
+
+At this point, ret = -1 and that just gets propagated all the way back 
+up, causing the entire record to be thrown out and ignored. The client 
+keeps sending ClientHellos with the cookie and the server keeps ignoring 
+them.
+
+I really have no idea what is happening.
+
+You can see my entire source code 
+here:<A HREF="https://gitlab.com/matthew.goulart/openssl.net">https://gitlab.com/matthew.goulart/openssl.net</A>
+
+I realize it's a lot to ask you to read all of my code, so if anyone has 
+suggestions as to what I might try next, I'm open!
+
+
+Thanks!
+
+[TestMethod]
+public async Task BasicDtlsTest()
+{
+     var socket =new Socket(AddressFamily.InterNetwork,SocketType.Dgram,ProtocolType.Udp);
+         socket.SetSocketOption(SocketOptionLevel.Socket,SocketOptionName.ReuseAddress,true);
+         socket.Bind(new IPEndPoint(IPAddress.Loopback,1114));
+
+         var ctx =new Context(SslMethod.DTLS);
+         ctx.UseCertificateFile(&quot;certs/cert.crt&quot;,CertificateType.PEM);
+         ctx.UsePrivateKeyFile(&quot;certs/key.key&quot;,CertificateType.PEM);
+         ctx.SetVerify(SslVerificationKind.SSL_VERIFY_PEER |SslVerificationKind.SSL_VERIFY_CLIENT_ONCE,
+             VerifyCert);
+         ctx.SetGenerateCookieCallback(GenerateCookie);
+         ctx.SetVerifyCookieCallback(VerifyCookie);
+         ctx.SetOptions(SslOptions.SSL_OP_COOKIE_EXCHANGE);
+
+         var ssl =new Ssl(ctx,new MemoryBio(),new MemoryBio());
+
+         var remoteEp =new IPEndPoint(IPAddress.Any,0);
+
+         var owner =MemoryPool&lt;byte&gt;.Shared.Rent(4096);
+         var mem = owner.Memory;
+         MemoryMarshal.TryGetArray(mem,out ArraySegment&lt;byte&gt; seg);
+         var buf = seg.Array;
+
+         SocketReceiveFromResult rcv;
+         BioAddress bioAddr =new BioAddress();
+
+         rcv =await socket.ReceiveFromAsync(seg,SocketFlags.None,new IPEndPoint(IPAddress.Any,0));
+         ssl.ReadBio.Write(buf, rcv.ReceivedBytes);
+
+         Ssl.DtlsListen(ssl, bioAddr);
+
+         var bytesRead = ssl.WriteBio.Read(buf,Ssl.TLS_MAX_RECORD_SIZE);
+         await socket.SendToAsync(seg.Slice(0, bytesRead),SocketFlags.None, rcv.RemoteEndPoint);
+
+         rcv =await socket.ReceiveFromAsync(seg,SocketFlags.None,new IPEndPoint(IPAddress.Any,0));
+         ssl.ReadBio.Write(buf, rcv.ReceivedBytes);
+
+         Assert.IsTrue(Ssl.DtlsListen(ssl, bioAddr));
+
+         socket.Close();
+         
+         var clientSock =new Socket(AddressFamily.InterNetwork,SocketType.Dgram,ProtocolType.Udp);
+         clientSock.SetSocketOption(SocketOptionLevel.Socket,SocketOptionName.ReuseAddress,true);
+         clientSock.Bind(new IPEndPoint(IPAddress.Loopback,1114));
+         clientSock.Connect(rcv.RemoteEndPoint);
+
+         while (!ssl.IsInitFinished)
+         {
+             Debug.WriteLine($&quot;Current handshake state is {ssl.HandshakeState}&quot;);
+
+             int bytesRcvd =await clientSock.ReceiveAsync(mem,SocketFlags.None);
+             Debug.WriteLine($&quot;{bytesRcvd} bytes read from socket.&quot;);
+             int bytesWritten = ssl.ReadBio.Write(buf, bytesRcvd);
+             Debug.WriteLine($&quot;{bytesWritten} bytes written to SSL&quot;);
+             Debug.Assert(bytesRcvd == bytesWritten);
+
+             int acc = ssl.Accept();
+             SslError result = ssl.GetError(acc);
+             if (result ==SslError.SSL_ERROR_SYSCALL)throw new SslException(ErrorHandler.GetError());
+
+             Debug.WriteLine($&quot;Auth result was: {result}&quot;);
+
+             if (ssl.WriteBio.BytesPending &gt;0)
+             {
+                 Debug.WriteLine($&quot;{ssl.WriteBio.BytesPending} bytes pending in write bio&quot;);
+                 bytesRead = ssl.WriteBio.Read(buf,4096);
+                 Debug.WriteLine($&quot;{bytesRead} bytes read from write bio&quot;);
+                 int bytesSent =await clientSock.SendAsync(mem.Slice(0, bytesRead),SocketFlags.None);
+                 Debug.WriteLine($&quot;{bytesSent} bytes sent to client&quot;);
+             }
+         }
+
+         ssl.Shutdown();
+
+         if (ssl.WriteBio.BytesPending &gt;0)
+         {
+             Debug.WriteLine($&quot;{ssl.WriteBio.BytesPending} bytes pending in write bio&quot;);
+             bytesRead = ssl.WriteBio.Read(buf,4096);
+             Debug.WriteLine($&quot;{bytesRead} bytes read from write bio&quot;);
+             int bytesSent =await clientSock.SendAsync(mem.Slice(0, bytesRead),SocketFlags.None);
+             Debug.WriteLine($&quot;{bytesSent} bytes sent to client&quot;);
+         }
+}
+
+[TestMethod]
+public async Task BasicListenerTest()
+{
+     var listener =new DtlsListener(new IPEndPoint(IPAddress.Loopback,1114),&quot;certs/cert.crt&quot;,
+         &quot;certs/key.key&quot;);
+     listener.Start();
+         
+     Debug.WriteLine(&quot;Server =&gt; Signalling ready to accept client&quot;);
+
+     var client =await listener.AcceptClientAsync();
+         
+     Debug.WriteLine($&quot;Server =&gt; Client session started&quot;);
+
+     await client.AuthenticateAsServerAsync();
+         
+     Debug.WriteLine(&quot;Server =&gt; Client successfully authenticated&quot;);
+
+     var msg =await client.ReceiveAsync();
+
+     Assert.IsTrue(msg.Length &gt;=4 &amp;&amp; msg.Length &lt;=5);
+     Assert.AreEqual(&quot;test&quot;,Encoding.Default.GetString(msg.Span.Slice(0,4)));
+
+     await client.SendAsync(MemoryMarshal.AsMemory(msg));
+
+     await listener.Stop();
+}
+     }
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20190830/e1d833d5/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20190830/e1d833d5/attachment-0001.html</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011112.html">SSL_get_certificate
+</A></li>
+	<LI>Next message: <A HREF="011116.html">BIO_read fails when performing DTLS handshake
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11115">[ date ]</a>
+              <a href="thread.html#11115">[ thread ]</a>
+              <a href="subject.html#11115">[ subject ]</a>
+              <a href="author.html#11115">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

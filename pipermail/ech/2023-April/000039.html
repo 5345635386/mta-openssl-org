@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [ech] would a callback for ECH retry-configs be useful?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/ech/2023-April/index.html" >
+   <LINK REL="made" HREF="mailto:ech%40openssl.org?Subject=Re%3A%20%5Bech%5D%20would%20a%20callback%20for%20ECH%20retry-configs%20be%20useful%3F&In-Reply-To=%3CCAF8qwaB0bjLfNsRX1uMBZ-eVfw_E26RiQ-bN5kL6FENsgHUcgQ%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000038.html">
+   <LINK REL="Next"  HREF="000040.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[ech] would a callback for ECH retry-configs be useful?</H1>
+    <B>David Benjamin</B> 
+    <A HREF="mailto:ech%40openssl.org?Subject=Re%3A%20%5Bech%5D%20would%20a%20callback%20for%20ECH%20retry-configs%20be%20useful%3F&In-Reply-To=%3CCAF8qwaB0bjLfNsRX1uMBZ-eVfw_E26RiQ-bN5kL6FENsgHUcgQ%40mail.gmail.com%3E"
+       TITLE="[ech] would a callback for ECH retry-configs be useful?">davidben at google.com
+       </A><BR>
+    <I>Tue Apr 18 15:06:43 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="000038.html">[ech] would a callback for ECH retry-configs be useful?
+</A></li>
+        <LI>Next message (by thread): <A HREF="000040.html">[ech] would a callback for ECH retry-configs be useful?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39">[ date ]</a>
+              <a href="thread.html#39">[ thread ]</a>
+              <a href="subject.html#39">[ subject ]</a>
+              <a href="author.html#39">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I don't think using the most recent config is right. We started with that
+in an early prototype, but quickly realized that doesn't work. For
+BoringSSL's API, when we make a config set, we just let you mark which
+configs are to be sent as retry configs and which aren't. I don't think you
+need a callback.
+
+First, consider a service backed by multiple servers, as in most large
+deployments. It is impossible to atomically deploy something across all
+servers concurrently, but you also need to rotate keys, so your deployment
+model needs to take all this into account. You'll need to satisfy the
+following:
+
+- New ECHConfigs, when they're generated, do not end up in DNS until all
+[or almost all] your servers support it
+- DNS caches should be assumed stale, so servers also need to support the
+last few generations of keys
+- The recovery flow makes a new connection, so it may hit a new server.
+Thus retry configs should also be ones that are expected to be supported by
+all servers
+
+Put all this together and you get something of this rough shape:
+
+- Servers keep a window of N configs. The most recent or so is in the
+process of being rolled out and may not be available on all its peers yet.
+Then there's one config that the server believes is rolled out to all its
+peers. *That* one should be the retry config. Then it also retains N-2 or
+so configs past that to deal with stale caches.
+
+- Periodically, some provisioning process generates a new ECHConfig,
+prepends it to this list, retires the oldest one, and deploys the new
+window to all servers. The new config is *not* put in DNS yet because not
+all servers have it.
+
+- Once the new config is sufficiently rolled out, put the new config in
+DNS, replacing the previous config. Possibly also do a round of rollout to
+all the servers to tell them they can bump the retry config forward by one
+generation, though the generation before that should also work fine
+provided N is large enough.
+
+Second, there may be more than one retry config, hence why it's an
+ECHConfigList. ECH's extensibility model is that the server presents
+multiple ECHConfigs and the client picks one. Suppose an ECH server
+supports both P-256 and X25519 KEMs. It would then provision pairs of
+(P-256, X25519) configs every time it rotates. So while I said N configs
+above, it's really N pairs (or more depending on what your generation size
+is). The thing that goes in DNS and retry configs is one full generation of
+configs. That means your API should be able to express that.
+
+Put another way: the retry config should be the answer to &quot;what would I, an
+individual server instance, want to put in DNS, as of the information I
+have right now?&quot; Having a simple boolean associated with each config
+suffices to let the caller control this, which is what we've done. (Though
+looking back, I see we didn't document the details here as well as I
+thought we had. I'll see about fixing that...)
+
+On Sun, Apr 16, 2023 at 9:08&#8239;PM Stephen Farrell &lt;<A HREF="../../../mailman/listinfo/ech.html">stephen.farrell at cs.tcd.ie</A>&gt;
+wrote:
+
+&gt;<i>
+</I>&gt;<i> Hiya,
+</I>&gt;<i>
+</I>&gt;<i> I've been adding code for testing badly encoded ECH stuff
+</I>&gt;<i> to my branch, esp. for EncodedClientHelloInner which is the
+</I>&gt;<i> new thing that could cause server bugs. That's in [1] and
+</I>&gt;<i> seems like a reasonable start to doing that well. And that
+</I>&gt;<i> approach (for testing) also seems to work ok for badly
+</I>&gt;<i> constructed values for the ECH acceptance signal in SH.random
+</I>&gt;<i> or within HRRs.
+</I>&gt;<i>
+</I>&gt;<i> One problem I've not solved (within the test harness) is
+</I>&gt;<i> how to do similarly for the retry-config values returned
+</I>&gt;<i> by a server when the wrong ECH public value is used by a
+</I>&gt;<i> client (or if a client GREASEs). Right now, a server (that
+</I>&gt;<i> has some ECH private values loaded) will return the ECHConfig
+</I>&gt;<i> corresponding to the most recently loaded ECH private value,
+</I>&gt;<i> which I think is reasonable.
+</I>&gt;<i>
+</I>&gt;<i> However, for testing, it might be useful to enable a server
+</I>&gt;<i> to trigger a callback, so that it could return a borked
+</I>&gt;<i> retry-config value, to check that doesn't result in badness
+</I>&gt;<i> for a client.
+</I>&gt;<i>
+</I>&gt;<i> My question is: would it be useful for real servers to be
+</I>&gt;<i> able to choose the retry-config value to return via a new
+</I>&gt;<i> callback? I guess that might be useful for servers that
+</I>&gt;<i> use multiple CDNs, but I'm not at all sure, since I don't
+</I>&gt;<i> get near such servers... hence asking:-)
+</I>&gt;<i>
+</I>&gt;<i> Secondary question: if useful, then what params might such
+</I>&gt;<i> a callback need?
+</I>&gt;<i>
+</I>&gt;<i> Opinions welcome!
+</I>&gt;<i> Thanks,
+</I>&gt;<i> S.
+</I>&gt;<i>
+</I>&gt;<i> [1]
+</I>&gt;<i>
+</I>&gt;<i> <A HREF="https://github.com/sftcd/openssl/blob/ECH-draft-13c/test/echcorrupttest.c#L41">https://github.com/sftcd/openssl/blob/ECH-draft-13c/test/echcorrupttest.c#L41</A>
+</I>&gt;<i> --
+</I>&gt;<i> ech mailing list
+</I>&gt;<i> <A HREF="../../../mailman/listinfo/ech.html">ech at openssl.org</A>
+</I>&gt;<i> <A HREF="../../../mailman/listinfo/ech.html">https://mta.openssl.org/mailman/listinfo/ech</A>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/ech/attachments/20230418/c7b090f5/attachment.htm">https://mta.openssl.org/pipermail/ech/attachments/20230418/c7b090f5/attachment.htm</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="000038.html">[ech] would a callback for ECH retry-configs be useful?
+</A></li>
+	<LI>Next message (by thread): <A HREF="000040.html">[ech] would a callback for ECH retry-configs be useful?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39">[ date ]</a>
+              <a href="thread.html#39">[ thread ]</a>
+              <a href="subject.html#39">[ subject ]</a>
+              <a href="author.html#39">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/ech.html">More information about the ech
+mailing list</a><br>
+</body></html>

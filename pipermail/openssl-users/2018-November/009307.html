@@ -1,0 +1,146 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2018-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%201.1.1a%3A%20crash%20in%20CRYPTO_THREAD_lock_free&In-Reply-To=%3C20181127224751.GX4122%40straasha.imrryr.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009302.html">
+   <LINK REL="Next"  HREF="009324.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%201.1.1a%3A%20crash%20in%20CRYPTO_THREAD_lock_free&In-Reply-To=%3C20181127224751.GX4122%40straasha.imrryr.org%3E"
+       TITLE="[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free">openssl-users at dukhovni.org
+       </A><BR>
+    <I>Tue Nov 27 22:47:51 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009302.html">[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free
+</A></li>
+        <LI>Next message: <A HREF="009324.html">[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9307">[ date ]</a>
+              <a href="thread.html#9307">[ thread ]</a>
+              <a href="subject.html#9307">[ subject ]</a>
+              <a href="author.html#9307">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Tue, Nov 27, 2018 at 04:11:06AM -0800, Claus Assmann wrote:
+
+&gt;<i> I'm trying OpenSSL 1.1.1a on FreeBSD 11.2-RELEASE-p4 and got the following
+</I>&gt;<i> crash in one of my test programs (I compiled OpenSSL with -g after the
+</I>&gt;<i> first time this happened to get at least some debug info):
+</I>&gt;<i> 
+</I>&gt;<i> #0  __je_huge_salloc (tsdn=&lt;value optimized out&gt;, ptr=&lt;value optimized out&gt;) at extent.h:114
+</I>&gt;<i> #1  0x000000080122d01e in ifree (tsd=&lt;value optimized out&gt;) at arena.h:141468
+</I>&gt;<i> #2  0x000000080122d5b1 in __free (ptr=0x800000000) at tsd.h:716
+</I>&gt;<i> #3  0x0000000801535abb in _pthread_rwlock_destroy (rwlock=&lt;value optimized out&gt;)
+</I>&gt;<i>    4at /usr/src/lib/libthr/thread/thr_rwlock.c:127
+</I>&gt;<i> #4  0x0000000800e67c28 in CRYPTO_THREAD_lock_free (lock=0x801a27298) at crypto/threads_pthread.c:102
+</I>&gt;<i> #5  0x0000000800dcb760 in EVP_PKEY_free (x=0x801a7b370) at crypto/evp/p_lib.c:601
+</I>&gt;<i> #6  0x00000008008affce in ssl3_free (s=0x801bbd000) at ssl/s3_lib.c:3321
+</I>&gt;<i> #7  0x0000000800904c91 in tls1_free (s=0x801bbd000) at ssl/t1_lib.c:115
+</I>&gt;<i> #8  0x00000008008c085c in SSL_free (s=0x801bbd000) at ssl/ssl_lib.c:1204
+</I>&gt;<i> #9  0x00000000004133d3 in sm_tlsbio_close (fp=0x6612e0, flags=0) at ../../mta/libmta/tlsbio.c:391
+</I>&gt;<i> ...
+</I>&gt;<i> (gdb) p (pthread_rwlock_t)0x801a27298
+</I>&gt;<i> $2 = (struct pthread_rwlock *) 0x801a27298
+</I>&gt;<i> (gdb) p *$2
+</I>&gt;<i> $3 = {lock = {rw_state = 1, rw_flags = 0, rw_blocked_readers = 1, rw_blocked_writers = 0, rw_spare = 0x801a272a8}, 
+</I>&gt;<i>   owner = 27402512}
+</I>
+I also use FreeBSD 11.2-RELEASE-p4, and have a /usr/src tree:
+
+    110 int
+    111 _pthread_rwlock_destroy (pthread_rwlock_t *rwlock)
+    112 {
+    113         pthread_rwlock_t prwlock;
+    114         int ret;
+    115
+    116         prwlock = *rwlock;
+    117         if (prwlock == THR_RWLOCK_INITIALIZER)
+    118                 ret = 0;
+    119         else if (prwlock == THR_RWLOCK_DESTROYED)
+    120                 ret = EINVAL;
+    121         else if (prwlock == THR_PSHARED_PTR) {
+    122                 *rwlock = THR_RWLOCK_DESTROYED;
+    123                 __thr_pshared_destroy(rwlock);
+    124                 ret = 0;
+    125         } else {
+    126                 *rwlock = THR_RWLOCK_DESTROYED;
+    127                 free(prwlock);
+    128                 ret = 0;
+    129         }
+    130         return (ret);
+    131 }
+
+The first thing to note is that the function tkaes a *pointer* to
+a pthread_rwlock_t, but the thing pointed to is itself a pointer.
+It has three &quot;magic&quot; values, and otherwise points to allocated
+storage, freed on line 127 (matching your stack trace).
+
+The magic values are:
+
+    #define   THR_RWLOCK_INITIALIZER          ((struct pthread_rwlock *)NULL)
+    #define   THR_RWLOCK_DESTROYED            ((struct pthread_rwlock *)1)
+    #define   THR_PSHARED_PTR                                         \
+	((void *)(uintptr_t)((1ULL &lt;&lt; (NBBY * sizeof(long) - 1)) | 1))
+
+But I think that your gdb commands to display the object are not
+right.  We have
+
+ lock = (pthread_rwlock_t *)0x801a27298
+ *lock = prwlock = (struct pthread_rwlock_t *) 0x80000000
+
+So you'd need to look at (**lock) not (*lock) to see the underlying
+structure, but the address may be invalid.  I don't know how it
+came to be 0x800000000 (2^35)...  I seems that something zeroed
+the low 32 bits of the pointer.
+
+More interesting that the lock might be the content of the EVP_PKEY
+in frame #5:
+
+    #5  0x0000000800dcb760 in EVP_PKEY_free (x=0x801a7b370) at crypto/evp/p_lib.c:601
+
+    p ((struct evp_pkey_st *)0x801a7b370)[0]
+
+Knowing what type of key this is might help to narrow the search.
+
+-- 
+	Viktor.
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009302.html">[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free
+</A></li>
+	<LI>Next message: <A HREF="009324.html">[openssl-users] 1.1.1a: crash in CRYPTO_THREAD_lock_free
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9307">[ date ]</a>
+              <a href="thread.html#9307">[ thread ]</a>
+              <a href="subject.html#9307">[ subject ]</a>
+              <a href="author.html#9307">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,154 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Server application hangs on SS_read, even when client disconnects
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CCAPMEXDbOGwpMhG3Ebc9Gow7OCzUWbJF61%3D1XPWv5TV3n5VsVYA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013139.html">
+   <LINK REL="Next"  HREF="013153.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Server application hangs on SS_read, even when client disconnects</H1>
+    <B>Kyle Hamilton</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Server%20application%20hangs%20on%20SS_read%2C%20even%20when%20client%20disconnects&In-Reply-To=%3CCAPMEXDbOGwpMhG3Ebc9Gow7OCzUWbJF61%3D1XPWv5TV3n5VsVYA%40mail.gmail.com%3E"
+       TITLE="Server application hangs on SS_read, even when client disconnects">aerowolf at gmail.com
+       </A><BR>
+    <I>Tue Nov 17 09:37:02 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013139.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+        <LI>Next message: <A HREF="013153.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13152">[ date ]</a>
+              <a href="thread.html#13152">[ thread ]</a>
+              <a href="subject.html#13152">[ subject ]</a>
+              <a href="author.html#13152">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>There's another reason why you'll want to close your socket with
+SSL_close(): SSL (and TLS) view a prematurely-closed stream as an
+exceptional condition to be reported to the application. This is to
+prevent truncation attacks against the data communication layer.
+While your application may not need that level of protection, it helps
+to keep the state of your application in lockstep with the state of
+the TLS protocol.  If your application doesn't expect to send any more
+data, SSL_close() sends another record across the TCP connection to
+tell the remote side that it should not keep the descriptor open.
+
+-Kyle H
+
+On Fri, Nov 13, 2020 at 11:51 AM Michael Wojcik
+&lt;<A HREF="../../../mailman/listinfo/openssl-users.html">Michael.Wojcik at microfocus.com</A>&gt; wrote:
+&gt;<i>
+</I>&gt;<i> &gt; From: Brice Andr&#233; &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">brice at famille-andre.be</A>&gt;
+</I>&gt;<i> &gt; Sent: Friday, 13 November, 2020 09:13
+</I>&gt;<i>
+</I>&gt;<i> &gt; &quot;Does the server parent process close its copy of the conversation socket?&quot;
+</I>&gt;<i> &gt; I checked in my code, but it seems that no. Is it needed?
+</I>&gt;<i>
+</I>&gt;<i> You'll want to do it, for a few reasons:
+</I>&gt;<i>
+</I>&gt;<i> - You'll be leaking descriptors in the server, and eventually it will hit its limit.
+</I>&gt;<i> - If the child process dies without cleanly closing its end of the conversation,
+</I>&gt;<i> the parent will still have an open descriptor for the socket, so the network stack
+</I>&gt;<i> won't terminate the TCP connection.
+</I>&gt;<i> - A related problem: If the child just closes its socket without calling shutdown,
+</I>&gt;<i> no FIN will be sent to the client system (because the parent still has its copy of
+</I>&gt;<i> the socket open). The client system will have the connection in one of the termination
+</I>&gt;<i> states (FIN_WAIT, maybe? I don't have my references handy) until it times out.
+</I>&gt;<i> - A bug in the parent process might cause it to operate on the connected socket,
+</I>&gt;<i> causing unexpected traffic on the connection.
+</I>&gt;<i> - All such sockets will be inherited by future child processes, and one of them might
+</I>&gt;<i> erroneously perform some operation on one of them. Obviously there could also be a
+</I>&gt;<i> security issue with this, depending on what your application does.
+</I>&gt;<i>
+</I>&gt;<i> Basically, when a descriptor is &quot;handed off&quot; to a child process by forking, you
+</I>&gt;<i> generally want to close it in the parent, unless it's used for parent-child
+</I>&gt;<i> communication. (There are some cases where the parent wants to keep it open for
+</I>&gt;<i> some reason, but they're rare.)
+</I>&gt;<i>
+</I>&gt;<i> On a similar note, if you exec a different program in the child process (I wasn't
+</I>&gt;<i> sure from your description), it's a good idea for the parent to set the FD_CLOEXEC
+</I>&gt;<i> option (with fcntl) on its listening socket and any other descriptors that shouldn't
+</I>&gt;<i> be passed along to child processes. You could close these manually in the child
+</I>&gt;<i> process between the fork and exec, but FD_CLOEXEC is often easier to maintain.
+</I>&gt;<i>
+</I>&gt;<i> For some applications, you might just dup2 the socket over descriptor 0 or
+</I>&gt;<i> descriptor 3, depending on whether the child needs access to stdio, and then close
+</I>&gt;<i> everything higher.
+</I>&gt;<i>
+</I>&gt;<i> Closing descriptors not needed by the child process is a good idea even if you
+</I>&gt;<i> don't exec, since it can prevent various problems and vulnerabilities that result
+</I>&gt;<i> from certain classes of bugs. It's a defensive measure.
+</I>&gt;<i>
+</I>&gt;<i> The best source for this sort of recommendation, in my opinion, remains W. Richard
+</I>&gt;<i> Stevens' /Advanced Programming in the UNIX Environment/. The book is old, and Linux
+</I>&gt;<i> isn't UNIX, but I don't know of any better explanation of how and why to do things
+</I>&gt;<i> in a UNIX-like OS.
+</I>&gt;<i>
+</I>&gt;<i> And my favorite source of TCP/IP information is Stevens' /TCP/IP Illustrated/.
+</I>&gt;<i>
+</I>&gt;<i> &gt; May it explain my problem?
+</I>&gt;<i>
+</I>&gt;<i> In this case, I don't offhand see how it does, but I may be overlooking something.
+</I>&gt;<i>
+</I>&gt;<i> &gt; I suppose that, if for some reason, the communication with the client is lost
+</I>&gt;<i> &gt; (crash of client, loss of network, etc.) and keepalive is not enabled, this may
+</I>&gt;<i> &gt; fully explain my problem ?
+</I>&gt;<i>
+</I>&gt;<i> It would give you those symptoms, yes.
+</I>&gt;<i>
+</I>&gt;<i> &gt; If yes, do you have an idea of why keepalive is not enabled?
+</I>&gt;<i>
+</I>&gt;<i> The Host Requirements RFC mandates that it be disabled by default. I think the
+</I>&gt;<i> primary reasoning for that was to avoid re-establishing virtual circuits (e.g.
+</I>&gt;<i> dial-up connections) for long-running connections that had long idle periods.
+</I>&gt;<i>
+</I>&gt;<i> Linux may well have a kernel tunable or similar to enable TCP keepalive by
+</I>&gt;<i> default, but it seems to be switched off on your system. You'd have to consult
+</I>&gt;<i> the documentation for your distribution, I think.
+</I>&gt;<i>
+</I>&gt;<i> By default (again per the Host Requirements RFC), it takes quite a long time for
+</I>&gt;<i> TCP keepalive to detect a broken connection. It doesn't start probing until the
+</I>&gt;<i> connection has been idle for 2 hours, and then you have to wait for the TCP
+</I>&gt;<i> retransmit timer times the retransmit count to be exhausted - typically over 10
+</I>&gt;<i> minutes. Again, some OSes let you change these defaults, and some let you change
+</I>&gt;<i> them on an individual connection.
+</I>&gt;<i>
+</I>&gt;<i> --
+</I>&gt;<i> Michael Wojcik
+</I>&gt;<i>
+</I></PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013139.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+	<LI>Next message: <A HREF="013153.html">Server application hangs on SS_read, even when client disconnects
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13152">[ date ]</a>
+              <a href="thread.html#13152">[ thread ]</a>
+              <a href="subject.html#13152">[ subject ]</a>
+              <a href="author.html#13152">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,454 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Double free of session occurs in multithread	program.
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2017-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Double%20free%20of%20session%20occurs%20in%20multithread%0A%09program.&In-Reply-To=%3C15CFFC2F2156164FA093C04D7DB5BFB365A75452%40GSjpTK1DCembx01.service.hitachi.net%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006711.html">
+   <LINK REL="Next"  HREF="006668.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Double free of session occurs in multithread	program.</H1>
+    <B>&#20849;&#36890;&#22522;&#30436;&#65331;&#65331;&#65324;&#65339;&#26989;&#21209;&#65321;&#65316;&#65341; / COMMONSSL&#65292;GYOUMU</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Double%20free%20of%20session%20occurs%20in%20multithread%0A%09program.&In-Reply-To=%3C15CFFC2F2156164FA093C04D7DB5BFB365A75452%40GSjpTK1DCembx01.service.hitachi.net%3E"
+       TITLE="[openssl-users] Double free of session occurs in multithread	program.">hrf-ssl at itg.hitachi.co.jp
+       </A><BR>
+    <I>Fri Oct  6 06:24:56 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006711.html">[openssl-users] OpenSSL on side
+</A></li>
+        <LI>Next message: <A HREF="006668.html">[openssl-users] ca md too weak
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6660">[ date ]</a>
+              <a href="thread.html#6660">[ thread ]</a>
+              <a href="subject.html#6660">[ subject ]</a>
+              <a href="author.html#6660">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+I am using OpenSSL's API to create multithreaded programs.
+Check the contents of the program in ssl_test.c.
+
+I have the following two questions.
+The purpose of the question is to create a program that does not cause double free.
+
+Question 1. Is this program correct as a program without double free?
+
+Question 2. Because this program is complicated, I want to make it a simple program.
+           I want to easily create a program that does not cause double free.
+           If you can create with this OpenSSL API different from this program, please tell us about API and usage.
+
+
+I will explain this program.
+
+It takes time to create a session each time communicate.
+Therefore, this program reuses sessions.
+
+If it set the references of the SSL_SESSION structure to 1 or higher, the session will not be released.
+SSL_connect() creates a new session.
+At this time, references are incremented with SSL_get1_session().
+This will cause references to be greater than 1, so the session will not be freed.
+Multiple threads will share this session on subsequent communications.
+
+When the session expires, it is necessary to release the old session that was being reused.
+SSL_SESSION_free() can free old sessions that were being reused.
+When executing SSL_SESSION_free(), specify the address of the session(SSL_SESSION structure).
+
+This program outputs a core dump when deleting the line of &quot;/*add*/&quot; in ssl_test.c.
+The cause is to double free the address of the same session by two threads.
+
+As a measure against this problem, I limit the old session to one release.
+Therefore, flag (fs_isDelete) is set to 1 when the preceding thread releases the old session.
+After that, the following thread does not release the old session because the flag (fs_isDelete) is 1.
+
+
+I will explain the API that affects the references of the SSL_SESSION structure.
+
+(1) SSL_set_session()
+Create a session to reuse.
+I will explain the references.
+The references of the reusing session are incremented.
+
+(2) SSL_connect()
+If the session has not expired, we will use the session to reuse.
+If the session has expired, we will create a new session.
+I will explain the references.
+If the session has not expired, references will not change.
+If the session has expired, the references for the new session are 1.
+If the session has expired, the references of the old session will be decremented.
+
+(3) SSL_get1_session()
+If the session has not expired, obtain the address of the session to reuse.
+If the session has expired, we will get a new session.
+I will explain the references.
+If the session has not expired, the references of the session to be reused will increment.
+If the session has expired, the references of the new session will increment.
+
+(4) SSL_SESSION_free()
+SSL_SESSION_free() can free old sessions that were being reused.
+When executing SSL_SESSION_free(), specify the address of the session (SSL_SESSION structure).
+I will explain the references.
+The references of the old session are decremented.
+If references is 0, old sessions are freed.
+If references are already 0, double the address of the same session.
+
+
+I will explain the sequence of double free.
+
+I will explain the operation in single thread.
+
+First, thread 0 creates a new session.
+
+Thread 0
+                References for sessions to reuse SSL processing starts.
+SSL_connect() ---------&gt; (+1) (1)
+SSL_get1_session() ----&gt; (+1) (2)
+SSL_free() ------------&gt; (-1) (1)
+SSL processing is terminated.
+
+After that, thread 1 reuses the session.
+At this time, the session may expire.
+In that case, SSL_SESSION_free() decrements the references of the old session.
+
+Thread 1
+                References of old sessions that have expired SSL processing starts.
+SSL_set_session() -----&gt; (+1) (2)
+SSL_connect() ---------&gt; (-1) (1)
+SSL_SESSION_free() ----&gt; (-1) (0)
+SSL processing is terminated.
+
+I will explain the operation in multithreading.
+
+Thread 1, SSL_SESSION_free() decrements references for old sessions.
+After that, thread 2 also decrements the references of the same session and double-releases it.
+
+Thread 1 Thread 2
+SSL processing starts. SSL processing starts.
+                 References of old sessions that have expired
+SSL_set_session() -----&gt; (+1) (2)
+                         (+1) (3) &lt;----- SSL_set_session()
+SSL_connect() ---------&gt; (-1) (2)
+                         (-1) (1) &lt;----- SSL_connect()
+SSL_SESSION_free() ----&gt; (-1) (0)
+                         (-1) (-1) &lt;---- SSL_SESSION_free() SSL processing is terminated. Doubles the address of the same session.
+
+
+ssl_test.c
+---------------------------------------
+#include &lt;sys/types.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;netinet/in.h&gt;
+#include &lt;netdb.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;time.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/time.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;pthread.h&gt;
+
+#include &lt;openssl/ssl.h&gt;
+#include &lt;openssl/err.h&gt;
+#include &lt;openssl/crypto.h&gt;
+
+#define MAX_SOCKET_COUNT  2
+#define SOCKID_EMPTY 0
+
+int localSocket[MAX_SOCKET_COUNT];
+int currentSocketCount = 0;
+
+char *g_premorthostname = &quot;hoge&quot;;
+char *g_pserver_port_no = &quot;12345&quot;;
+
+#define CERTIFICATEFILEPATH &quot;/home/server.crt&quot;
+SSL_CTX *ctx = NULL;
+SSL_SESSION *fs_session = NULL;
+SSL_SESSION *fs_session_new = NULL;
+static int fs_refCount = 0;
+static int fs_isDelete = 0;
+static int fs_isAdd = 0;
+
+
+static pthread_mutex_t fs_lock_mutex;
+static pthread_mutex_t *fs_lock_mp = NULL; static long *fs_lock_count;
+
+void finalizer(void)
+{
+}
+
+void do_connect(char *argv1,char *argv2, int *p_localsocket) {
+  int rc;
+
+  struct  hostent     connecthostentstruct;
+  struct  hostent     *connecthostentptr;
+  struct  sockaddr_in   connectaddr;
+  memset((void *)&amp;connectaddr,0,sizeof(struct sockaddr_in));
+
+  *p_localsocket = -1;
+
+   int sock = socket(AF_INET, SOCK_STREAM, 0);
+  *p_localsocket = sock;
+
+  rc = fcntl(sock,F_SETFD,FD_CLOEXEC);
+
+  int ival = 1;
+  rc = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&amp;ival, sizeof ival);
+
+  u_long lval = 1;
+  int flag = fcntl(sock, F_GETFL, 0);
+  rc = fcntl(sock, F_SETFL, O_NONBLOCK|flag);
+
+  connecthostentptr = gethostbyname (argv1);
+
+  connecthostentstruct = *connecthostentptr;
+  connectaddr.sin_family = AF_INET;
+  connectaddr.sin_port = htons(atoi(argv2));
+  connectaddr.sin_addr = * ((struct in_addr *) connecthostentstruct.h_addr); 
+
+  rc = connect(sock, (const struct sockaddr*)&amp;connectaddr, sizeof connectaddr);
+
+  if (errno == EINPROGRESS ) {
+    fd_set fds_write;
+    fd_set fds_except;
+    FD_ZERO(&amp;fds_write);
+    FD_SET(sock, &amp;fds_write);
+    FD_ZERO(&amp;fds_except);
+    FD_SET(sock, &amp;fds_except);
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    rc = select(sock+1, 0, &amp;fds_write, &amp;fds_except, &amp;timeout);
+    int err = 0;
+    socklen_t err_len = sizeof(err);
+    rc = getsockopt(sock, SOL_SOCKET, SO_ERROR, &amp;err, &amp;err_len );
+  }
+
+  lval = 0;
+  rc = fcntl(sock, F_SETFL, flag);
+}
+
+void linux_locking_callback(int mode, int type, const char *file, int line) {
+  if (mode &amp; CRYPTO_LOCK) {
+    pthread_mutex_lock(&amp;(fs_lock_mp[type]));
+  } else {
+    pthread_mutex_unlock(&amp;(fs_lock_mp[type]));
+  }
+}
+
+unsigned long linux_thread_id(void)
+{
+  unsigned long ret;
+
+  ret = (unsigned long)pthread_self();
+
+  return ret;
+}
+
+int thread_setup()
+{
+  int i;
+
+  fs_lock_mp = (pthread_mutex_t *)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
+
+  for (i = 0; i &lt; CRYPTO_num_locks(); i++) {
+    pthread_mutex_init(&amp;(fs_lock_mp[i]), NULL);
+  }
+
+  CRYPTO_set_id_callback(linux_thread_id);
+  CRYPTO_set_locking_callback(linux_locking_callback);
+}
+
+int ThreadFunc(void *argv)
+{
+  int *p_threadIdx = (int *)argv;
+  int threadIdx = *p_threadIdx;
+  long cnt = 0;
+  int localsocket = -1;
+  SSL *ssl = NULL;
+  int ret = 0;
+  SSL_SESSION *session = NULL;
+  SSL_SESSION *session_new = NULL;
+  int nSSLError = SSL_ERROR_NONE;
+
+  while (1) {
+    session = NULL;
+    session_new = NULL;
+
+    ssl = SSL_new(ctx);
+
+    do_connect(g_premorthostname,g_pserver_port_no,&amp;localsocket);
+
+    pthread_mutex_lock(&amp;fs_lock_mutex);
+    if (fs_isDelete &amp;&amp; fs_refCount &lt;= 0) {
+      fs_isDelete = 0;
+      fs_isAdd = 0;
+      fs_session = fs_session_new;
+    }
+    if (fs_isDelete == 0) {
+      fs_refCount++;
+      session = fs_session;
+    }
+    if (session != NULL) {
+      ret = SSL_set_session(ssl, session);        /*(1)*/
+    }
+    pthread_mutex_unlock(&amp;fs_lock_mutex);
+
+    ret = SSL_set_fd(ssl, localsocket);
+
+    ret = SSL_connect(ssl);                       /*(2)*/
+
+    session_new = SSL_get0_session(ssl);
+    pthread_mutex_lock(&amp;fs_lock_mutex);
+    if (session != NULL) {
+      fs_refCount--;
+      if ((session_new != session) &amp;&amp; (session_new != NULL)) {
+        if (fs_isDelete == 0) {                   /*add*/
+          fs_isDelete = 1
+          SSL_SESSION_free(session);              /*(4)*/
+          fs_isAdd = 1;
+        }                                         /*add*/
+      }
+    } else if (session_new != NULL) {
+      fs_isAdd = 1;
+    }
+
+    if (fs_isAdd) {
+      if (fs_session_new == NULL) {
+        fs_session_new = SSL_get1_session(ssl);    /*(3)*/
+      }
+    }
+    pthread_mutex_unlock(&amp;fs_lock_mutex);
+    sleep(1);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(localsocket);
+  }
+}
+
+int main(int argc,char *argv[])
+{
+  int retCode = 0;
+  pthread_attr_t attr[MAX_SOCKET_COUNT];
+  pthread_t thid[MAX_SOCKET_COUNT];
+
+  int ret = 0;
+
+  SSL_load_error_strings();
+  SSL_library_init();
+
+  atexit(finalizer);
+  pthread_mutex_init(&amp;fs_lock_mutex, NULL);
+
+  ctx = SSL_CTX_new(SSLv23_client_method());
+
+  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1);
+
+  ret = SSL_CTX_load_verify_locations(ctx, CERTIFICATEFILEPATH, NULL);
+
+  thread_setup();
+
+  while (1) {
+    if(currentSocketCount &gt;= MAX_SOCKET_COUNT)
+    {
+      sleep(1);
+      continue;
+    }
+    retCode = pthread_attr_init(&amp;attr[currentSocketCount]);
+    pthread_attr_setdetachstate(&amp;attr[currentSocketCount], PTHREAD_CREATE_JOINABLE);
+    retCode = pthread_create(&amp;thid[currentSocketCount], &amp;attr[currentSocketCount], (void *)ThreadFunc, (void*)&amp;currentSocketCount);
+    pthread_attr_destroy(&amp;attr[currentSocketCount]);
+    currentSocketCount++;
+    usleep(200000);
+
+  }
+
+  SSL_CTX_free(ctx);
+  ERR_free_strings();
+
+  return 0;
+}
+---------------------------------------
+
+Thanks in advance.
+
+
+Regards,
+
+Manabu
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006711.html">[openssl-users] OpenSSL on side
+</A></li>
+	<LI>Next message: <A HREF="006668.html">[openssl-users] ca md too weak
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6660">[ date ]</a>
+              <a href="thread.html#6660">[ thread ]</a>
+              <a href="subject.html#6660">[ subject ]</a>
+              <a href="author.html#6660">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

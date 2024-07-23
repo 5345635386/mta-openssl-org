@@ -1,0 +1,143 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] [openssl-user] How to use memory debug functions (CRYPTO_mem_leaks) in OpenSSL 1.1.0 (pre6 release) ?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20%5Bopenssl-user%5D%20How%20to%20use%20memory%20debug%20functions%0A%20%28CRYPTO_mem_leaks%29%20in%20OpenSSL%201.1.0%20%28pre6%20release%29%20%3F&In-Reply-To=%3C936BE946F26E274A8595DBF91A05BD764B30B26F%40SHSMSX101.ccr.corp.intel.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004274.html">
+   <LINK REL="Next"  HREF="004268.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] [openssl-user] How to use memory debug functions (CRYPTO_mem_leaks) in OpenSSL 1.1.0 (pre6 release) ?</H1>
+    <B>Wei, Changzheng</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20%5Bopenssl-user%5D%20How%20to%20use%20memory%20debug%20functions%0A%20%28CRYPTO_mem_leaks%29%20in%20OpenSSL%201.1.0%20%28pre6%20release%29%20%3F&In-Reply-To=%3C936BE946F26E274A8595DBF91A05BD764B30B26F%40SHSMSX101.ccr.corp.intel.com%3E"
+       TITLE="[openssl-users] [openssl-user] How to use memory debug functions (CRYPTO_mem_leaks) in OpenSSL 1.1.0 (pre6 release) ?">changzheng.wei at intel.com
+       </A><BR>
+    <I>Thu Aug 25 01:04:54 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004274.html">[openssl-users] Example on SSL_SESSION_set_ex_data?
+</A></li>
+        <LI>Next message: <A HREF="004268.html">[openssl-users] [openssl-user] How to use memory debug functions (CRYPTO_mem_leaks) in OpenSSL 1.1.0 (pre6 release) ?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4266">[ date ]</a>
+              <a href="thread.html#4266">[ thread ]</a>
+              <a href="subject.html#4266">[ subject ]</a>
+              <a href="author.html#4266">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I used memory debug functions (such as CRYPTO_mem_leaks/CRYPTO_mem_leaks_fp) to check the memory leak. In the old version, such as openssl-1.0.2d, I can call CRYPTO_mem_leaks() functions any time in my application to dump the memory information. But in OpenSSL-1.1.0, it will fail due to the new CRYPTO_mem_leaks() introduce the RUN_ONCE() function to initialize the memory lock and cleanup the locks at the end of the function.
+My application is a multi-process application, parent process will perform the memory lock initialization once, so in child process the RUN_ONCE() function will never be performed. After I perform CRYPTO_mem_leaks(), at the end of this function, the malloc_lock will be freed, so it will cause unexpected coredump if I insert CRYPTO_mem_leaks() function in my code. What I can do now is register this function to atexit(), when the process exit, CRYPTO_mem_leaks() will be performed to dump the memory leakage information.
+Is this behavior expected?
+
+int CRYPTO_mem_leaks(BIO *b)
+{
+    MEM_LEAK ml;
+
+    /*
+     * OPENSSL_cleanup() will free the ex_data locks so we can't have any
+     * ex_data hanging around
+     */
+    bio_free_ex_data(b);
+
+    /* Ensure all resources are released */
+    OPENSSL_cleanup();
+
+    if (!RUN_ONCE(&amp;memdbg_init, do_memdbg_init))
+        return -1;
+
+    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
+
+    ml.bio = b;
+    ml.bytes = 0;
+    ml.chunks = 0;
+    if (mh != NULL)
+        lh_MEM_doall_MEM_LEAK(mh, print_leak, &amp;ml);
+
+    if (ml.chunks != 0) {
+        BIO_printf(b, &quot;%ld bytes leaked in %d chunks\n&quot;, ml.bytes, ml.chunks);
+    } else {
+        /*
+         * Make sure that, if we found no leaks, memory-leak debugging itself
+         * does not introduce memory leaks (which might irritate external
+         * debugging tools). (When someone enables leak checking, but does not
+         * call this function, we declare it to be their fault.)
+         */
+        int old_mh_mode;
+
+        CRYPTO_THREAD_write_lock(malloc_lock);
+
+        /*
+         * avoid deadlock when lh_free() uses CRYPTO_mem_debug_free(), which uses
+         * mem_check_on
+         */
+        old_mh_mode = mh_mode;
+        mh_mode = CRYPTO_MEM_CHECK_OFF;
+
+        lh_MEM_free(mh);
+        mh = NULL;
+
+        mh_mode = old_mh_mode;
+        CRYPTO_THREAD_unlock(malloc_lock);
+    }
+    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_OFF);
+
+    /* Clean up locks etc */
+    CRYPTO_THREAD_cleanup_local(&amp;appinfokey);
+    CRYPTO_THREAD_lock_free(malloc_lock);
+    CRYPTO_THREAD_lock_free(long_malloc_lock);
+    malloc_lock = NULL;
+    long_malloc_lock = NULL;
+
+    return ml.chunks == 0 ? 1 : 0;
+}
+
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20160825/45a32167/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20160825/45a32167/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004274.html">[openssl-users] Example on SSL_SESSION_set_ex_data?
+</A></li>
+	<LI>Next message: <A HREF="004268.html">[openssl-users] [openssl-user] How to use memory debug functions (CRYPTO_mem_leaks) in OpenSSL 1.1.0 (pre6 release) ?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4266">[ date ]</a>
+              <a href="thread.html#4266">[ thread ]</a>
+              <a href="subject.html#4266">[ subject ]</a>
+              <a href="author.html#4266">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

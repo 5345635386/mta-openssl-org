@@ -1,0 +1,200 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Performance problems with OpenSSL and threading
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Performance%20problems%20with%20OpenSSL%20and%20threading&In-Reply-To=%3C5539844F.4090107%40cisco.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001196.html">
+   <LINK REL="Next"  HREF="001206.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Performance problems with OpenSSL and threading</H1>
+    <B>John Foley</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Performance%20problems%20with%20OpenSSL%20and%20threading&In-Reply-To=%3C5539844F.4090107%40cisco.com%3E"
+       TITLE="[openssl-users] Performance problems with OpenSSL and threading">foleyj at cisco.com
+       </A><BR>
+    <I>Thu Apr 23 23:46:23 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001196.html">[openssl-users] Performance problems with OpenSSL and threading
+</A></li>
+        <LI>Next message: <A HREF="001206.html">[openssl-users] Performance problems with OpenSSL and threading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1197">[ date ]</a>
+              <a href="thread.html#1197">[ thread ]</a>
+              <a href="subject.html#1197">[ subject ]</a>
+              <a href="author.html#1197">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Looking at your call stack, it appears you're testing with FIPS mode
+enabled.  There's a lock in FIPS_selftest_failed() that's used to ensure
+the crypto algorithms inside the FIPS boundary are not utilized until
+after the POST has completed and passed. Unfortunately this lock remains
+installed for the lifetime of the process.  We've seen thread contention
+in this area when using OpenSSL.  One work-around is to modify your
+handler that you pass to SSL_locking_callback() to not lock when the
+lock ID is CRYPTO_LOCK_FIPS.  But you would only want to disable this
+particular lock ID after the POST has completed.
+
+If the above doesn't help, another item to check is whether you're
+instantiating an SSL_CTX for each thread.  I've seen some developers use
+a single SSL_CTX for multiple threads.  This results in a single
+instance of the server cert and private key being shared across all the
+threads.  This results in thread contention on the asymmetric key
+operations associated with the cert and private key (e.g. RSA).  Be sure
+that each thread instantiates it's own SSL_CTX and certificate/private key.
+
+Lastly, add some debugs to count the locks by lock ID in your lock
+handler.  There are about 40 different lock IDs defined in
+crypto/crypto.h.  You'll need to identify which lock is causing the
+thread contention.  Once you know that, then you can look in the code to
+see where that lock is used and troubleshoot from there.
+
+
+
+On 04/23/2015 07:23 PM, Bryan Call wrote:
+&gt;<i> I was running a benchmark on a 28 core (56 hyper-threaded) server that
+</I>&gt;<i> is running 84 threads in the process and I am seeing a lot of lock
+</I>&gt;<i> contention.  I saw a lot of lock contention in the calls to
+</I>&gt;<i> SSL_get_error() ssl3_accept().  I am running RHEL 6.5
+</I>&gt;<i> and openssl-1.0.1e-30.el6_6.7.x86_64.  We have
+</I>&gt;<i> used SSL_locking_callback() to setup pthread mutex locks, but haven&#8217;t
+</I>&gt;<i> setup dynlocks yet.  Would dynlocks help in this scenario?
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Output from perf:
+</I>&gt;<i> Samples: 1M of event 'cycles', Event count (approx.): 602783506611
+</I>&gt;<i> - 48.04% [ET_NET 0] [kernel.kallsyms] [k] _spin_lock &#9670;
+</I>&gt;<i> - _spin_lock &#9618;
+</I>&gt;<i>
+</I>&gt;<i>   * + 48.05% futex_wait_setup &#9618;
+</I>&gt;<i>   * + 47.79% futex_wake &#9618;
+</I>&gt;<i>   * + 1.20% tcp_v4_rcv &#9618;
+</I>&gt;<i>   * + 0.98% task_rq_lock &#9618;
+</I>&gt;<i>   * + 0.64% double_lock_balance &#9618;
+</I>&gt;<i>
+</I>&gt;<i> + 3.94% [ET_NET 0] libcrypto.so.1.0.1e [.] bn_mul_mont &#9618;
+</I>&gt;<i> + 1.93% [ET_NET 0] libcrypto.so.1.0.1e [.] BN_usub &#9618;
+</I>&gt;<i> + 1.80% [ET_NET 0] libcrypto.so.1.0.1e [.] 0x00000000000e5200 &#9618;
+</I>&gt;<i> + 1.49% [ET_NET 0] libcrypto.so.1.0.1e [.] sha256_block_data_order &#9618;
+</I>&gt;<i> + 0.97% [ET_NET 0] libcrypto.so.1.0.1e [.] gcm_ghash_clmul &#9618;
+</I>&gt;<i> + 0.85% [ET_NET 0] libpthread-2.12.so [.] pthread_mutex_lock &#9618;
+</I>&gt;<i> + 0.84% [ET_NET 0] libcrypto.so.1.0.1e [.] aesni_ctr32_encrypt_blocks &#9618;
+</I>&gt;<i> + 0.74% [ET_NET 0] libc-2.12.so [.] malloc &#9618;
+</I>&gt;<i> + 0.72% [ET_NET 0] libc-2.12.so [.] memcpy &#9618;
+</I>&gt;<i> + 0.57% [ET_NET 0] libcrypto.so.1.0.1e [.] BN_mod_mul_montgomery &#9618;
+</I>&gt;<i> + 0.51% [ET_NET 0] libpthread-2.12.so [.] pthread_mutex_unlock
+</I>&gt;<i>
+</I>&gt;<i> pstack of the process (only a couple of the interesting threads):
+</I>&gt;<i> Thread 1 (Thread 0x7f1fba151800 (LWP 1106)):
+</I>&gt;<i> #0 0x00007f1fbaaeb264 in __lll_lock_wait () from /lib64/libpthread.so.0
+</I>&gt;<i> #1 0x00007f1fbaae6508 in _L_lock_854 () from /lib64/libpthread.so.0
+</I>&gt;<i> #2 0x00007f1fbaae63d7 in pthread_mutex_lock () from /lib64/libpthread.so.0
+</I>&gt;<i> #3 0x000000000072822f in SSL_locking_callback(int, int, char const*,
+</I>&gt;<i> int) ()
+</I>&gt;<i> #4 0x00000031d2ae7f03 in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #5 0x00000031d2ae7d8c in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #6 0x00000031d2ae80ab in ERR_get_state () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #7 0x00000031d2ae8557 in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #8 0x00000031d2e424a9 in SSL_get_error () from /usr/lib64/libssl.so.10
+</I>&gt;<i> #9 0x00000000007249ef in
+</I>&gt;<i> SSLNetVConnection::load_buffer_and_write(long, long&amp;, long&amp;,
+</I>&gt;<i> MIOBufferAccessor&amp;, int&amp;) ()
+</I>&gt;<i> #10 0x00000000007389df in write_to_net_io(NetHandler*,
+</I>&gt;<i> UnixNetVConnection*, EThread*) ()
+</I>&gt;<i> #11 0x0000000000738523 in write_to_net(NetHandler*,
+</I>&gt;<i> UnixNetVConnection*, EThread*) ()
+</I>&gt;<i> #12 0x0000000000731922 in NetHandler::mainNetEvent(int, Event*) ()
+</I>&gt;<i> #13 0x00000000004f6d48 in Continuation::handleEvent(int, void*) ()
+</I>&gt;<i> #14 0x000000000075877a in EThread::process_event(Event*, int) ()
+</I>&gt;<i> #15 0x0000000000758c84 in EThread::ex
+</I>&gt;<i>
+</I>&gt;<i> Thread 56 (Thread 0x7f1fb0ecd700 (LWP 1172)):
+</I>&gt;<i> #0 0x00007f1fbaae77d9 in pthread_mutex_unlock () from
+</I>&gt;<i> /lib64/libpthread.so.0
+</I>&gt;<i> #1 0x0000000000728265 in SSL_locking_callback(int, int, char const*,
+</I>&gt;<i> int) ()
+</I>&gt;<i> #2 0x00000031d2b57402 in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #3 0x00000031d2b574bd in FIPS_selftest_failed () from
+</I>&gt;<i> /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #4 0x00000031d2ae9f1c in EVP_DigestInit_ex () from
+</I>&gt;<i> /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #5 0x00000031d2a7977e in HMAC_Init_ex () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #6 0x00000031d2a79c29 in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #7 0x00000031d2af7a42 in EVP_PKEY_CTX_ctrl () from
+</I>&gt;<i> /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #8 0x00000031d2ae9ffb in EVP_DigestInit_ex () from
+</I>&gt;<i> /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #9 0x00000031d2af952a in ?? () from /usr/lib64/libcrypto.so.10
+</I>&gt;<i> #10 0x00000031d2e34cf2 in tls1_PRF () from /usr/lib64/libssl.so.10
+</I>&gt;<i> #11 0x00000031d2e35796 in tls1_final_finish_mac () from
+</I>&gt;<i> /usr/lib64/libssl.so.10
+</I>&gt;<i> #12 0x00000031d2e2db2e in ssl3_get_message () from /usr/lib64/libssl.so.10
+</I>&gt;<i> #13 0x00000031d2e1dc3c in ssl3_get_cert_verify () from
+</I>&gt;<i> /usr/lib64/libssl.so.10
+</I>&gt;<i> #14 0x00000031d2e220d6 in ssl3_accept () from /usr/lib64/libssl.so.10
+</I>&gt;<i> #15 0x0000000000725287 in
+</I>&gt;<i> SSLNetVConnection::sslServerHandShakeEvent(int&amp;) ()
+</I>&gt;<i> #16 0x00000000007251b3 in SSLNetVConnection::sslStartHandShake(int,
+</I>&gt;<i> int&amp;) ()
+</I>&gt;<i> #17 0x0000000000723df3 in SSLNetVConnection::net_read_io(NetHandler*,
+</I>&gt;<i> EThread*) ()
+</I>&gt;<i> #18 0x0000000000731852 in NetHandler::mainNetEvent(int, Event*) ()
+</I>&gt;<i> #19 0x00000000004f6d48 in Continuation::handleEvent(int, void*) ()
+</I>&gt;<i> #20 0x000000000075877a in EThread::process_event(Event*, int) ()
+</I>&gt;<i> #21 0x0000000000758c84 in EThread::execute() ()
+</I>&gt;<i> #22 0x0000000000757cf8 in spawn_thread_internal(void*) ()
+</I>&gt;<i> #23 0x00007f1fbaae49d1 in start_thread () from /lib64/libpthread.so.0
+</I>&gt;<i> #24 0x00000030ff0e88fd in clone () from /lib64/libc.so.6
+</I>&gt;<i>
+</I>&gt;<i> -Bryan
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> openssl-users mailing list
+</I>&gt;<i> To unsubscribe: <A HREF="../../../mailman/listinfo/openssl-users.html">https://mta.openssl.org/mailman/listinfo/openssl-users</A>
+</I>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20150423/89594536/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20150423/89594536/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001196.html">[openssl-users] Performance problems with OpenSSL and threading
+</A></li>
+	<LI>Next message: <A HREF="001206.html">[openssl-users] Performance problems with OpenSSL and threading
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1197">[ date ]</a>
+              <a href="thread.html#1197">[ thread ]</a>
+              <a href="subject.html#1197">[ subject ]</a>
+              <a href="author.html#1197">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

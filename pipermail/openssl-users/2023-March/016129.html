@@ -1,0 +1,181 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Migrating low level ec APIs from openssl1.1.1 to openssl3.0.7 high level EVP APIs
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2023-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Migrating%20low%20level%20ec%20APIs%20from%20openssl1.1.1%20to%20openssl3.0.7%20high%0A%20level%20EVP%20APIs&In-Reply-To=%3CCAK_7CmpRn1m7aW6QORoMhcc%3DWjrA4-aT1dpJ_70BoRFbeHi3BQ%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016128.html">
+   <LINK REL="Next"  HREF="016130.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Migrating low level ec APIs from openssl1.1.1 to openssl3.0.7 high level EVP APIs</H1>
+    <B>Vishal Patil</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Migrating%20low%20level%20ec%20APIs%20from%20openssl1.1.1%20to%20openssl3.0.7%20high%0A%20level%20EVP%20APIs&In-Reply-To=%3CCAK_7CmpRn1m7aW6QORoMhcc%3DWjrA4-aT1dpJ_70BoRFbeHi3BQ%40mail.gmail.com%3E"
+       TITLE="Migrating low level ec APIs from openssl1.1.1 to openssl3.0.7 high level EVP APIs">vishable at gmail.com
+       </A><BR>
+    <I>Wed Mar 29 20:00:41 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="016128.html">OpenSSL 1.0.2k EVP_PKEY decryption failing 
+</A></li>
+        <LI>Next message (by thread): <A HREF="016130.html">Migrating low level ec APIs from openssl1.1.1 to openssl3.0.7 high level EVP APIs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16129">[ date ]</a>
+              <a href="thread.html#16129">[ thread ]</a>
+              <a href="subject.html#16129">[ subject ]</a>
+              <a href="author.html#16129">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>We are having some troubles converting some code from OpenSSL 1.1.x to
+OpenSSL
+3.0.7 APIs, to get rid of deprecation warnings, and hope someone may be
+able to
+give us some hints in the right direction.
+
+
+*Part1*:  We are encrypting some text file with openssl3 commands
+and extracting public part(ephdata) of provate key and appending it to
+encryptedfile.
+All openssl operations done using openssl(version 3.0.7) commands in bash
+script.
+
+openssl ecparam -name secp521r1 -genkey -noout -out ephpri.pem
+openssl pkeyutl -derive -inkey ephpri.pem -peerkey ecpubkey.pem -out
+derive.bin
+ENVELOPE=$(openssl dgst -sha512 derive.bin | awk '{print $2}')
+AESKEY=$(echo $ENVELOPE | cut -c1-64)
+AESIV=$(echo $ENVELOPE | cut -c65-96)
+echo &quot;AESKEY = $AESKEY&quot;
+echo &quot;AESIV  = $AESIV&quot;
+# encrypt file.txt
+openssl enc -e -aes-256-ctr -in file.txt -out file.enc -K $AESKEY -iv $AESIV
+
+#extract and append pub part of private-key
+# export public data of the ephemeral key
+openssl ec -in ephpri.pem -pubout -out ephdata.tmp -outform DER -conv_form
+compressed
+OFFSET=$(openssl asn1parse -inform DER -in ephdata.tmp | grep &quot;BIT STRING&quot;
+|<i> awk -F ':' '{print $1}' | awk '{print $1}')
+</I>OFFSET=$(expr $OFFSET + 3)
+dd if=ephdata.tmp of=ephdata bs=$OFFSET count=1024 skip=1
+append_file file.enc ephdata
+
+*Part2*: We are processing the encrypted file on other peer using
+application which uses openssl3 APIs.
+1) extraction of ephdata(pub part of key in part1) from encrypted file.
+2) preparing public key from ephdata
+3) prearing hash using own private key and derived public key
+4) deriving of AES keys from hash and decrypting encrypted file using the
+same.
+
+*Low level APIs: ( part2 decryption succeeds):*
+
+group = EC_GROUP_new_by_curve_name(NID_secp521r1);
+EC_GROUP_precompute_mult(group, nullptr)
+EC_GROUP_set_point_conversion_form(group, POINT_CONVERSION_COMPRESSED);
+
+publicKey  = EC_KEY_new();
+EC_KEY_set_group(key, group)
+point = EC_POINT_new(group);
+EC_POINT_oct2point(group, point, data, length, nullptr)  // data is
+ephdata - derived in part1
+EC_KEY_set_public_key( publicKey  , point)
+EC_POINT_free(point);
+EC_KEY_check_key( publicKey  ) // key is public key derived from ephdata
+
+ECDH_compute_key(envelope,
+                         SHA512_DIGEST_LENGTH,
+                         EC_KEY_get0_public_key(publicKey),
+                         privateKey,
+                         eciesKeyDerivationFn)
+--------------------------------------------------------------------------------------------------------------------------------------
+
+
+*Replaced with high level APIs ( part2 decryption fails) :*
+// ctx setting with named curve
+ nid = NID_secp521r1;
+    pctx = EVP_PKEY_CTX_new_from_name(NULL, &quot;EC&quot;, NULL);
+    EVP_PKEY_keygen_init(pctx)
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, nid)
+    params[0] = OSSL_PARAM_construct_utf8_string(&quot;point-format&quot;,
+compressionState, 0);
+    params[1] = OSSL_PARAM_construct_end();
+    EVP_PKEY_CTX_set_params(pctx, params)
+
+// public key derivation from pubdata from peer
+   dctx = EVP_PKEY_CTX_new_from_name(NULL, &quot;EC&quot;, NULL)
+   EVP_PKEY_fromdata_init(dctx)
+    //param struct for fromdata
+    OSSL_PARAM params[4];
+    char *secp521r1 = (char *)&quot;secp521r1&quot;;
+    params[0] = OSSL_PARAM_construct_octet_string(&quot;pub&quot;, (void *) data,
+length);
+    params[1] = OSSL_PARAM_construct_utf8_string(&quot;group&quot;, secp521r1, 0);
+    char *compressionState = (char *)&quot;compressed&quot;;
+    params[2] = OSSL_PARAM_construct_utf8_string(&quot;point-format&quot;,
+compressionState, 0);
+    params[3] = OSSL_PARAM_construct_end();
+    EVP_PKEY * public_key = nullptr;
+    EVP_PKEY_fromdata(dctx, &amp;public_key   , EVP_PKEY_PUBLIC_KEY, params)
+
+// hash/envelope derivation
+dctx = EVP_PKEY_CTX_new_from_pkey(NULL, d-&gt;privateKey, NULL);
+EVP_PKEY_derive_init(dctx)
+OSSL_PARAM params[4];
+unsigned int padding = 1;
+params[0] = OSSL_PARAM_construct_uint(OSSL_EXCHANGE_PARAM_PAD, &amp;padding);
+params[1] = OSSL_PARAM_construct_utf8_string(OSSL_EXCHANGE_PARAM_KDF_DIGEST,
+                        (char*)&quot;sha512&quot;, 0);
+params[2] = OSSL_PARAM_construct_size_t(OSSL_EXCHANGE_PARAM_KDF_OUTLEN,
+                        &amp;length);
+params[3] = OSSL_PARAM_construct_end();
+EVP_PKEY_CTX_set_params(dctx, params)
+EVP_PKEY_derive_set_peer(dctx, publicKey)
+EVP_PKEY_derive(dctx, envelope, &amp;length)
+
+
+*Issue*:
+If part2 application uses high level APIs, decryption of the file fails.
+However if part2 application uses low level APIs ( deprecated in openssl3)
+decryption succeeds.
+Issue could be either in publickey derivation from ephdata or hash.
+
+
+Thanks,
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20230330/d544d079/attachment.htm">https://mta.openssl.org/pipermail/openssl-users/attachments/20230330/d544d079/attachment.htm</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="016128.html">OpenSSL 1.0.2k EVP_PKEY decryption failing 
+</A></li>
+	<LI>Next message (by thread): <A HREF="016130.html">Migrating low level ec APIs from openssl1.1.1 to openssl3.0.7 high level EVP APIs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16129">[ date ]</a>
+              <a href="thread.html#16129">[ thread ]</a>
+              <a href="subject.html#16129">[ subject ]</a>
+              <a href="author.html#16129">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

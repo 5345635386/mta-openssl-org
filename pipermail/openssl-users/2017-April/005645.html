@@ -1,0 +1,135 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] SSL_shutdown return error when close in init
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2017-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SSL_shutdown%20return%20error%20when%20close%20in%20init&In-Reply-To=%3C3dcdb47f-b7b0-f5af-a9f6-eaf349dcbb5a%40wisemo.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005640.html">
+   <LINK REL="Next"  HREF="005646.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] SSL_shutdown return error when close in init</H1>
+    <B>Jakob Bohm</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20SSL_shutdown%20return%20error%20when%20close%20in%20init&In-Reply-To=%3C3dcdb47f-b7b0-f5af-a9f6-eaf349dcbb5a%40wisemo.com%3E"
+       TITLE="[openssl-users] SSL_shutdown return error when close in init">jb-openssl at wisemo.com
+       </A><BR>
+    <I>Thu Apr 20 14:00:56 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005640.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+        <LI>Next message: <A HREF="005646.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5645">[ date ]</a>
+              <a href="thread.html#5645">[ thread ]</a>
+              <a href="subject.html#5645">[ subject ]</a>
+              <a href="author.html#5645">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 20/04/2017 13:16, Linsell, StevenX wrote:
+&gt;<i> On 19/04/2017, Bohn, Jakob via openssl-users wrote:
+</I>&gt;<i>
+</I>&gt;&gt;<i> On 19/04/2017 14:35, Salz, Rich via openssl-users wrote:
+</I>&gt;&gt;&gt;&gt;<i> The OpenSSL documentation makes it clear that you must keep calling
+</I>&gt;&gt;&gt;&gt;<i> the same asynchronous function with the same parameters until the
+</I>&gt;&gt;&gt;&gt;<i> async job has completed.
+</I>&gt;&gt;&gt;<i> Is there a way we can (relatively cheaply) check for that type of
+</I>&gt;&gt;&gt;<i>   programming error and return an &quot;in progress on another op&quot; error?
+</I>&gt;<i> Yes, I raised a pull request for something similar here:
+</I>&gt;<i> <A HREF="https://github.com/openssl/openssl/pull/1736">https://github.com/openssl/openssl/pull/1736</A>
+</I>&gt;<i> Unfortunately it is over 6 months old now and needs to be rebased and brought
+</I>&gt;<i> up to date with the latest master (my bad as I've not had time).
+</I>&gt;<i> If I get a moment I'll try and get it back up to date.
+</I>&gt;<i>
+</I>&gt;&gt;<i> Also, for the shutdown case, it would be nice (in general) if attempting
+</I>&gt;&gt;<i> shutdown during a handshake will make the handshake abort as soon as the
+</I>&gt;&gt;<i> protocol allows, rather than going through all the remaining steps and their
+</I>&gt;&gt;<i> transmissions.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> In other words, returning appropriate errors/alerts to the other end
+</I>&gt;&gt;<i> according to the handshake step.
+</I>&gt;<i> The problem here is that you have a suspended fibre midway through the
+</I>&gt;<i> handshake operation. It may have allocated memory not just on the stack
+</I>&gt;<i> local to the fibre but dynamically on the heap. The fibre must be resumed
+</I>&gt;<i> to allow it to return up the stack and exit the fibre. When you are
+</I>&gt;<i> running asynchronously you are also by definition going to be running
+</I>&gt;<i> with non-blocking sockets. This means when you recall the
+</I>&gt;<i> SSL_do_handshake to resume the fibre you are only going to keep
+</I>&gt;<i> recalling it until the point it first comes back up the stack and exits the
+</I>&gt;<i> fibre. This will happen at the first point you try and do some non blocking
+</I>&gt;<i> I/O, i.e. send or receive during the handshake. At that point you will be
+</I>&gt;<i> in the same situation you are in if you were running synchronously with
+</I>&gt;<i> non blocking sockets (you may have detected the error earlier when
+</I>&gt;<i> running asynchronously but both asynchronous and synchronous
+</I>&gt;<i> only act on it at the same stage of the handshake).
+</I>&gt;<i> The pain point for the user is in having to remember the error has
+</I>&gt;<i> occurred and keep recalling the SSL_do_handshake until the
+</I>&gt;<i> async job (fibre) has completed.
+</I>Let me clarify: The idea was not to change the synchronization structure,
+but to set a flag or otherwise (asynchronously or in a small critical
+section) change the state such that when the communication async
+operations resume, they will proceed directly to a failure state
+skipping as much of the processing and transmission as possible.
+
+For example if it was waiting for a &quot;hello&quot; from the other end,
+when that &quot;hello&quot; arrives, it would not process the bytes in that
+hello, but respond as if it received a bad hello (with
+&quot;aborted/closed&quot; rather than &quot;invalid hello&quot; as the error/alert
+code).  It would not proceed to e.g. validate incoming public keys,
+send public keys, generate nonces, derive keys etc.
+
+This serves two purposes: To make the &quot;SSL_shutdown&quot; call &quot;just work&quot;
+from an application perspective, and to minimize security exposure
+after the call has been made (e.g. in case some application level
+code decides the other end is probably malicious).
+
+Enjoy
+
+Jakob
+-- 
+Jakob Bohm, CIO, Partner, WiseMo A/S.  <A HREF="https://www.wisemo.com">https://www.wisemo.com</A>
+Transformervej 29, 2860 S&#248;borg, Denmark.  Direct +45 31 13 16 10
+This public discussion message is non-binding and may contain errors.
+WiseMo - Remote Service Management for PCs, Phones and Embedded
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005640.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+	<LI>Next message: <A HREF="005646.html">[openssl-users] SSL_shutdown return error when close in init
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5645">[ date ]</a>
+              <a href="thread.html#5645">[ thread ]</a>
+              <a href="subject.html#5645">[ subject ]</a>
+              <a href="author.html#5645">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,640 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Questions about using Elliptic Curve ciphers in OpenSSL
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Questions%20about%20using%20Elliptic%20Curve%20ciphers%20in%20OpenSSL&In-Reply-To=%3CCANm5x_PrLHgO%3D-og%3Dq_FTKw_W_06KeVLNEPXEWrRFQ1FvFEyNw%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011861.html">
+   <LINK REL="Next"  HREF="011877.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Questions about using Elliptic Curve ciphers in OpenSSL</H1>
+    <B>Nicola Tuveri</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Questions%20about%20using%20Elliptic%20Curve%20ciphers%20in%20OpenSSL&In-Reply-To=%3CCANm5x_PrLHgO%3D-og%3Dq_FTKw_W_06KeVLNEPXEWrRFQ1FvFEyNw%40mail.gmail.com%3E"
+       TITLE="Questions about using Elliptic Curve ciphers in OpenSSL">nic.tuv at gmail.com
+       </A><BR>
+    <I>Wed Feb 19 21:42:06 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011861.html">Questions about using Elliptic Curve ciphers in OpenSSL
+</A></li>
+        <LI>Next message: <A HREF="011877.html">Questions about using Elliptic Curve ciphers in OpenSSL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11864">[ date ]</a>
+              <a href="thread.html#11864">[ thread ]</a>
+              <a href="subject.html#11864">[ subject ]</a>
+              <a href="author.html#11864">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I think there might be some confusion.
+
+The &quot;parameters&quot; files are a legacy from when cryptosystems using &quot;custom&quot;
+domains were not widely deprecated.
+Such parameter files were required for any instance of key generation, to
+make sure that a key was generated in the defined custom domain, and were
+part of any key serialization because in cryptosystems that define domain
+parameters a keypair is generally void of operational meaning if it isn't
+associated with a domain in which that keypair can be used to perform
+operations and also because when two or more peers are involved we need  to
+make sure that exchanged keys belonged to the same domain in which we chose
+to operate.
+
+Nowadays the experts discourage &quot;custom&quot; domains (see e.g. RFC 8422), as
+they bring way more disadvantages than advantages, especially considering
+that the disadvantages include potential serious security pitfalls.
+
+Historically you needed to pregenerate a domain parameters file for
+ephemeral DH used in the key exchange part of the TLS handshake, because
+key generation is a relatively cheap operation, but generating the big
+random primes required for creating new domain parameters is a quite
+demanding process: this was the params file that was provided to the
+SSL/TLS backend and needed to be saved alongside keys and certificates.
+With ECDH, parameter generation for custom domains is even more involved,
+error prone, and the validation of custom parameters received from a peer
+is very expensive and littered with risks for the overall security if not
+done properly.
+
+That being said, recommending &quot;use named curves&quot; just means to use
+well-established and studied set of parameters that standardizing bodies
+deemed recommendable for secure use: this way both peers refer to a set of
+parameters with a given common name rather than explicit parameters, and
+the clients can trust the evaluation done by experts rather than having to
+verify the received parameters for complex mathematical properties.
+
+Now, to the commands in your email, it must be clear that there are a few
+cryptosystems involved in a generic TLS handshake:
+1. key exchange: usually ephemeral ECDH
+2. digital signature (to validate the handshake with the server
+credentials): commonly RSA, ECDSA or EdDSA (depending on the server key
+type)
+3. digital signature (to validate the certificate where the CA states &quot;this
+public key belongs to this subject&quot;): commonly RSA, ECDSA or EdDSA
+(depending on the CA key type)
+
+(We should note that 3 does not necessarily require a `verify()` operation
+for every handshake, because both the issuer and the subject credentials
+are static, so a certificate for a server could be validated once and
+cached for later use).
+
+1)
+
+Ephemeral ECDH generates a new keypair for every handshake, so the parties
+need to agree on which domain parameters to use.
+We negotiate named curves rather than explicit parameters, and that is what
+`status = SSL_CTX_set1_curves_list(ctx, &quot;P-521:P-384:P-256&quot;);` does: both
+parties specify a list of supported curves, and one in common is picked
+(preference on multiple hits is an irrelevant detail here).
+So no need for a parameters file here, we use a list of names, and this is
+independent from the cryptosystem picked for the two digital signature
+operations.
+
+2)
+
+The server needs to have its own keypair, this means a one-time-only keygen
+operation for which parameters are necessary if we pick ECDSA as the
+cryptosystem of our choice.
+You can do this using explicit parameters or a named curve, and the latter
+is preferred. In any case there is no need to store a parameters file after
+the key has been generated, as the key parameters are saved in the key
+serialization anyway, both for named and for custom curves.
+
+There is no harm in generating an intermediary params file, but it is
+superfluous, and also the fact that there is no need to create such a file
+should answer to your original question about where/how it is best to store
+the parameter file.
+
+To generate such a private key without the need for an intermediate params
+file you could run:
+
+~~~sh
+curve_name=prime256v1
+privkey_file=mykeyout.pem
+
+openssl genpkey \
+    -algorithm EC -pkeyopt ec_paramgen_curve:$curve_name \
+    -pkeyopt ec_param_enc:named_curve \
+    -outform pem -out $privkey_file
+~~~
+
+Once you have a private key you could generate a certificate signing
+request (CSR) for your CA to issue a certificate for your server:
+
+~~~sh
+csr_file=mycsrout.pem
+csr_config=/etc/ssl/openssl.cnf
+
+openssl req -sha256 \
+   -key $privkey_file \
+   -new -out $csr_file -outform pem \
+   -config $csr_config
+~~~
+
+Your CA upon receiving your CSR would do its due diligence to verify this
+is a valid request, that you are indeed entitled to request such a
+certificate for the requested subject, and all kinds of checks.
+If the CSR meets all the CA criteria, they will proceed to generate a
+certificate out of your CSR. The CA key type is often RSA, so it wouldn't
+be uncommon to obtain a certificate in which the issuer (the CA) owns an
+RSA key, and the subject is associated with an EC key. As an example I
+created my own fake CA key+certificate and signed a CSR for &quot;Internet
+Widgits Pty Ltd&quot;.
+
+The CA could sign your CSR using openssl like this:
+
+~~~sh
+ca_cert=ca_cert.pem
+ca_privkey=ca_privkey.pem
+ca_config=/etc/ssl/openssl.cnf
+days=30
+cert_file=mycertfileout.pem
+
+openssl x509 \
+    -req -in $csr_file \
+    -CA $ca_cert -CAkey $ca_privkey \
+    -CAcreateserial -config $ca_config \
+    -days $days -sha256 \
+    -out $cert_file
+~~~
+
+The resulting certificate could be inspected by:
+
+~~~sh
+openssl x509 -in $cert_file -noout -text
+Certificate:
+    Data:
+        Version: 1 (0x0)
+        Serial Number:
+            5a:59:46:22:0c:71:16:24:31:52:bc:9c:d7:ac:39:11:36:44:97:d7
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C = AU, ST = Some-State, O = Fake CA, OU = CA, CN =
+ca.fake.example.com
+        Validity
+            Not Before: Feb 19 20:50:47 2020 GMT
+            Not After : Mar 20 20:50:47 2020 GMT
+        Subject: C = AU, ST = Some-State, O = Internet Widgits Pty Ltd
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:6c:2d:42:83:8a:17:dc:8f:9f:c4:b4:e6:84:eb:
+                    ac:90:7a:98:23:a2:9c:cf:35:da:cf:f7:79:bd:5d:
+                    56:4d:de:5a:2a:72:7b:82:6c:bb:fa:ee:14:d7:2c:
+                    45:d1:bf:a5:7c:ec:e2:30:01:9c:98:c9:42:0c:ae:
+                    fd:84:a4:91:c4
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+    Signature Algorithm: sha256WithRSAEncryption
+         c0:02:28:4e:3d:f0:b8:2a:a1:31:30:ec:f8:4f:8c:c3:d1:e2:
+         c4:57:1e:ff:ce:d7:49:ad:44:68:71:00:43:f5:49:2e:2d:c0:
+         06:0e:92:fa:d0:64:5c:b7:d9:ff:69:0b:0f:7b:7d:b5:32:48:
+         1a:e4:87:8d:38:b5:01:1d:0a:3f:d1:f9:14:d5:27:c1:ad:54:
+         c1:03:12:e7:ed:7e:35:af:db:82:25:e6:c5:29:84:52:45:5a:
+         ed:8d:9c:d8:16:56:d5:3e:14:5c:5d:94:88:f5:b2:c1:d1:48:
+         95:a2:c7:dc:17:a8:37:39:51:c5:42:a0:2a:76:7d:86:6c:cb:
+         c9:84:63:df:86:bb:87:2e:17:b5:da:9b:08:ff:d6:2a:92:c0:
+         9b:8b:29:cf:c4:73:c9:83:3a:e7:89:81:37:4d:52:1f:a2:f4:
+         f4:01:4f:7d:67:d5:d1:50:44:f1:6c:f9:04:62:89:29:0e:40:
+         4b:f2:04:c4:bc:78:02:25:05:e8:41:47:10:36:43:19:54:6f:
+         77:1e:02:a9:63:c3:4a:23:7f:86:c9:88:f8:aa:57:89:49:87:
+         d8:26:de:32:54:f1:8b:72:ac:75:08:ec:2c:cc:cc:c6:d9:66:
+         00:a0:4d:a4:f1:d8:ae:c7:5e:b8:fd:62:6d:2a:ba:ce:63:17:
+         30:bd:0c:cb
+~~~
+
+As you can see the signature on the certificate is an RSA signature
+(because the CA key in this example was an RSA key), while the Subject
+Public Key that the certificate authenticates is an EC key (over the NIST
+P-256 curve).
+Normally you would distribute such certificate alongside a chain of
+certificates that can validate a trust link up to some trusted third party
+that your clients will recognize as trustworthy.
+
+
+
+Now in your first command in the last email you are merging all the 3 steps
+(keygen, CSR generation, CSR signing) into a single command to generate a
+key and a self signed certificate where the subject/issuer/signer is
+certifying itself.
+This kind of certificate is not particularly useful if not for testing
+purposes or unless you are bootstrapping your own private PKI and control
+all your clients so that you can force them to include your new root CA
+certificate among their trusted certificates.
+
+Compared to your original command, even here there is no need to create a
+separate param file as long as you are using named curves:
+
+~~~sh
+openssl req -sha256 \
+   -newkey ec -pkeyopt ec_paramgen_curve:$curve_name -pkeyopt
+ec_param_enc:named_curve \
+   -keyout $privkey_file \
+   -new -x509 -out $cert_file -outform pem \
+   -config $ca_config -days $days
+~~~
+
+This can be inspected with:
+
+~~~sh
+openssl x509 -noout -text -in $cert_file
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            1d:ba:c3:dc:35:db:3f:3a:ca:21:ca:06:fe:4b:2b:3d:78:f8:e4:a7
+        Signature Algorithm: ecdsa-with-SHA256
+        Issuer: C = AU, ST = Some-State, O = Internet Widgits Pty Ltd, OU =
+private root CA, CN = root_ca.example.com
+
+
+        Validity
+            Not Before: Feb 19 21:27:58 2020 GMT
+            Not After : Mar 20 21:27:58 2020 GMT
+        Subject: C = AU, ST = Some-State, O = Internet Widgits Pty Ltd, OU
+= private root CA, CN = root_ca.example.com
+
+
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:77:ce:fb:29:ed:1d:25:27:09:bd:27:56:95:88:
+                    42:71:82:49:2f:ab:be:be:45:99:22:a8:1c:43:74:
+                    af:f9:07:1b:49:b7:91:d1:5a:ea:bd:f1:b9:12:65:
+                    dd:42:e2:83:ec:0b:96:03:b8:1d:5b:ea:81:02:28:
+                    6d:a3:53:6a:2f
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+        X509v3 extensions:
+            X509v3 Subject Key Identifier:
+                D8:87:52:0C:DE:12:5F:2F:04:22:7B:EE:CF:E9:A2:4B:18:E2:AE:FD
+            X509v3 Authority Key Identifier:
+
+keyid:D8:87:52:0C:DE:12:5F:2F:04:22:7B:EE:CF:E9:A2:4B:18:E2:AE:FD
+
+            X509v3 Basic Constraints: critical
+                CA:TRUE
+    Signature Algorithm: ecdsa-with-SHA256
+         30:45:02:21:00:8c:9c:39:a1:70:0b:27:69:c9:2c:7d:52:7f:
+         31:3d:b1:73:bf:15:9d:6c:df:73:98:58:2b:14:15:2d:87:63:
+         25:02:20:2a:3f:b2:c0:f5:cd:83:8c:92:5d:e5:69:ad:34:33:
+         7e:2a:ca:b1:2a:c0:21:2a:82:a1:51:f8:1c:07:7b:50:c5
+~~~
+
+&gt;<i>From which it is evident that Issuer and Subject are identical, that the
+</I>Subject key identifier matches the Authority key identifier, ans where the
+certificate signature is ECDSA because the Issuer key is an EC key.
+
+
+I hope this long email clarified the doubts you expressed.
+
+
+Cheers,
+
+Nicola Tuveri
+
+
+On Tue, 18 Feb 2020 at 19:45, Jason Schultz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt; wrote:
+
+&gt;<i> Nicola-
+</I>&gt;<i>
+</I>&gt;<i> Thanks for your response. It does help, but at the same time it also
+</I>&gt;<i> raises questions and maybe conflicts with what I thought I was doing
+</I>&gt;<i> correct earlier in this thread. I'm talking mostly about where I landed in
+</I>&gt;<i> this post:
+</I>&gt;<i>
+</I>&gt;<i> <A HREF="https://www.mail-archive.com/openssl-users@openssl.org/msg87538.html">https://www.mail-archive.com/openssl-users@openssl.org/msg87538.html</A>
+</I>&gt;<i> Re: Questions about using Elliptic Curve ciphers in OpenSSL
+</I>&gt;<i> &lt;<A HREF="https://www.mail-archive.com/openssl-users@openssl.org/msg87538.html">https://www.mail-archive.com/openssl-users@openssl.org/msg87538.html</A>&gt;
+</I>&gt;<i> Thank you for your response Thulasi, this helped. I'm posting this back to
+</I>&gt;<i> the OpenSSL users list in case it helps anyone else, and in case anyone can
+</I>&gt;<i> help with my additional questions.
+</I>&gt;<i> www.mail-archive.com
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> I am only using named curves. You also said:
+</I>&gt;<i>
+</I>&gt;<i> &quot;...you don't really need at all to generate a ecparam file (which only
+</I>&gt;<i> contains the name): the private key file already contains the very same
+</I>&gt;<i> name and fully contains what you need to perform ECDSA signatures that can
+</I>&gt;<i> be validated against a matching certificate.&quot;
+</I>&gt;<i>
+</I>&gt;<i> Let me apply that and start from the beginning and outline everything (I
+</I>&gt;<i> think) I need to do in that case:
+</I>&gt;<i>
+</I>&gt;<i> 1 - Generate a certificate and private key pair. Using the OpenSSL command
+</I>&gt;<i> line:
+</I>&gt;<i>
+</I>&gt;<i> openssl req -nodes -sha256 -newkey ec:&lt;(openssl ecparam -name prime256v1)
+</I>&gt;<i> -keyout mykeyout.pem -new -out mycertfileout.pem -config /etc/ssl/openssl.cnf
+</I>&gt;<i> -x509 -days 365 -outform pem
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Note: the &quot;ec:&quot; parameter basically substitutes the openssl command above
+</I>&gt;<i> with the file I had created and used in this command. Also, the &quot;-genkey&quot;
+</I>&gt;<i> parameter I included in the ecparam command was probably not needed, or
+</I>&gt;<i> potentially bad?
+</I>&gt;<i>
+</I>&gt;<i> 2 - Call the SSL_CTX_use_PrivateKey_file() and
+</I>&gt;<i> SSL_CTX_use_certificate_file() to use the certificate and private key pair.
+</I>&gt;<i> (Same as before)
+</I>&gt;<i>
+</I>&gt;<i> 3 - Call the APIs to set the curves and allow the server to pick the
+</I>&gt;<i> appropriate curves for the client:
+</I>&gt;<i>
+</I>&gt;<i> status = SSL_CTX_set1_curves_list(ctx, &quot;P-521:P-384:P-256&quot;);
+</I>&gt;<i> status = SSL_CTX_set_ecdh_auto(ctx, 1);
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Do I have this right? Is the only difference combining the two commands
+</I>&gt;<i> into one in Step 1 above, instead of the intermediate ecparams file? Or is
+</I>&gt;<i> there something else I'm missing on the generation of certificate/private
+</I>&gt;<i> key pairs?
+</I>&gt;<i>
+</I>&gt;<i> Thanks,
+</I>&gt;<i>
+</I>&gt;<i> Jason
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> ------------------------------
+</I>&gt;<i> *From:* Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">nic.tuv at gmail.com</A>&gt;
+</I>&gt;<i> *Sent:* Tuesday, February 18, 2020 2:50 PM
+</I>&gt;<i> *To:* Jason Schultz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt;
+</I>&gt;<i> *Cc:* Kyle Hamilton &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">aerowolf at gmail.com</A>&gt;; openssl-users &lt;
+</I>&gt;<i> <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>&gt;
+</I>&gt;<i> *Subject:* Re: Questions about using Elliptic Curve ciphers in OpenSSL
+</I>&gt;<i>
+</I>&gt;<i> The ec parameters are public anyway, so there is no real need to store
+</I>&gt;<i> such files somewhere with restricted reading access.
+</I>&gt;<i>
+</I>&gt;<i> On the other hand, I want to reiterate that if you are using (and this is
+</I>&gt;<i> highly recommended) one of the named curves (e.g. NIST P-256) you don't
+</I>&gt;<i> really need at all to generate a ecparam file (which only contains the
+</I>&gt;<i> name): the private key file already contains the very same name and fully
+</I>&gt;<i> contains what you need to perform ECDSA signatures that can be validated
+</I>&gt;<i> against a matching certificate.
+</I>&gt;<i>
+</I>&gt;<i> In the same way, for the ECDHE part, pick curves that you want to support
+</I>&gt;<i> (most TLS 1.2 and 1.3 clients will be happy to support P-256 and X25519 key
+</I>&gt;<i> exchanges) from the named curves: also in this case there is no need to
+</I>&gt;<i> generate a separate ecparam file.
+</I>&gt;<i>
+</I>&gt;<i> Hope this helps!
+</I>&gt;<i>
+</I>&gt;<i> Best regards,
+</I>&gt;<i>
+</I>&gt;<i> Nicola Tuveri
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On Tue, 18 Feb 2020 at 15:27, Jason Schultz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt; wrote:
+</I>&gt;<i>
+</I>&gt;<i> This comment does spark another question though. Do I need to protect the
+</I>&gt;<i> ecparam file I created for us in generating the private key? I know the
+</I>&gt;<i> private key should reside in /etc/ssl/private/ as that directory has no
+</I>&gt;<i> read access. Right now I have the ecparam generated file in
+</I>&gt;<i> /etc/ssl/dsaparams/, which is readable. Should that file also reside in
+</I>&gt;<i> /etc/ssl/private/ so it's protected?
+</I>&gt;<i>
+</I>&gt;<i> Thanks.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> ------------------------------
+</I>&gt;<i> *From:* Kyle Hamilton &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">aerowolf at gmail.com</A>&gt;
+</I>&gt;<i> *Sent:* Sunday, February 16, 2020 10:49 PM
+</I>&gt;<i> *To:* Jason Schultz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt;
+</I>&gt;<i> *Cc:* Thulasi Goriparthi &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">thulasi.goriparthi at gmail.com</A>&gt;; openssl-users &lt;
+</I>&gt;<i> <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>&gt;
+</I>&gt;<i> *Subject:* Re: Questions about using Elliptic Curve ciphers in OpenSSL
+</I>&gt;<i>
+</I>&gt;<i> Be aware that you just posted your certificate's private key, and thus you
+</I>&gt;<i> should regenerate a new keypair/certificate to use.  Otherwise, anyone who
+</I>&gt;<i> can manipulate traffic to your machine can execute a man-in-the-middle
+</I>&gt;<i> attack.
+</I>&gt;<i>
+</I>&gt;<i> -Kyle H
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On Fri, Feb 14, 2020, 07:40 Jason Schultz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt; wrote:
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Thank you for your response Thulasi, this helped. I'm posting this back to
+</I>&gt;<i> the OpenSSL users list in case it helps anyone else, and in case anyone can
+</I>&gt;<i> help with my additional questions. While waiting for responses, I've been
+</I>&gt;<i> able to find out how my certificate and keys were generated. I'd like to
+</I>&gt;<i> walk through that to hopefully verify I'm handling things correctly.
+</I>&gt;<i>
+</I>&gt;<i> First, here is how my EC parameters file was generated:
+</I>&gt;<i>
+</I>&gt;<i> openssl ecparam -name prime256v1 -genkey -out myecparamsfile.pem
+</I>&gt;<i>
+</I>&gt;<i> And the resulting file:
+</I>&gt;<i>
+</I>&gt;<i> M640A-SAIL:/etc/ssl # openssl ecparam -in myecparamsfile.pem -text
+</I>&gt;<i>
+</I>&gt;<i> ASN1 OID: prime256v1
+</I>&gt;<i>
+</I>&gt;<i> NIST CURVE: P-256
+</I>&gt;<i>
+</I>&gt;<i> -----BEGIN EC PARAMETERS-----
+</I>&gt;<i>
+</I>&gt;<i> BggqhkjOPQMBBw==
+</I>&gt;<i>
+</I>&gt;<i> -----END EC PARAMETERS-----
+</I>&gt;<i>
+</I>&gt;<i>  # openssl ecparam -in myecparamsfile.pem -text
+</I>&gt;<i>
+</I>&gt;<i> ASN1 OID: prime256v1
+</I>&gt;<i>
+</I>&gt;<i> NIST CURVE: P-256
+</I>&gt;<i>
+</I>&gt;<i> -----BEGIN EC PARAMETERS-----
+</I>&gt;<i>
+</I>&gt;<i> BggqhkjOPQMBBw==
+</I>&gt;<i>
+</I>&gt;<i> -----END EC PARAMETERS-----
+</I>&gt;<i>
+</I>&gt;<i> Is this good so far? Do I need the -genkey?
+</I>&gt;<i>
+</I>&gt;<i> Then I take this file and use it when I generate my certificate and
+</I>&gt;<i> private key pair, here is the openssl command I used:
+</I>&gt;<i>
+</I>&gt;<i> openssl req -nodes -sha256 -newkey ec:/etc/ssl/private/myecparamsfile.pem
+</I>&gt;<i> -keyout mykeyout.pem -new -out mycertfileout.pem -config
+</I>&gt;<i> /etc/ssl/openssl.cnf -x509 -days 365 -outform pem
+</I>&gt;<i> Generating a EC private key
+</I>&gt;<i> writing new private key to 'mykeyout.pem'
+</I>&gt;<i> &lt;parameter input snipped&gt;
+</I>&gt;<i>
+</I>&gt;<i> And the resulting key:
+</I>&gt;<i>
+</I>&gt;<i> # cat mykeyout.pem
+</I>&gt;<i> -----BEGIN PRIVATE KEY-----
+</I>&gt;<i> MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbfUwVhomun9Q5IAY
+</I>&gt;<i> xTOAn+sDoXZ+k4UWkvUyfshPBJ6hRANCAAQsakFVUTV4JmfVJH31XOvHVhhBodnV
+</I>&gt;<i> 8evYCJSd2Jgo4uOomCSh3oekKL+Tia+LOmynygfvmneOX2YadoNr9uzH
+</I>&gt;<i> -----END PRIVATE KEY-----
+</I>&gt;<i>
+</I>&gt;<i> # openssl ec -noout -text -in mykeyout.pem
+</I>&gt;<i> read EC key
+</I>&gt;<i> Private-Key: (256 bit)
+</I>&gt;<i> priv:
+</I>&gt;<i>     6d:f5:30:56:1a:26:ba:7f:50:e4:80:18:c5:33:80:
+</I>&gt;<i>     9f:eb:03:a1:76:7e:93:85:16:92:f5:32:7e:c8:4f:
+</I>&gt;<i>     04:9e
+</I>&gt;<i> pub:
+</I>&gt;<i>     04:2c:6a:41:55:51:35:78:26:67:d5:24:7d:f5:5c:
+</I>&gt;<i>     eb:c7:56:18:41:a1:d9:d5:f1:eb:d8:08:94:9d:d8:
+</I>&gt;<i>     98:28:e2:e3:a8:98:24:a1:de:87:a4:28:bf:93:89:
+</I>&gt;<i>     af:8b:3a:6c:a7:ca:07:ef:9a:77:8e:5f:66:1a:76:
+</I>&gt;<i>     83:6b:f6:ec:c7
+</I>&gt;<i> ASN1 OID: prime256v1
+</I>&gt;<i> NIST CURVE: P-256
+</I>&gt;<i>
+</I>&gt;<i> And certificate:
+</I>&gt;<i>
+</I>&gt;<i> M740A-PMM1:/etc/ssl # openssl x509 -text -in mycertfileout.pem
+</I>&gt;<i> Certificate:
+</I>&gt;<i>     Data:
+</I>&gt;<i>         Version: 3 (0x2)
+</I>&gt;<i>         Serial Number:
+</I>&gt;<i>             e2:2f:c6:e4:bf:f1:de:20
+</I>&gt;<i>     Signature Algorithm: ecdsa-with-SHA256
+</I>&gt;<i>         Issuer: C=US, ST=NY, L=Loc, O=Org, OU=test, CN=My
+</I>&gt;<i> Name/emailAddress=<A HREF="../../../mailman/listinfo/openssl-users.html">test at example.com</A>
+</I>&gt;<i>         Validity
+</I>&gt;<i>             Not Before: Feb 13 16:11:39 2020 GMT
+</I>&gt;<i>             Not After : Feb 12 16:11:39 2021 GMT
+</I>&gt;<i>         Subject: C=US, ST=NY, L=Loc, O=Org, OU=test, CN=My
+</I>&gt;<i> Name/emailAddress=<A HREF="../../../mailman/listinfo/openssl-users.html">test at example.com</A>
+</I>&gt;<i>         Subject Public Key Info:
+</I>&gt;<i>             Public Key Algorithm: id-ecPublicKey
+</I>&gt;<i>                 Public-Key: (256 bit)
+</I>&gt;<i>                 pub:
+</I>&gt;<i>                     04:2c:6a:41:55:51:35:78:26:67:d5:24:7d:f5:5c:
+</I>&gt;<i>                     eb:c7:56:18:41:a1:d9:d5:f1:eb:d8:08:94:9d:d8:
+</I>&gt;<i>                     98:28:e2:e3:a8:98:24:a1:de:87:a4:28:bf:93:89:
+</I>&gt;<i>                     af:8b:3a:6c:a7:ca:07:ef:9a:77:8e:5f:66:1a:76:
+</I>&gt;<i>                     83:6b:f6:ec:c7
+</I>&gt;<i>                 ASN1 OID: prime256v1
+</I>&gt;<i>                 NIST CURVE: P-256
+</I>&gt;<i>         X509v3 extensions:
+</I>&gt;<i>             X509v3 Subject Key Identifier:
+</I>&gt;<i>                 D6:8A:F3:3B:4E:A1:F8:F8:34:C1:1B:7A:EC:BF:9B:58:7F:68:4A:D9
+</I>&gt;<i>             X509v3 Authority Key Identifier:
+</I>&gt;<i>
+</I>&gt;<i> keyid:D6:8A:F3:3B:4E:A1:F8:F8:34:C1:1B:7A:EC:BF:9B:58:7F:68:4A:D9
+</I>&gt;<i>
+</I>&gt;<i>             X509v3 Basic Constraints:
+</I>&gt;<i>                 CA:TRUE
+</I>&gt;<i>     Signature Algorithm: ecdsa-with-SHA256
+</I>&gt;<i>          30:44:02:20:37:f0:f7:f7:4a:b4:8e:8f:64:72:e4:d1:31:9f:
+</I>&gt;<i>          a1:36:c5:5d:f3:42:4c:24:37:75:cf:b6:55:b0:66:1b:6e:63:
+</I>&gt;<i>          02:20:39:18:81:f8:6c:86:3a:57:74:05:cc:99:6c:d9:dc:6a:
+</I>&gt;<i>          a2:20:98:4c:66:a1:97:d1:c7:ea:42:b4:01:1a:f7:b2
+</I>&gt;<i>
+</I>&gt;<i> Then I call the APIs as described in my first email to use them:
+</I>&gt;<i>
+</I>&gt;<i> ctx = SSL_CTX_new(TLS_method());
+</I>&gt;<i>
+</I>&gt;<i> status = SSL_CTX_use_PrivateKey_file(ctx,&lt;keyfile&gt;,SSL_FILETYPE_PEM);
+</I>&gt;<i> status = SSL_CTX_use_certificate_file(ctx, ,&lt;certfile&gt;,SSL_FILETYPE_PEM);
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> // Verify the cert and key are a pair
+</I>&gt;<i> status = SSL_CTX_check_private_key(ctx);
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Then call the APIs to set the curves and allow the server to pick the
+</I>&gt;<i> appropriate curve for the client:
+</I>&gt;<i>
+</I>&gt;<i> status = SSL_CTX_set1_curves_list(ctx, &quot;P-521:P-384:P-256&quot;);
+</I>&gt;<i> status = SSL_CTX_set_ecdh_auto(ctx, 1);
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> That should be it, right? The EC parameters file has been used to generate
+</I>&gt;<i> the private key, it does not need to be read in by an API call.
+</I>&gt;<i>
+</I>&gt;<i> With the steps above, I get a successful TLS connection from a client
+</I>&gt;<i> using ECDHE-ECDSA-AES256-GCM-SHA384.
+</I>&gt;<i>
+</I>&gt;<i> And yes, I think my main confusion was on what to do with the DH
+</I>&gt;<i> parameters file. I thought using ECDHE key exchange was similar to DSA with
+</I>&gt;<i> DH. With ECDHE, I don't need to read in a parameters file at all.
+</I>&gt;<i>
+</I>&gt;<i> If there's anything wrong above, please let me know, otherwise, thanks for
+</I>&gt;<i> all the help!
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> ------------------------------
+</I>&gt;<i> *From:* Thulasi Goriparthi &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">thulasi.goriparthi at gmail.com</A>&gt;
+</I>&gt;<i> *Sent:* Wednesday, February 12, 2020 8:29 AM
+</I>&gt;<i> *To:* <A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A> &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">jetson23 at hotmail.com</A>&gt;
+</I>&gt;<i> *Cc:* <A HREF="../../../mailman/listinfo/openssl-users.html">rsalz at akamai.com</A> &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">rsalz at akamai.com</A>&gt;
+</I>&gt;<i> *Subject:* Re: Questions about using Elliptic Curve ciphers in OpenSSL
+</I>&gt;<i>
+</I>&gt;<i> To clarify further, EC keys can be generated from either explicit (group)
+</I>&gt;<i> parameters or named curves which are standardized numbers to specific group
+</I>&gt;<i> parameters.
+</I>&gt;<i>
+</I>&gt;<i> Explicit/Custom EC parameters are not recommended/convenient/usual. Your
+</I>&gt;<i> key contains parameters in the form of a named curve (p-256).
+</I>&gt;<i>
+</I>&gt;<i> You are probably getting confused between dhparam used to generate
+</I>&gt;<i> ephemeral keys for DHE based key exchange and EC curve selection for ECDHE
+</I>&gt;<i> based key exchange.
+</I>&gt;<i>
+</I>&gt;<i> Curve selection for ECDHE will be done from the list of curves offered by
+</I>&gt;<i> the client and can be different from the curve used in the server's
+</I>&gt;<i> certificate(ECDSA).
+</I>&gt;<i>
+</I>&gt;<i> Thanks,
+</I>&gt;<i> Thulasi.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On Tue, 11 Feb, 2020, 23:24 Salz, Rich via openssl-users, &lt;
+</I>&gt;<i> <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>&gt; wrote:
+</I>&gt;<i>
+</I>&gt;<i> I believe you just load your ECDSA cert and the other stuff &#8211; Dhparams!! &#8211;
+</I>&gt;<i> is not needed.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-users/attachments/20200219/96aee841/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-users/attachments/20200219/96aee841/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011861.html">Questions about using Elliptic Curve ciphers in OpenSSL
+</A></li>
+	<LI>Next message: <A HREF="011877.html">Questions about using Elliptic Curve ciphers in OpenSSL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11864">[ date ]</a>
+              <a href="thread.html#11864">[ thread ]</a>
+              <a href="subject.html#11864">[ subject ]</a>
+              <a href="author.html#11864">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

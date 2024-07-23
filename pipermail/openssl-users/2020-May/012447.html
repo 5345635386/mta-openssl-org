@@ -1,0 +1,139 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> How to debug a TLSv1.3 protocol problem?
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20How%20to%20debug%20a%20TLSv1.3%20protocol%20problem%3F&In-Reply-To=%3Ccb151955-13ce-0d70-d3f0-84c6054aaaa8%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012446.html">
+   <LINK REL="Next"  HREF="012448.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>How to debug a TLSv1.3 protocol problem?</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20How%20to%20debug%20a%20TLSv1.3%20protocol%20problem%3F&In-Reply-To=%3Ccb151955-13ce-0d70-d3f0-84c6054aaaa8%40openssl.org%3E"
+       TITLE="How to debug a TLSv1.3 protocol problem?">matt at openssl.org
+       </A><BR>
+    <I>Wed May 20 13:01:59 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012446.html">How to debug a TLSv1.3 protocol problem?
+</A></li>
+        <LI>Next message: <A HREF="012448.html">How to debug a TLSv1.3 protocol problem?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12447">[ date ]</a>
+              <a href="thread.html#12447">[ thread ]</a>
+              <a href="subject.html#12447">[ subject ]</a>
+              <a href="author.html#12447">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+
+On 20/05/2020 13:44, Claus Assmann wrote:
+&gt;<i> On Wed, May 20, 2020, Matt Caswell wrote:
+</I>&gt;<i> 
+</I>&gt;&gt;<i> SSL_accept:TLSv1.3 early data
+</I>&gt;<i> 
+</I>&gt;&gt;<i> What happens in the application code? What was the function being called
+</I>&gt;&gt;<i> (SSL_accept?) and what return value do you get? What does
+</I>&gt;&gt;<i> SSL_get_error() return at this point?
+</I>&gt;<i> 
+</I>&gt;<i> It's:
+</I>&gt;<i> 	r = SSL_accept(srv_ssl);
+</I>&gt;<i> 	if (r &lt;= 0)
+</I>&gt;<i> 		ssl_err = SSL_get_error(srv_ssl, r);
+</I>&gt;<i> 
+</I>&gt;<i> return value=-1
+</I>&gt;<i> ssl_err=5 SSL_ERROR_SYSCALL
+</I>&gt;<i> errno=0
+</I>&gt;<i> 
+</I>&gt;<i> It seems to me server and client get &quot;out of sync&quot; at the I/O layer
+</I>&gt;<i> if I understand the SSL traces correctly:
+</I>&gt;<i> 
+</I>&gt;<i> S8: sends 2 records at the end:
+</I>&gt;<i>   - handshake
+</I>&gt;<i>   - ChangeCipherSpec
+</I>&gt;<i> 
+</I>&gt;<i> M1: receives
+</I>&gt;<i>   handshake
+</I>&gt;<i>   but seemingly not
+</I>&gt;<i>   ChangeCipherSpec
+</I>&gt;<i>   Instead it sends only its own
+</I>&gt;<i>   ChangeCipherSpec
+</I>&gt;<i>   then its handshake again
+</I>&gt;<i>   and only then it receives ChangeCipherSpec
+</I>&gt;<i> 
+</I>&gt;<i> and S8 seemingly tries to interprete the out-of-sync data as TLSv1.3
+</I>&gt;<i> early data and fails, thus returning an error from SSL_accept().
+</I>&gt;<i> 
+</I>&gt;<i> If that analysis is correct (can someone check please?), then I
+</I>&gt;<i> need to look at the I/O layers of both programs -- they are rather
+</I>&gt;<i> different :-(
+</I>&gt;<i> 
+</I>
+The &quot;early data&quot; here is a red herring. It is normal for the internal
+libssl state machine to (briefly) transition through the &quot;early data&quot;
+state even though there is no early data being sent. In this case the
+early data state is the last state that occurs after having written
+change cipher spec, but before reading the second Client Hello following
+an HRR.
+
+I *think* what is happening here is that the server side state machine
+has finished its writing tasks, and is now attempting to read data from
+the client again (i.e. the 2nd ClientHello). Normally what would happen
+at this point is that it would read the header of the next record that
+is received from the client to check that the message type it has
+received is sane. It is expecting the ClientHello message type, and only
+at that point will it move the state machine on from the &quot;early data&quot;
+state into the &quot;SSLv3/TLS read client hello&quot; state.
+
+For some reason it is experiencing a failure while reading the client
+hello from the client. Therefore it never makes the state transition out
+of the &quot;early data&quot; state.
+
+The SSL_ERROR_SYSCALL return suggests to me that the underlying system
+call to read the data has failed for some reason. However errno being 0
+indicates otherwise. There is actually a known scenario in 1.1.1 where
+this can occur: if EOF is unexpectedly encountered on the socket. We
+briefly fixed this (you should never normally get SSL_ERROR_SYSCALL with
+errno == 0) but had to back the fix out because it broke some
+applications which were written to expect this buggy behaviour.
+
+I wonder if there could be some middlebox in between these two peers
+that is interfering with the connection in some way and arbitrarily
+closing it down?
+
+Matt
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012446.html">How to debug a TLSv1.3 protocol problem?
+</A></li>
+	<LI>Next message: <A HREF="012448.html">How to debug a TLSv1.3 protocol problem?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12447">[ date ]</a>
+              <a href="thread.html#12447">[ thread ]</a>
+              <a href="subject.html#12447">[ subject ]</a>
+              <a href="author.html#12447">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Failing unit tests after adding public key check to pkey_ec_derive()
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Failing%20unit%20tests%20after%20adding%20public%20key%20check%20to%20pkey_ec_derive%28%29&In-Reply-To=%3CCAHE9VWs%3D%3DFGDfOBtWuzTdKf%3DUD70uVR0D-qQ6%3DsqRcjd1LpWqw%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013284.html">
+   <LINK REL="Next"  HREF="013285.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Failing unit tests after adding public key check to pkey_ec_derive()</H1>
+    <B>Patrick Jakubowski</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Failing%20unit%20tests%20after%20adding%20public%20key%20check%20to%20pkey_ec_derive%28%29&In-Reply-To=%3CCAHE9VWs%3D%3DFGDfOBtWuzTdKf%3DUD70uVR0D-qQ6%3DsqRcjd1LpWqw%40mail.gmail.com%3E"
+       TITLE="Failing unit tests after adding public key check to pkey_ec_derive()">patrick at qumulo.com
+       </A><BR>
+    <I>Tue Dec 29 22:20:41 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013284.html">Using AES utilities in 3.0
+</A></li>
+        <LI>Next message: <A HREF="013285.html">Failing unit tests after adding public key check to pkey_ec_derive()
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13282">[ date ]</a>
+              <a href="thread.html#13282">[ thread ]</a>
+              <a href="subject.html#13282">[ subject ]</a>
+              <a href="author.html#13282">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all,
+
+I've been tasked with making some modifications to OpenSSL 1.1.1 in order
+to bring it into compliance with FIPS 140-2. One of the items on the to-do
+list was to implement the required key agreement scheme assurances
+specified in NIST SP.800-56Ar3 Section 9. This involves performing some
+validation on the public key provided via the EVP_PKEY_derive() call.
+
+To that end, I backported this patch which purports to implement the
+required validation in EC_KEY_check_key():
+
+commit 5173cdde7d758824e6a07f2a6c6808b254602e11
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">shane.lontis at oracle.com</A>&gt;
+Date:   Sat Mar 23 13:12:08 2019 +1000
+
+    ec key validation checks updated
+
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8564">https://github.com/openssl/openssl/pull/8564</A>)
+
+I then added a call to EC_KEY_check_key in pkey_ec_derive() to validate the
+public key, like so:
+
+diff --git a/crypto/ec/ec_pmeth.c b/crypto/ec/ec_pmeth.c
+index 5bee031b92..84d8eb5d95 100644
+--- a/crypto/ec/ec_pmeth.c
++++ b/crypto/ec/ec_pmeth.c
+@@ -163,6 +163,14 @@ static int pkey_ec_derive(EVP_PKEY_CTX *ctx, unsigned
+char *key, size_t *keylen)
+
+     eckey = dctx-&gt;co_key ? dctx-&gt;co_key : ctx-&gt;pkey-&gt;pkey.ec;
+
++    /*
++     * Check the validity of the received public key as required by NIST
++     * SP.800-56Ar3 Section 9
++     */
++    ret = EC_KEY_check_key(ctx-&gt;peerkey-&gt;pkey.ec);
++    if (ret &lt;= 0)
++        return ret;
++
+     if (!key) {
+         const EC_GROUP *group;
+         group = EC_KEY_get0_group(eckey);
+
+Adding this check causes several unexpected unit test failures, which I was
+hoping someone could help me with. The first category of failure seems to
+be with TLS 1.3 tests that exercise the HelloRetryRequest (HRR)
+functionality. Unfortunately, I'm not terribly familiar with the TLS
+protocol, so my understanding here is limited. It seems like the unit tests
+induce this HRR condition by calling SSL_set1_groups_list(&quot;P-256&quot;) while
+providing an RSA private key. I'm not exactly sure of the effect of this
+change, but here is an example test failure:
+
+ok 22 - test_early_data_skip
+    # Subtest: test_early_data_skip_hrr
+    1..3
+    # ERROR: (bool) 'SSL_write_ex(clientssl, MSG2, strlen(MSG2), &amp;written)
+== true' failed @ test/sslapitest.c:2620
+    # false
+    # 139755660280960:error:1010207B:elliptic curve
+routines:ec_key_simple_check_key:invalid private key:crypto/ec/ec_key.c:406:
+    # 139755660280960:error:1424E044:SSL routines:ssl_derive:internal
+error:ssl/s3_lib.c:4781:
+    not ok 1 - iteration 1
+
+There are a couple of other tests that use SSL_set1_groups_list to do a
+similar thing and fail in a similar way.
+
+Additionally, there is another test in test_evp whose failure I don't quite
+understand. The test involves calling EVP_PKEY_derive() with the
+ALICE_zero_secp112r2 and BOB_zero_secp112r2_PUB keys from
+test/recipes/30-test_evp_data/evppkey_ecc.txt. It appears to have been
+added by commit 5d92b853f6b875ba8d1a1b51b305f14df5adb8aa as a regression
+test for a change to the GFp ladder algorithm.
+
+The test failure looks like this:
+
+# Starting &quot;zero x-coord regression tests&quot; tests at line 4536
+# INFO:  @ test/evp_test.c:2320
+# ../../test/recipes/30-test_evp_data/evppkey_ecc.txt:4670: Source of above
+error; unexpected error DERIVE_ERROR
+# 140441081306112:error:10102082:elliptic curve
+routines:ec_key_simple_check_key:wrong order:crypto/ec/ec_key.c:382:
+
+My question is: is there something invalid about adding this call to
+EC_KEY_check_key() to pkey_ec_derive() or are these failures benign and
+indications that the tests need to be changed? I'm particularly concerned
+about the TLS 1.3 HRR tests as I want to make sure I haven't somehow broken
+the TLS protocol.
+
+FWIW, I see a similar check to the one I added in the DH shared secret
+derivation codepath.
+
+Thank you for any insight you can bring to bear!
+
+
+-- 
+*Patrick Jakubowski*
+
+*Member of Technical Staff*
+*___________________________________*
+*Qumulo, Inc.*
+*World's First Data-Aware Scale-Out NAS*
+
+Twitter &lt;<A HREF="https://twitter.com/qumulo?lang=en">https://twitter.com/qumulo?lang=en</A>&gt; /// LinkedIn
+&lt;<A HREF="https://www.linkedin.com/company/2533593?trk=tyah&amp;trkInfo=idx%3A3-1-6%2CtarId%3A1426264780078%2Ctas%3Aqumul">https://www.linkedin.com/company/2533593?trk=tyah&amp;trkInfo=idx%3A3-1-6%2CtarId%3A1426264780078%2Ctas%3Aqumul</A>&gt;
+ /// Facebook &lt;<A HREF="https://www.facebook.com/Qumulo">https://www.facebook.com/Qumulo</A>&gt; /// YouTube
+&lt;<A HREF="https://www.youtube.com/channel/UCe6kSaQmqlCzpNd-tWIP9pQ/feed">https://www.youtube.com/channel/UCe6kSaQmqlCzpNd-tWIP9pQ/feed</A>&gt;
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="https://mta.openssl.org/pipermail/openssl-users/attachments/20201229/a67b13fe/attachment.html">https://mta.openssl.org/pipermail/openssl-users/attachments/20201229/a67b13fe/attachment.html</A>&gt;
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013284.html">Using AES utilities in 3.0
+</A></li>
+	<LI>Next message: <A HREF="013285.html">Failing unit tests after adding public key check to pkey_ec_derive()
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13282">[ date ]</a>
+              <a href="thread.html#13282">[ thread ]</a>
+              <a href="subject.html#13282">[ subject ]</a>
+              <a href="author.html#13282">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

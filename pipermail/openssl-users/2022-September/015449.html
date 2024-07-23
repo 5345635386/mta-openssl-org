@@ -1,0 +1,491 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2022-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Updating%20RSA%20public%20key%20generation%20and%20signature%20verification%0A%20from%201.1.1%20to%203.0&In-Reply-To=%3CMWHPR12MB1631AD6E93221F57ABD89C039E579%40MWHPR12MB1631.namprd12.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015447.html">
+   <LINK REL="Next"  HREF="015454.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Updating RSA public key generation and signature verification from 1.1.1 to 3.0</H1>
+    <B>GonzalezVillalobos, Diego</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20Updating%20RSA%20public%20key%20generation%20and%20signature%20verification%0A%20from%201.1.1%20to%203.0&In-Reply-To=%3CMWHPR12MB1631AD6E93221F57ABD89C039E579%40MWHPR12MB1631.namprd12.prod.outlook.com%3E"
+       TITLE="Updating RSA public key generation and signature verification from 1.1.1 to 3.0">Diego.GonzalezVillalobos at amd.com
+       </A><BR>
+    <I>Thu Sep 29 19:22:39 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015447.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+        <LI>Next message (by thread): <A HREF="015454.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15449">[ date ]</a>
+              <a href="thread.html#15449">[ thread ]</a>
+              <a href="subject.html#15449">[ subject ]</a>
+              <a href="author.html#15449">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>[AMD Official Use Only - General]
+
+Hello Tomas,
+
+So, I made sure that px_size and py_size are equal to the group order (48). I was able to verify successfully using our previous method (deprecated) with the new key generation method, but I'm still not able to get the digestverify to work successfully. As a reminder this is how we were verifying before:
+
+// Determine if SHA_TYPE is 256 bit or 384 bit
+if (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_RSA_SHA256 || parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256 ||parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA256)
+        {
+            sha_type = SHA_TYPE_256;
+            sha_digest = sha_digest_256;
+            sha_length = sizeof(hmac_sha_256);
+        }
+else if (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_RSA_SHA384 || parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA384 || parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA384)
+        {
+            sha_type = SHA_TYPE_384;
+            sha_digest = sha_digest_384;
+            sha_length = sizeof(hmac_sha_512);
+        }
+        else
+        {
+            break;
+        }
+
+        // 1. SHA256 hash the cert from Version through pub_key parameters
+        // Calculate the digest of the input message   rsa.c -&gt; rsa_pss_verify_msg()
+        // SHA256/SHA384 hash the cert from the [Version:pub_key] params
+        uint32_t pub_key_offset = offsetof(sev_cert, sig_1_usage);  // 16 + sizeof(SEV_PUBKEY)
+        if (!digest_sha((uint8_t *)child_cert, pub_key_offset, sha_digest, sha_length, sha_type)) {
+            break;
+        }
+if ((parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256) ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA384) ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA256)  ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA384)) {      // ecdsa.c -&gt; sign_verify_msg
+                ECDSA_SIG *tmp_ecdsa_sig = ECDSA_SIG_new();
+                BIGNUM *r_big_num = BN_new();
+                BIGNUM *s_big_num = BN_new();
+
+                // Store the x and y components as separate BIGNUM objects. The values in the
+                // SEV certificate are little-endian, must reverse bytes before storing in BIGNUM
+                r_big_num = BN_lebin2bn(cert_sig[i].ecdsa.r, sizeof(sev_ecdsa_sig::r), r_big_num);    // LE to BE
+                s_big_num = BN_lebin2bn(cert_sig[i].ecdsa.s, sizeof(sev_ecdsa_sig::s), s_big_num);
+
+                // Calling ECDSA_SIG_set0() transfers the memory management of the values to
+                // the ECDSA_SIG object, and therefore the values that have been passed
+                // in should not be freed directly after this function has been called
+                if (ECDSA_SIG_set0(tmp_ecdsa_sig, r_big_num, s_big_num) != 1) {
+                    BN_free(s_big_num);                   // Frees BIGNUMs manually here
+                    BN_free(r_big_num);
+                    ECDSA_SIG_free(tmp_ecdsa_sig);
+                    continue;
+                }
+                EC_KEY *tmp_ec_key = EVP_PKEY_get1_EC_KEY(parent_signing_key); // Make a local key so you can free it later
+                if (ECDSA_do_verify(sha_digest, (uint32_t)sha_length, tmp_ecdsa_sig, tmp_ec_key) != 1) {
+                    EC_KEY_free(tmp_ec_key);
+                    ECDSA_SIG_free(tmp_ecdsa_sig);      // Frees BIGNUMs too
+                    continue;
+                }
+
+                found_match = true;
+                EC_KEY_free(tmp_ec_key);
+                ECDSA_SIG_free(tmp_ecdsa_sig);      // Frees BIGNUMs too
+                break;
+            }
+
+
+Digest sha function:
+bool digest_sha(const void *msg, size_t msg_len, uint8_t *digest,
+                size_t digest_len, SHA_TYPE sha_type)
+{
+    bool ret = false;
+
+    do {    //TODO 384 vs 512 is all a mess
+        if ((sha_type == SHA_TYPE_256 &amp;&amp; digest_len != SHA256_DIGEST_LENGTH)/* ||
+            (sha_type == SHA_TYPE_384 &amp;&amp; digest_len != SHA384_DIGEST_LENGTH)*/)
+                break;
+
+        if (sha_type == SHA_TYPE_256) {
+            SHA256_CTX context;
+
+            if (SHA256_Init(&amp;context) != 1)
+                break;
+            if (SHA256_Update(&amp;context, (void *)msg, msg_len) != 1)
+                break;
+            if (SHA256_Final(digest, &amp;context) != 1)
+                break;
+        }
+        else if (sha_type == SHA_TYPE_384) {
+            SHA512_CTX context;
+
+            if (SHA384_Init(&amp;context) != 1)
+                break;
+            if (SHA384_Update(&amp;context, (void *)msg, msg_len) != 1)
+                break;
+            if (SHA384_Final(digest, &amp;context) != 1)
+                break;
+        }
+
+        ret = true;
+    } while (0);
+
+    return ret;
+}
+
+This works using the new EC EVP key generation.
+The current verification method keeps failing:
+
+if ((parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256) ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA384) ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA256)  ||
+                     (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA384)) {      // ecdsa.c -&gt; sign_verify_msg
+                
+                ECDSA_SIG *tmp_ecdsa_sig = ECDSA_SIG_new();
+                BIGNUM *r_big_num = BN_new();
+                BIGNUM *s_big_num = BN_new();
+                uint32_t sig_len;
+                unsigned char* der_sig = NULL;;
+
+                // Store the x and y components as separate BIGNUM objects. The values in the
+                // SEV certificate are little-endian, must reverse bytes before storing in BIGNUM
+                r_big_num = BN_lebin2bn(cert_sig[i].ecdsa.r, sizeof(sev_ecdsa_sig::r), r_big_num);    // LE to BE
+                s_big_num = BN_lebin2bn(cert_sig[i].ecdsa.s, sizeof(sev_ecdsa_sig::s), s_big_num);
+
+                // Calling ECDSA_SIG_set0() transfers the memory management of the values to
+                // the ECDSA_SIG object, and therefore the values that have been passed
+                // in should not be freed directly after this function has been called
+                if (ECDSA_SIG_set0(tmp_ecdsa_sig, r_big_num,s_big_num) != 1) {
+                    BN_free(s_big_num); // FreesBIGNUMs manually here
+                    BN_free(r_big_num);
+                    ECDSA_SIG_free(tmp_ecdsa_sig);
+                    break;
+                }
+
+                int der_sig_len = i2d_ECDSA_SIG(tmp_ecdsa_sig, &amp;der_sig);
+                // der_sig = static_cast&lt;unsigned char*&gt;(OPENSSL_malloc(der_sig_len));
+                // unsigned char* der_iter = der_sig;
+                // der_sig_len = i2d_ECDSA_SIG(tmp_ecdsa_sig, &amp;der_iter); // &lt;= bugfix here
+
+
+                if (der_sig_len == 0) {
+                    cout &lt;&lt; &quot;sig length invalid&quot; &lt;&lt; endl;
+                    break;
+                }
+
+                if (der_sig == NULL) {
+                    cout &lt;&lt; &quot;sig generation failed&quot; &lt;&lt; endl;
+                    break;
+                }
+
+                // loop through the array elements
+                for (size_t i = 0; i &lt; der_sig_len; i++) {
+                    cout &lt;&lt; der_sig[i] &lt;&lt; ' ';
+                }
+
+                verify_md_ctx = EVP_MD_CTX_new();
+
+
+                if (!verify_md_ctx) {
+                    cout &lt;&lt; &quot;Error md verify context &quot; &lt;&lt; endl;;
+                    break;
+                }
+
+                if (EVP_DigestVerifyInit(verify_md_ctx, NULL, (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256 || parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA256) ? EVP_sha256(): EVP_sha384(), NULL, parent_signing_key) &lt;= 0) {
+                    cout &lt;&lt; &quot;Init fails &quot; &lt;&lt; endl;
+                    break;
+                }
+
+                if (EVP_DigestVerifyUpdate(verify_md_ctx, (uint8_t *)child_cert, pub_key_offset) &lt;= 0){    // Calls SHA256_UPDATE
+                    cout &lt;&lt; &quot;updating digest fails&quot; &lt;&lt; endl;
+                    break;
+                }
+
+                int ret = EVP_DigestVerifyFinal(verify_md_ctx, der_sig, der_sig_len);
+                if (ret == 0) {
+                    cout &lt;&lt; &quot;EC Verify digest fails&quot; &lt;&lt; endl;
+                    break;
+                } else if (ret &lt; 0) {
+                    printf(&quot;Failed Final Verify %s\n&quot;,ERR_error_string(ERR_get_error(),NULL));
+                    cout &lt;&lt; &quot;EC Verify error&quot; &lt;&lt; endl;
+                    break;
+                }
+
+                found_match = true;
+                cout &lt;&lt; &quot;SEV EC verification Succesful&quot; &lt;&lt; endl;
+
+                if (verify_md_ctx)
+                    EVP_MD_CTX_free(verify_md_ctx);
+
+                break;
+            }
+
+The only difference still is using the der signature; besides that, it is the same. Could it be a bug?
+
+Thank you,
+
+Diego Gonzalez
+----------------------------------------------------------------------------------------------------------------------------------
+&#160;
+
+-----Original Message-----
+From: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">tomas at openssl.org</A>&gt; 
+Sent: Thursday, September 29, 2022 1:12 AM
+To: GonzalezVillalobos, Diego &lt;<A HREF="../../../mailman/listinfo/openssl-users.html">Diego.GonzalezVillalobos at amd.com</A>&gt;; <A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users at openssl.org</A>
+Subject: Re: Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+
+Caution: This message originated from an External Source. Use proper caution when opening attachments, clicking links, or responding.
+
+
+Hi,
+
+comments below.
+
+On Wed, 2022-09-28 at 22:12 +0000, GonzalezVillalobos, Diego wrote:
+&gt;<i> [AMD Official Use Only - General]
+</I>&gt;<i>
+</I>&gt;<i> Hello Tomas,
+</I>&gt;<i>
+</I>&gt;<i> I generated the key as you suggested, and I am no longer getting an 
+</I>&gt;<i> error message! Thank you for that. Here is how I'm generating the key
+</I>&gt;<i> now:
+</I>&gt;<i>
+</I>&gt;<i> // SEV certificate are little-endian, must reverse bytes before 
+</I>&gt;<i> generating key
+</I>&gt;<i>             if ((cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256) ||
+</I>&gt;<i>                 (cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA384)) {
+</I>&gt;<i>                 //Grab x param and flip bytes to BE
+</I>&gt;<i>                 memcpy(px, &amp;cert-&gt;pub_key.ecdsa.qx, ec_group_order);
+</I>&gt;<i>                 if(!sev::reverse_bytes(px, sizeof(px)))
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 //Grab y param and flip bytes to BE
+</I>&gt;<i>                 memcpy(py, &amp;cert-&gt;pub_key.ecdsa.qy, ec_group_order);
+</I>&gt;<i>                 if(!sev::reverse_bytes(py, sizeof(py)))
+</I>&gt;<i>                     break;
+</I>&gt;<i>             }
+</I>&gt;<i>             else if ((cert-&gt;pub_key_algo ==
+</I>&gt;<i> SEV_SIG_ALGO_ECDH_SHA256)  ||
+</I>&gt;<i>                     (cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA384)) 
+</I>&gt;<i> {
+</I>&gt;<i>                 //Grab x param and flip bytes to BE
+</I>&gt;<i>                 memcpy(px, &amp;cert-&gt;pub_key.ecdh.qx, ec_group_order);
+</I>&gt;<i>                 if(!sev::reverse_bytes(px, sizeof(px)))
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 //Grab y param and flip bytes to BE
+</I>&gt;<i>                 memcpy(py, &amp;cert-&gt;pub_key.ecdh.qy, ec_group_order);
+</I>&gt;<i>                 if(!sev::reverse_bytes(py, sizeof(py)))
+</I>&gt;<i>                     break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             int px_size = sizeof(px)/sizeof(*px);
+</I>&gt;<i>             int py_size = sizeof(py)/sizeof(*py);
+</I>&gt;<i>
+</I>&gt;<i>             // Will contain x and y components
+</I>&gt;<i>             unsigned char public_key_xy[1 + px_size + py_size] = {0};
+</I>&gt;<i>
+</I>&gt;<i>             //Add point conversion as first value
+</I>&gt;<i>             public_key_xy[0] = POINT_CONVERSION_UNCOMPRESSED;
+</I>&gt;<i>
+</I>&gt;<i>             //Add x components after point compression
+</I>&gt;<i>             memcpy(public_key_xy + 1, px, px_size);
+</I>&gt;<i>             //Add y components after x
+</I>&gt;<i>             memcpy(public_key_xy + px_size + 1, py ,py_size);
+</I>&gt;<i>
+</I>&gt;<i>             // int nid = EC_curve_nist2nid(&quot;P-384&quot;);   //
+</I>&gt;<i> NID_secp384r1
+</I>&gt;<i>
+</I>&gt;<i>             OSSL_PARAM_BLD *params_build = OSSL_PARAM_BLD_new();
+</I>&gt;<i>
+</I>&gt;<i>             if ( params_build == NULL ) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;Params build fails&quot; &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             if (!OSSL_PARAM_BLD_push_utf8_string(params_build,
+</I>&gt;<i> OSSL_PKEY_PARAM_GROUP_NAME, &quot;P-384&quot;, 0)) {
+</I>&gt;<i>                 cout&lt;&lt; &quot;Push EC curve to build fails&quot; &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             if (!OSSL_PARAM_BLD_push_octet_string(params_build,
+</I>&gt;<i> OSSL_PKEY_PARAM_PUB_KEY, public_key_xy, sizeof(public_key_xy))) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;Error: failed to push qx into param build.&quot;
+</I>&gt;<i> &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             OSSL_PARAM *params =
+</I>&gt;<i> OSSL_PARAM_BLD_to_param(params_build);
+</I>&gt;<i>
+</I>&gt;<i>             if ( params == NULL ) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;Error: building parameters.&quot; &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             OSSL_PARAM_BLD_free(params_build);
+</I>&gt;<i>
+</I>&gt;<i>             key_gen_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+</I>&gt;<i>
+</I>&gt;<i>             if(EVP_PKEY_fromdata_init(key_gen_ctx) != 1) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;failed to initialize key creation.&quot; &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             if(EVP_PKEY_fromdata(key_gen_ctx, &amp;evp_pub_key, 
+</I>&gt;<i> EVP_PKEY_PUBLIC_KEY, params) != 1) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;key generation breaks&quot; &lt;&lt; endl;
+</I>&gt;<i>                 printf(&quot;Failed Final Verify 
+</I>&gt;<i> %s\n&quot;,ERR_error_string(ERR_get_error(),NULL));
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>
+</I>&gt;<i>             if (EVP_PKEY_get_base_id(evp_pub_key) != EVP_PKEY_EC) {
+</I>&gt;<i>                 cout &lt;&lt; &quot;wrong key type&quot; &lt;&lt; endl;
+</I>&gt;<i>                 break;
+</I>&gt;<i>             }
+</I>&gt;<i>         }
+</I>&gt;<i>
+</I>&gt;<i>         if (!evp_pub_key) {
+</I>&gt;<i>             cout &lt;&lt; &quot;no evp pkey&quot; &lt;&lt; endl;
+</I>&gt;<i>             break;
+</I>&gt;<i>         }
+</I>&gt;<i>         cout &lt;&lt; &quot;compile key succesful&quot; &lt;&lt; endl;
+</I>&gt;<i>         cmd_ret = STATUS_SUCCESS;
+</I>&gt;<i>
+</I>&gt;<i> Although the key generation works and I'm not getting a verify error 
+</I>&gt;<i> anymore, I am still unsuccessful on verifying the digest. It keeps 
+</I>&gt;<i> failing (returning 0). Here is how I'm currently trying to do the 
+</I>&gt;<i> verification.
+</I>
+Are you sure the px_size and py_size is equal to the group order? The x and y values must be padded to the group order with 0 (at the start because the values need to be BE).
+
+&gt;<i> ECDSA_SIG *tmp_ecdsa_sig = ECDSA_SIG_new();
+</I>&gt;<i>                 BIGNUM *r_big_num = BN_new();
+</I>&gt;<i>                 BIGNUM *s_big_num = BN_new();
+</I>&gt;<i>                 uint32_t sig_len;
+</I>&gt;<i>                 unsigned char* der_sig;
+</I>&gt;<i>
+</I>&gt;<i>                 // Store the x and y components as separate BIGNUM 
+</I>&gt;<i> objects. The values in the
+</I>&gt;<i>                 // SEV certificate are little-endian, must reverse 
+</I>&gt;<i> bytes before storing in BIGNUM
+</I>&gt;<i>                 r_big_num = BN_lebin2bn(cert_sig[i].ecdsa.r,
+</I>&gt;<i> sizeof(sev_ecdsa_sig::r), r_big_num);    // LE to BE
+</I>&gt;<i>                 s_big_num = BN_lebin2bn(cert_sig[i].ecdsa.s, 
+</I>&gt;<i> sizeof(sev_ecdsa_sig::s), s_big_num);
+</I>&gt;<i>
+</I>&gt;<i>                 // Calling ECDSA_SIG_set0() transfers the memory 
+</I>&gt;<i> management of the values to
+</I>&gt;<i>                 // the ECDSA_SIG object, and therefore the values that 
+</I>&gt;<i> have been passed
+</I>&gt;<i>                 // in should not be freed directly after this function 
+</I>&gt;<i> has been called
+</I>&gt;<i>                 if (ECDSA_SIG_set0(tmp_ecdsa_sig,
+</I>&gt;<i> r_big_num,s_big_num) != 1) {
+</I>&gt;<i>                     BN_free(s_big_num); // FreesBIGNUMs manually here
+</I>&gt;<i>                     BN_free(r_big_num);
+</I>&gt;<i>                     ECDSA_SIG_free(tmp_ecdsa_sig);
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>
+
+&gt;<i>                 int der_sig_len = i2d_ECDSA_SIG(tmp_ecdsa_sig, NULL);
+</I>&gt;<i>                 der_sig = static_cast&lt;unsigned 
+</I>&gt;<i> char*&gt;(OPENSSL_malloc(der_sig_len));
+</I>&gt;<i>                 unsigned char* der_iter = der_sig;
+</I>&gt;<i>                 der_sig_len = i2d_ECDSA_SIG(tmp_ecdsa_sig, &amp;der_iter); 
+</I>&gt;<i> // &lt;= bugfix here
+</I>&gt;<i>
+</I>&gt;<i>                 if (der_sig_len == 0) {
+</I>&gt;<i>                     cout &lt;&lt; &quot;sig length invalid&quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>&gt;<i>                 if (der_sig == NULL) {
+</I>&gt;<i>                     cout &lt;&lt; &quot;sig generation failed&quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>
+You do not need to call i2d_ECDSA_SIG() twice. Just assign NULL to der_iter and i2d_ECDSA_SIG(tmp_ecdsa_sig, &amp;der_iter) call will allocate the buffer for the encoded signature for you.
+
+
+&gt;<i>                 verify_md_ctx = EVP_MD_CTX_new();
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>                 if (!verify_md_ctx) {
+</I>&gt;<i>                     cout &lt;&lt; &quot;Error md verify context &quot; &lt;&lt; endl;;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>&gt;<i>                 if (EVP_DigestVerifyInit(verify_md_ctx, NULL, 
+</I>&gt;<i> (parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDSA_SHA256 || 
+</I>&gt;<i> parent_cert-&gt;pub_key_algo == SEV_SIG_ALGO_ECDH_SHA256) ?
+</I>&gt;<i> EVP_sha256(): EVP_sha384(), NULL, parent_signing_key) &lt;= 0) {
+</I>&gt;<i>                     cout &lt;&lt; &quot;Init fails &quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>&gt;<i>                 if (EVP_DigestVerifyUpdate(verify_md_ctx, (uint8_t 
+</I>&gt;<i> *)child_cert, pub_key_offset) &lt;= 0){&#160;&#160;&#160; // Calls SHA256_UPDATE
+</I>&gt;<i>                     cout &lt;&lt; &quot;updating digest fails&quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>&gt;<i>                 int ret = EVP_DigestVerifyFinal(verify_md_ctx,
+</I>&gt;<i> der_sig, der_sig_len);
+</I>&gt;<i>                 cout &lt;&lt; ret &lt;&lt; endl;
+</I>&gt;<i>                 if (ret == 0) {
+</I>&gt;<i>                     cout &lt;&lt; &quot;EC Verify digest fails&quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 } else if (ret &lt; 0) {
+</I>&gt;<i>                     printf(&quot;Failed Final Verify 
+</I>&gt;<i> %s\n&quot;,ERR_error_string(ERR_get_error(),NULL));
+</I>&gt;<i>                     cout &lt;&lt; &quot;EC Verify error&quot; &lt;&lt; endl;
+</I>&gt;<i>                     break;
+</I>&gt;<i>                 }
+</I>&gt;<i>
+</I>&gt;<i>                 found_match = true;
+</I>&gt;<i>                 cout &lt;&lt; &quot;SEV EC verification Succesful&quot; &lt;&lt; endl;
+</I>&gt;<i>
+</I>&gt;<i> Could it be because I'm creating a ECDSA SIG object and then turning 
+</I>&gt;<i> it into a der format to verify? Again, suggestions would be 
+</I>&gt;<i> appreciated.
+</I>
+No, that should be correct. The signature as produced or verified by the EVP_DigestSignFinal or EVP_DigestVerifyFinal should be in the DER encoding of the ECDSA_SIG. So you have that correct.
+
+I do not see any apparent problem with your code apart of the remarks above.
+
+--
+Tom&#225;&#353; Mr&#225;z, OpenSSL
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015447.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+	<LI>Next message (by thread): <A HREF="015454.html">Updating RSA public key generation and signature verification from 1.1.1 to 3.0
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15449">[ date ]</a>
+              <a href="thread.html#15449">[ thread ]</a>
+              <a href="subject.html#15449">[ subject ]</a>
+              <a href="author.html#15449">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

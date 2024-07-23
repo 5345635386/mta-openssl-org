@@ -1,0 +1,128 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Find size of available data prior to ssl_read
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2015-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Find%20size%20of%20available%20data%20prior%20to%20ssl_read&In-Reply-To=%3CB550B44BF8AF314BB00C4E2AC1C18088015DC6E8A4%40Rock-Exchange1.microfocus.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002568.html">
+   <LINK REL="Next"  HREF="002570.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Find size of available data prior to ssl_read</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Find%20size%20of%20available%20data%20prior%20to%20ssl_read&In-Reply-To=%3CB550B44BF8AF314BB00C4E2AC1C18088015DC6E8A4%40Rock-Exchange1.microfocus.com%3E"
+       TITLE="[openssl-users] Find size of available data prior to ssl_read">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Wed Dec 16 20:00:39 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002568.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+        <LI>Next message: <A HREF="002570.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2569">[ date ]</a>
+              <a href="thread.html#2569">[ thread ]</a>
+              <a href="subject.html#2569">[ subject ]</a>
+              <a href="author.html#2569">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf
+</I>&gt;<i> Of Martin Brampton
+</I>&gt;<i> Sent: Wednesday, December 16, 2015 13:23
+</I>&gt;<i> 
+</I>&gt;<i> Is there a way to obtain the amount of data available to be read?
+</I>&gt;<i> 
+</I>&gt;<i> I'm working with a system that operates in non-blocking mode using
+</I>&gt;<i> epoll. When an EPOLLIN event is received the aim is to read the data.
+</I>&gt;<i> For the non-SSL case, the amount of data can be obtained using ioctl
+</I>&gt;<i> FIONREAD.  This is used to malloc a suitable sized buffer, followed by
+</I>&gt;<i> read the data into the buffer.
+</I>&gt;<i> 
+</I>&gt;<i> How should the SSL version of our code work?  At present it is using the
+</I>&gt;<i> sum of the number obtained from ioctl FIONREAD (which seems suspect
+</I>&gt;<i> when
+</I>&gt;<i> SSL is in use and appears to be always too large) and the number from
+</I>&gt;<i> ssl_pending (which seems to be zero).  The buffer then has to be truncated.
+</I>
+TCP is a stream service. It may deliver (to the application, which in this case means to OpenSSL) part of an SSL/TLS record, a single complete record, multiple records...
+
+In some situations, you may reliably receive one TLS record at a time. You can't assume that will be the general case, particularly for application protocols that aren't simple alternating request-response pairs, or over long network paths, or with large blocks of application data, or if the recipient's stack is squeezed for resources.
+
+FIONREAD will show the amount of data available from the stack. SSL_pending will show the amount of application data from complete records OpenSSL has already received and processed that the application has not read from OpenSSL yet. Per above, the former can represent less than one record to multiple records and possibly a partial one at the end. The latter may well not be zero, for example if the peer does multiple sends, or sends a block of data large enough that it gets chunked into multiple TLS records; then OpenSSL may read data from the stack and get multiple complete records, in which case SSL_pending will be &gt; 0.
+
+Note that nothing in the OpenSSL API gives you the number of bytes of a partial record that OpenSSL has received from the stack.
+
+Even in the ideal case where exactly a single TLS record is sitting in the stack's buffers, FIONREAD will be larger than the size of the application data, because it's a TLS record, which has non-zero overhead. Specifically it has a header containing type, version, and length, and a footer with MAC and padding. The application only gets the application data, so it must get fewer than FIONREAD bytes.
+
+Unless I'm forgetting something, since Open SSL will only deliver application data to the caller, and only from a complete record, then:
+
+- If, when the application obtains the values from FIONREAD + ssl_pending (call this sum N), at least one complete TLS record has been received by the stack and not read by the application, then the amount of data the application gets from SSL_read will be strictly less than N
+- Otherwise, in the case where the application gets those values too early, N will be less than the size of the record OpenSSL will eventually assemble, the amount of application data *may* be greater than, equal to (unlikely), or less than N. In this case there's simply no way for the application to know.
+
+&gt;<i> Can this approach work?
+</I>
+No. OpenSSL doesn't know how much data is in a TLS record until it's processed it, and it doesn't know that until it has the complete record. (It could assume the record is valid before it has the complete record and look at the length field, but it doesn't know how long the padding is until it has the very last byte. And assuming the record is valid is a Bad Idea.)
+
+Consequently, your application can't know that either.
+
+Looking at the amount of data buffered by the stack is pointless, for the reasons discussed above.
+
+&gt;<i>  Could it be improved?  Or is there some
+</I>&gt;<i> fundamental problem with operating in this way?
+</I>
+The fundamental problem is that you don't know how much data is going to be available from whatever complete records OpenSSL has received, and you don't even know that OpenSSL has received a complete record. The sender could be dribbling data to you one byte at a time. (This would be perverse, but what if some MITM is mucking about with your window announcements? Note those are at the TCP protocol level and so are not protected by TLS.)
+
+You might want to look at something like this:
+
+- Use non-blocking sockets. When you get a POLLIN event, try SSL_read with a small fixed buffer. If it returns SSL_WANT_READ, you don't have a complete record yet.
+- Set the read-ahead flag with SSL_CTX_set_read_ahead (before creating your SSL objects), so that OpenSSL will grab all available data off the wire when you call SSL_read; that will reduce useless POLLIN events.
+- When you have a successful SSL_read, use SSL_pending to get the number of application-data bytes remaining. Allocate a buffer of fixed-small-buffer-size + value-from-SSL_pending. Copy in the small fixed buffer, then SSL_read into the tail of the allocated buffer.
+- If SSL_read returns SSL_WANT_READ, loop back to poll. The call to SSL_read (with read-ahead set in the SSL object via the context) should have grabbed the available data from the socket, so the socket will no longer be readable unless something else has arrived in the meantime.
+
+Disclaimer: I haven't tried this.
+
+-- 
+Michael Wojcik
+Technology Specialist, Micro Focus
+
+
+</PRE>
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002568.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+	<LI>Next message: <A HREF="002570.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2569">[ date ]</a>
+              <a href="thread.html#2569">[ thread ]</a>
+              <a href="subject.html#2569">[ subject ]</a>
+              <a href="author.html#2569">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

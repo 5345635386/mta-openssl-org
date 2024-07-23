@@ -1,0 +1,193 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> EVP_PKEY_get_params strange behaviors
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2022-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20EVP_PKEY_get_params%20strange%20behaviors&In-Reply-To=%3CY3zLtZY3R1QqS20M%40archenemy.localdomain%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015703.html">
+   <LINK REL="Next"  HREF="015687.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>EVP_PKEY_get_params strange behaviors</H1>
+    <B>ryan at splintermail.com</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20EVP_PKEY_get_params%20strange%20behaviors&In-Reply-To=%3CY3zLtZY3R1QqS20M%40archenemy.localdomain%3E"
+       TITLE="EVP_PKEY_get_params strange behaviors">ryan at splintermail.com
+       </A><BR>
+    <I>Tue Nov 22 13:16:37 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015703.html">Upgrading OpenSSL on Windows 10
+</A></li>
+        <LI>Next message (by thread): <A HREF="015687.html">OpenSSL FIPS certificate #4282
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15680">[ date ]</a>
+              <a href="thread.html#15680">[ thread ]</a>
+              <a href="subject.html#15680">[ subject ]</a>
+              <a href="author.html#15680">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I just migrated some JWK code from openssl 1.x to 3.x.
+
+First I have to say, a lot of things got a lot easier and a lot clearer
+than before.
+
+I did see some strange behaviors with EVP_PKEY_get_params.  I see the
+following statements from `man OSSL_PARAM`:
+
+    [A] When requesting parameters, it's acceptable for data to be NULL.
+    This can be used by the requestor to figure out dynamically exactly
+    how much buffer space is needed to store the parameter data.  In
+    this case, data_size is ignored.
+
+    [B] If a responder finds that some data sizes are too small for the
+    requested data, it must set return_size for each such OSSL_PARAM
+    item to the minimum required size, and eventually return an error.
+
+    [C] For the integer type parameters (OSSL_PARAM_UNSIGNED_INTEGER and
+    OSSL_PARAM_INTEGER), a responder may choose to return an error if
+    the data_size isn't a suitable size (even if data_size is bigger
+    than needed).  If the responder finds the size suitable, it must
+    fill all data_size bytes and ensure correct padding for the native
+    endianness, and set return_size to the same value as data_size.
+
+My understanding of [A] is that: when requesting parameters, if data is
+NULL then data_size is *ignored*, meaning it does not affect any outputs
+or behaviors of the function.
+
+My understanding of [C] is that: it applies to each of the &quot;qx&quot;, &quot;qy&quot;,
+and &quot;priv&quot; members of my EC-based pkey, which are all unsigned integers
+according to `man EVP_PKEY-EC`.
+
+But what I observe is that:
+
+- [A] is not being respected, and EVP_PKEY_get_params() is returning
+  errors when data_size is too small, even when data==NULL.
+
+- In those failure cases, the return_size is not being set, which
+  violates [B].
+
+- When data is set and data_size is larger-than-necessary, qx and qy are
+  behaving according to [C] but priv is not.
+
+
+Reproducing code:
+
+    #include &lt;openssl/ec.h&gt; #include &lt;openssl/evp.h&gt;
+
+    int main(void){
+        EVP_PKEY *pkey = EVP_EC_gen(&quot;P-256&quot;);
+        int ret;
+
+        #define UINT OSSL_PARAM_UNSIGNED_INTEGER
+        OSSL_PARAM p1[] = {
+            {.key=&quot;qx&quot;, .data_type=UINT, .data=NULL },
+            {.key=&quot;qy&quot;, .data_type=UINT, .data=NULL },
+            {.key=&quot;priv&quot;, .data_type=UINT, .data=NULL },
+            {0},
+        };
+        ret = EVP_PKEY_get_params(pkey, p1);
+
+        printf(&quot;ret = %d\n&quot;, ret);
+        printf(&quot;xlen = %zu\n&quot;, p1[0].return_size);
+        printf(&quot;ylen = %zu\n&quot;, p1[1].return_size);
+        printf(&quot;dlen = %zu\n--\n&quot;, p1[2].return_size);
+
+        // output:
+        //   ret = 0      # Failure because of B, but only if you ignore A.
+        //   xlen = 32
+        //   ylen = 32
+        //   dlen = 0     # Violates B.
+
+        OSSL_PARAM p2[] = {
+            {.key=&quot;qx&quot;, .data_type=UINT, .data=NULL, .data_size=SIZE_MAX },
+            {.key=&quot;qy&quot;, .data_type=UINT, .data=NULL, .data_size=SIZE_MAX },
+            {.key=&quot;priv&quot;, .data_type=UINT, .data=NULL, .data_size=SIZE_MAX },
+            {0},
+        };
+        ret = EVP_PKEY_get_params(pkey, p2);
+
+        printf(&quot;ret = %d\n&quot;, ret);
+        printf(&quot;xlen = %zu\n&quot;, p2[0].return_size);
+        printf(&quot;ylen = %zu\n&quot;, p2[1].return_size);
+        printf(&quot;dlen = %zu\n--\n&quot;, p2[2].return_size);
+
+        // output:     # What I wanted, but requires undocumented inputs.
+        //   ret = 1
+        //   xlen = 32
+        //   ylen = 32
+        //   dlen = 32
+
+        char x[256];
+        char y[256];
+        char d[256];
+
+        OSSL_PARAM p3[] = {
+            {.key=&quot;qx&quot;, .data_type=UINT, .data=x, .data_size=256 },
+            {.key=&quot;qy&quot;, .data_type=UINT, .data=y, .data_size=256 },
+            {.key=&quot;priv&quot;, .data_type=UINT, .data=d, .data_size=256 },
+            {0},
+        };
+        ret = EVP_PKEY_get_params(pkey, p3);
+
+        printf(&quot;ret = %d\n&quot;, ret);
+        printf(&quot;xlen = %zu\n&quot;, p3[0].return_size);
+        printf(&quot;ylen = %zu\n&quot;, p3[1].return_size);
+        printf(&quot;dlen = %zu\n&quot;, p3[2].return_size);
+
+        // output:
+        //   ret = 1
+        //   xlen = 256  # Seems annoying, but this is what C. says.
+        //   ylen = 256
+        //   dlen = 32   # Seems helpful, but actually violates C.
+
+        EVP_PKEY_free(pkey);
+
+        return 0;
+    }
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015703.html">Upgrading OpenSSL on Windows 10
+</A></li>
+	<LI>Next message (by thread): <A HREF="015687.html">OpenSSL FIPS certificate #4282
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15680">[ date ]</a>
+              <a href="thread.html#15680">[ thread ]</a>
+              <a href="subject.html#15680">[ subject ]</a>
+              <a href="author.html#15680">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

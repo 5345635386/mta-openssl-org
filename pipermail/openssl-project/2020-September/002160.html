@@ -1,0 +1,217 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> Reordering new API's that have a libctx, propq
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-project/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20Reordering%20new%20API%27s%20that%20have%20a%20libctx%2C%20propq&In-Reply-To=%3C87pn6vs2vv.wl-levitte%40openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002180.html">
+   <LINK REL="Next"  HREF="002161.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>Reordering new API's that have a libctx, propq</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-project%40openssl.org?Subject=Re%3A%20Reordering%20new%20API%27s%20that%20have%20a%20libctx%2C%20propq&In-Reply-To=%3C87pn6vs2vv.wl-levitte%40openssl.org%3E"
+       TITLE="Reordering new API's that have a libctx, propq">levitte at openssl.org
+       </A><BR>
+    <I>Wed Sep  9 09:41:56 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002180.html">Reordering new API's that have a libctx, propq
+</A></li>
+        <LI>Next message: <A HREF="002161.html">Reordering new API's that have a libctx, propq
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2160">[ date ]</a>
+              <a href="thread.html#2160">[ thread ]</a>
+              <a href="subject.html#2160">[ subject ]</a>
+              <a href="author.html#2160">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>A few of the more active developers currently have a videocall meeting
+every tuesday, in the morning for us in Europe.
+
+We talked about this issue yesterday, and realised quite a few things.
+One pretty important thing to realise is that while many new functions
+take a library context and a property query string that are located
+together, that doesn't mean that they are the coupled pair that we
+made them out to be, quite the contrary.
+
+The library context has been called many things...  during the vidcall
+yesterday, it was compared to &quot;a global state&quot;, which could be a term
+that we can agree with, since its primary function is to be a
+collection of stuff that were previously global.
+
+The property query string, on the other hand, is only interesting for
+fetching implementations, so if it's to be conceptually coupled with
+anything, it's with the name of the algorithm that's being fetched.
+This is most visible when we pass a cipher or digest name to some
+provider-side implementations; they also always take a property query
+string (if we've missed a spot, please raise an issue).
+
+Do note that there are places where we pass a property query string
+without passing an algorithm name.  That happen when the algorithm
+name is inferred from another object that's passed in.  For example:
+
+    EVP_PKEY_CTX *EVP_PKEY_CTX_new_from_pkey(OPENSSL_CTX *libctx,
+                                             EVP_PKEY *pkey,
+                                             const char *propquery);
+
+This function would classically be used when you have a |pkey| with
+just domain parameters, and you want to generate a key from it.  In
+this case, the algorithm name is inferred from the |pkey|.
+
+With this, it makes sense to conceptually decouple the library context
+and the property query string, and to view the passing of them to
+diverse functions in form of a pair as accidental.  We can thereby
+talk about them separately.
+
+                        --------
+
+Regarding the library context, when viewed as a global state, it makes
+sense to have it as a first argument where it's being passed, if at
+all.  The question is, where should we actually pass it?  We have a
+few different suggestions, in wording or in code, on the table:
+
+1.  Pass it as first argument everywhere.  This is problematic, as
+    &quot;everywhere&quot; is a *lot*, and if we do this, we might as well
+    re-design the whole libcrypto API [*], and that's definitely not
+    what OpenSSL 3.0 is about, quite the contrary.
+
+    This has been partially done, with all the _with_libctx
+    functions.  As far as I've understood, these have been added on
+    need basis, i.e. somewhere down the code path, a library context
+    or a property query string is needed.  I can't say if this gives
+    any sense of completeness or consistency, viewed as an cohesive
+    API, or if we stand any chance of getting there without a complete
+    API re-design.
+
+    Something to be noted is that it doesn't make sense to pass the
+    library context everywhere, because it's already part of other
+    structures that are passed.  For example, any method structure,
+    such as EVP_CIPHER, EVP_MD, etc are tied to a provider, which is
+    in turn tied to a library context.  Passing another library
+    context to anything that includes one of those method structures
+    would only be confusing.
+
+2.  Pass it when constructing different structures, mostly other
+    context structures.  As an example, EVP_PKEY_CTX_new_from_pkey()
+    that I displayed above.  There may be cases where we need to pass
+    it directly to functions that aren't constructors, but I expect
+    those cases to be relatively few.
+
+    This has been done for some other structures as well, on an as
+    needed basis:
+
+        X509 *X509_new_with_libctx(OPENSSL_CTX *libctx, const char *propq);
+
+        X509_STORE_CTX *X509_STORE_CTX_new_with_libctx(OPENSSL_CTX *libctx,
+                                                       const char *propq);
+
+    (the following are internal only)
+
+        int x509_set0_libctx(X509 *x, OPENSSL_CTX *libctx, const char *propq);
+        int x509_crl_set0_libctx(X509_CRL *x, OPENSSL_CTX *libctx, const char *propq);
+
+3.  Set a current library context, a pointer in a thread local
+    variable.  We already have support for that, which this function:
+
+        OPENSSL_CTX *OPENSSL_CTX_set0_default(OPENSSL_CTX *libctx);
+
+    The usage model is this:
+
+        OPENSSL_CTX *prevctx = OPENSSL_CTX_set0_default(libctx);
+
+        /* do stuff with |libctx| as implicit current global state */
+
+        OPENSSL_CTX_set0_default(prevctx)
+
+Looking at that list now, I realise that it goes from most intrusive
+to least intrusive, viewed as a public API.
+
+The third choice in particular would let any application or library
+just set their library context for the duration of the code that
+should be execute with that as a &quot;global state&quot;, and restore it when
+done, leaving the rest of the OpenSSL calls untouched.
+
+Something to be noted is that model 2 and 3 is possible to combine,
+which could give us a smoother transition between the current API and
+whatever we design going forward.
+
+                        --------
+
+Regarding the property query string, looking at it separate from the
+library context, the question remains where to put it, and a few
+proposals are on the table:
+
+1.  Put it last.
+
+2.  Put it next to the algorithm name or the object that an algorithm
+    name is inferred from.
+
+3.  Set it &quot;globally&quot; with a thread local variable, a bit like what
+    OPENSSL_CTX_set0_default() does for library contexts.
+
+    For this model, it's been argued if it should simply be stored in
+    the current library context, thereby avoiding to add another
+    thread local variable (which, for all intents and purposes, is
+    another actually global thing to deal with, even though on
+    per-thread level).
+
+In my mind, model 2 would be more sensible than model 1, because of
+the implied tie between algorithm name and property query string.
+Also, even here, model 3 is possible to combine with model 2, and even
+with model 1.
+
+Regarding model 3, it must be said that there is potential for confusion
+on what it's supposed to do, replace the default property query string
+(settable with EVP_set_default_properties()), or merge with it.
+Remember that a property query string given through any XXX_fetch()
+function is temporarly merged with the default properties when looking
+for fitting algorithms.
+
+                        --------
+
+Thoughts?
+
+Cheers,
+Richard
+
+[*] The OpenSSL API could do with a re-design, but that's for the
+farther future and requires a lot of thought and time.
+
+-- 
+Richard Levitte         <A HREF="../../../mailman/listinfo/openssl-project.html">levitte at openssl.org</A>
+OpenSSL Project         <A HREF="http://www.openssl.org/~levitte/">http://www.openssl.org/~levitte/</A>
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002180.html">Reordering new API's that have a libctx, propq
+</A></li>
+	<LI>Next message: <A HREF="002161.html">Reordering new API's that have a libctx, propq
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2160">[ date ]</a>
+              <a href="thread.html#2160">[ thread ]</a>
+              <a href="subject.html#2160">[ subject ]</a>
+              <a href="author.html#2160">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-project.html">More information about the openssl-project
+mailing list</a><br>
+</body></html>

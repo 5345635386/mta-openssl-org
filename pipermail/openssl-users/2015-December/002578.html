@@ -1,0 +1,119 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Find size of available data prior to ssl_read
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2015-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Find%20size%20of%20available%20data%20prior%20to%20ssl_read&In-Reply-To=%3CB550B44BF8AF314BB00C4E2AC1C18088015DC6EFAA%40Rock-Exchange1.microfocus.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002577.html">
+   <LINK REL="Next"  HREF="002581.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Find size of available data prior to ssl_read</H1>
+    <B>Michael Wojcik</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Find%20size%20of%20available%20data%20prior%20to%20ssl_read&In-Reply-To=%3CB550B44BF8AF314BB00C4E2AC1C18088015DC6EFAA%40Rock-Exchange1.microfocus.com%3E"
+       TITLE="[openssl-users] Find size of available data prior to ssl_read">Michael.Wojcik at microfocus.com
+       </A><BR>
+    <I>Thu Dec 17 18:00:45 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002577.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+        <LI>Next message: <A HREF="002581.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2578">[ date ]</a>
+              <a href="thread.html#2578">[ thread ]</a>
+              <a href="subject.html#2578">[ subject ]</a>
+              <a href="author.html#2578">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: openssl-users [mailto:<A HREF="../../../mailman/listinfo/openssl-users.html">openssl-users-bounces at openssl.org</A>] On Behalf
+</I>&gt;<i> Of counterpoint
+</I>&gt;<i> Sent: Thursday, December 17, 2015 11:35
+</I>&gt;<i> 
+</I>&gt;<i> Thanks, that makes sense. My ability to optimise is constrained - the system
+</I>&gt;<i> is a product so I do not know what the actual pattern of usage will be. But
+</I>&gt;<i> there is a limit on buffer size within the system. It's a defined symbol, so
+</I>&gt;<i> can be altered from the default of 32 KB, but only by recompiling the
+</I>&gt;<i> system. I rely on a working assumption that people who change definitions
+</I>&gt;<i> and recompile know what they're doing.
+</I>
+Fair enough.
+
+&gt;<i> The system is threaded, but it is designed to operate with a relatively
+</I>&gt;<i> small number of highly active threads, so grabbing 32 KB on the stack for a
+</I>&gt;<i> short period shouldn't be too much of an issue.
+</I>
+It's not really a matter of how many threads there are (except indirectly), or of how long the item is on the stack. It's a question of how much space is available on the thread's stack when you try to allocate the buffer (which, assuming we're talking C or C++, is when you enter the function / method).
+
+A thread's stack size is typically set at creation time, with a default that may be fixed in the threading implementation or set at link time. How much space is available when you allocate that 32 KB buffer depends on how deep your call chain is and how much data each of those frames adds to the stack.
+
+If the stack is too small to accommodate the buffer and can't be expanded, you'll get some kind of run-time failure, like a Windows exception or a UNIX signal.
+
+Note that stack space is an address-space resource, not (generally) a virtual memory one - that is, stack-space is unlikely to be constrained because the system is running short on virtual memory. It'll happen because most language implementations use contiguous stacks for performance (rather than, say, displays or other non-contiguous structures), and if the stack runs into something else in the process address space, it can't grow any further. So if your process is 64-bit, you should be able to specify ridiculously large thread stacks and not worry about it.
+
+If the process is 32-bit, take a look at your thread stack sizes and do a quick estimate on how much space you expect will be there. You can determine this for a specific thread, in a specific run, in a debugger by looking at the address of an automatic variable at the bottom of the thread's stack (in the thread's initial function) and the address of one in your data-receiving function. (Technically comparing those addresses isn't authorized by the language standard, but it's valid on most of the platforms OpenSSL supports.)
+
+So I'd say try it in some test runs and see if it looks like stack space might be getting tight; if so, you can likely increase the stack size you specify when creating your threads, since you don't have many of them.
+
+&gt;<i> One remaining point leaves me uncertain. Supposing an SSL write gets the
+</I>&gt;<i> response SSL_ERROR_WANT_READ. Then there is a POLLIN event. I take it
+</I>&gt;<i> the
+</I>&gt;<i> first thing that must happen is a retry of the write. Assuming that works,
+</I>&gt;<i> do I need to assume that there could be data to be read?  Or will a further
+</I>&gt;<i> event occur, so that I should return to looking out for events?  I guess the
+</I>&gt;<i> answer to the last question is probably no, but am unsure.
+</I>
+There could be data to be read. Consider this scenario:
+
+1. The peer decides it wants to renegotiate during the conversation.
+2. In the middle of the handshake, you call SSL_write. The handshake hasn't completed, and the local side is waiting for a message from the peer, so SSL_write returns SSL_ERROR_WANT_READ.
+3. You wait for POLLIN, then call SSL_write again.
+4. Before SSL_write returns, the peer has time to respond to the request you just sent. Or it sends something else immediately after completing the handshake, if your application doesn't use a strict switched-duplex request-response protocol.
+
+So I'd recommend going ahead and trying a non-blocking SSL_read at that point. The overhead is tiny and you won't miss any inbound-data events.
+
+-- 
+Michael Wojcik
+Technology Specialist, Micro Focus
+
+
+</PRE>
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002577.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+	<LI>Next message: <A HREF="002581.html">[openssl-users] Find size of available data prior to ssl_read
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2578">[ date ]</a>
+              <a href="thread.html#2578">[ thread ]</a>
+              <a href="subject.html#2578">[ subject ]</a>
+              <a href="author.html#2578">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>

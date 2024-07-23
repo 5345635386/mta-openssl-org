@@ -1,0 +1,161 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-users] Behaviour of OpenSSL when CApath or CAfile contains a 'trusted certificate' with all uses rejected
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-users/2015-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Behaviour%20of%20OpenSSL%20when%20CApath%20or%20CAfile%0A%20contains%20a%20%27trusted%20certificate%27%20with%20all%20uses%20rejected&In-Reply-To=%3C1421358704.15361.249.camel%40redhat.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000267.html">
+   <LINK REL="Next"  HREF="000272.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-users] Behaviour of OpenSSL when CApath or CAfile contains a 'trusted certificate' with all uses rejected</H1>
+    <B>Adam Williamson</B> 
+    <A HREF="mailto:openssl-users%40openssl.org?Subject=Re%3A%20%5Bopenssl-users%5D%20Behaviour%20of%20OpenSSL%20when%20CApath%20or%20CAfile%0A%20contains%20a%20%27trusted%20certificate%27%20with%20all%20uses%20rejected&In-Reply-To=%3C1421358704.15361.249.camel%40redhat.com%3E"
+       TITLE="[openssl-users] Behaviour of OpenSSL when CApath or CAfile contains a 'trusted certificate' with all uses rejected">awilliam at redhat.com
+       </A><BR>
+    <I>Thu Jan 15 21:51:44 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000267.html">[openssl-users] Behaviour of OpenSSL when CApath or CAfile contains a 'trusted certificate' with all uses rejected
+</A></li>
+        <LI>Next message: <A HREF="000272.html">[openssl-users] [PATCH] apps: when -purpose is passed,	set matching trust param
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#271">[ date ]</a>
+              <a href="thread.html#271">[ thread ]</a>
+              <a href="subject.html#271">[ subject ]</a>
+              <a href="author.html#271">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Thu, 2015-01-15 at 04:52 -0800, Adam Williamson wrote:
+
+&gt;<i> If anyone can point out what I'm missing I'd be very grateful :)
+</I>
+So I think I may actually know more or less what's going on, now.
+
+Passing -purpose to `verify` seems to really enable only *purpose* 
+checking. It doesn't actually enable any *trust* checking. I was 
+thrown for a while because of this, in v3_purp.c:
+
+static X509_PURPOSE xstandard[] = {
+        {X509_PURPOSE_SSL_CLIENT, X509_TRUST_SSL_CLIENT, 0, check_purpose_ssl_client, &quot;SSL client&quot;, &quot;sslclient&quot;, NULL},
+        {X509_PURPOSE_SSL_SERVER, X509_TRUST_SSL_SERVER, 0, check_purpose_ssl_server, &quot;SSL server&quot;, &quot;sslserver&quot;, NULL},
+        {X509_PURPOSE_NS_SSL_SERVER, X509_TRUST_SSL_SERVER, 0, check_purpose_ns_ssl_server, &quot;Netscape SSL server&quot;, &quot;nssslserver&quot;, NULL},
+        {X509_PURPOSE_SMIME_SIGN, X509_TRUST_EMAIL, 0, check_purpose_smime_sign, &quot;S/MIME signing&quot;, &quot;smimesign&quot;, NULL},
+        {X509_PURPOSE_SMIME_ENCRYPT, X509_TRUST_EMAIL, 0, check_purpose_smime_encrypt, &quot;S/MIME encryption&quot;, &quot;smimeencrypt&quot;, NULL},
+        {X509_PURPOSE_CRL_SIGN, X509_TRUST_COMPAT, 0, check_purpose_crl_sign, &quot;CRL signing&quot;, &quot;crlsign&quot;, NULL},
+        {X509_PURPOSE_ANY, X509_TRUST_DEFAULT, 0, no_check, &quot;Any Purpose&quot;, &quot;any&quot;, NULL},
+        {X509_PURPOSE_OCSP_HELPER, X509_TRUST_COMPAT, 0, ocsp_helper, &quot;OCSP helper&quot;, &quot;ocsphelper&quot;, NULL},
+        {X509_PURPOSE_TIMESTAMP_SIGN, X509_TRUST_TSA, 0, check_purpose_timestamp_sign, &quot;Time Stamp signing&quot;, &quot;timestampsign&quot;, NULL},
+
+which clearly associates an X509_TRUST with each X509_PURPOSE. But 
+then I noticed that nothing ever calls X509_PURPOSE_get_trust(). So it 
+seems like that's kind of vestigial - the association between purpose 
+and trust is written in, and there's a function to get the trust for a 
+given purpose, but nothing *uses* it.
+
+In my test situation, pure purpose checking will never fail any of the 
+certs in the chain for SSL server purposes, and that's not actually 
+wrong: they *are* valid as far as the purpose checks go.
+
+When 's_client' fails, it fails when running X509_check_trust() on the 
+root cert, which is pretty much what you'd expect. That wouldn't 
+happen with 'verify', not even when you pass -purpose , because 
+nothing sets a trust from the purpose, so X509_check_trust() never 
+gets called in this bit of X509_verify_cert():
+
+        /* The chain extensions are OK: check trust */
+
+        if (param-&gt;trust &gt; 0) ok = check_trust(ctx);
+
+because param-&gt;trust is 0, the default for x509 per the 
+'default_table[]' in x509_vpm.c. Right? Whereas when using s_client, 
+param-&gt;trust gets set to X509_TRUST_SSL_CLIENT or 
+X509_TRUST_SSL_SERVER because those are the defaults for 'ssl_client' 
+and 'ssl_server' in default_table[] (and if you traced that back out 
+all the way to ssl3_connect(), it seems to always read in the defaults 
+for either ssl_client or ssl_server from that table, boy that was fun 
+to figure out).
+
+Basically, it seems like you can't ever cause trust checking to happen 
+when using 'verify'. I did throw some printf()s into 
+X509_check_trust() and check_purpose_ssl_server() and indeed I see 
+both sets of messages when using 's_client', but I only see the 
+messages from check_purpose_ssl_server() when using 'verify', not the 
+ones from X509_check_trust().
+
+(I also now see on a careful read of x509_vfy.c that purpose checks 
+are done on all of the untrusted certs in the chain, which is why 
+they're not done on the root CA cert, and check_trust() in 1.0.1k is 
+run on the last cert in the chain - presumably expected to be the root 
+CA - while in master it's run on all trusted certs in the chain. That 
+clears up my confusion about exactly what tests were being run on what 
+certs).
+
+So, I think I more or less understand the behaviour I'm seeing now, 
+and in practice, I *think* it'd be safe to say that p11-kit's approach 
+should work correctly in practice, because real-world SSL clients will 
+be going through the SSL bits and hence getting a correct default 
+'trust' parameter if they don't their own. Right?
+
+I'm guessing perhaps the PURPOSE -&gt; TRUST associations were *intended* 
+to enable trust checking in 'verify', but this just never got 
+finished. They, and the X509_PURPOSE_get_trust() function, both seem 
+to have turned up in commit d4cec6a13dfb2c1d1ddf66dff499aaf21bbbf002 , 
+in 1999:
+
+
+
+
+&#160;&#160;&#160;&#160;New options to the -verify program which can be used for chain verification.&#160;&#160;&#160;&#160;Extend the X509_PURPOSE structure to include shortnames for purposed and default&#160;&#160;&#160;&#160;trust ids.&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;Still need some extendable trust checking code and integration with the SSL and&#160;&#160;&#160;&#160;S/MIME code.
+but I'm guessing that just never quite got finished off?
+-- 
+Adam Williamson
+Fedora QA Community Monkey
+IRC: adamw | Twitter: AdamW_Fedora | XMPP: adamw AT happyassassin . net
+<A HREF="http://www.happyassassin.net">http://www.happyassassin.net</A>
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000267.html">[openssl-users] Behaviour of OpenSSL when CApath or CAfile contains a 'trusted certificate' with all uses rejected
+</A></li>
+	<LI>Next message: <A HREF="000272.html">[openssl-users] [PATCH] apps: when -purpose is passed,	set matching trust param
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#271">[ date ]</a>
+              <a href="thread.html#271">[ thread ]</a>
+              <a href="subject.html#271">[ subject ]</a>
+              <a href="author.html#271">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-users.html">More information about the openssl-users
+mailing list</a><br>
+</body></html>
