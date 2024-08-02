@@ -1,0 +1,163 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1495551151.441034.12106.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014758.html">
+   <LINK REL="Next"  HREF="014762.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1495551151.441034.12106.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Tue May 23 14:52:31 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014758.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="014762.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14761">[ date ]</a>
+              <a href="thread.html#14761">[ thread ]</a>
+              <a href="subject.html#14761">[ subject ]</a>
+              <a href="author.html#14761">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  caf2b6b54f04e89585184ba7bb4cb80b818d5ede (commit)
+      from  719b289d62d32fe45226e8bc5b4fb0d76f6a1b5d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit caf2b6b54f04e89585184ba7bb4cb80b818d5ede
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Tue May 23 12:56:51 2017 +0100
+
+    Don't use one shot API for SSLv3.
+    
+    SSLv3 (specifically with client auth) cannot use one shot APIs: the digested
+    data and the master secret are handled in separate update operations. So
+    in the special case of SSLv3 use the streaming API.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3527">https://github.com/openssl/openssl/pull/3527</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem_lib.c | 55 ++++++++++++++++++++++++++++---------------------
+ 1 file changed, 32 insertions(+), 23 deletions(-)
+
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index fbf5a3c..c2b1485 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -264,16 +264,18 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+             SSLerr(SSL_F_TLS_CONSTRUCT_CERT_VERIFY, ERR_R_EVP_LIB);
+             goto err;
+         }
+-    } else if (s-&gt;version == SSL3_VERSION) {
+-        if (!EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
+-                             (int)s-&gt;session-&gt;master_key_length,
+-                             s-&gt;session-&gt;master_key)) {
++    }
++    if (s-&gt;version == SSL3_VERSION) {
++        if (EVP_DigestSignUpdate(mctx, hdata, hdatalen) &lt;= 0
++            || !EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
++                                (int)s-&gt;session-&gt;master_key_length,
++                                s-&gt;session-&gt;master_key)
++            || EVP_DigestSignFinal(mctx, sig, &amp;siglen) &lt;= 0) {
++
+             SSLerr(SSL_F_TLS_CONSTRUCT_CERT_VERIFY, ERR_R_EVP_LIB);
+             goto err;
+         }
+-    }
+-
+-    if (EVP_DigestSign(mctx, sig, &amp;siglen, hdata, hdatalen) &lt;= 0) {
++    } else if (EVP_DigestSign(mctx, sig, &amp;siglen, hdata, hdatalen) &lt;= 0) {
+         SSLerr(SSL_F_TLS_CONSTRUCT_CERT_VERIFY, ERR_R_EVP_LIB);
+         goto err;
+     }
+@@ -436,23 +438,30 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+             SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, ERR_R_EVP_LIB);
+             goto f_err;
+         }
+-    } else if (s-&gt;version == SSL3_VERSION
+-        &amp;&amp; !EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
+-                            (int)s-&gt;session-&gt;master_key_length,
+-                            s-&gt;session-&gt;master_key)) {
+-        SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, ERR_R_EVP_LIB);
+-        goto f_err;
+     }
+-
+-    j = EVP_DigestVerify(mctx, data, len, hdata, hdatalen);
+-
+-    if (j &lt; 0) {
+-        SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, ERR_R_EVP_LIB);
+-        goto f_err;
+-    } else if (j == 0) {
+-        al = SSL_AD_DECRYPT_ERROR;
+-        SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, SSL_R_BAD_SIGNATURE);
+-        goto f_err;
++    if (s-&gt;version == SSL3_VERSION) {
++        if (EVP_DigestVerifyUpdate(mctx, hdata, hdatalen) &lt;= 0
++                || !EVP_MD_CTX_ctrl(mctx, EVP_CTRL_SSL3_MASTER_SECRET,
++                                    (int)s-&gt;session-&gt;master_key_length,
++                                    s-&gt;session-&gt;master_key)) {
++            SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, ERR_R_EVP_LIB);
++            goto f_err;
++        }
++        if (EVP_DigestVerifyFinal(mctx, data, len) &lt;= 0) {
++            al = SSL_AD_DECRYPT_ERROR;
++            SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, SSL_R_BAD_SIGNATURE);
++            goto f_err;
++        }
++    } else {
++        j = EVP_DigestVerify(mctx, data, len, hdata, hdatalen);
++        if (j &lt; 0) {
++            SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, ERR_R_EVP_LIB);
++            goto f_err;
++        } else if (j == 0) {
++            al = SSL_AD_DECRYPT_ERROR;
++            SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, SSL_R_BAD_SIGNATURE);
++            goto f_err;
++        }
+     }
+ 
+     ret = MSG_PROCESS_CONTINUE_READING;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014758.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="014762.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14761">[ date ]</a>
+              <a href="thread.html#14761">[ thread ]</a>
+              <a href="subject.html#14761">[ subject ]</a>
+              <a href="author.html#14761">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

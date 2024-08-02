@@ -1,0 +1,514 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1462945649.490067.24226.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007101.html">
+   <LINK REL="Next"  HREF="007124.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1462945649.490067.24226.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Wed May 11 05:47:29 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007101.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007124.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7112">[ date ]</a>
+              <a href="thread.html#7112">[ thread ]</a>
+              <a href="subject.html#7112">[ subject ]</a>
+              <a href="author.html#7112">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  fde2257f055f187e8e78542ea6d64ad6c206d10b (commit)
+      from  9b5164ce7788d6985b005e410bb7b53bd553c99e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit fde2257f055f187e8e78542ea6d64ad6c206d10b
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Mon May 2 14:46:51 2016 -0400
+
+    Fix i2d_X509_AUX, update docs and add tests
+    
+    When *pp is NULL, don't write garbage, return an unexpected pointer
+    or leak memory on error.
+    
+    Reviewed-by: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_x509.c                               |  54 ++++-
+ doc/crypto/d2i_X509.pod                            |  14 +-
+ test/build.info                                    |   6 +-
+ test/danetest.c                                    |   5 +-
+ test/recipes/{80-test_dane.t =&gt; 80-test_x509aux.t} |  11 +-
+ test/x509aux.c                                     | 226 +++++++++++++++++++++
+ 6 files changed, 305 insertions(+), 11 deletions(-)
+ copy test/recipes/{80-test_dane.t =&gt; 80-test_x509aux.t} (65%)
+ create mode 100644 test/x509aux.c
+
+diff --git a/crypto/x509/x_x509.c b/crypto/x509/x_x509.c
+index 043ab07..3eba360 100644
+--- a/crypto/x509/x_x509.c
++++ b/crypto/x509/x_x509.c
+@@ -181,12 +181,26 @@ X509 *d2i_X509_AUX(X509 **a, const unsigned char **pp, long length)
+     return NULL;
+ }
+ 
+-int i2d_X509_AUX(X509 *a, unsigned char **pp)
++/*
++ * Serialize trusted certificate to *pp or just return the required buffer
++ * length if pp == NULL.  We ultimately want to avoid modifying *pp in the
++ * error path, but that depends on similar hygiene in lower-level functions.
++ * Here we avoid compounding the problem.
++ */
++static int i2d_x509_aux_internal(X509 *a, unsigned char **pp)
+ {
+     int length, tmplen;
+     unsigned char *start = pp != NULL ? *pp : NULL;
++
++    OPENSSL_assert(pp == NULL || *pp != NULL);
++
++    /*
++     * This might perturb *pp on error, but fixing that belongs in i2d_X509()
++     * not here.  It should be that if a == NULL length is zero, but we check
++     * both just in case.
++     */
+     length = i2d_X509(a, pp);
+-    if (length &lt; 0 || a == NULL)
++    if (length &lt;= 0 || a == NULL)
+         return length;
+ 
+     tmplen = i2d_X509_CERT_AUX(a-&gt;aux, pp);
+@@ -200,6 +214,42 @@ int i2d_X509_AUX(X509 *a, unsigned char **pp)
+     return length;
+ }
+ 
++/*
++ * Serialize trusted certificate to *pp, or just return the required buffer
++ * length if pp == NULL.
++ *
++ * When pp is not NULL, but *pp == NULL, we allocate the buffer, but since
++ * we're writing two ASN.1 objects back to back, we can't have i2d_X509() do
++ * the allocation, nor can we allow i2d_X509_CERT_AUX() to increment the
++ * allocated buffer.
++ */
++int i2d_X509_AUX(X509 *a, unsigned char **pp)
++{
++    int length;
++    unsigned char *tmp;
++
++    /* Buffer provided by caller */
++    if (pp == NULL || *pp != NULL)
++        return i2d_x509_aux_internal(a, pp);
++
++    /* Obtain the combined length */
++    if ((length = i2d_x509_aux_internal(a, NULL)) &lt;= 0)
++        return length;
++
++    /* Allocate requisite combined storage */
++    *pp = tmp = OPENSSL_malloc(length);
++    if (tmp == NULL)
++        return -1; /* Push error onto error stack? */
++
++    /* Encode, but keep *pp at the originally malloced pointer */
++    length = i2d_x509_aux_internal(a, &amp;tmp);
++    if (length &lt;= 0) {
++        OPENSSL_free(*pp);
++        *pp = NULL;
++    }
++    return length;
++}
++
+ int i2d_re_X509_tbs(X509 *x, unsigned char **pp)
+ {
+     x-&gt;cert_info.enc.modified = 1;
+diff --git a/doc/crypto/d2i_X509.pod b/doc/crypto/d2i_X509.pod
+index 3cd2509..14b84f2 100644
+--- a/doc/crypto/d2i_X509.pod
++++ b/doc/crypto/d2i_X509.pod
+@@ -9,8 +9,10 @@ i2d_X509_fp - X509 encode and decode functions
+ 
+  #include &lt;openssl/x509.h&gt;
+ 
+- X509 *d2i_X509(X509 **px, const unsigned char **in, int len);
++ X509 *d2i_X509(X509 **px, const unsigned char **in, long len);
++ X509 *d2i_X509_AUX(X509 **px, const unsigned char **in, long len);
+  int i2d_X509(X509 *x, unsigned char **out);
++ int i2d_X509_AUX(X509 *x, unsigned char **out);
+ 
+  X509 *d2i_X509_bio(BIO *bp, X509 **x);
+  X509 *d2i_X509_fp(FILE *fp, X509 **x);
+@@ -37,6 +39,11 @@ below, and the discussion in the RETURN VALUES section).
+ If the call is successful B&lt;*in&gt; is incremented to the byte following the
+ parsed data.
+ 
++d2i_X509_AUX() is similar to d2i_X509() but the input is expected to consist of
++an X509 certificate followed by auxiliary trust information.
++This is used by the PEM routines to read &quot;TRUSTED CERTIFICATE&quot; objects.
++This function should not be called on untrusted input.
++
+ i2d_X509() encodes the structure pointed to by B&lt;x&gt; into DER format.
+ If B&lt;out&gt; is not B&lt;NULL&gt; is writes the DER encoded data to the buffer
+ at B&lt;*out&gt;, and increments it to point after the data just written.
+@@ -48,6 +55,11 @@ allocated for a buffer and the encoded data written to it. In this
+ case B&lt;*out&gt; is not incremented and it points to the start of the
+ data just written.
+ 
++i2d_X509_AUX() is similar to i2d_X509(), but the encoded output contains both
++the certificate and any auxiliary trust information.
++This is used by the PEM routines to write &quot;TRUSTED CERTIFICATE&quot; objects.
++Note, this is a non-standard OpenSSL-specific data format.
++
+ d2i_X509_bio() is similar to d2i_X509() except it attempts
+ to parse data from BIO B&lt;bp&gt;.
+ 
+diff --git a/test/build.info b/test/build.info
+index 4fd4d99..8bd7f62 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -16,7 +16,7 @@ IF[{- !$disabled{tests} -}]
+           constant_time_test verify_extra_test clienthellotest \
+           packettest asynctest secmemtest srptest memleaktest \
+           dtlsv1listentest ct_test threadstest afalgtest d2i_test \
+-          ssl_test_ctx_test ssl_test
++          ssl_test_ctx_test ssl_test x509aux
+ 
+   SOURCE[aborttest]=aborttest.c
+   INCLUDE[aborttest]={- rel2abs(catdir($builddir,&quot;../include&quot;)) -} ../include
+@@ -237,4 +237,8 @@ IF[{- !$disabled{tests} -}]
+   INCLUDE[testutil.o]=..
+   INCLUDE[ssl_test_ctx.o]={- rel2abs(catdir($builddir,&quot;../include&quot;)) -} ../include
+   INCLUDE[handshake_helper.o]={- rel2abs(catdir($builddir,&quot;../include&quot;)) -} ../include
++
++  SOURCE[x509aux]=x509aux.c
++  INCLUDE[x509aux]={- rel2abs(catdir($builddir,&quot;../include&quot;)) -} ../include
++  DEPEND[x509aux]=../libcrypto
+ ENDIF
+diff --git a/test/danetest.c b/test/danetest.c
+index e89f711..3bcc02e 100644
+--- a/test/danetest.c
++++ b/test/danetest.c
+@@ -475,7 +475,7 @@ int main(int argc, char *argv[])
+     progname = argv[0];
+     if (argc != 4) {
+         test_usage();
+-        EXIT(1);
++        EXIT(ret);
+     }
+     basedomain = argv[1];
+     CAfile = argv[2];
+@@ -492,10 +492,9 @@ int main(int argc, char *argv[])
+     if (f == NULL) {
+         fprintf(stderr, &quot;%s: Error opening tlsa record file: '%s': %s\n&quot;,
+                 progname, tlsafile, strerror(errno));
+-        return 0;
++        EXIT(ret);
+     }
+ 
+-
+     ctx = SSL_CTX_new(TLS_client_method());
+     if (SSL_CTX_dane_enable(ctx) &lt;= 0) {
+         print_errors();
+diff --git a/test/recipes/80-test_dane.t b/test/recipes/80-test_x509aux.t
+similarity index 65%
+copy from test/recipes/80-test_dane.t
+copy to test/recipes/80-test_x509aux.t
+index 527e663..65ba5fc 100644
+--- a/test/recipes/80-test_dane.t
++++ b/test/recipes/80-test_x509aux.t
+@@ -12,13 +12,16 @@ use warnings;
+ use OpenSSL::Test qw/:DEFAULT srctop_file/;
+ use OpenSSL::Test::Utils;
+ 
+-setup(&quot;test_dane&quot;);
++setup(&quot;test_x509aux&quot;);
+ 
+ plan skip_all =&gt; &quot;test_dane uses ec which is not supported by this OpenSSL build&quot;
+     if disabled(&quot;ec&quot;);
+ 
+ plan tests =&gt; 1;                # The number of tests being performed
+ 
+-ok(run(test([&quot;danetest&quot;, &quot;example.com&quot;,
+-             srctop_file(&quot;test&quot;, &quot;danetest.pem&quot;),
+-             srctop_file(&quot;test&quot;, &quot;danetest.in&quot;)])), &quot;dane tests&quot;);
++ok(run(test([&quot;x509aux&quot;, 
++                srctop_file(&quot;test&quot;, &quot;certs&quot;, &quot;roots.pem&quot;),
++                srctop_file(&quot;test&quot;, &quot;certs&quot;, &quot;root+anyEKU.pem&quot;),
++                srctop_file(&quot;test&quot;, &quot;certs&quot;, &quot;root-anyEKU.pem&quot;),
++                srctop_file(&quot;test&quot;, &quot;certs&quot;, &quot;root-cert.pem&quot;)]
++        )), &quot;x509aux tests&quot;);
+diff --git a/test/x509aux.c b/test/x509aux.c
+new file mode 100644
+index 0000000..4f00196
+--- /dev/null
++++ b/test/x509aux.c
+@@ -0,0 +1,226 @@
++/*
++ * Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL licenses, (the &quot;License&quot;);
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ * or in the file LICENSE in the source distribution.
++ */
++
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;errno.h&gt;
++
++#include &lt;openssl/x509.h&gt;
++#include &lt;openssl/pem.h&gt;
++#include &lt;openssl/conf.h&gt;
++#include &lt;openssl/err.h&gt;
++
++#include &quot;../e_os.h&quot;
++
++static const char *progname;
++
++static void test_usage(void)
++{
++    fprintf(stderr, &quot;usage: %s certfile\n&quot;, progname);
++}
++
++static void print_errors(void)
++{
++    unsigned long err;
++    char buffer[1024];
++    const char *file;
++    const char *data;
++    int line;
++    int flags;
++
++    while ((err = ERR_get_error_line_data(&amp;file, &amp;line, &amp;data, &amp;flags)) != 0) {
++        ERR_error_string_n(err, buffer, sizeof(buffer));
++        if (flags &amp; ERR_TXT_STRING)
++            fprintf(stderr, &quot;Error: %s:%s:%d:%s\n&quot;, buffer, file, line, data);
++        else
++            fprintf(stderr, &quot;Error: %s:%s:%d\n&quot;, buffer, file, line);
++    }
++}
++
++static int test_certs(BIO *fp)
++{
++    int count;
++    char *name = 0;
++    char *header = 0;
++    unsigned char *data = 0;
++    long len;
++    typedef X509 *(*d2i_X509_t)(X509 **, const unsigned char **, long);
++    typedef int (*i2d_X509_t)(X509 *, unsigned char **);
++    int err = 0;
++
++    for (count = 0;
++         !err &amp;&amp; PEM_read_bio(fp, &amp;name, &amp;header, &amp;data, &amp;len);
++	 ++count) {
++        int trusted = strcmp(name, PEM_STRING_X509_TRUSTED) == 0;
++        d2i_X509_t d2i = trusted ? d2i_X509_AUX : d2i_X509;
++        i2d_X509_t i2d = trusted ? i2d_X509_AUX : i2d_X509;
++        X509 *cert = NULL;
++	const unsigned char *p = data;
++        unsigned char *buf = NULL;
++        unsigned char *bufp;
++        long enclen;
++
++	if (!trusted
++            &amp;&amp; strcmp(name, PEM_STRING_X509) != 0
++	    &amp;&amp; strcmp(name, PEM_STRING_X509_OLD) != 0) {
++	    fprintf(stderr, &quot;unexpected PEM object: %s\n&quot;, name);
++            err = 1;
++	    goto next;
++        }
++        cert = d2i(NULL, &amp;p, len);
++
++        if (cert == NULL || (p - data) != len) {
++	    fprintf(stderr, &quot;error parsing input %s\n&quot;, name);
++            err = 1;
++            goto next;
++        }
++
++        /* Test traditional 2-pass encoding into caller allocated buffer */
++        enclen = i2d(cert, NULL);
++        if (len != enclen) {
++	    fprintf(stderr, &quot;encoded length %ld of %s != input length %ld\n&quot;,
++                    enclen, name, len);
++            err = 1;
++            goto next;
++        }
++        if ((buf = bufp = OPENSSL_malloc(len)) == NULL) {
++            perror(&quot;malloc&quot;);
++            err = 1;
++            goto next;
++        }
++        enclen = i2d(cert, &amp;bufp);
++        if (len != enclen) {
++	    fprintf(stderr, &quot;encoded length %ld of %s != input length %ld\n&quot;,
++                    enclen, name, len);
++            err = 1;
++            goto next;
++        }
++        enclen = (long) (bufp - buf);
++        if (enclen != len) {
++	    fprintf(stderr, &quot;unexpected buffer position after encoding %s\n&quot;,
++                    name);
++            err = 1;
++            goto next;
++        }
++        if (memcmp(buf, data, len) != 0) {
++	    fprintf(stderr, &quot;encoded content of %s does not match input\n&quot;,
++                    name);
++            err = 1;
++            goto next;
++        }
++        OPENSSL_free(buf);
++        buf = NULL;
++
++        /* Test 1-pass encoding into library allocated buffer */
++        enclen = i2d(cert, &amp;buf);
++        if (len != enclen) {
++	    fprintf(stderr, &quot;encoded length %ld of %s != input length %ld\n&quot;,
++                    enclen, name, len);
++            err = 1;
++            goto next;
++        }
++        if (memcmp(buf, data, len) != 0) {
++	    fprintf(stderr, &quot;encoded content of %s does not match input\n&quot;,
++                    name);
++            err = 1;
++            goto next;
++        }
++
++        if (trusted) {
++            /* Encode just the cert and compare with initial encoding */
++            OPENSSL_free(buf);
++            buf = NULL;
++
++            /* Test 1-pass encoding into library allocated buffer */
++            enclen = i2d(cert, &amp;buf);
++            if (enclen &gt; len) {
++                fprintf(stderr, &quot;encoded length %ld of %s &gt; input length %ld\n&quot;,
++                        enclen, name, len);
++                err = 1;
++                goto next;
++            }
++            if (memcmp(buf, data, enclen) != 0) {
++                fprintf(stderr, &quot;encoded cert content does not match input\n&quot;);
++                err = 1;
++                goto next;
++            }
++        }
++
++	/*
++	 * If any of these were null, PEM_read() would have failed.
++	 */
++    next:
++        X509_free(cert);
++        OPENSSL_free(buf);
++	OPENSSL_free(name);
++	OPENSSL_free(header);
++	OPENSSL_free(data);
++    }
++
++    if (ERR_GET_REASON(ERR_peek_last_error()) == PEM_R_NO_START_LINE) {
++        /* Reached end of PEM file */
++        if (count &gt; 0) {
++            ERR_clear_error();
++            return 1;
++        }
++    }
++
++    /* Some other PEM read error */
++    print_errors();
++    return 0;
++}
++
++int main(int argc, char *argv[])
++{
++    BIO *bio_err;
++    const char *certfile;
++    const char *p;
++    int ret = 1;
++
++    progname = argv[0];
++    if (argc &lt; 2) {
++        test_usage();
++        EXIT(ret);
++    }
++
++    bio_err = BIO_new_fp(stderr, BIO_NOCLOSE | BIO_FP_TEXT);
++
++    p = getenv(&quot;OPENSSL_DEBUG_MEMORY&quot;);
++    if (p != NULL &amp;&amp; strcmp(p, &quot;on&quot;) == 0)
++        CRYPTO_set_mem_debug(1);
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
++
++    while ((certfile = *++argv) != NULL) {
++        BIO *f = BIO_new_file(certfile, &quot;r&quot;);
++        int ok;
++
++        if (f == NULL) {
++            fprintf(stderr, &quot;%s: Error opening cert file: '%s': %s\n&quot;,
++                    progname, certfile, strerror(errno));
++            EXIT(ret);
++        }
++        ret = !(ok = test_certs(f));
++        BIO_free(f);
++
++        if (!ok) {
++            printf(&quot;%s ERROR\n&quot;, certfile);
++            ret = 1;
++            break;
++        }
++        printf(&quot;%s OK\n&quot;, certfile);
++    }
++
++#ifndef OPENSSL_NO_CRYPTO_MDEBUG
++    if (CRYPTO_mem_leaks(bio_err) &lt;= 0)
++        ret = 1;
++#endif
++    BIO_free(bio_err);
++    EXIT(ret);
++}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007101.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007124.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7112">[ date ]</a>
+              <a href="thread.html#7112">[ thread ]</a>
+              <a href="subject.html#7112">[ subject ]</a>
+              <a href="author.html#7112">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

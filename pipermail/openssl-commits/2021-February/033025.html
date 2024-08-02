@@ -1,0 +1,508 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1612692162.950876.25893.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033019.html">
+   <LINK REL="Next"  HREF="033030.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1612692162.950876.25893.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Sun Feb  7 10:02:42 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033019.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033030.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33025">[ date ]</a>
+              <a href="thread.html#33025">[ thread ]</a>
+              <a href="subject.html#33025">[ subject ]</a>
+              <a href="author.html#33025">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  64954e2f34b8839ca7ad1e9576a6efaf3e49e17c (commit)
+      from  11ddbf84597d26c937ecb8f266424dea7f72cbdf (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 64954e2f34b8839ca7ad1e9576a6efaf3e49e17c
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">ppzgs1 at gmail.com</A>&gt;
+Date:   Thu Feb 4 14:40:19 2021 +1000
+
+    Fix race condition &amp; allow operation cache to grow.
+    
+    This fixes a race condition where the index to the cache location was found
+    under a read lock and a later write lock set the cache entry.  The issue being
+    that two threads could get the same location index and then fight each other
+    over writing the cache entry.  The most likely outcome is a memory leak,
+    however it would be possible to set up an invalid cache entry.
+    
+    The operation cache was a fixed sized array, once full an assertion failed.
+    The other fix here is to convert this to a stack.  The code is simplified and
+    it avoids a cache overflow condition.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14062">https://github.com/openssl/openssl/pull/14062</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/keymgmt_lib.c                           | 99 ++++++++++++----------
+ crypto/evp/p_lib.c                                 | 33 ++++----
+ .../man3/evp_keymgmt_util_export_to_provider.pod   | 31 ++++---
+ include/crypto/evp.h                               | 36 +++++---
+ 4 files changed, 110 insertions(+), 89 deletions(-)
+
+diff --git a/crypto/evp/keymgmt_lib.c b/crypto/evp/keymgmt_lib.c
+index 0112036263..85a39b3d89 100644
+--- a/crypto/evp/keymgmt_lib.c
++++ b/crypto/evp/keymgmt_lib.c
+@@ -87,7 +87,7 @@ int evp_keymgmt_util_export(const EVP_PKEY *pk, int selection,
+ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+ {
+     struct evp_keymgmt_util_try_import_data_st import_data;
+-    size_t i = 0;
++    OP_CACHE_ELEM *op;
+ 
+     /* Export to where? */
+     if (keymgmt == NULL)
+@@ -104,15 +104,14 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+     CRYPTO_THREAD_read_lock(pk-&gt;lock);
+     /*
+      * If the provider native &quot;origin&quot; hasn't changed since last time, we
+-     * try to find our keymgmt in the operation cache.  If it has changed,
+-     * |i| remains zero, and we will clear the cache further down.
++     * try to find our keymgmt in the operation cache.  If it has changed
++     * and our keymgmt isn't found, we will clear the cache further down.
+      */
+     if (pk-&gt;dirty_cnt == pk-&gt;dirty_cnt_copy) {
+         /* If this key is already exported to |keymgmt|, no more to do */
+-        i = evp_keymgmt_util_find_operation_cache_index(pk, keymgmt);
+-        if (i &lt; OSSL_NELEM(pk-&gt;operation_cache)
+-            &amp;&amp; pk-&gt;operation_cache[i].keymgmt != NULL) {
+-            void *ret = pk-&gt;operation_cache[i].keydata;
++        op = evp_keymgmt_util_find_operation_cache(pk, keymgmt);
++        if (op != NULL &amp;&amp; op-&gt;keymgmt != NULL) {
++            void *ret = op-&gt;keydata;
+ 
+             CRYPTO_THREAD_unlock(pk-&gt;lock);
+             return ret;
+@@ -128,15 +127,6 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+     if (pk-&gt;keymgmt-&gt;export == NULL)
+         return NULL;
+ 
+-    /* Check that we have found an empty slot in the export cache */
+-    /*
+-     * TODO(3.0) Right now, we assume we have ample space.  We will have to
+-     * think about a cache aging scheme, though, if |i| indexes outside the
+-     * array.
+-     */
+-    if (!ossl_assert(i &lt; OSSL_NELEM(pk-&gt;operation_cache)))
+-        return NULL;
+-
+     /*
+      * Make sure that the type of the keymgmt to export to matches the type
+      * of the &quot;origin&quot;
+@@ -168,10 +158,9 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+ 
+     CRYPTO_THREAD_write_lock(pk-&gt;lock);
+     /* Check to make sure some other thread didn't get there first */
+-    i = evp_keymgmt_util_find_operation_cache_index(pk, keymgmt);
+-    if (i &lt; OSSL_NELEM(pk-&gt;operation_cache)
+-        &amp;&amp; pk-&gt;operation_cache[i].keymgmt != NULL) {
+-        void *ret = pk-&gt;operation_cache[i].keydata;
++    op = evp_keymgmt_util_find_operation_cache(pk, keymgmt);
++    if (op != NULL &amp;&amp; op-&gt;keydata != NULL) {
++        void *ret = op-&gt;keydata;
+ 
+         CRYPTO_THREAD_unlock(pk-&gt;lock);
+ 
+@@ -192,7 +181,7 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+         evp_keymgmt_util_clear_operation_cache(pk, 0);
+ 
+     /* Add the new export to the operation cache */
+-    if (!evp_keymgmt_util_cache_keydata(pk, i, keymgmt, import_data.keydata)) {
++    if (!evp_keymgmt_util_cache_keydata(pk, keymgmt, import_data.keydata)) {
+         evp_keymgmt_freedata(keymgmt, import_data.keydata);
+         return NULL;
+     }
+@@ -205,22 +194,20 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+     return import_data.keydata;
+ }
+ 
+-int evp_keymgmt_util_clear_operation_cache(EVP_PKEY *pk, int locking)
++static void op_cache_free(OP_CACHE_ELEM *e)
+ {
+-    size_t i, end = OSSL_NELEM(pk-&gt;operation_cache);
++    evp_keymgmt_freedata(e-&gt;keymgmt, e-&gt;keydata);
++    EVP_KEYMGMT_free(e-&gt;keymgmt);
++    OPENSSL_free(e);
++}
+ 
++int evp_keymgmt_util_clear_operation_cache(EVP_PKEY *pk, int locking)
++{
+     if (pk != NULL) {
+         if (locking &amp;&amp; pk-&gt;lock != NULL &amp;&amp; !CRYPTO_THREAD_write_lock(pk-&gt;lock))
+             return 0;
+-        for (i = 0; i &lt; end &amp;&amp; pk-&gt;operation_cache[i].keymgmt != NULL; i++) {
+-            EVP_KEYMGMT *keymgmt = pk-&gt;operation_cache[i].keymgmt;
+-            void *keydata = pk-&gt;operation_cache[i].keydata;
+-
+-            pk-&gt;operation_cache[i].keymgmt = NULL;
+-            pk-&gt;operation_cache[i].keydata = NULL;
+-            evp_keymgmt_freedata(keymgmt, keydata);
+-            EVP_KEYMGMT_free(keymgmt);
+-        }
++        sk_OP_CACHE_ELEM_pop_free(pk-&gt;operation_cache, op_cache_free);
++        pk-&gt;operation_cache = NULL;
+         if (locking &amp;&amp; pk-&gt;lock != NULL)
+             CRYPTO_THREAD_unlock(pk-&gt;lock);
+     }
+@@ -228,28 +215,52 @@ int evp_keymgmt_util_clear_operation_cache(EVP_PKEY *pk, int locking)
+     return 1;
+ }
+ 
+-size_t evp_keymgmt_util_find_operation_cache_index(EVP_PKEY *pk,
+-                                                   EVP_KEYMGMT *keymgmt)
++OP_CACHE_ELEM *evp_keymgmt_util_find_operation_cache(EVP_PKEY *pk,
++                                                     EVP_KEYMGMT *keymgmt)
+ {
+-    size_t i, end = OSSL_NELEM(pk-&gt;operation_cache);
++    int i, end = sk_OP_CACHE_ELEM_num(pk-&gt;operation_cache);
++    OP_CACHE_ELEM *p;
+ 
+-    for (i = 0; i &lt; end &amp;&amp; pk-&gt;operation_cache[i].keymgmt != NULL; i++) {
+-        if (keymgmt == pk-&gt;operation_cache[i].keymgmt)
+-            break;
++    /*
++     * A comparison and sk_P_CACHE_ELEM_find() are avoided to not cause
++     * problems when we've only a read lock.
++     */
++    for (i = 0; i &lt; end; i++) {
++        p = sk_OP_CACHE_ELEM_value(pk-&gt;operation_cache, i);
++        if (keymgmt == p-&gt;keymgmt)
++            return p;
+     }
+-
+-    return i;
++    return NULL;
+ }
+ 
+-int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk, size_t index,
++int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk,
+                                    EVP_KEYMGMT *keymgmt, void *keydata)
+ {
++    OP_CACHE_ELEM *p = NULL;
++
+     if (keydata != NULL) {
+-        if (!EVP_KEYMGMT_up_ref(keymgmt))
++        if (pk-&gt;operation_cache == NULL) {
++            pk-&gt;operation_cache = sk_OP_CACHE_ELEM_new_null();
++            if (pk-&gt;operation_cache == NULL)
++                return 0;
++        }
++
++        p = OPENSSL_malloc(sizeof(*p));
++        if (p == NULL)
+             return 0;
++        p-&gt;keydata = keydata;
++        p-&gt;keymgmt = keymgmt;
+ 
+-        pk-&gt;operation_cache[index].keydata = keydata;
+-        pk-&gt;operation_cache[index].keymgmt = keymgmt;
++        if (!EVP_KEYMGMT_up_ref(keymgmt)) {
++            OPENSSL_free(p);
++            return 0;
++        }
++
++        if (!sk_OP_CACHE_ELEM_push(pk-&gt;operation_cache, p)) {
++            EVP_KEYMGMT_free(keymgmt);
++            OPENSSL_free(p);
++            return 0;
++        }
+     }
+     return 1;
+ }
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 95cc15e9d7..fc0e5be7de 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -1629,6 +1629,7 @@ static void evp_pkey_free_it(EVP_PKEY *x)
+     /* internal function; x is never NULL */
+ 
+     evp_keymgmt_util_clear_operation_cache(x, 1);
++    sk_OP_CACHE_ELEM_free(x-&gt;operation_cache);
+ #ifndef FIPS_MODULE
+     evp_pkey_free_legacy(x);
+ #endif
+@@ -1734,7 +1735,7 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OSSL_LIB_CTX *libctx,
+ 
+ #ifndef FIPS_MODULE
+     if (pk-&gt;pkey.ptr != NULL) {
+-        size_t i = 0;
++        OP_CACHE_ELEM *op;
+ 
+         /*
+          * If the legacy &quot;origin&quot; hasn't changed since last time, we try
+@@ -1744,7 +1745,7 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OSSL_LIB_CTX *libctx,
+         if (pk-&gt;ameth-&gt;dirty_cnt(pk) == pk-&gt;dirty_cnt_copy) {
+             if (!CRYPTO_THREAD_read_lock(pk-&gt;lock))
+                 goto end;
+-            i = evp_keymgmt_util_find_operation_cache_index(pk, tmp_keymgmt);
++            op = evp_keymgmt_util_find_operation_cache(pk, tmp_keymgmt);
+ 
+             /*
+              * If |tmp_keymgmt| is present in the operation cache, it means
+@@ -1752,23 +1753,14 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OSSL_LIB_CTX *libctx,
+              * token copies of the cached pointers, to have token success
+              * values to return.
+              */
+-            if (i &lt; OSSL_NELEM(pk-&gt;operation_cache)
+-                &amp;&amp; pk-&gt;operation_cache[i].keymgmt != NULL) {
+-                keydata = pk-&gt;operation_cache[i].keydata;
++            if (op != NULL &amp;&amp; op-&gt;keymgmt != NULL) {
++                keydata = op-&gt;keydata;
+                 CRYPTO_THREAD_unlock(pk-&gt;lock);
+                 goto end;
+             }
+             CRYPTO_THREAD_unlock(pk-&gt;lock);
+         }
+ 
+-        /*
+-         * TODO(3.0) Right now, we assume we have ample space.  We will have
+-         * to think about a cache aging scheme, though, if |i| indexes outside
+-         * the array.
+-         */
+-        if (!ossl_assert(i &lt; OSSL_NELEM(pk-&gt;operation_cache)))
+-            goto end;
+-
+         /* Make sure that the keymgmt key type matches the legacy NID */
+         if (!ossl_assert(EVP_KEYMGMT_is_a(tmp_keymgmt, OBJ_nid2sn(pk-&gt;type))))
+             goto end;
+@@ -1806,8 +1798,19 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OSSL_LIB_CTX *libctx,
+         }
+         EVP_KEYMGMT_free(tmp_keymgmt); /* refcnt-- */
+ 
++        /* Check to make sure some other thread didn't get there first */
++        op = evp_keymgmt_util_find_operation_cache(pk, tmp_keymgmt);
++        if (op != NULL &amp;&amp; op-&gt;keymgmt != NULL) {
++            void *tmp_keydata = op-&gt;keydata;
++
++            CRYPTO_THREAD_unlock(pk-&gt;lock);
++            evp_keymgmt_freedata(tmp_keymgmt, keydata);
++            keydata = tmp_keydata;
++            goto end;
++        }
++
+         /* Add the new export to the operation cache */
+-        if (!evp_keymgmt_util_cache_keydata(pk, i, tmp_keymgmt, keydata)) {
++        if (!evp_keymgmt_util_cache_keydata(pk, tmp_keymgmt, keydata)) {
+             CRYPTO_THREAD_unlock(pk-&gt;lock);
+             evp_keymgmt_freedata(tmp_keymgmt, keydata);
+             keydata = NULL;
+@@ -1972,7 +1975,7 @@ int evp_pkey_downgrade(EVP_PKEY *pk)
+          * reference count, so we need to decrement it, or there will be a
+          * leak.
+          */
+-        evp_keymgmt_util_cache_keydata(pk, 0, tmp_copy.keymgmt,
++        evp_keymgmt_util_cache_keydata(pk, tmp_copy.keymgmt,
+                                        tmp_copy.keydata);
+         EVP_KEYMGMT_free(tmp_copy.keymgmt);
+ 
+diff --git a/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod b/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
+index 31f8b00e47..f55980376e 100644
+--- a/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
++++ b/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
+@@ -4,24 +4,27 @@
+ 
+ evp_keymgmt_util_export,
+ evp_keymgmt_util_export_to_provider,
+-evp_keymgmt_util_find_operation_cache_index,
++evp_keymgmt_util_find_operation_cache,
+ evp_keymgmt_util_clear_operation_cache,
+ evp_keymgmt_util_cache_keydata,
+ evp_keymgmt_util_cache_keyinfo,
+-evp_keymgmt_util_fromdata
++evp_keymgmt_util_fromdata,
++OP_CACHE_ELEM
+ - internal KEYMGMT utility functions
+ 
+ =head1 SYNOPSIS
+ 
+  #include &quot;crypto/evp.h&quot;
+ 
++ typedef struct OP_CACHE_ELEM;
++
+  int evp_keymgmt_util_export(const EVP_PKEY *pk, int selection,
+                              OSSL_CALLBACK *export_cb, void *export_cbarg);
+  void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt);
+- size_t evp_keymgmt_util_find_operation_cache_index(EVP_PKEY *pk,
+-                                                    EVP_KEYMGMT *keymgmt);
++ OP_CACHE_ELEM *evp_keymgmt_util_find_operation_cache(EVP_PKEY *pk,
++                                                      EVP_KEYMGMT *keymgmt);
+  int evp_keymgmt_util_clear_operation_cache(EVP_PKEY *pk, int locking);
+- int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk, size_t index,
++ int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk,
+                                     EVP_KEYMGMT *keymgmt, void *keydata);
+  void evp_keymgmt_util_cache_keyinfo(EVP_PKEY *pk);
+  void *evp_keymgmt_util_fromdata(EVP_PKEY *target, EVP_KEYMGMT *keymgmt,
+@@ -41,20 +44,17 @@ of all provider side keys.
+ To export a legacy key, use L&lt;evp_pkey_export_to_provider(3)&gt; instead,
+ as this function ignores any legacy key data.
+ 
+-evp_keymgmt_util_find_operation_cache_index() finds the location if
+-I&lt;keymgmt&gt; in I&lt;pk&gt;'s cache of provided keys for operations.  If
+-I&lt;keymgmt&gt; is NULL or couldn't be found in the cache, it finds the
+-first empty slot instead if there is any. It should only be called while
+-holding I&lt;pk&gt;'s lock (read or write).
++evp_keymgmt_util_find_operation_cache() finds
++I&lt;keymgmt&gt; in I&lt;pk&gt;'s cache of provided keys for operations.
++It should only be called while holding I&lt;pk&gt;'s lock (read or write).
+ 
+ evp_keymgmt_util_clear_operation_cache() can be used to explicitly
+ clear the cache of operation key references. If I&lt;locking&gt; is set to 1 then
+ then I&lt;pk&gt;'s lock will be obtained while doing the clear. Otherwise it will be
+ assumed that the lock has already been obtained or is not required.
+ 
+-evp_keymgmt_util_cache_keydata() can be used to assign a provider key
+-object to a specific cache slot in the given I&lt;target&gt;.
+-I&lt;Use extreme care&gt;.
++evp_keymgmt_util_cache_keydata() can be used to add a provider key
++object to a B&lt;PKEY&gt;.
+ 
+ evp_keymgmt_util_cache_keyinfo() can be used to get all kinds of
+ information from the provvider &quot;origin&quot; and save it in I&lt;pk&gt;'s
+@@ -70,10 +70,9 @@ evp_keymgmt_export_to_provider() and evp_keymgmt_util_fromdata()
+ return a pointer to the appropriate provider side key (created or
+ found again), or NULL on error.
+ 
+-evp_keymgmt_util_find_operation_cache_index() returns the index of the
++evp_keymgmt_util_find_operation_cache() returns a pointer to the
+ operation cache slot.  If I&lt;keymgmt&gt; is NULL, or if there is no slot
+-with a match for I&lt;keymgmt&gt;, the index of the first empty slot is
+-returned, or the maximum number of slots if there isn't an empty one.
++with a match for I&lt;keymgmt&gt;, NULL is returned.
+ 
+ evp_keymgmt_util_cache_keydata() and evp_keymgmt_util_clear_operation_cache()
+ return 1 on success or 0 otherwise.
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 7b3c4bfd2f..60f07c7cf7 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -548,6 +548,23 @@ int evp_cipher_param_to_asn1_ex(EVP_CIPHER_CTX *c, ASN1_TYPE *type,
+ int evp_cipher_asn1_to_param_ex(EVP_CIPHER_CTX *c, ASN1_TYPE *type,
+                                 evp_cipher_aead_asn1_params *params);
+ 
++/*
++ * To support transparent execution of operation in backends other
++ * than the &quot;origin&quot; key, we support transparent export/import to
++ * those providers, and maintain a cache of the imported keydata,
++ * so we don't need to redo the export/import every time we perform
++ * the same operation in that same provider.
++ * This requires that the &quot;origin&quot; backend (whether it's a legacy or a
++ * provider &quot;origin&quot;) implements exports, and that the target provider
++ * has an EVP_KEYMGMT that implements import.
++ */
++typedef struct {
++    EVP_KEYMGMT *keymgmt;
++    void *keydata;
++} OP_CACHE_ELEM;
++
++DEFINE_STACK_OF(OP_CACHE_ELEM)
++
+ /*
+  * An EVP_PKEY can have the following states:
+  *
+@@ -644,18 +661,9 @@ struct evp_pkey_st {
+      * those providers, and maintain a cache of the imported keydata,
+      * so we don't need to redo the export/import every time we perform
+      * the same operation in that same provider.
+-     * This requires that the &quot;origin&quot; backend (whether it's a legacy or a
+-     * provider &quot;origin&quot;) implements exports, and that the target provider
+-     * has an EVP_KEYMGMT that implements import.
+-     *
+-     * The cache limit is set at 10 different providers using the same
+-     * &quot;origin&quot;.  It's probably over the top, but is preferable to too
+-     * few.
+      */
+-    struct {
+-        EVP_KEYMGMT *keymgmt;
+-        void *keydata;
+-    } operation_cache[10];
++    STACK_OF(OP_CACHE_ELEM) *operation_cache;
++
+     /*
+      * We keep a copy of that &quot;origin&quot;'s dirty count, so we know if the
+      * operation cache needs flushing.
+@@ -726,10 +734,10 @@ EVP_PKEY *evp_keymgmt_util_make_pkey(EVP_KEYMGMT *keymgmt, void *keydata);
+ int evp_keymgmt_util_export(const EVP_PKEY *pk, int selection,
+                             OSSL_CALLBACK *export_cb, void *export_cbarg);
+ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt);
+-size_t evp_keymgmt_util_find_operation_cache_index(EVP_PKEY *pk,
+-                                                   EVP_KEYMGMT *keymgmt);
++OP_CACHE_ELEM *evp_keymgmt_util_find_operation_cache(EVP_PKEY *pk,
++                                                     EVP_KEYMGMT *keymgmt);
+ int evp_keymgmt_util_clear_operation_cache(EVP_PKEY *pk, int locking);
+-int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk, size_t index,
++int evp_keymgmt_util_cache_keydata(EVP_PKEY *pk,
+                                    EVP_KEYMGMT *keymgmt, void *keydata);
+ void evp_keymgmt_util_cache_keyinfo(EVP_PKEY *pk);
+ void *evp_keymgmt_util_fromdata(EVP_PKEY *target, EVP_KEYMGMT *keymgmt,
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033019.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033030.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33025">[ date ]</a>
+              <a href="thread.html#33025">[ thread ]</a>
+              <a href="subject.html#33025">[ subject ]</a>
+              <a href="author.html#33025">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

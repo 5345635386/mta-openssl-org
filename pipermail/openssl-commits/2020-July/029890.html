@@ -1,0 +1,263 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596007940.012871.30338.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029881.html">
+   <LINK REL="Next"  HREF="029892.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596007940.012871.30338.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Wed Jul 29 07:32:20 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029881.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029892.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29890">[ date ]</a>
+              <a href="thread.html#29890">[ thread ]</a>
+              <a href="subject.html#29890">[ subject ]</a>
+              <a href="author.html#29890">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  79410c5f8b139c423be436810b4fe4de4637fc24 (commit)
+      from  5cd9962272388fc9a51711495a8c6a3f230ab5ce (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 79410c5f8b139c423be436810b4fe4de4637fc24
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Tue Jul 28 11:14:14 2020 +1000
+
+    namemap: fix threading issue
+    
+    The locking was too fine grained when adding entries to a namemap.
+    Refactored the working code into unlocked functions and call these with
+    appropriate locking.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12545">https://github.com/openssl/openssl/pull/12545</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/core_namemap.c | 87 ++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 52 insertions(+), 35 deletions(-)
+
+diff --git a/crypto/core_namemap.c b/crypto/core_namemap.c
+index e17b3ac0e2..b08fb84556 100644
+--- a/crypto/core_namemap.c
++++ b/crypto/core_namemap.c
+@@ -143,11 +143,24 @@ void ossl_namemap_doall_names(const OSSL_NAMEMAP *namemap, int number,
+     CRYPTO_THREAD_unlock(namemap-&gt;lock);
+ }
+ 
++static int namemap_name2num_n(const OSSL_NAMEMAP *namemap,
++                              const char *name, size_t name_len)
++{
++    NAMENUM_ENTRY *namenum_entry, namenum_tmpl;
++
++    if ((namenum_tmpl.name = OPENSSL_strndup(name, name_len)) == NULL)
++        return 0;
++    namenum_tmpl.number = 0;
++    namenum_entry =
++        lh_NAMENUM_ENTRY_retrieve(namemap-&gt;namenum, &amp;namenum_tmpl);
++    OPENSSL_free(namenum_tmpl.name);
++    return namenum_entry != NULL ? namenum_entry-&gt;number : 0;
++}
++
+ int ossl_namemap_name2num_n(const OSSL_NAMEMAP *namemap,
+                             const char *name, size_t name_len)
+ {
+-    NAMENUM_ENTRY *namenum_entry, namenum_tmpl;
+-    int number = 0;
++    int number;
+ 
+ #ifndef FIPS_MODULE
+     if (namemap == NULL)
+@@ -157,16 +170,9 @@ int ossl_namemap_name2num_n(const OSSL_NAMEMAP *namemap,
+     if (namemap == NULL)
+         return 0;
+ 
+-    if ((namenum_tmpl.name = OPENSSL_strndup(name, name_len)) == NULL)
+-        return 0;
+-    namenum_tmpl.number = 0;
+     CRYPTO_THREAD_read_lock(namemap-&gt;lock);
+-    namenum_entry =
+-        lh_NAMENUM_ENTRY_retrieve(namemap-&gt;namenum, &amp;namenum_tmpl);
+-    if (namenum_entry != NULL)
+-        number = namenum_entry-&gt;number;
++    number = namemap_name2num_n(namemap, name, name_len);
+     CRYPTO_THREAD_unlock(namemap-&gt;lock);
+-    OPENSSL_free(namenum_tmpl.name);
+ 
+     return number;
+ }
+@@ -205,45 +211,50 @@ const char *ossl_namemap_num2name(const OSSL_NAMEMAP *namemap, int number,
+     return data.name;
+ }
+ 
+-int ossl_namemap_add_name_n(OSSL_NAMEMAP *namemap, int number,
+-                            const char *name, size_t name_len)
++static int namemap_add_name_n(OSSL_NAMEMAP *namemap, int number,
++                              const char *name, size_t name_len)
+ {
+     NAMENUM_ENTRY *namenum = NULL;
+     int tmp_number;
+ 
+-#ifndef FIPS_MODULE
+-    if (namemap == NULL)
+-        namemap = ossl_namemap_stored(NULL);
+-#endif
+-
+-    if (name == NULL || name_len == 0 || namemap == NULL)
+-        return 0;
+-
+-    if ((tmp_number = ossl_namemap_name2num_n(namemap, name, name_len)) != 0)
+-        return tmp_number;       /* Pretend success */
+-
+-    CRYPTO_THREAD_write_lock(namemap-&gt;lock);
++    /* If it already exists, we don't add it */
++    if ((tmp_number = namemap_name2num_n(namemap, name, name_len)) != 0)
++        return tmp_number;
+ 
+     if ((namenum = OPENSSL_zalloc(sizeof(*namenum))) == NULL
+         || (namenum-&gt;name = OPENSSL_strndup(name, name_len)) == NULL)
+         goto err;
+ 
+-    namenum-&gt;number = tmp_number =
++    namenum-&gt;number =
+         number != 0 ? number : 1 + tsan_counter(&amp;namemap-&gt;max_number);
+     (void)lh_NAMENUM_ENTRY_insert(namemap-&gt;namenum, namenum);
+ 
+     if (lh_NAMENUM_ENTRY_error(namemap-&gt;namenum))
+         goto err;
+-
+-    CRYPTO_THREAD_unlock(namemap-&gt;lock);
+-
+-    return tmp_number;
++    return namenum-&gt;number;
+ 
+  err:
+     namenum_free(namenum);
++    return 0;
++}
+ 
++int ossl_namemap_add_name_n(OSSL_NAMEMAP *namemap, int number,
++                            const char *name, size_t name_len)
++{
++    int tmp_number;
++
++#ifndef FIPS_MODULE
++    if (namemap == NULL)
++        namemap = ossl_namemap_stored(NULL);
++#endif
++
++    if (name == NULL || name_len == 0 || namemap == NULL)
++        return 0;
++
++    CRYPTO_THREAD_write_lock(namemap-&gt;lock);
++    tmp_number = namemap_add_name_n(namemap, number, name, name_len);
+     CRYPTO_THREAD_unlock(namemap-&gt;lock);
+-    return 0;
++    return tmp_number;
+ }
+ 
+ int ossl_namemap_add_name(OSSL_NAMEMAP *namemap, int number, const char *name)
+@@ -266,6 +277,7 @@ int ossl_namemap_add_names(OSSL_NAMEMAP *namemap, int number,
+         return 0;
+     }
+ 
++    CRYPTO_THREAD_write_lock(namemap-&gt;lock);
+     /*
+      * Check that no name is an empty string, and that all names have at
+      * most one numeric identity together.
+@@ -278,11 +290,11 @@ int ossl_namemap_add_names(OSSL_NAMEMAP *namemap, int number,
+         else
+             l = q - p;           /* offset to the next separator */
+ 
+-        this_number = ossl_namemap_name2num_n(namemap, p, l);
++        this_number = namemap_name2num_n(namemap, p, l);
+ 
+         if (*p == '\0' || *p == separator) {
+             ERR_raise(ERR_LIB_CRYPTO, CRYPTO_R_BAD_ALGORITHM_NAME);
+-            return 0;
++            goto err;
+         }
+         if (number == 0) {
+             number = this_number;
+@@ -290,7 +302,7 @@ int ossl_namemap_add_names(OSSL_NAMEMAP *namemap, int number,
+             ERR_raise_data(ERR_LIB_CRYPTO, CRYPTO_R_CONFLICTING_NAMES,
+                            &quot;\&quot;%.*s\&quot; has an existing different identity %d (from \&quot;%s\&quot;)&quot;,
+                            l, p, this_number, names);
+-            return 0;
++            goto err;
+         }
+     }
+ 
+@@ -303,18 +315,23 @@ int ossl_namemap_add_names(OSSL_NAMEMAP *namemap, int number,
+         else
+             l = q - p;           /* offset to the next separator */
+ 
+-        this_number = ossl_namemap_add_name_n(namemap, number, p, l);
++        this_number = namemap_add_name_n(namemap, number, p, l);
+         if (number == 0) {
+             number = this_number;
+         } else if (this_number != number) {
+             ERR_raise_data(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR,
+                            &quot;Got number %d when expecting %d&quot;,
+                            this_number, number);
+-            return 0;
++            goto err;
+         }
+     }
+ 
++    CRYPTO_THREAD_unlock(namemap-&gt;lock);
+     return number;
++
++ err:
++    CRYPTO_THREAD_unlock(namemap-&gt;lock);
++    return 0;
+ }
+ 
+ /*-
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029881.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029892.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29890">[ date ]</a>
+              <a href="thread.html#29890">[ thread ]</a>
+              <a href="subject.html#29890">[ subject ]</a>
+              <a href="author.html#29890">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

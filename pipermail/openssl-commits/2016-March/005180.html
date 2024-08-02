@@ -1,0 +1,414 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457484060.178739.3778.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005172.html">
+   <LINK REL="Next"  HREF="005181.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457484060.178739.3778.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Mar  9 00:41:00 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005172.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005181.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5180">[ date ]</a>
+              <a href="thread.html#5180">[ thread ]</a>
+              <a href="subject.html#5180">[ subject ]</a>
+              <a href="author.html#5180">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0b1a07c8a70486534526d8967f03e32806da5661 (commit)
+      from  16203f7b71bd343550f89f266eaf9fb9693f6148 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0b1a07c8a70486534526d8967f03e32806da5661
+Author: Alessandro Ghedini &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alessandro at ghedini.me</A>&gt;
+Date:   Tue Mar 8 22:37:01 2016 +0000
+
+    Convert RSA blinding to new multi-threading API
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/bn_blind.c           | 49 +++++++++++++++++++++++++++---------------
+ crypto/rsa/rsa_crpt.c          |  4 +++-
+ crypto/rsa/rsa_ossl.c          | 10 ++++-----
+ doc/crypto/BN_BLINDING_new.pod | 42 ++++++++++++++++++++----------------
+ include/openssl/bn.h           | 11 +++++-----
+ include/openssl/crypto.h       |  1 -
+ util/libcrypto.num             | 10 ++++++---
+ 7 files changed, 77 insertions(+), 50 deletions(-)
+
+diff --git a/crypto/bn/bn_blind.c b/crypto/bn/bn_blind.c
+index a08d821..81b895c 100644
+--- a/crypto/bn/bn_blind.c
++++ b/crypto/bn/bn_blind.c
+@@ -110,6 +110,7 @@
+ 
+ #include &lt;openssl/opensslconf.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
++#include &quot;internal/threads.h&quot;
+ #include &quot;bn_lcl.h&quot;
+ 
+ #define BN_BLINDING_COUNTER     32
+@@ -119,16 +120,13 @@ struct bn_blinding_st {
+     BIGNUM *Ai;
+     BIGNUM *e;
+     BIGNUM *mod;                /* just a reference */
+-#if OPENSSL_API_COMPAT &lt; 0x10000000L
+-    unsigned long thread_id;    /* added in OpenSSL 0.9.6j and 0.9.7b; used
+-                                 * only by crypto/rsa/rsa_eay.c, rsa_lib.c */
+-#endif
+-    CRYPTO_THREADID tid;
++    CRYPTO_THREAD_ID tid;
+     int counter;
+     unsigned long flags;
+     BN_MONT_CTX *m_ctx;
+     int (*bn_mod_exp) (BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
+                        const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *m_ctx);
++    CRYPTO_RWLOCK *lock;
+ };
+ 
+ BN_BLINDING *BN_BLINDING_new(const BIGNUM *A, const BIGNUM *Ai, BIGNUM *mod)
+@@ -139,12 +137,23 @@ BN_BLINDING *BN_BLINDING_new(const BIGNUM *A, const BIGNUM *Ai, BIGNUM *mod)
+ 
+     if ((ret = OPENSSL_zalloc(sizeof(*ret))) == NULL) {
+         BNerr(BN_F_BN_BLINDING_NEW, ERR_R_MALLOC_FAILURE);
+-        return (NULL);
++        return NULL;
+     }
++
++    ret-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ret-&gt;lock == NULL) {
++        BNerr(BN_F_BN_BLINDING_NEW, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(ret);
++        return NULL;
++    }
++
++    BN_BLINDING_set_current_thread(ret);
++
+     if (A != NULL) {
+         if ((ret-&gt;A = BN_dup(A)) == NULL)
+             goto err;
+     }
++
+     if (Ai != NULL) {
+         if ((ret-&gt;Ai = BN_dup(Ai)) == NULL)
+             goto err;
+@@ -153,6 +162,7 @@ BN_BLINDING *BN_BLINDING_new(const BIGNUM *A, const BIGNUM *Ai, BIGNUM *mod)
+     /* save a copy of mod in the BN_BLINDING structure */
+     if ((ret-&gt;mod = BN_dup(mod)) == NULL)
+         goto err;
++
+     if (BN_get_flags(mod, BN_FLG_CONSTTIME) != 0)
+         BN_set_flags(ret-&gt;mod, BN_FLG_CONSTTIME);
+ 
+@@ -162,11 +172,12 @@ BN_BLINDING *BN_BLINDING_new(const BIGNUM *A, const BIGNUM *Ai, BIGNUM *mod)
+      * use.
+      */
+     ret-&gt;counter = -1;
+-    CRYPTO_THREADID_current(&amp;ret-&gt;tid);
+-    return (ret);
++
++    return ret;
++
+  err:
+     BN_BLINDING_free(ret);
+-    return (NULL);
++    return NULL;
+ }
+ 
+ void BN_BLINDING_free(BN_BLINDING *r)
+@@ -178,6 +189,7 @@ void BN_BLINDING_free(BN_BLINDING *r)
+     BN_free(r-&gt;Ai);
+     BN_free(r-&gt;e);
+     BN_free(r-&gt;mod);
++    CRYPTO_THREAD_lock_free(r-&gt;lock);
+     OPENSSL_free(r);
+ }
+ 
+@@ -271,21 +283,24 @@ int BN_BLINDING_invert_ex(BIGNUM *n, const BIGNUM *r, BN_BLINDING *b,
+     return (ret);
+ }
+ 
+-#if OPENSSL_API_COMPAT &lt; 0x10000000L
+-unsigned long BN_BLINDING_get_thread_id(const BN_BLINDING *b)
++int BN_BLINDING_is_current_thread(BN_BLINDING *b)
++{
++    return CRYPTO_THREAD_compare_id(CRYPTO_THREAD_get_current_id(), b-&gt;tid);
++}
++
++void BN_BLINDING_set_current_thread(BN_BLINDING *b)
+ {
+-    return b-&gt;thread_id;
++    b-&gt;tid = CRYPTO_THREAD_get_current_id();
+ }
+ 
+-void BN_BLINDING_set_thread_id(BN_BLINDING *b, unsigned long n)
++int BN_BLINDING_lock(BN_BLINDING *b)
+ {
+-    b-&gt;thread_id = n;
++    return CRYPTO_THREAD_write_lock(b-&gt;lock);
+ }
+-#endif
+ 
+-CRYPTO_THREADID *BN_BLINDING_thread_id(BN_BLINDING *b)
++int BN_BLINDING_unlock(BN_BLINDING *b)
+ {
+-    return &amp;b-&gt;tid;
++    return CRYPTO_THREAD_unlock(b-&gt;lock);
+ }
+ 
+ unsigned long BN_BLINDING_get_flags(const BN_BLINDING *b)
+diff --git a/crypto/rsa/rsa_crpt.c b/crypto/rsa/rsa_crpt.c
+index 466eefc..cec4a7c 100644
+--- a/crypto/rsa/rsa_crpt.c
++++ b/crypto/rsa/rsa_crpt.c
+@@ -217,7 +217,9 @@ BN_BLINDING *RSA_setup_blinding(RSA *rsa, BN_CTX *in_ctx)
+         RSAerr(RSA_F_RSA_SETUP_BLINDING, ERR_R_BN_LIB);
+         goto err;
+     }
+-    CRYPTO_THREADID_current(BN_BLINDING_thread_id(ret));
++
++    BN_BLINDING_set_current_thread(ret);
++
+  err:
+     BN_CTX_end(ctx);
+     if (ctx != in_ctx)
+diff --git a/crypto/rsa/rsa_ossl.c b/crypto/rsa/rsa_ossl.c
+index 925cf65..8d3383b 100644
+--- a/crypto/rsa/rsa_ossl.c
++++ b/crypto/rsa/rsa_ossl.c
+@@ -248,7 +248,6 @@ static int rsa_ossl_public_encrypt(int flen, const unsigned char *from,
+ static BN_BLINDING *rsa_get_blinding(RSA *rsa, int *local, BN_CTX *ctx)
+ {
+     BN_BLINDING *ret;
+-    CRYPTO_THREADID cur;
+ 
+     CRYPTO_THREAD_write_lock(rsa-&gt;lock);
+ 
+@@ -260,8 +259,7 @@ static BN_BLINDING *rsa_get_blinding(RSA *rsa, int *local, BN_CTX *ctx)
+     if (ret == NULL)
+         goto err;
+ 
+-    CRYPTO_THREADID_current(&amp;cur);
+-    if (!CRYPTO_THREADID_cmp(&amp;cur, BN_BLINDING_thread_id(ret))) {
++    if (BN_BLINDING_is_current_thread(ret)) {
+         /* rsa-&gt;blinding is ours! */
+ 
+         *local = 1;
+@@ -299,9 +297,11 @@ static int rsa_blinding_convert(BN_BLINDING *b, BIGNUM *f, BIGNUM *unblind,
+          * Shared blinding: store the unblinding factor outside BN_BLINDING.
+          */
+         int ret;
+-        CRYPTO_w_lock(CRYPTO_LOCK_RSA_BLINDING);
++
++        BN_BLINDING_lock(b);
+         ret = BN_BLINDING_convert_ex(f, unblind, b, ctx);
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RSA_BLINDING);
++        BN_BLINDING_unlock(b);
++
+         return ret;
+     }
+ }
+diff --git a/doc/crypto/BN_BLINDING_new.pod b/doc/crypto/BN_BLINDING_new.pod
+index 8688e48..acc1220 100644
+--- a/doc/crypto/BN_BLINDING_new.pod
++++ b/doc/crypto/BN_BLINDING_new.pod
+@@ -4,9 +4,9 @@
+ 
+ BN_BLINDING_new, BN_BLINDING_free, BN_BLINDING_update, BN_BLINDING_convert, 
+ BN_BLINDING_invert, BN_BLINDING_convert_ex, BN_BLINDING_invert_ex, 
+-BN_BLINDING_get_thread_id, BN_BLINDING_set_thread_id, BN_BLINDING_thread_id, BN_BLINDING_get_flags,
+-BN_BLINDING_set_flags, BN_BLINDING_create_param - blinding related BIGNUM
+-functions.
++BN_BLINDING_is_current_thread, BN_BLINDING_set_current_thread,
++BN_BLINDING_lock, BN_BLINDING_unlock, BN_BLINDING_get_flags,
++BN_BLINDING_set_flags, BN_BLINDING_create_param - blinding related BIGNUM functions.
+ 
+ =head1 SYNOPSIS
+ 
+@@ -22,7 +22,10 @@ functions.
+ 	BN_CTX *ctx);
+  int BN_BLINDING_invert_ex(BIGNUM *n, const BIGNUM *r, BN_BLINDING *b,
+ 	BN_CTX *ctx);
+- CRYPTO_THREADID *BN_BLINDING_thread_id(BN_BLINDING *);
++ int BN_BLINDING_is_current_thread(BN_BLINDING *b);
++ void BN_BLINDING_set_current_thread(BN_BLINDING *b);
++ int BN_BLINDING_lock(BN_BLINDING *b);
++ int BN_BLINDING_unlock(BN_BLINDING *b);
+  unsigned long BN_BLINDING_get_flags(const BN_BLINDING *);
+  void BN_BLINDING_set_flags(BN_BLINDING *, unsigned long);
+  BN_BLINDING *BN_BLINDING_create_param(BN_BLINDING *b,
+@@ -31,13 +34,6 @@ functions.
+ 			  const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *m_ctx),
+ 	BN_MONT_CTX *m_ctx);
+ 
+-Deprecated:
+-
+- #if OPENSSL_API_COMPAT &lt; 0x10000000L
+- unsigned long BN_BLINDING_get_thread_id(const BN_BLINDING *);
+- void BN_BLINDING_set_thread_id(BN_BLINDING *, unsigned long);
+- #endif
+-
+ =head1 DESCRIPTION
+ 
+ BN_BLINDING_new() allocates a new B&lt;BN_BLINDING&gt; structure and copies
+@@ -61,11 +57,16 @@ BN_BLINDING_convert() and BN_BLINDING_invert() are wrapper
+ functions for BN_BLINDING_convert_ex() and BN_BLINDING_invert_ex()
+ with B&lt;r&gt; set to NULL.
+ 
+-BN_BLINDING_thread_id() provides access to the B&lt;CRYPTO_THREADID&gt;
+-object within the B&lt;BN_BLINDING&gt; structure. This is to help users
+-provide proper locking if needed for multi-threaded use. The &quot;thread
+-id&quot; object of a newly allocated B&lt;BN_BLINDING&gt; structure is
+-initialised to the thread id in which BN_BLINDING_new() was called.
++BN_BLINDING_is_current_thread() returns whether the B&lt;BN_BLINDING&gt;
++structure is owned by the current thread. This is to help users
++provide proper locking if needed for multi-threaded use.
++
++BN_BLINDING_set_current_thread() sets the current thread as the
++owner of the B&lt;BN_BLINDING&gt; structure.
++
++BN_BLINDING_lock() locks the B&lt;BN_BLINDING&gt; structure.
++
++BN_BLINDING_unlock() unlocks the B&lt;BN_BLINDING&gt; structure.
+ 
+ BN_BLINDING_get_flags() returns the BN_BLINDING flags. Currently
+ there are two supported flags: B&lt;BN_BLINDING_NO_UPDATE&gt; and
+@@ -90,8 +91,13 @@ BN_BLINDING_update(), BN_BLINDING_convert(), BN_BLINDING_invert(),
+ BN_BLINDING_convert_ex() and BN_BLINDING_invert_ex() return 1 on
+ success and 0 if an error occurred.
+ 
+-BN_BLINDING_thread_id() returns a pointer to the thread id object
+-within a B&lt;BN_BLINDING&gt; object.
++BN_BLINDING_is_current_thread() returns 1 if the current thread owns
++the B&lt;BN_BLINDING&gt; object, 0 otherwise.
++
++BN_BLINDING_set_current_thread() doesn't return anything.
++
++BN_BLINDING_lock(), BN_BLINDING_unlock() return 1 if the operation
++succeded or 0 on error.
+ 
+ BN_BLINDING_get_flags() returns the currently set B&lt;BN_BLINDING&gt; flags
+ (a B&lt;unsigned long&gt; value).
+diff --git a/include/openssl/bn.h b/include/openssl/bn.h
+index db01b7e..8d2d5a8 100644
+--- a/include/openssl/bn.h
++++ b/include/openssl/bn.h
+@@ -431,11 +431,12 @@ int BN_BLINDING_invert(BIGNUM *n, BN_BLINDING *b, BN_CTX *ctx);
+ int BN_BLINDING_convert_ex(BIGNUM *n, BIGNUM *r, BN_BLINDING *b, BN_CTX *);
+ int BN_BLINDING_invert_ex(BIGNUM *n, const BIGNUM *r, BN_BLINDING *b,
+                           BN_CTX *);
+-DEPRECATEDIN_1_0_0(unsigned long
+-                   BN_BLINDING_get_thread_id(const BN_BLINDING *))
+-DEPRECATEDIN_1_0_0(void
+-                   BN_BLINDING_set_thread_id(BN_BLINDING *, unsigned long))
+-CRYPTO_THREADID *BN_BLINDING_thread_id(BN_BLINDING *);
++
++int BN_BLINDING_is_current_thread(BN_BLINDING *b);
++void BN_BLINDING_set_current_thread(BN_BLINDING *b);
++int BN_BLINDING_lock(BN_BLINDING *b);
++int BN_BLINDING_unlock(BN_BLINDING *b);
++
+ unsigned long BN_BLINDING_get_flags(const BN_BLINDING *);
+ void BN_BLINDING_set_flags(BN_BLINDING *, unsigned long);
+ BN_BLINDING *BN_BLINDING_create_param(BN_BLINDING *b,
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 3f9ce2b..d010bfa 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -168,7 +168,6 @@ extern &quot;C&quot; {
+ # define CRYPTO_LOCK_X509_STORE          11
+ # define CRYPTO_LOCK_RAND                18
+ # define CRYPTO_LOCK_RAND2               19
+-# define CRYPTO_LOCK_RSA_BLINDING        25
+ # define CRYPTO_LOCK_DYNLOCK             29
+ # define CRYPTO_LOCK_ENGINE              30
+ # define CRYPTO_LOCK_ECDSA               32
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 3afb06f..ba3060f 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -1657,7 +1657,7 @@ TS_ext_print_bio                        1607	1_1_0	EXIST::FUNCTION:
+ SCT_set1_log_id                         1608	1_1_0	EXIST::FUNCTION:
+ X509_get0_pubkey_bitstr                 1609	1_1_0	EXIST::FUNCTION:
+ ENGINE_register_all_RAND                1610	1_1_0	EXIST::FUNCTION:ENGINE
+-BN_BLINDING_thread_id                   1611	1_1_0	EXIST::FUNCTION:
++BN_BLINDING_thread_id                   1611	1_1_0	NOEXIST::FUNCTION:
+ EVP_MD_meth_get_result_size             1612	1_1_0	EXIST::FUNCTION:
+ BIO_ADDRINFO_address                    1613	1_1_0	EXIST::FUNCTION:
+ ASN1_STRING_print_ex                    1614	1_1_0	EXIST::FUNCTION:
+@@ -1963,7 +1963,7 @@ UI_UTIL_read_pw_string                  1900	1_1_0	EXIST::FUNCTION:
+ NOTICEREF_free                          1901	1_1_0	EXIST::FUNCTION:
+ AES_cfb1_encrypt                        1902	1_1_0	EXIST::FUNCTION:AES
+ X509v3_get_ext                          1903	1_1_0	EXIST::FUNCTION:
+-BN_BLINDING_set_thread_id               1904	1_1_0	EXIST::FUNCTION:DEPRECATEDIN_1_0_0
++BN_BLINDING_set_thread_id               1904	1_1_0	NOEXIST::FUNCTION:
+ CRYPTO_gcm128_encrypt_ctr32             1905	1_1_0	EXIST::FUNCTION:
+ SCT_set1_signature                      1906	1_1_0	EXIST::FUNCTION:
+ CONF_imodule_get_module                 1907	1_1_0	EXIST::FUNCTION:
+@@ -2732,7 +2732,7 @@ d2i_PBKDF2PARAM                         2640	1_1_0	EXIST::FUNCTION:
+ ERR_load_COMP_strings                   2641	1_1_0	EXIST::FUNCTION:
+ EVP_PKEY_meth_add0                      2642	1_1_0	EXIST::FUNCTION:
+ EVP_rc4_40                              2643	1_1_0	EXIST::FUNCTION:RC4
+-BN_BLINDING_get_thread_id               2644	1_1_0	EXIST::FUNCTION:DEPRECATEDIN_1_0_0
++BN_BLINDING_get_thread_id               2644	1_1_0	NOEXIST::FUNCTION:
+ RSA_bits                                2645	1_1_0	EXIST::FUNCTION:RSA
+ ASN1_item_dup                           2646	1_1_0	EXIST::FUNCTION:
+ GENERAL_NAMES_it                        2647	1_1_0	EXIST:!EXPORT_VAR_AS_FUNCTION:VARIABLE:
+@@ -4046,3 +4046,7 @@ EVP_CIPHER_CTX_get_cipher_data          3911	1_1_0	EXIST::FUNCTION:
+ BIO_up_ref                              3912	1_1_0	EXIST::FUNCTION:
+ X509_STORE_up_ref                       3913	1_1_0	EXIST::FUNCTION:
+ DSA_SIG_get0                            3914	1_1_0	EXIST::FUNCTION:DSA
++BN_BLINDING_is_current_thread           3915	1_1_0	EXIST::FUNCTION:
++BN_BLINDING_set_current_thread          3916	1_1_0	EXIST::FUNCTION:
++BN_BLINDING_lock                        3917	1_1_0	EXIST::FUNCTION:
++BN_BLINDING_unlock                      3918	1_1_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005172.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005181.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5180">[ date ]</a>
+              <a href="thread.html#5180">[ thread ]</a>
+              <a href="subject.html#5180">[ subject ]</a>
+              <a href="author.html#5180">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619774111.714338.32243.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034068.html">
+   <LINK REL="Next"  HREF="034070.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619774111.714338.32243.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Apr 30 09:15:11 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034068.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034070.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34069">[ date ]</a>
+              <a href="thread.html#34069">[ thread ]</a>
+              <a href="subject.html#34069">[ subject ]</a>
+              <a href="author.html#34069">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c230e938c75c7c2d24b5d1d322a34ec369d92696 (commit)
+       via  e73fc81345ae2cdcc4be55768345d8a00fed6453 (commit)
+      from  38230e30118e434ca1c41d05d03fe2c41042d97d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c230e938c75c7c2d24b5d1d322a34ec369d92696
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Apr 28 21:28:11 2021 +0200
+
+    CORE: Rework the pre-population of the namemap
+    
+    The pre-population of names has become more thorough.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15066">https://github.com/openssl/openssl/pull/15066</A>)
+
+commit e73fc81345ae2cdcc4be55768345d8a00fed6453
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Apr 28 11:02:36 2021 +0200
+
+    STORE: Use the 'expect' param to limit the amount of decoders used
+    
+    In the provider file: scheme loader implementation, the OSSL_DECODER_CTX
+    was set up with all sorts of implementations, even if the caller has
+    declared a limited expectation on what should be loaded, which means
+    that even though a certificate is expected, all the diverse decoders
+    to produce an EVP_PKEY are added to the decoding change.
+    
+    This optimization looks more closely at the expected type, and only
+    adds the EVP_PKEY related decoder implementations to the chain if
+    there is no expectation, or if the expectation is one of
+    OSSL_STORE_INFO_PARAMS, OSSL_STORE_INFO_PUBKEY, OSSL_STORE_INFO_PKEY.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15066">https://github.com/openssl/openssl/pull/15066</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/core_namemap.c                            | 71 +++++++++++-------------
+ providers/implementations/storemgmt/file_store.c | 14 +++--
+ 2 files changed, 41 insertions(+), 44 deletions(-)
+
+diff --git a/crypto/core_namemap.c b/crypto/core_namemap.c
+index daf22c3af2..1009fb1e94 100644
+--- a/crypto/core_namemap.c
++++ b/crypto/core_namemap.c
+@@ -379,66 +379,62 @@ int ossl_namemap_add_names(OSSL_NAMEMAP *namemap, int number,
+ #include &lt;openssl/evp.h&gt;
+ 
+ /* Creates an initial namemap with names found in the legacy method db */
+-static void get_legacy_evp_names(const char *name, const char *desc,
+-                                 const ASN1_OBJECT *obj, void *arg)
++static void get_legacy_evp_names(int base_nid, int nid, const char *pem_name,
++                                 void *arg)
+ {
+-    int num = ossl_namemap_add_name(arg, 0, name);
++    int num = 0;
++    ASN1_OBJECT *obj;
+ 
+-    /*
+-     * We currently treat the description (&quot;long name&quot; in OBJ speak) as an
+-     * alias.
+-     */
+-
+-    /*
+-     * We could check that the returned value is the same as id, but since
+-     * this is a void function, there's no sane way to report the error.
+-     * The best we can do is trust ourselve to keep the legacy method
+-     * database conflict free.
+-     *
+-     * This registers any alias with the same number as the main name.
+-     * Should it be that the current |on| *has* the main name, this is
+-     * simply a no-op.
+-     */
+-    if (desc != NULL) {
+-        (void)ossl_namemap_add_name(arg, num, desc);
++    if (base_nid != NID_undef) {
++        num = ossl_namemap_add_name(arg, num, OBJ_nid2sn(base_nid));
++        num = ossl_namemap_add_name(arg, num, OBJ_nid2ln(base_nid));
+     }
+ 
+-    if (obj != NULL) {
+-        char txtoid[OSSL_MAX_NAME_SIZE];
++    if (nid != NID_undef) {
++        num = ossl_namemap_add_name(arg, num, OBJ_nid2sn(nid));
++        num = ossl_namemap_add_name(arg, num, OBJ_nid2ln(nid));
++        if ((obj = OBJ_nid2obj(nid)) != NULL) {
++            char txtoid[OSSL_MAX_NAME_SIZE];
+ 
+-        if (OBJ_obj2txt(txtoid, sizeof(txtoid), obj, 1))
+-            (void)ossl_namemap_add_name(arg, num, txtoid);
++            if (OBJ_obj2txt(txtoid, sizeof(txtoid), obj, 1))
++                num = ossl_namemap_add_name(arg, num, txtoid);
++        }
+     }
++    if (pem_name != NULL)
++        num = ossl_namemap_add_name(arg, num, pem_name);
+ }
+ 
+ static void get_legacy_cipher_names(const OBJ_NAME *on, void *arg)
+ {
+     const EVP_CIPHER *cipher = (void *)OBJ_NAME_get(on-&gt;name, on-&gt;type);
+-    int nid = EVP_CIPHER_type(cipher);
+ 
+-    get_legacy_evp_names(OBJ_nid2sn(nid), OBJ_nid2ln(nid), OBJ_nid2obj(nid),
+-                         arg);
++    get_legacy_evp_names(NID_undef, EVP_CIPHER_type(cipher), NULL, arg);
+ }
+ 
+ static void get_legacy_md_names(const OBJ_NAME *on, void *arg)
+ {
+     const EVP_MD *md = (void *)OBJ_NAME_get(on-&gt;name, on-&gt;type);
+-    int nid = EVP_MD_type(md);
+ 
+-    get_legacy_evp_names(OBJ_nid2sn(nid), OBJ_nid2ln(nid), OBJ_nid2obj(nid),
+-                         arg);
++    get_legacy_evp_names(0, EVP_MD_type(md), NULL, arg);
+ }
+ 
+ static void get_legacy_pkey_meth_names(const EVP_PKEY_ASN1_METHOD *ameth,
+                                        void *arg)
+ {
+     int nid = 0, base_nid = 0, flags = 0;
++    const char *pem_name = NULL;
+ 
+-    EVP_PKEY_asn1_get0_info(&amp;nid, &amp;base_nid, &amp;flags, NULL, NULL, ameth);
++    EVP_PKEY_asn1_get0_info(&amp;nid, &amp;base_nid, &amp;flags, NULL, &amp;pem_name, ameth);
+     if (nid != NID_undef) {
+         if ((flags &amp; ASN1_PKEY_ALIAS) == 0) {
+-            get_legacy_evp_names(OBJ_nid2sn(nid), OBJ_nid2ln(nid),
+-                                 OBJ_nid2obj(nid), arg);
++            switch (nid) {
++            case EVP_PKEY_DHX:
++                /* We know that the name &quot;DHX&quot; is used too */
++                get_legacy_evp_names(0, nid, &quot;DHX&quot;, arg);
++                /* FALLTHRU */
++            default:
++                get_legacy_evp_names(0, nid, pem_name, arg);
++            }
+         } else {
+             /*
+              * Treat aliases carefully, some of them are undesirable, or
+@@ -447,20 +443,15 @@ static void get_legacy_pkey_meth_names(const EVP_PKEY_ASN1_METHOD *ameth,
+ 
+             switch (nid) {
+             case EVP_PKEY_SM2:
+-            case EVP_PKEY_DHX:
+                 /*
+                  * SM2 is a separate keytype with providers, not an alias for
+                  * EC.
+-                 * DHX is a separate keytype with providers, not an alias for
+-                 * DH.
+                  */
+-                get_legacy_evp_names(OBJ_nid2sn(nid), OBJ_nid2ln(nid),
+-                                     OBJ_nid2obj(nid), arg);
++                get_legacy_evp_names(0, nid, pem_name, arg);
+                 break;
+             default:
+                 /* Use the short name of the base nid as the common reference */
+-                get_legacy_evp_names(OBJ_nid2sn(base_nid), OBJ_nid2ln(nid),
+-                                     OBJ_nid2obj(nid), arg);
++                get_legacy_evp_names(base_nid, nid, pem_name, arg);
+             }
+         }
+     }
+diff --git a/providers/implementations/storemgmt/file_store.c b/providers/implementations/storemgmt/file_store.c
+index 37f2fcee67..033efb40ac 100644
+--- a/providers/implementations/storemgmt/file_store.c
++++ b/providers/implementations/storemgmt/file_store.c
+@@ -415,7 +415,7 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+     OSSL_DECODER_INSTANCE *to_obj_inst = NULL;
+     OSSL_DECODER_CLEANUP *old_cleanup = NULL;
+     void *old_construct_data = NULL;
+-    int ok = 0;
++    int ok = 0, expect_evp_pkey = 0;
+ 
+     /* Setup for this session, so only if not already done */
+     if (ctx-&gt;_.file.decoderctx == NULL) {
+@@ -424,6 +424,11 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+             goto err;
+         }
+ 
++        expect_evp_pkey = (ctx-&gt;expected_type == 0
++                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PARAMS
++                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PUBKEY
++                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PKEY);
++
+         /* Make sure the input type is set */
+         if (!OSSL_DECODER_CTX_set_input_type(ctx-&gt;_.file.decoderctx,
+                                              ctx-&gt;_.file.input_type)) {
+@@ -462,9 +467,10 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+          * Since we're setting up our own constructor, we don't need to care
+          * more than that...
+          */
+-        if (!ossl_decoder_ctx_setup_for_pkey(ctx-&gt;_.file.decoderctx,
+-                                             &amp;dummy, NULL,
+-                                             libctx, ctx-&gt;_.file.propq)
++        if ((expect_evp_pkey
++             &amp;&amp; !ossl_decoder_ctx_setup_for_pkey(ctx-&gt;_.file.decoderctx,
++                                                 &amp;dummy, NULL,
++                                                 libctx, ctx-&gt;_.file.propq))
+             || !OSSL_DECODER_CTX_add_extra(ctx-&gt;_.file.decoderctx,
+                                            libctx, ctx-&gt;_.file.propq)) {
+             ERR_raise(ERR_LIB_PROV, ERR_R_OSSL_DECODER_LIB);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034068.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034070.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34069">[ date ]</a>
+              <a href="thread.html#34069">[ thread ]</a>
+              <a href="subject.html#34069">[ subject ]</a>
+              <a href="author.html#34069">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

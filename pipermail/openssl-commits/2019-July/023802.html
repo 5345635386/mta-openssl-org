@@ -1,0 +1,369 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1562079788.982822.27302.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023801.html">
+   <LINK REL="Next"  HREF="023803.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1562079788.982822.27302.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jul  2 15:03:08 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023801.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="023803.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23802">[ date ]</a>
+              <a href="thread.html#23802">[ thread ]</a>
+              <a href="subject.html#23802">[ subject ]</a>
+              <a href="author.html#23802">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6592ab81d21fc01e05a01cd5b96c84b069bf8acf (commit)
+       via  6ebc2f56f04ac2738d3b9bfc732063ad8f51e75d (commit)
+      from  7c95390ef021e18d6b834cea9009d0d26b4642d5 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6592ab81d21fc01e05a01cd5b96c84b069bf8acf
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Jun 18 11:39:13 2019 +0200
+
+    FIPS module: adapt for the changed error reporting methods
+    
+    The FIPS module inner provider doesn't need to deal with error reason
+    strings or error library number, since it uses the outer provider's
+    error reporting upcalls.  We therefore disable that code in
+    crypto/provider_core.c when building the FIPS module.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9174">https://github.com/openssl/openssl/pull/9174</A>)
+
+commit 6ebc2f56f04ac2738d3b9bfc732063ad8f51e75d
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Jun 18 11:18:31 2019 +0200
+
+    Replumbing: re-implement error reporting for providers
+    
+    The idea is that providers should only have to report a reason code.
+    The library code is considered to be libcrypto internal, and are
+    allocated dynamically and automatically for providers on creation.
+    
+    We reserve the upper 8 bits of the reason code for internal OpenSSL
+    use.  This allows our own providers to report errors in form of a
+    packed number that includes library number, function number and
+    reason number.
+    
+    With this, a provider can potentially use any reason number it wants
+    from 1 to 16777216, although the current error semantics really only
+    allow 1 to 4095 (because only the lower 12 bits are currently
+    considered an actual reason code by the ERR subsystem).
+    
+    A provider can provide a reason string table in form of an array of
+    ERR_STRING_DATA, with each item containing just the reason code and
+    the associated string, with the dispatch function numbered
+    OSSL_FUNC_PROVIDER_GET_REASON_STRINGS matching the type
+    OSSL_provider_get_reason_strings_fn.
+    If available, libcrypto will call that function on provider
+    activation.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9174">https://github.com/openssl/openssl/pull/9174</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_core.c         | 127 ++++++++++++++++++++++++++++++++++++++++-
+ include/openssl/core_numbers.h |  11 +++-
+ providers/fips/fipsprov.c      |  11 ++--
+ 3 files changed, 138 insertions(+), 11 deletions(-)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index cb136c4..5860448 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -49,6 +49,16 @@ struct ossl_provider_st {
+     STACK_OF(INFOPAIR) *parameters;
+     OPENSSL_CTX *libctx; /* The library context this instance is in */
+     struct provider_store_st *store; /* The store this instance belongs to */
++#ifndef FIPS_MODE
++    /*
++     * In the FIPS module inner provider, this isn't needed, since the
++     * error upcalls are always direct calls to the outer provider.
++     */
++    int error_lib;     /* ERR library number, one for each provider */
++# ifndef OPENSSL_NO_ERR
++    ERR_STRING_DATA *error_strings; /* Copy of what the provider gives us */
++# endif
++#endif
+ 
+     /* Provider side functions */
+     OSSL_provider_teardown_fn *teardown;
+@@ -123,6 +133,9 @@ static void *provider_store_new(OPENSSL_CTX *ctx)
+         }
+         prov-&gt;libctx = ctx;
+         prov-&gt;store = store;
++#ifndef FIPS_MODE
++        prov-&gt;error_lib = ERR_get_next_error_library();
++#endif
+         if(p-&gt;is_fallback)
+             ossl_provider_set_fallback(prov);
+     }
+@@ -233,6 +246,9 @@ OSSL_PROVIDER *ossl_provider_new(OPENSSL_CTX *libctx, const char *name,
+     } else {
+         prov-&gt;libctx = libctx;
+         prov-&gt;store = store;
++#ifndef FIPS_MODE
++        prov-&gt;error_lib = ERR_get_next_error_library();
++#endif
+     }
+     CRYPTO_THREAD_unlock(store-&gt;lock);
+ 
+@@ -274,6 +290,15 @@ void ossl_provider_free(OSSL_PROVIDER *prov)
+ #endif
+             if (prov-&gt;teardown != NULL)
+                 prov-&gt;teardown(prov-&gt;provctx);
++#ifndef OPENSSL_NO_ERR
++# ifndef FIPS_MODE
++            if (prov-&gt;error_strings != NULL) {
++                ERR_unload_strings(prov-&gt;error_lib, prov-&gt;error_strings);
++                OPENSSL_free(prov-&gt;error_strings);
++                prov-&gt;error_strings = NULL;
++            }
++# endif
++#endif
+             prov-&gt;flag_initialized = 0;
+         }
+ 
+@@ -352,6 +377,11 @@ static const OSSL_DISPATCH *core_dispatch; /* Define further down */
+ static int provider_activate(OSSL_PROVIDER *prov)
+ {
+     const OSSL_DISPATCH *provider_dispatch = NULL;
++#ifndef OPENSSL_NO_ERR
++# ifndef FIPS_MODE
++    OSSL_provider_get_reason_strings_fn *p_get_reason_strings = NULL;
++# endif
++#endif
+ 
+     if (prov-&gt;flag_initialized)
+         return 1;
+@@ -435,9 +465,62 @@ static int provider_activate(OSSL_PROVIDER *prov)
+             prov-&gt;query_operation =
+                 OSSL_get_provider_query_operation(provider_dispatch);
+             break;
++#ifndef OPENSSL_NO_ERR
++# ifndef FIPS_MODE
++        case OSSL_FUNC_PROVIDER_GET_REASON_STRINGS:
++            p_get_reason_strings =
++                OSSL_get_provider_get_reason_strings(provider_dispatch);
++            break;
++# endif
++#endif
+         }
+     }
+ 
++#ifndef OPENSSL_NO_ERR
++# ifndef FIPS_MODE
++    if (p_get_reason_strings != NULL) {
++        const OSSL_ITEM *reasonstrings = p_get_reason_strings(prov-&gt;provctx);
++        size_t cnt, cnt2;
++
++        /*
++         * ERR_load_strings() handles ERR_STRING_DATA rather than OSSL_ITEM,
++         * although they are essentially the same type.
++         * Furthermore, ERR_load_strings() patches the array's error number
++         * with the error library number, so we need to make a copy of that
++         * array either way.
++         */
++        cnt = 1;                 /* One for the terminating item */
++        while (reasonstrings[cnt].id != 0) {
++            if (ERR_GET_LIB(reasonstrings[cnt].id) != 0)
++                return 0;
++            cnt++;
++        }
++
++        /* Allocate one extra item for the &quot;library&quot; name */
++        prov-&gt;error_strings =
++            OPENSSL_zalloc(sizeof(ERR_STRING_DATA) * (cnt + 1));
++        if (prov-&gt;error_strings == NULL)
++            return 0;
++
++        /*
++         * Set the &quot;library&quot; name.
++         */
++        prov-&gt;error_strings[0].error = ERR_PACK(prov-&gt;error_lib, 0, 0);
++        prov-&gt;error_strings[0].string = prov-&gt;name;
++        /*
++         * Copy reasonstrings item 0..cnt-1 to prov-&gt;error_trings positions
++         * 1..cnt.
++         */
++        for (cnt2 = 1; cnt2 &lt;= cnt; cnt2++) {
++            prov-&gt;error_strings[cnt2].error = (int)reasonstrings[cnt2-1].id;
++            prov-&gt;error_strings[cnt2].string = reasonstrings[cnt2-1].ptr;
++        }
++
++        ERR_load_strings(prov-&gt;error_lib, prov-&gt;error_strings);
++    }
++# endif
++#endif
++
+     /* With this flag set, this provider has become fully &quot;loaded&quot;. */
+     prov-&gt;flag_initialized = 1;
+ 
+@@ -675,13 +758,53 @@ static int core_thread_start(const OSSL_PROVIDER *prov,
+     return ossl_init_thread_start(prov, prov-&gt;provctx, handfn);
+ }
+ 
++/*
++ * The FIPS module inner provider doesn't implement these.  They aren't
++ * needed there, since the FIPS module upcalls are always the outer provider
++ * ones.
++ */
++#ifndef FIPS_MODE
++static void core_put_error(const OSSL_PROVIDER *prov,
++                           uint32_t reason, const char *file, int line)
++{
++    /*
++     * If the uppermost 8 bits are non-zero, it's an OpenSSL library
++     * error and will be treated as such.  Otherwise, it's a new style
++     * provider error and will be treated as such.
++     */
++    if (ERR_GET_LIB(reason) != 0) {
++        ERR_PUT_error(ERR_GET_LIB(reason),
++                      ERR_GET_FUNC(reason),
++                      ERR_GET_REASON(reason),
++                      file, line);
++    } else {
++        ERR_PUT_error(prov-&gt;error_lib, 0, (int)reason, file, line);
++    }
++}
++
++/*
++ * TODO(3.0) This, as well as core_put_error above, should use |prov|
++ * to select the proper library context to report in the correct error
++ * stack, at least if error stacks become tied to the library context.
++ * We cannot currently do that since there's no support for it in the
++ * ERR subsystem.
++ */
++static void core_add_error_vdata(const OSSL_PROVIDER *prov,
++                                 int num, va_list args)
++{
++    ERR_add_error_vdata(num, args);
++}
++#endif
++
+ static const OSSL_DISPATCH core_dispatch_[] = {
+     { OSSL_FUNC_CORE_GET_PARAM_TYPES, (void (*)(void))core_get_param_types },
+     { OSSL_FUNC_CORE_GET_PARAMS, (void (*)(void))core_get_params },
+     { OSSL_FUNC_CORE_GET_LIBRARY_CONTEXT, (void (*)(void))core_get_libctx },
+     { OSSL_FUNC_CORE_THREAD_START, (void (*)(void))core_thread_start },
+-    { OSSL_FUNC_CORE_PUT_ERROR, (void (*)(void))ERR_put_error },
+-    { OSSL_FUNC_CORE_ADD_ERROR_VDATA, (void (*)(void))ERR_add_error_vdata },
++#ifndef FIPS_MODE
++    { OSSL_FUNC_CORE_PUT_ERROR, (void (*)(void))core_put_error },
++    { OSSL_FUNC_CORE_ADD_ERROR_VDATA, (void (*)(void))core_add_error_vdata },
++#endif
+     { 0, NULL }
+ };
+ static const OSSL_DISPATCH *core_dispatch = core_dispatch_;
+diff --git a/include/openssl/core_numbers.h b/include/openssl/core_numbers.h
+index 8807942..ff50636 100644
+--- a/include/openssl/core_numbers.h
++++ b/include/openssl/core_numbers.h
+@@ -62,10 +62,12 @@ OSSL_CORE_MAKE_FUNC(int,core_get_params,(const OSSL_PROVIDER *prov,
+ OSSL_CORE_MAKE_FUNC(int,core_thread_start,(const OSSL_PROVIDER *prov,
+                                            OSSL_thread_stop_handler_fn handfn))
+ # define OSSL_FUNC_CORE_PUT_ERROR              4
+-OSSL_CORE_MAKE_FUNC(void,core_put_error,(int lib, int func, int reason,
+-                                         const char *file, int line))
++OSSL_CORE_MAKE_FUNC(void,core_put_error,
++                    (const OSSL_PROVIDER *prov,
++                     uint32_t reason, const char *file, int line))
+ # define OSSL_FUNC_CORE_ADD_ERROR_VDATA        5
+-OSSL_CORE_MAKE_FUNC(void,core_add_error_vdata,(int num, va_list args))
++OSSL_CORE_MAKE_FUNC(void,core_add_error_vdata,(const OSSL_PROVIDER *prov,
++                                               int num, va_list args))
+ # define OSSL_FUNC_CORE_GET_LIBRARY_CONTEXT    6
+ OSSL_CORE_MAKE_FUNC(OPENSSL_CTX *,core_get_library_context,
+                     (const OSSL_PROVIDER *prov))
+@@ -83,6 +85,9 @@ OSSL_CORE_MAKE_FUNC(int,provider_get_params,(void *provctx,
+ # define OSSL_FUNC_PROVIDER_QUERY_OPERATION  1027
+ OSSL_CORE_MAKE_FUNC(const OSSL_ALGORITHM *,provider_query_operation,
+                     (void *provctx, int operation_id, const int *no_store))
++# define OSSL_FUNC_PROVIDER_GET_REASON_STRINGS 1028
++OSSL_CORE_MAKE_FUNC(const OSSL_ITEM *,provider_get_reason_strings,
++                    (void *provctx))
+ 
+ /* Digests */
+ 
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index b0196f0..eb2a0c4 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -378,12 +378,11 @@ int fips_intern_provider_init(const OSSL_PROVIDER *provider,
+ void ERR_put_error(int lib, int func, int reason, const char *file, int line)
+ {
+     /*
+-     * TODO(3.0): This works for the FIPS module because we're going to be
+-     * using lib/func/reason codes that libcrypto already knows about. This
+-     * won't work for third party providers that have their own error mechanisms,
+-     * so we'll need to come up with something else for them.
++     * TODO(3.0) the first argument is currently NULL but is expected to
++     * be passed something else in the future, either an OSSL_PROVIDER or
++     * a OPENSSL_CTX pointer.
+      */
+-    c_put_error(lib, func, reason, file, line);
++    c_put_error(NULL, ERR_PACK(lib, func, reason), file, line);
+     ERR_add_error_data(1, &quot;(in the FIPS module)&quot;);
+ }
+ 
+@@ -398,7 +397,7 @@ void ERR_add_error_data(int num, ...)
+ 
+ void ERR_add_error_vdata(int num, va_list args)
+ {
+-    c_add_error_vdata(num, args);
++    c_add_error_vdata(NULL, num, args);
+ }
+ 
+ const OSSL_PROVIDER *FIPS_get_provider(OPENSSL_CTX *ctx)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023801.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="023803.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23802">[ date ]</a>
+              <a href="thread.html#23802">[ thread ]</a>
+              <a href="subject.html#23802">[ subject ]</a>
+              <a href="author.html#23802">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

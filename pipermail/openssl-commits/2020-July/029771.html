@@ -1,0 +1,588 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595378827.266174.17437.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029765.html">
+   <LINK REL="Next"  HREF="029773.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595378827.266174.17437.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Wed Jul 22 00:47:07 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029765.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029773.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29771">[ date ]</a>
+              <a href="thread.html#29771">[ thread ]</a>
+              <a href="subject.html#29771">[ subject ]</a>
+              <a href="author.html#29771">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  90409da6a520812b0266fcb1303175406dea81fe (commit)
+      from  77174598920a05826a28d8a0bd87a3af43d3f4d8 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 90409da6a520812b0266fcb1303175406dea81fe
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Wed Jul 22 10:40:55 2020 +1000
+
+    Fix provider cipher reinit issue
+    
+    Fixes #12405
+    Fixes #12377
+    
+    Calling Init()/Update() and then Init()/Update() again gave a different result when using the same key and iv.
+    Cipher modes that were using ctx-&gt;num were not resetting this value, this includes OFB, CFB &amp; CTR.
+    The fix is to reset this value during the ciphers einit() and dinit() methods.
+    Most ciphers go thru a generic method so one line fixes most cases.
+    
+    Add test for calling EVP_EncryptInit()/EVP_EncryptUpdate() multiple times for all ciphers.
+    Ciphers should return the same value for both updates.
+    DES3-WRAP does not since it uses a random in the update.
+    CCM modes currently also fail on the second update (This also happens in 1_1_1).
+    
+    Fix memory leak in AES_OCB cipher if EVP_EncryptInit is called multiple times.
+    
+    Fix AES_SIV cipher dup_ctx and init.
+    Calling EVP_CIPHER_init multiple times resulted in a memory leak in the siv.
+    Fixing this leak also showed that the dup ctx was not working for siv mode.
+    Note: aes_siv_cleanup() can not be used by aes_siv_dupctx() as it clears data
+    that is required for the decrypt (e.g the tag).
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12413">https://github.com/openssl/openssl/pull/12413</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/e_aes.c                                 |  2 +-
+ crypto/modes/siv128.c                              | 24 ++++--
+ include/crypto/siv.h                               |  6 +-
+ .../implementations/ciphers/cipher_aes_ocb_hw.c    |  1 +
+ providers/implementations/ciphers/cipher_aes_siv.c | 19 +++++
+ providers/implementations/ciphers/cipher_aes_siv.h |  4 +-
+ .../implementations/ciphers/cipher_aes_siv_hw.c    | 49 +++++++++---
+ providers/implementations/ciphers/cipher_des.c     |  1 +
+ .../implementations/ciphers/cipher_tdes_common.c   |  1 +
+ providers/implementations/ciphers/ciphercommon.c   |  2 +
+ test/evp_libctx_test.c                             | 90 +++++++++++++++++++++-
+ test/recipes/30-test_evp_libctx.t                  | 11 +--
+ 12 files changed, 185 insertions(+), 25 deletions(-)
+
+diff --git a/crypto/evp/e_aes.c b/crypto/evp/e_aes.c
+index 05be21901d..c037090695 100644
+--- a/crypto/evp/e_aes.c
++++ b/crypto/evp/e_aes.c
+@@ -4061,7 +4061,7 @@ static int aes_siv_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+ 
+     /* klen is the length of the underlying cipher, not the input key,
+        which should be twice as long */
+-    return CRYPTO_siv128_init(sctx, key, klen, cbc, ctr);
++    return CRYPTO_siv128_init(sctx, key, klen, cbc, ctr, NULL, NULL);
+ }
+ 
+ #define aesni_siv_cipher aes_siv_cipher
+diff --git a/crypto/modes/siv128.c b/crypto/modes/siv128.c
+index d3655674b4..27e29c3cc6 100644
+--- a/crypto/modes/siv128.c
++++ b/crypto/modes/siv128.c
+@@ -140,13 +140,15 @@ __owur static ossl_inline int siv128_do_encrypt(EVP_CIPHER_CTX *ctx, unsigned ch
+ /*
+  * Create a new SIV128_CONTEXT
+  */
+-SIV128_CONTEXT *CRYPTO_siv128_new(const unsigned char *key, int klen, EVP_CIPHER* cbc, EVP_CIPHER* ctr)
++SIV128_CONTEXT *CRYPTO_siv128_new(const unsigned char *key, int klen,
++                                  EVP_CIPHER *cbc, EVP_CIPHER *ctr,
++                                  OPENSSL_CTX *libctx, const char *propq)
+ {
+     SIV128_CONTEXT *ctx;
+     int ret;
+ 
+     if ((ctx = OPENSSL_malloc(sizeof(*ctx))) != NULL) {
+-        ret = CRYPTO_siv128_init(ctx, key, klen, cbc, ctr);
++        ret = CRYPTO_siv128_init(ctx, key, klen, cbc, ctr, libctx, propq);
+         if (ret)
+             return ctx;
+         OPENSSL_free(ctx);
+@@ -159,7 +161,8 @@ SIV128_CONTEXT *CRYPTO_siv128_new(const unsigned char *key, int klen, EVP_CIPHER
+  * Initialise an existing SIV128_CONTEXT
+  */
+ int CRYPTO_siv128_init(SIV128_CONTEXT *ctx, const unsigned char *key, int klen,
+-                       const EVP_CIPHER* cbc, const EVP_CIPHER* ctr)
++                       const EVP_CIPHER *cbc, const EVP_CIPHER *ctr,
++                       OPENSSL_CTX *libctx, const char *propq)
+ {
+     static const unsigned char zero[SIV_LEN] = { 0 };
+     size_t out_len = SIV_LEN;
+@@ -174,14 +177,17 @@ int CRYPTO_siv128_init(SIV128_CONTEXT *ctx, const unsigned char *key, int klen,
+     params[2] = OSSL_PARAM_construct_end();
+ 
+     memset(&amp;ctx-&gt;d, 0, sizeof(ctx-&gt;d));
++    EVP_CIPHER_CTX_free(ctx-&gt;cipher_ctx);
++    EVP_MAC_CTX_free(ctx-&gt;mac_ctx_init);
++    EVP_MAC_free(ctx-&gt;mac);
++    ctx-&gt;mac = NULL;
+     ctx-&gt;cipher_ctx = NULL;
+     ctx-&gt;mac_ctx_init = NULL;
+ 
+     if (key == NULL || cbc == NULL || ctr == NULL
+             || (ctx-&gt;cipher_ctx = EVP_CIPHER_CTX_new()) == NULL
+-            /* TODO(3.0) library context */
+             || (ctx-&gt;mac =
+-                EVP_MAC_fetch(NULL, OSSL_MAC_NAME_CMAC, NULL)) == NULL
++                EVP_MAC_fetch(libctx, OSSL_MAC_NAME_CMAC, propq)) == NULL
+             || (ctx-&gt;mac_ctx_init = EVP_MAC_CTX_new(ctx-&gt;mac)) == NULL
+             || !EVP_MAC_CTX_set_params(ctx-&gt;mac_ctx_init, params)
+             || !EVP_EncryptInit_ex(ctx-&gt;cipher_ctx, ctr, NULL, key + klen, NULL)
+@@ -209,12 +215,20 @@ int CRYPTO_siv128_init(SIV128_CONTEXT *ctx, const unsigned char *key, int klen,
+ int CRYPTO_siv128_copy_ctx(SIV128_CONTEXT *dest, SIV128_CONTEXT *src)
+ {
+     memcpy(&amp;dest-&gt;d, &amp;src-&gt;d, sizeof(src-&gt;d));
++    if (dest-&gt;cipher_ctx == NULL) {
++        dest-&gt;cipher_ctx = EVP_CIPHER_CTX_new();
++        if (dest-&gt;cipher_ctx == NULL)
++            return 0;
++    }
+     if (!EVP_CIPHER_CTX_copy(dest-&gt;cipher_ctx, src-&gt;cipher_ctx))
+         return 0;
+     EVP_MAC_CTX_free(dest-&gt;mac_ctx_init);
+     dest-&gt;mac_ctx_init = EVP_MAC_CTX_dup(src-&gt;mac_ctx_init);
+     if (dest-&gt;mac_ctx_init == NULL)
+         return 0;
++    dest-&gt;mac = src-&gt;mac;
++    if (dest-&gt;mac != NULL)
++        EVP_MAC_up_ref(dest-&gt;mac);
+     return 1;
+ }
+ 
+diff --git a/include/crypto/siv.h b/include/crypto/siv.h
+index 8a8ef6e15f..9ed8b1b121 100644
+--- a/include/crypto/siv.h
++++ b/include/crypto/siv.h
+@@ -12,9 +12,11 @@
+ typedef struct siv128_context SIV128_CONTEXT;
+ 
+ SIV128_CONTEXT *CRYPTO_siv128_new(const unsigned char *key, int klen,
+-                                  EVP_CIPHER* cbc, EVP_CIPHER* ctr);
++                                  EVP_CIPHER *cbc, EVP_CIPHER *ctr,
++                                  OPENSSL_CTX *libctx, const char *propq);
+ int CRYPTO_siv128_init(SIV128_CONTEXT *ctx, const unsigned char *key, int klen,
+-                       const EVP_CIPHER* cbc, const EVP_CIPHER* ctr);
++                       const EVP_CIPHER *cbc, const EVP_CIPHER *ctr,
++                       OPENSSL_CTX *libctx, const char *propq);
+ int CRYPTO_siv128_copy_ctx(SIV128_CONTEXT *dest, SIV128_CONTEXT *src);
+ int CRYPTO_siv128_aad(SIV128_CONTEXT *ctx, const unsigned char *aad,
+                       size_t len);
+diff --git a/providers/implementations/ciphers/cipher_aes_ocb_hw.c b/providers/implementations/ciphers/cipher_aes_ocb_hw.c
+index da82b66fa1..5caca0b1df 100644
+--- a/providers/implementations/ciphers/cipher_aes_ocb_hw.c
++++ b/providers/implementations/ciphers/cipher_aes_ocb_hw.c
+@@ -18,6 +18,7 @@
+ #define OCB_SET_KEY_FN(fn_set_enc_key, fn_set_dec_key,                         \
+                        fn_block_enc, fn_block_dec,                             \
+                        fn_stream_enc, fn_stream_dec)                           \
++CRYPTO_ocb128_cleanup(&amp;ctx-&gt;ocb);                                              \
+ fn_set_enc_key(key, keylen * 8, &amp;ctx-&gt;ksenc.ks);                               \
+ fn_set_dec_key(key, keylen * 8, &amp;ctx-&gt;ksdec.ks);                               \
+ if (!CRYPTO_ocb128_init(&amp;ctx-&gt;ocb, &amp;ctx-&gt;ksenc.ks, &amp;ctx-&gt;ksdec.ks,             \
+diff --git a/providers/implementations/ciphers/cipher_aes_siv.c b/providers/implementations/ciphers/cipher_aes_siv.c
+index 48bf01649a..84c078da82 100644
+--- a/providers/implementations/ciphers/cipher_aes_siv.c
++++ b/providers/implementations/ciphers/cipher_aes_siv.c
+@@ -19,6 +19,7 @@
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/providercommonerr.h&quot;
+ #include &quot;prov/ciphercommon_aead.h&quot;
++#include &quot;prov/provider_ctx.h&quot;
+ 
+ #define siv_stream_update siv_cipher
+ #define SIV_FLAGS AEAD_FLAGS
+@@ -34,6 +35,7 @@ static void *aes_siv_newctx(void *provctx, size_t keybits, unsigned int mode,
+         ctx-&gt;flags = flags;
+         ctx-&gt;keylen = keybits / 8;
+         ctx-&gt;hw = PROV_CIPHER_HW_aes_siv(keybits);
++        ctx-&gt;libctx = PROV_LIBRARY_CONTEXT_OF(provctx);
+     }
+     return ctx;
+ }
+@@ -48,6 +50,22 @@ static void aes_siv_freectx(void *vctx)
+     }
+ }
+ 
++static void *siv_dupctx(void *vctx)
++{
++    PROV_AES_SIV_CTX *in = (PROV_AES_SIV_CTX *)vctx;
++    PROV_AES_SIV_CTX *ret = OPENSSL_malloc(sizeof(*ret));
++
++    if (ret == NULL) {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++    if (!in-&gt;hw-&gt;dupctx(in, ret)) {
++        OPENSSL_free(ret);
++        ret = NULL;
++    }
++    return ret;
++}
++
+ static int siv_init(void *vctx, const unsigned char *key, size_t keylen,
+                     const unsigned char *iv, size_t ivlen, int enc)
+ {
+@@ -219,6 +237,7 @@ static void * alg##kbits##lc##_newctx(void *provctx)                           \
+ const OSSL_DISPATCH alg##kbits##lc##_functions[] = {                           \
+     { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))alg##kbits##lc##_newctx },      \
+     { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))alg##_##lc##_freectx },        \
++    { OSSL_FUNC_CIPHER_DUPCTX, (void (*)(void)) lc##_dupctx },                 \
+     { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void)) lc##_einit },            \
+     { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void)) lc##_dinit },            \
+     { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void)) lc##_stream_update },          \
+diff --git a/providers/implementations/ciphers/cipher_aes_siv.h b/providers/implementations/ciphers/cipher_aes_siv.h
+index 05411d7012..3179943f0e 100644
+--- a/providers/implementations/ciphers/cipher_aes_siv.h
++++ b/providers/implementations/ciphers/cipher_aes_siv.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2019-2020 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -18,6 +18,7 @@ typedef struct prov_cipher_hw_aes_siv_st {
+     void (*setspeed)(void *ctx, int speed);
+     int (*settag)(void *ctx, const unsigned char *tag, size_t tagl);
+     void (*cleanup)(void *ctx);
++    int (*dupctx)(void *src, void *dst);
+ } PROV_CIPHER_HW_AES_SIV;
+ 
+ typedef struct prov_siv_ctx_st {
+@@ -30,6 +31,7 @@ typedef struct prov_siv_ctx_st {
+     EVP_CIPHER *ctr;        /* These are fetched - so we need to free them */
+     EVP_CIPHER *cbc;
+     const PROV_CIPHER_HW_AES_SIV *hw;
++    OPENSSL_CTX *libctx;
+ } PROV_AES_SIV_CTX;
+ 
+ const PROV_CIPHER_HW_AES_SIV *PROV_CIPHER_HW_aes_siv(size_t keybits);
+diff --git a/providers/implementations/ciphers/cipher_aes_siv_hw.c b/providers/implementations/ciphers/cipher_aes_siv_hw.c
+index ef910dd6f8..547eb1a4c4 100644
+--- a/providers/implementations/ciphers/cipher_aes_siv_hw.c
++++ b/providers/implementations/ciphers/cipher_aes_siv_hw.c
+@@ -15,33 +15,63 @@
+ 
+ #include &quot;cipher_aes_siv.h&quot;
+ 
++static void aes_siv_cleanup(void *vctx);
++
+ static int aes_siv_initkey(void *vctx, const unsigned char *key, size_t keylen)
+ {
+     PROV_AES_SIV_CTX *ctx = (PROV_AES_SIV_CTX *)vctx;
+     SIV128_CONTEXT *sctx = &amp;ctx-&gt;siv;
+     size_t klen  = keylen / 2;
++    OPENSSL_CTX *libctx = ctx-&gt;libctx;
++    const char *propq = NULL;
++
++    EVP_CIPHER_free(ctx-&gt;cbc);
++    EVP_CIPHER_free(ctx-&gt;ctr);
++    ctx-&gt;cbc = NULL;
++    ctx-&gt;ctr = NULL;
+ 
+     switch (klen) {
+     case 16:
+-        ctx-&gt;cbc = EVP_CIPHER_fetch(NULL, &quot;AES-128-CBC&quot;, &quot;&quot;);
+-        ctx-&gt;ctr = EVP_CIPHER_fetch(NULL, &quot;AES-128-CTR&quot;, &quot;&quot;);
++        ctx-&gt;cbc = EVP_CIPHER_fetch(libctx, &quot;AES-128-CBC&quot;, propq);
++        ctx-&gt;ctr = EVP_CIPHER_fetch(libctx, &quot;AES-128-CTR&quot;, propq);
+         break;
+     case 24:
+-        ctx-&gt;cbc = EVP_CIPHER_fetch(NULL, &quot;AES-192-CBC&quot;, &quot;&quot;);
+-        ctx-&gt;ctr = EVP_CIPHER_fetch(NULL, &quot;AES-192-CTR&quot;, &quot;&quot;);
++        ctx-&gt;cbc = EVP_CIPHER_fetch(libctx, &quot;AES-192-CBC&quot;, propq);
++        ctx-&gt;ctr = EVP_CIPHER_fetch(libctx, &quot;AES-192-CTR&quot;, propq);
+         break;
+     case 32:
+-        ctx-&gt;cbc = EVP_CIPHER_fetch(NULL, &quot;AES-256-CBC&quot;, &quot;&quot;);
+-        ctx-&gt;ctr = EVP_CIPHER_fetch(NULL, &quot;AES-256-CTR&quot;, &quot;&quot;);
++        ctx-&gt;cbc = EVP_CIPHER_fetch(libctx, &quot;AES-256-CBC&quot;, propq);
++        ctx-&gt;ctr = EVP_CIPHER_fetch(libctx, &quot;AES-256-CTR&quot;, propq);
+         break;
+     default:
+-        return 0;
++        break;
+     }
++    if (ctx-&gt;cbc == NULL || ctx-&gt;ctr == NULL)
++        return 0;
+     /*
+      * klen is the length of the underlying cipher, not the input key,
+      * which should be twice as long
+      */
+-    return CRYPTO_siv128_init(sctx, key, klen, ctx-&gt;cbc, ctx-&gt;ctr);
++    return CRYPTO_siv128_init(sctx, key, klen, ctx-&gt;cbc, ctx-&gt;ctr, libctx,
++                              propq);
++}
++
++static int aes_siv_dupctx(void *in_vctx, void *out_vctx)
++{
++    PROV_AES_SIV_CTX *in = (PROV_AES_SIV_CTX *)in_vctx;
++    PROV_AES_SIV_CTX *out = (PROV_AES_SIV_CTX *)out_vctx;
++
++    *out = *in;
++    out-&gt;siv.cipher_ctx = NULL;
++    out-&gt;siv.mac_ctx_init = NULL;
++    out-&gt;siv.mac = NULL;
++    if (!CRYPTO_siv128_copy_ctx(&amp;out-&gt;siv, &amp;in-&gt;siv))
++        return 0;
++    if (out-&gt;cbc != NULL)
++        EVP_CIPHER_up_ref(out-&gt;cbc);
++    if (out-&gt;ctr != NULL)
++        EVP_CIPHER_up_ref(out-&gt;ctr);
++    return 1;
+ }
+ 
+ static int aes_siv_settag(void *vctx, const unsigned char *tag, size_t tagl)
+@@ -96,7 +126,8 @@ static const PROV_CIPHER_HW_AES_SIV aes_siv_hw =
+     aes_siv_cipher,
+     aes_siv_setspeed,
+     aes_siv_settag,
+-    aes_siv_cleanup
++    aes_siv_cleanup,
++    aes_siv_dupctx,
+ };
+ 
+ const PROV_CIPHER_HW_AES_SIV *PROV_CIPHER_HW_aes_siv(size_t keybits)
+diff --git a/providers/implementations/ciphers/cipher_des.c b/providers/implementations/ciphers/cipher_des.c
+index 7a60e0501c..9a7c13902f 100644
+--- a/providers/implementations/ciphers/cipher_des.c
++++ b/providers/implementations/ciphers/cipher_des.c
+@@ -67,6 +67,7 @@ static int des_init(void *vctx, const unsigned char *key, size_t keylen,
+ {
+     PROV_CIPHER_CTX *ctx = (PROV_CIPHER_CTX *)vctx;
+ 
++    ctx-&gt;num = 0;
+     ctx-&gt;enc = enc;
+ 
+     if (iv != NULL) {
+diff --git a/providers/implementations/ciphers/cipher_tdes_common.c b/providers/implementations/ciphers/cipher_tdes_common.c
+index 6cdc88749c..d2379f741b 100644
+--- a/providers/implementations/ciphers/cipher_tdes_common.c
++++ b/providers/implementations/ciphers/cipher_tdes_common.c
+@@ -57,6 +57,7 @@ static int tdes_init(void *vctx, const unsigned char *key, size_t keylen,
+ {
+     PROV_CIPHER_CTX *ctx = (PROV_CIPHER_CTX *)vctx;
+ 
++    ctx-&gt;num = 0;
+     ctx-&gt;enc = enc;
+ 
+     if (iv != NULL) {
+diff --git a/providers/implementations/ciphers/ciphercommon.c b/providers/implementations/ciphers/ciphercommon.c
+index a8905d1242..a3ebd3f7e7 100644
+--- a/providers/implementations/ciphers/ciphercommon.c
++++ b/providers/implementations/ciphers/ciphercommon.c
+@@ -149,6 +149,8 @@ static int cipher_generic_init_internal(PROV_CIPHER_CTX *ctx,
+                                         const unsigned char *iv, size_t ivlen,
+                                         int enc)
+ {
++    ctx-&gt;num = 0;
++    ctx-&gt;updated = 0;
+     ctx-&gt;enc = enc ? 1 : 0;
+ 
+     if (iv != NULL &amp;&amp; ctx-&gt;mode != EVP_CIPH_ECB_MODE) {
+diff --git a/test/evp_libctx_test.c b/test/evp_libctx_test.c
+index 77054f93a2..a9f665842a 100644
+--- a/test/evp_libctx_test.c
++++ b/test/evp_libctx_test.c
+@@ -23,13 +23,18 @@
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/provider.h&gt;
+ #include &lt;openssl/dsa.h&gt;
++#include &lt;openssl/safestack.h&gt;
+ #include &quot;testutil.h&quot;
+ #include &quot;internal/nelem.h&quot;
+-#include &quot;crypto/bn_dh.h&quot;        /* _bignum_ffdhe2048_p */
++#include &quot;crypto/bn_dh.h&quot;   /* _bignum_ffdhe2048_p */
++#include &quot;../e_os.h&quot;        /* strcasecmp */
++
++DEFINE_STACK_OF_CSTRING()
+ 
+ static OPENSSL_CTX *libctx = NULL;
+ static OSSL_PROVIDER *nullprov = NULL;
+ static OSSL_PROVIDER *libprov = NULL;
++static STACK_OF(OPENSSL_CSTRING) *cipher_names = NULL;
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1,
+@@ -193,9 +198,83 @@ static int test_dh_safeprime_param_keygen(int tstid)
+     };
+     return do_dh_param_keygen(tstid, bn);
+ }
+-
+ #endif /* OPENSSL_NO_DH */
+ 
++static int test_cipher_reinit(int test_id)
++{
++    int ret = 0, out1_len = 0, out2_len = 0, diff, ccm;
++    EVP_CIPHER *cipher = NULL;
++    EVP_CIPHER_CTX *ctx = NULL;
++    unsigned char out1[256];
++    unsigned char out2[256];
++    unsigned char in[16] = {
++        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
++        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
++    };
++    unsigned char key[64] = {
++        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++        0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++        0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++        0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++    };
++    unsigned char iv[16] = {
++        0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08,
++        0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00
++    };
++    const char *name = sk_OPENSSL_CSTRING_value(cipher_names, test_id);
++
++    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new()))
++        goto err;
++
++    TEST_note(&quot;Fetching %s\n&quot;, name);
++    if (!TEST_ptr(cipher = EVP_CIPHER_fetch(libctx, name, NULL)))
++        goto err;
++
++    /* ccm fails on the second update - this matches OpenSSL 1_1_1 behaviour */
++    ccm = (EVP_CIPHER_mode(cipher) == EVP_CIPH_CCM_MODE);
++
++    /* DES3-WRAP uses random every update - so it will give a different value */
++    diff = EVP_CIPHER_is_a(cipher, &quot;DES3-WRAP&quot;);
++
++    if (!TEST_true(EVP_EncryptInit_ex(ctx, cipher, NULL, key, iv))
++        || !TEST_true(EVP_EncryptUpdate(ctx, out1, &amp;out1_len, in, sizeof(in)))
++        || !TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv))
++        || !TEST_int_eq(EVP_EncryptUpdate(ctx, out2, &amp;out2_len, in, sizeof(in)),
++                        ccm ? 0 : 1))
++        goto err;
++
++    if (ccm == 0) {
++        if (diff) {
++            if (!TEST_mem_ne(out1, out1_len, out2, out2_len))
++                goto err;
++        } else {
++            if (!TEST_mem_eq(out1, out1_len, out2, out2_len))
++                goto err;
++        }
++    }
++    ret = 1;
++err:
++    EVP_CIPHER_free(cipher);
++    EVP_CIPHER_CTX_free(ctx);
++    return ret;
++}
++
++static int name_cmp(const char * const *a, const char * const *b)
++{
++    return strcasecmp(*a, *b);
++}
++
++static void collect_cipher_names(EVP_CIPHER *cipher, void *cipher_names_list)
++{
++    STACK_OF(OPENSSL_CSTRING) *names = cipher_names_list;
++
++    sk_OPENSSL_CSTRING_push(names, EVP_CIPHER_name(cipher));
++}
++
+ int setup_tests(void)
+ {
+     const char *prov_name = &quot;default&quot;;
+@@ -242,11 +321,18 @@ int setup_tests(void)
+ #ifndef OPENSSL_NO_DH
+     ADD_ALL_TESTS(test_dh_safeprime_param_keygen, 3 * 3 * 3);
+ #endif
++
++    if (!TEST_ptr(cipher_names = sk_OPENSSL_CSTRING_new(name_cmp)))
++        return 0;
++    EVP_CIPHER_do_all_provided(libctx, collect_cipher_names, cipher_names);
++
++    ADD_ALL_TESTS(test_cipher_reinit, sk_OPENSSL_CSTRING_num(cipher_names));
+     return 1;
+ }
+ 
+ void cleanup_tests(void)
+ {
++    sk_OPENSSL_CSTRING_free(cipher_names);
+     OSSL_PROVIDER_unload(libprov);
+     OPENSSL_CTX_free(libctx);
+     OSSL_PROVIDER_unload(nullprov);
+diff --git a/test/recipes/30-test_evp_libctx.t b/test/recipes/30-test_evp_libctx.t
+index 0d0a762900..8c36a9e24e 100644
+--- a/test/recipes/30-test_evp_libctx.t
++++ b/test/recipes/30-test_evp_libctx.t
+@@ -27,7 +27,7 @@ my $infile = bldtop_file('providers', platform-&gt;dso('fips'));
+ my @test_args = ( );
+ 
+ plan tests =&gt;
+-    ($no_fips ? 0 : 1)          # FIPS install test
++    ($no_fips ? 0 : 2)          # FIPS install test
+     + 1;
+ 
+ unless ($no_fips) {
+@@ -36,10 +36,11 @@ unless ($no_fips) {
+ 
+     ok(run(app(['openssl', 'fipsinstall',
+                '-out', bldtop_file('providers', 'fipsmodule.cnf'),
+-               '-module', $infile,
+-               '-provider_name', 'fips', '-mac_name', 'HMAC',
+-               '-section_name', 'fips_sect'])),
++               '-module', $infile])),
+        &quot;fipsinstall&quot;);
++    ok(run(test([&quot;evp_libctx_test&quot;, @test_args])), &quot;running fips evp_libctx_test&quot;);
+ }
+ 
+-ok(run(test([&quot;evp_libctx_test&quot;, @test_args])), &quot;running evp_libctx_test&quot;);
++ok(run(test([&quot;evp_libctx_test&quot;,
++             &quot;-config&quot;, srctop_file(&quot;test&quot;,&quot;default-and-legacy.cnf&quot;),])),
++   &quot;running default-and-legacy evp_libctx_test&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029765.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029773.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29771">[ date ]</a>
+              <a href="thread.html#29771">[ thread ]</a>
+              <a href="subject.html#29771">[ subject ]</a>
+              <a href="author.html#29771">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,547 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1517424439.560452.16193.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017868.html">
+   <LINK REL="Next"  HREF="017874.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>kaduk at mit.edu</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1517424439.560452.16193.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kaduk at mit.edu
+       </A><BR>
+    <I>Wed Jan 31 18:47:19 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017868.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="017874.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17870">[ date ]</a>
+              <a href="thread.html#17870">[ thread ]</a>
+              <a href="subject.html#17870">[ subject ]</a>
+              <a href="author.html#17870">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  adeb4bc7a03aa61b6b26c3857dd91b05164daa60 (commit)
+       via  63ab5ea13b671cb60dd4b7cfde2bcae9d14c5a60 (commit)
+      from  94f1c9379c3ed4b088718b35d0dd807d619d50c5 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit adeb4bc7a03aa61b6b26c3857dd91b05164daa60
+Author: Benjamin Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bkaduk at akamai.com</A>&gt;
+Date:   Fri Jan 26 09:32:40 2018 -0600
+
+    Restore clearing of init_lock after free
+    
+    The behavior of resetting the init_lock value to NULL after
+    freeing it during OPENSSL_cleanup() was added as part of the
+    global lock commits that were just reverted, but there is desire
+    to retain this behavior for clarity.
+    
+    It is unclear that the library would actually remain usable in
+    any form after OPENSSL_cleanup(), since the required re-initialization
+    occurs under a CRYPTO_ONCE check that cannot be reset at cleanup time.
+    That said, a NULL dereference is probably more friendly behavior
+    in these treacherous waters than using freed memory would be.
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5089">https://github.com/openssl/openssl/pull/5089</A>)
+
+commit 63ab5ea13b671cb60dd4b7cfde2bcae9d14c5a60
+Author: Benjamin Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bkaduk at akamai.com</A>&gt;
+Date:   Tue Jan 16 09:49:54 2018 -0600
+
+    Revert the crypto &quot;global lock&quot; implementation
+    
+    Conceptually, this is a squashed version of:
+    
+        Revert &quot;Address feedback&quot;
+    
+        This reverts commit 75551e07bd2339dfea06ef1d31d69929e13a4495.
+    
+    and
+    
+        Revert &quot;Add CRYPTO_thread_glock_new&quot;
+    
+        This reverts commit ed6b2c7938ec6f07b15745d4183afc276e74c6dd.
+    
+    But there were some intervening commits that made neither revert apply
+    cleanly, so instead do it all as one shot.
+    
+    The crypto global locks were an attempt to cope with the awkward
+    POSIX semantics for pthread_atfork(); its documentation (the &quot;RATIONALE&quot;
+    section) indicates that the expected usage is to have the prefork handler
+    lock all &quot;global&quot; locks, and the parent and child handlers release those
+    locks, to ensure that forking happens with a consistent (lock) state.
+    However, the set of functions available in the child process is limited
+    to async-signal-safe functions, and pthread_mutex_unlock() is not on
+    the list of async-signal-safe functions!  The only synchronization
+    primitives that are async-signal-safe are the semaphore primitives,
+    which are not really appropriate for general-purpose usage.
+    
+    However, the state consistency problem that the global locks were
+    attempting to solve is not actually a serious problem, particularly for
+    OpenSSL.  That is, we can consider four cases of forking application
+    that might use OpenSSL:
+    
+    (1) Single-threaded, does not call into OpenSSL in the child (e.g.,
+    the child calls exec() immediately)
+    
+    For this class of process, no locking is needed at all, since there is
+    only ever a single thread of execution and the only reentrancy is due to
+    signal handlers (which are themselves limited to async-signal-safe
+    operation and should not be doing much work at all).
+    
+    (2) Single-threaded, calls into OpenSSL after fork()
+    
+    The application must ensure that it does not fork() with an unexpected
+    lock held (that is, one that would get unlocked in the parent but
+    accidentally remain locked in the child and cause deadlock).  Since
+    OpenSSL does not expose any of its internal locks to the application
+    and the application is single-threaded, the OpenSSL internal locks
+    will be unlocked for the fork(), and the state will be consistent.
+    (OpenSSL will need to reseed its PRNG in the child, but that is
+    an orthogonal issue.)  If the application makes use of locks from
+    libcrypto, proper handling for those locks is the responsibility of
+    the application, as for any other locking primitive that is available
+    for application programming.
+    
+    (3) Multi-threaded, does not call into OpenSSL after fork()
+    
+    As for (1), the OpenSSL state is only relevant in the parent, so
+    no particular fork()-related handling is needed.  The internal locks
+    are relevant, but there is no interaction with the child to consider.
+    
+    (4) Multi-threaded, calls into OpenSSL after fork()
+    
+    This is the case where the pthread_atfork() hooks to ensure that all
+    global locks are in a known state across fork() would come into play,
+    per the above discussion.  However, these &quot;calls into OpenSSL after
+    fork()&quot; are still subject to the restriction to async-signal-safe
+    functions.  Since OpenSSL uses all sorts of locking and libc functions
+    that are not on the list of safe functions (e.g., malloc()), this
+    case is not currently usable and is unlikely to ever be usable,
+    independently of the locking situation.  So, there is no need to
+    go through contortions to attempt to support this case in the one small
+    area of locking interaction with fork().
+    
+    In light of the above analysis (thanks @davidben and @achernya), go
+    back to the simpler implementation that does not need to distinguish
+    &quot;library-global&quot; locks or to have complicated atfork handling for locks.
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5089">https://github.com/openssl/openssl/pull/5089</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/b_addr.c           |  2 +-
+ crypto/bio/bio_meth.c         |  2 +-
+ crypto/engine/eng_lib.c       |  2 +-
+ crypto/err/err.c              |  2 +-
+ crypto/ex_data.c              |  2 +-
+ crypto/init.c                 | 81 +------------------------------------------
+ crypto/mem_dbg.c              |  9 +++--
+ crypto/mem_sec.c              |  2 +-
+ crypto/objects/o_names.c      |  2 +-
+ crypto/rand/drbg_lib.c        | 18 ++++------
+ crypto/rand/rand_lib.c        |  4 +--
+ crypto/store/store_register.c |  2 +-
+ include/openssl/crypto.h      |  1 -
+ util/libcrypto.num            |  1 -
+ 14 files changed, 21 insertions(+), 109 deletions(-)
+
+diff --git a/crypto/bio/b_addr.c b/crypto/bio/b_addr.c
+index 6fb135a..ab8e7ff 100644
+--- a/crypto/bio/b_addr.c
++++ b/crypto/bio/b_addr.c
+@@ -603,7 +603,7 @@ static int addrinfo_wrap(int family, int socktype,
+ DEFINE_RUN_ONCE_STATIC(do_bio_lookup_init)
+ {
+     OPENSSL_init_crypto(0, NULL);
+-    bio_lookup_lock = CRYPTO_THREAD_glock_new(&quot;bio_lookup&quot;);
++    bio_lookup_lock = CRYPTO_THREAD_lock_new();
+     return bio_lookup_lock != NULL;
+ }
+ 
+diff --git a/crypto/bio/bio_meth.c b/crypto/bio/bio_meth.c
+index 955be84..1c5d196 100644
+--- a/crypto/bio/bio_meth.c
++++ b/crypto/bio/bio_meth.c
+@@ -15,7 +15,7 @@ static CRYPTO_ONCE bio_type_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ DEFINE_RUN_ONCE_STATIC(do_bio_type_init)
+ {
+-    bio_type_lock = CRYPTO_THREAD_glock_new(&quot;bio_type&quot;);
++    bio_type_lock = CRYPTO_THREAD_lock_new();
+     return bio_type_lock != NULL;
+ }
+ 
+diff --git a/crypto/engine/eng_lib.c b/crypto/engine/eng_lib.c
+index 8f65584..db7717f 100644
+--- a/crypto/engine/eng_lib.c
++++ b/crypto/engine/eng_lib.c
+@@ -21,7 +21,7 @@ CRYPTO_ONCE engine_lock_init = CRYPTO_ONCE_STATIC_INIT;
+ DEFINE_RUN_ONCE(do_engine_lock_init)
+ {
+     OPENSSL_init_crypto(0, NULL);
+-    global_engine_lock = CRYPTO_THREAD_glock_new(&quot;global_engine&quot;);
++    global_engine_lock = CRYPTO_THREAD_lock_new();
+     return global_engine_lock != NULL;
+ }
+ 
+diff --git a/crypto/err/err.c b/crypto/err/err.c
+index c0bdbb8..a83da9b 100644
+--- a/crypto/err/err.c
++++ b/crypto/err/err.c
+@@ -266,7 +266,7 @@ static void ERR_STATE_free(ERR_STATE *s)
+ DEFINE_RUN_ONCE_STATIC(do_err_strings_init)
+ {
+     OPENSSL_init_crypto(0, NULL);
+-    err_string_lock = CRYPTO_THREAD_glock_new(&quot;err_string&quot;);
++    err_string_lock = CRYPTO_THREAD_lock_new();
+     int_error_hash = lh_ERR_STRING_DATA_new(err_string_data_hash,
+                                             err_string_data_cmp);
+     return err_string_lock != NULL &amp;&amp; int_error_hash != NULL;
+diff --git a/crypto/ex_data.c b/crypto/ex_data.c
+index 78162b5..538fdb1 100644
+--- a/crypto/ex_data.c
++++ b/crypto/ex_data.c
+@@ -38,7 +38,7 @@ static CRYPTO_ONCE ex_data_init = CRYPTO_ONCE_STATIC_INIT;
+ DEFINE_RUN_ONCE_STATIC(do_ex_data_init)
+ {
+     OPENSSL_init_crypto(0, NULL);
+-    ex_data_lock = CRYPTO_THREAD_glock_new(&quot;ex_data&quot;);
++    ex_data_lock = CRYPTO_THREAD_lock_new();
+     return ex_data_lock != NULL;
+ }
+ 
+diff --git a/crypto/init.c b/crypto/init.c
+index 909775a..1b94d07 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -27,15 +27,6 @@
+ #include &quot;internal/dso.h&quot;
+ #include &quot;internal/store.h&quot;
+ 
+-
+-typedef struct global_lock_st {
+-    CRYPTO_RWLOCK *lock;
+-    const char *name;
+-    struct global_lock_st *next;
+-} GLOBAL_LOCK;
+-
+-static GLOBAL_LOCK *global_locks;
+-
+ static int stopped = 0;
+ 
+ static void ossl_init_thread_stop(struct thread_local_inits_st *locals);
+@@ -72,8 +63,6 @@ struct ossl_init_stop_st {
+     OPENSSL_INIT_STOP *next;
+ };
+ 
+-static CRYPTO_RWLOCK *glock_lock = NULL;
+-
+ static OPENSSL_INIT_STOP *stop_handlers = NULL;
+ static CRYPTO_RWLOCK *init_lock = NULL;
+ 
+@@ -95,7 +84,6 @@ DEFINE_RUN_ONCE_STATIC(ossl_init_base)
+ #ifndef OPENSSL_SYS_UEFI
+     atexit(OPENSSL_cleanup);
+ #endif
+-    /* Do not change this to glock's! */
+     if ((init_lock = CRYPTO_THREAD_lock_new()) == NULL)
+         return 0;
+     OPENSSL_cpuid_setup();
+@@ -514,16 +502,6 @@ void OPENSSL_cleanup(void)
+     obj_cleanup_int();
+     err_cleanup();
+ 
+-    /* Free list of global locks. */
+-    while (global_locks != NULL) {
+-        GLOBAL_LOCK *next = global_locks-&gt;next;
+-
+-        free(global_locks);
+-        global_locks = next;
+-    }
+-    CRYPTO_THREAD_lock_free(glock_lock);
+-    glock_lock = NULL;
+-
+     base_inited = 0;
+ }
+ 
+@@ -707,56 +685,7 @@ int OPENSSL_atexit(void (*handler)(void))
+     return 1;
+ }
+ 
+-#ifndef OPENSSL_SYS_UNIX
+-CRYPTO_RWLOCK *CRYPTO_THREAD_glock_new(const char *name)
+-{
+-    return CRYPTO_THREAD_lock_new();
+-}
+-
+-#else
+-DEFINE_RUN_ONCE_STATIC(glock_init)
+-{
+-    glock_lock = CRYPTO_THREAD_lock_new();
+-    return glock_lock != NULL;
+-}
+-
+-/*
+- * Create a new global lock, return NULL on error.
+- */
+-CRYPTO_RWLOCK *CRYPTO_THREAD_glock_new(const char *name)
+-{
+-    static CRYPTO_ONCE glock_once = CRYPTO_ONCE_STATIC_INIT;
+-    GLOBAL_LOCK *newlock;
+-
+-    if (glock_lock == NULL &amp;&amp; !RUN_ONCE(&amp;glock_once, glock_init))
+-        return NULL;
+-    if ((newlock = malloc(sizeof(*newlock))) == NULL)
+-        return NULL;
+-    if ((newlock-&gt;lock = CRYPTO_THREAD_lock_new()) == NULL) {
+-        free(newlock);
+-        return NULL;
+-    }
+-    newlock-&gt;name = name;
+-    CRYPTO_THREAD_write_lock(glock_lock);
+-    newlock-&gt;next = global_locks;
+-    global_locks = newlock;
+-    CRYPTO_THREAD_unlock(glock_lock);
+-    return newlock-&gt;lock;
+-}
+-
+-/*
+- * Unlock all global locks.
+- */
+-static void unlock_all(void)
+-{
+-    GLOBAL_LOCK *lp;
+-
+-    CRYPTO_THREAD_write_lock(glock_lock);
+-    for (lp = global_locks; lp != NULL; lp = lp-&gt;next)
+-        CRYPTO_THREAD_unlock(lp-&gt;lock);
+-    CRYPTO_THREAD_unlock(glock_lock);
+-}
+-
++#ifdef OPENSSL_SYS_UNIX
+ /*
+  * The following three functions are for OpenSSL developers.  This is
+  * where we set/reset state across fork (called via pthread_atfork when
+@@ -770,22 +699,14 @@ static void unlock_all(void)
+ 
+ void OPENSSL_fork_prepare(void)
+ {
+-    GLOBAL_LOCK *lp;
+-
+-    CRYPTO_THREAD_write_lock(glock_lock);
+-    for (lp = global_locks; lp != NULL; lp = lp-&gt;next)
+-        CRYPTO_THREAD_write_lock(lp-&gt;lock);
+-    CRYPTO_THREAD_unlock(glock_lock);
+ }
+ 
+ void OPENSSL_fork_parent(void)
+ {
+-    unlock_all();
+ }
+ 
+ void OPENSSL_fork_child(void)
+ {
+-    unlock_all();
+     rand_fork();
+ }
+ #endif
+diff --git a/crypto/mem_dbg.c b/crypto/mem_dbg.c
+index b394de8..e113882 100644
+--- a/crypto/mem_dbg.c
++++ b/crypto/mem_dbg.c
+@@ -93,11 +93,10 @@ static CRYPTO_THREAD_ID disabling_threadid;
+ 
+ DEFINE_RUN_ONCE_STATIC(do_memdbg_init)
+ {
+-    memdbg_lock = CRYPTO_THREAD_glock_new(&quot;malloc&quot;);
+-    long_memdbg_lock = CRYPTO_THREAD_glock_new(&quot;long_malloc&quot;);
+-    if (memdbg_lock == NULL
+-            || long_memdbg_lock == NULL
+-            || !CRYPTO_THREAD_init_local(&amp;appinfokey, NULL)) {
++    memdbg_lock = CRYPTO_THREAD_lock_new();
++    long_memdbg_lock = CRYPTO_THREAD_lock_new();
++    if (memdbg_lock == NULL || long_memdbg_lock == NULL
++        || !CRYPTO_THREAD_init_local(&amp;appinfokey, NULL)) {
+         CRYPTO_THREAD_lock_free(memdbg_lock);
+         memdbg_lock = NULL;
+         CRYPTO_THREAD_lock_free(long_memdbg_lock);
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 8f4ae9c..4c01045 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -68,7 +68,7 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+     int ret = 0;
+ 
+     if (!secure_mem_initialized) {
+-        sec_malloc_lock = CRYPTO_THREAD_glock_new(&quot;sec_malloc&quot;);
++        sec_malloc_lock = CRYPTO_THREAD_lock_new();
+         if (sec_malloc_lock == NULL)
+             return 0;
+         if ((ret = sh_init(size, minsize)) != 0) {
+diff --git a/crypto/objects/o_names.c b/crypto/objects/o_names.c
+index d0e8e05..7367644 100644
+--- a/crypto/objects/o_names.c
++++ b/crypto/objects/o_names.c
+@@ -69,7 +69,7 @@ DEFINE_RUN_ONCE_STATIC(o_names_init)
+ {
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
+     names_lh = lh_OBJ_NAME_new(obj_name_hash, obj_name_cmp);
+-    obj_lock = CRYPTO_THREAD_glock_new(&quot;obj&quot;);
++    obj_lock = CRYPTO_THREAD_lock_new();
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
+     return names_lh != NULL &amp;&amp; obj_lock != NULL;
+ }
+diff --git a/crypto/rand/drbg_lib.c b/crypto/rand/drbg_lib.c
+index 5e6bdce..cb2f9e8 100644
+--- a/crypto/rand/drbg_lib.c
++++ b/crypto/rand/drbg_lib.c
+@@ -98,7 +98,7 @@ static const char ossl_pers_string[] = &quot;OpenSSL NIST SP 800-90A DRBG&quot;;
+ 
+ static CRYPTO_ONCE rand_drbg_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+-static RAND_DRBG *drbg_setup(const char *name, RAND_DRBG *parent);
++static RAND_DRBG *drbg_setup(RAND_DRBG *parent);
+ static void drbg_cleanup(RAND_DRBG *drbg);
+ 
+ /*
+@@ -666,24 +666,18 @@ void *RAND_DRBG_get_ex_data(const RAND_DRBG *drbg, int idx)
+ /*
+  * Allocates a new global DRBG on the secure heap (if enabled) and
+  * initializes it with default settings.
+- * A global lock for the DRBG is created with the given name.
+  *
+  * Returns a pointer to the new DRBG instance on success, NULL on failure.
+  */
+-static RAND_DRBG *drbg_setup(const char *name, RAND_DRBG *parent)
++static RAND_DRBG *drbg_setup(RAND_DRBG *parent)
+ {
+     RAND_DRBG *drbg;
+ 
+-    if (name == NULL) {
+-        RANDerr(RAND_F_DRBG_SETUP, ERR_R_INTERNAL_ERROR);
+-        return NULL;
+-    }
+-
+     drbg = OPENSSL_secure_zalloc(sizeof(RAND_DRBG));
+     if (drbg == NULL)
+         return NULL;
+ 
+-    drbg-&gt;lock = CRYPTO_THREAD_glock_new(name);
++    drbg-&gt;lock = CRYPTO_THREAD_lock_new();
+     if (drbg-&gt;lock == NULL) {
+         RANDerr(RAND_F_DRBG_SETUP, RAND_R_FAILED_TO_CREATE_LOCK);
+         goto err;
+@@ -737,9 +731,9 @@ DEFINE_RUN_ONCE_STATIC(do_rand_drbg_init)
+     if (!OPENSSL_init_crypto(0, NULL))
+         return 0;
+ 
+-    drbg_master = drbg_setup(&quot;drbg_master&quot;, NULL);
+-    drbg_public = drbg_setup(&quot;drbg_public&quot;, drbg_master);
+-    drbg_private = drbg_setup(&quot;drbg_private&quot;, drbg_master);
++    drbg_master = drbg_setup(NULL);
++    drbg_public = drbg_setup(drbg_master);
++    drbg_private = drbg_setup(drbg_master);
+ 
+     if (drbg_master == NULL || drbg_public == NULL || drbg_private == NULL)
+         return 0;
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index ab03356..20ac583 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -282,10 +282,10 @@ DEFINE_RUN_ONCE_STATIC(do_rand_init)
+     int ret = 1;
+ 
+ #ifndef OPENSSL_NO_ENGINE
+-    rand_engine_lock = CRYPTO_THREAD_glock_new(&quot;rand_engine&quot;);
++    rand_engine_lock = CRYPTO_THREAD_lock_new();
+     ret &amp;= rand_engine_lock != NULL;
+ #endif
+-    rand_meth_lock = CRYPTO_THREAD_glock_new(&quot;rand_meth&quot;);
++    rand_meth_lock = CRYPTO_THREAD_lock_new();
+     ret &amp;= rand_meth_lock != NULL;
+ 
+     return ret;
+diff --git a/crypto/store/store_register.c b/crypto/store/store_register.c
+index 987ca42..85c38b8 100644
+--- a/crypto/store/store_register.c
++++ b/crypto/store/store_register.c
+@@ -20,7 +20,7 @@ static CRYPTO_ONCE registry_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ DEFINE_RUN_ONCE_STATIC(do_registry_init)
+ {
+-    registry_lock = CRYPTO_THREAD_glock_new(&quot;registry&quot;);
++    registry_lock = CRYPTO_THREAD_lock_new();
+     return registry_lock != NULL;
+ }
+ 
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 5e9517d..478f9e2 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -67,7 +67,6 @@ typedef struct {
+ typedef void CRYPTO_RWLOCK;
+ 
+ CRYPTO_RWLOCK *CRYPTO_THREAD_lock_new(void);
+-CRYPTO_RWLOCK *CRYPTO_THREAD_glock_new(const char *name);
+ int CRYPTO_THREAD_read_lock(CRYPTO_RWLOCK *lock);
+ int CRYPTO_THREAD_write_lock(CRYPTO_RWLOCK *lock);
+ int CRYPTO_THREAD_unlock(CRYPTO_RWLOCK *lock);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 536a3d2..a2d03c6 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4388,7 +4388,6 @@ EVP_aria_256_ccm                        4332	1_1_1	EXIST::FUNCTION:ARIA
+ EVP_aria_128_gcm                        4333	1_1_1	EXIST::FUNCTION:ARIA
+ EVP_aria_128_ccm                        4334	1_1_1	EXIST::FUNCTION:ARIA
+ EVP_aria_192_gcm                        4335	1_1_1	EXIST::FUNCTION:ARIA
+-CRYPTO_THREAD_glock_new                 4336	1_1_1	EXIST::FUNCTION:
+ UI_get_result_length                    4337	1_1_1	EXIST::FUNCTION:
+ UI_set_result_ex                        4338	1_1_1	EXIST::FUNCTION:
+ UI_get_result_string_length             4339	1_1_1	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017868.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="017874.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17870">[ date ]</a>
+              <a href="thread.html#17870">[ thread ]</a>
+              <a href="subject.html#17870">[ subject ]</a>
+              <a href="author.html#17870">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

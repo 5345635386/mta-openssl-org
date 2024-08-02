@@ -1,0 +1,433 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1433245934.626206.7360.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001392.html">
+   <LINK REL="Next"  HREF="001220.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1433245934.626206.7360.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">matt at openssl.org
+       </A><BR>
+    <I>Tue Jun  2 11:52:14 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001392.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001220.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1215">[ date ]</a>
+              <a href="thread.html#1215">[ thread ]</a>
+              <a href="subject.html#1215">[ subject ]</a>
+              <a href="author.html#1215">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  27c76b9b8010b536687318739c6f631ce4194688 (commit)
+      from  8744ba5e4260ccb47daae3c45bb8e7b5bac42cd3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 27c76b9b8010b536687318739c6f631ce4194688
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon May 18 16:27:48 2015 +0100
+
+    Fix race condition in NewSessionTicket
+    
+    If a NewSessionTicket is received by a multi-threaded client when
+    attempting to reuse a previous ticket then a race condition can occur
+    potentially leading to a double free of the ticket data.
+    
+    CVE-2015-1791
+    
+    This also fixes RT#3808 where a session ID is changed for a session already
+    in the client session cache. Since the session ID is the key to the cache
+    this breaks the cache access.
+    
+    Parts of this patch were inspired by this Akamai change:
+    <A HREF="https://github.com/akamai/openssl/commit/c0bf69a791239ceec64509f9f19fcafb2461b0d3">https://github.com/akamai/openssl/commit/c0bf69a791239ceec64509f9f19fcafb2461b0d3</A>
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_clnt.c  |  32 +++++++++++++++
+ ssl/ssl.h      |   1 +
+ ssl/ssl_err.c  |   1 +
+ ssl/ssl_locl.h |   1 +
+ ssl/ssl_sess.c | 123 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 158 insertions(+)
+
+diff --git a/ssl/s3_clnt.c b/ssl/s3_clnt.c
+index 98c7b9e..feb1e3b 100644
+--- a/ssl/s3_clnt.c
++++ b/ssl/s3_clnt.c
+@@ -2229,6 +2229,38 @@ int ssl3_get_new_session_ticket(SSL *s)
+     }
+ 
+     p = d = (unsigned char *)s-&gt;init_msg;
++
++    if (s-&gt;session-&gt;session_id_length &gt; 0) {
++        int i = s-&gt;session_ctx-&gt;session_cache_mode;
++        SSL_SESSION *new_sess;
++        /*
++         * We reused an existing session, so we need to replace it with a new
++         * one
++         */
++        if (i &amp; SSL_SESS_CACHE_CLIENT) {
++            /*
++             * Remove the old session from the cache
++             */
++            if (i &amp; SSL_SESS_CACHE_NO_INTERNAL_STORE) {
++                if (s-&gt;session_ctx-&gt;remove_session_cb != NULL)
++                    s-&gt;session_ctx-&gt;remove_session_cb(s-&gt;session_ctx,
++                                                      s-&gt;session);
++            } else {
++                /* We carry on if this fails */
++                SSL_CTX_remove_session(s-&gt;session_ctx, s-&gt;session);
++            }
++        }
++
++        if ((new_sess = ssl_session_dup(s-&gt;session, 0)) == 0) {
++            al = SSL_AD_INTERNAL_ERROR;
++            SSLerr(SSL_F_SSL3_GET_NEW_SESSION_TICKET, ERR_R_MALLOC_FAILURE);
++            goto f_err;
++        }
++
++        SSL_SESSION_free(s-&gt;session);
++        s-&gt;session = new_sess;
++    }
++
+     n2l(p, s-&gt;session-&gt;tlsext_tick_lifetime_hint);
+     n2s(p, ticklen);
+     /* ticket_lifetime_hint + ticket_length + ticket */
+diff --git a/ssl/ssl.h b/ssl/ssl.h
+index 8eb852a..6fe1a24 100644
+--- a/ssl/ssl.h
++++ b/ssl/ssl.h
+@@ -2787,6 +2787,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_SSL_RSA_PUBLIC_ENCRYPT                     188
+ # define SSL_F_SSL_SCAN_CLIENTHELLO_TLSEXT                320
+ # define SSL_F_SSL_SCAN_SERVERHELLO_TLSEXT                321
++# define SSL_F_SSL_SESSION_DUP                            348
+ # define SSL_F_SSL_SESSION_NEW                            189
+ # define SSL_F_SSL_SESSION_PRINT_FP                       190
+ # define SSL_F_SSL_SESSION_SET1_ID_CONTEXT                312
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index fc0fb8f..1a6030e 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -312,6 +312,7 @@ static ERR_STRING_DATA SSL_str_functs[] = {
+      &quot;SSL_SCAN_CLIENTHELLO_TLSEXT&quot;},
+     {ERR_FUNC(SSL_F_SSL_SCAN_SERVERHELLO_TLSEXT),
+      &quot;SSL_SCAN_SERVERHELLO_TLSEXT&quot;},
++    {ERR_FUNC(SSL_F_SSL_SESSION_DUP), &quot;ssl_session_dup&quot;},
+     {ERR_FUNC(SSL_F_SSL_SESSION_NEW), &quot;SSL_SESSION_new&quot;},
+     {ERR_FUNC(SSL_F_SSL_SESSION_PRINT_FP), &quot;SSL_SESSION_print_fp&quot;},
+     {ERR_FUNC(SSL_F_SSL_SESSION_SET1_ID_CONTEXT),
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index fb65fed..6c2c551 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -1058,6 +1058,7 @@ int ssl_set_peer_cert_type(SESS_CERT *c, int type);
+ int ssl_get_new_session(SSL *s, int session);
+ int ssl_get_prev_session(SSL *s, unsigned char *session, int len,
+                          const unsigned char *limit);
++SSL_SESSION *ssl_session_dup(SSL_SESSION *src, int ticket);
+ int ssl_cipher_id_cmp(const SSL_CIPHER *a, const SSL_CIPHER *b);
+ DECLARE_OBJ_BSEARCH_GLOBAL_CMP_FN(SSL_CIPHER, SSL_CIPHER, ssl_cipher_id);
+ int ssl_cipher_ptr_id_cmp(const SSL_CIPHER *const *ap,
+diff --git a/ssl/ssl_sess.c b/ssl/ssl_sess.c
+index 8b9945b..ca5d2d6 100644
+--- a/ssl/ssl_sess.c
++++ b/ssl/ssl_sess.c
+@@ -227,6 +227,129 @@ SSL_SESSION *SSL_SESSION_new(void)
+     return (ss);
+ }
+ 
++/*
++ * Create a new SSL_SESSION and duplicate the contents of |src| into it. If
++ * ticket == 0 then no ticket information is duplicated, otherwise it is.
++ */
++SSL_SESSION *ssl_session_dup(SSL_SESSION *src, int ticket)
++{
++    SSL_SESSION *dest;
++
++    dest = OPENSSL_malloc(sizeof(*src));
++    if (dest == NULL) {
++        goto err;
++    }
++    memcpy(dest, src, sizeof(*dest));
++
++#ifndef OPENSSL_NO_KRB5
++    dest-&gt;krb5_client_princ_len = dest-&gt;krb5_client_princ_len;
++    if (src-&gt;krb5_client_princ_len &gt; 0)
++        memcpy(dest-&gt;krb5_client_princ, src-&gt;krb5_client_princ,
++               src-&gt;krb5_client_princ_len);
++#endif
++
++#ifndef OPENSSL_NO_PSK
++    if (src-&gt;psk_identity_hint) {
++        dest-&gt;psk_identity_hint = BUF_strdup(src-&gt;psk_identity_hint);
++        if (dest-&gt;psk_identity_hint == NULL) {
++            goto err;
++        }
++    } else {
++        dest-&gt;psk_identity_hint = NULL;
++    }
++    if (src-&gt;psk_identity) {
++        dest-&gt;psk_identity = BUF_strdup(src-&gt;psk_identity);
++        if (dest-&gt;psk_identity == NULL) {
++            goto err;
++        }
++    } else {
++        dest-&gt;psk_identity = NULL;
++    }
++#endif
++
++    if (src-&gt;sess_cert != NULL)
++        CRYPTO_add(&amp;src-&gt;sess_cert-&gt;references, 1, CRYPTO_LOCK_SSL_SESS_CERT);
++
++    if (src-&gt;peer != NULL)
++        CRYPTO_add(&amp;src-&gt;peer-&gt;references, 1, CRYPTO_LOCK_X509);
++
++    dest-&gt;references = 1;
++
++    if(src-&gt;ciphers != NULL) {
++        dest-&gt;ciphers = sk_SSL_CIPHER_dup(src-&gt;ciphers);
++        if (dest-&gt;ciphers == NULL)
++            goto err;
++    } else {
++        dest-&gt;ciphers = NULL;
++    }
++
++    if (!CRYPTO_dup_ex_data(CRYPTO_EX_INDEX_SSL_SESSION,
++                                            &amp;dest-&gt;ex_data, &amp;src-&gt;ex_data)) {
++        goto err;
++    }
++
++    /* We deliberately don't copy the prev and next pointers */
++    dest-&gt;prev = NULL;
++    dest-&gt;next = NULL;
++
++#ifndef OPENSSL_NO_TLSEXT
++    if (src-&gt;tlsext_hostname) {
++        dest-&gt;tlsext_hostname = BUF_strdup(src-&gt;tlsext_hostname);
++        if (dest-&gt;tlsext_hostname == NULL) {
++            goto err;
++        }
++    } else {
++        dest-&gt;tlsext_hostname = NULL;
++    }
++# ifndef OPENSSL_NO_EC
++    if (src-&gt;tlsext_ecpointformatlist) {
++        dest-&gt;tlsext_ecpointformatlist =
++            BUF_memdup(src-&gt;tlsext_ecpointformatlist,
++                       src-&gt;tlsext_ecpointformatlist_length);
++        if (dest-&gt;tlsext_ecpointformatlist == NULL)
++            goto err;
++        dest-&gt;tlsext_ecpointformatlist_length =
++            src-&gt;tlsext_ecpointformatlist_length;
++    }
++    if (src-&gt;tlsext_ellipticcurvelist) {
++        dest-&gt;tlsext_ellipticcurvelist =
++            BUF_memdup(src-&gt;tlsext_ellipticcurvelist,
++                       src-&gt;tlsext_ellipticcurvelist_length);
++        if (dest-&gt;tlsext_ellipticcurvelist == NULL)
++            goto err;
++        dest-&gt;tlsext_ellipticcurvelist_length =
++            src-&gt;tlsext_ellipticcurvelist_length;
++    }
++# endif
++#endif
++
++    if (ticket != 0) {
++        dest-&gt;tlsext_tick_lifetime_hint = src-&gt;tlsext_tick_lifetime_hint;
++        dest-&gt;tlsext_ticklen = src-&gt;tlsext_ticklen;
++        if((dest-&gt;tlsext_tick = OPENSSL_malloc(src-&gt;tlsext_ticklen)) == NULL) {
++            goto err;
++        }
++    }
++
++#ifndef OPENSSL_NO_SRP
++    dest-&gt;srp_username = NULL;
++    if (src-&gt;srp_username) {
++        dest-&gt;srp_username = BUF_strdup(src-&gt;srp_username);
++        if (dest-&gt;srp_username == NULL) {
++            goto err;
++        }
++    } else {
++        dest-&gt;srp_username = NULL;
++    }
++#endif
++
++    return dest;
++err:
++    SSLerr(SSL_F_SSL_SESSION_DUP, ERR_R_MALLOC_FAILURE);
++    SSL_SESSION_free(dest);
++    return NULL;
++}
++
+ const unsigned char *SSL_SESSION_get_id(const SSL_SESSION *s,
+                                         unsigned int *len)
+ {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001392.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001220.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1215">[ date ]</a>
+              <a href="thread.html#1215">[ thread ]</a>
+              <a href="subject.html#1215">[ subject ]</a>
+              <a href="author.html#1215">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

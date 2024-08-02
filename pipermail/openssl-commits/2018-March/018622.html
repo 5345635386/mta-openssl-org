@@ -1,0 +1,400 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1521465781.787827.30385.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018621.html">
+   <LINK REL="Next"  HREF="018623.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>bernd.edlinger at hotmail.de</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1521465781.787827.30385.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">bernd.edlinger at hotmail.de
+       </A><BR>
+    <I>Mon Mar 19 13:23:01 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018621.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018623.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18622">[ date ]</a>
+              <a href="thread.html#18622">[ thread ]</a>
+              <a href="subject.html#18622">[ subject ]</a>
+              <a href="author.html#18622">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c911e5da3c8e09a9531149c95aa92c65ecdf4b99 (commit)
+      from  d4ef4fbf46a51837a54e4a7cd0140eb9f08fdf30 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c911e5da3c8e09a9531149c95aa92c65ecdf4b99
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Mon Mar 19 14:20:53 2018 +0100
+
+    Fix bio callback backward compatibility
+    
+    Don't pass a pointer to uninitialized processed value
+    for BIO_CB_READ and BIO_CB_WRITE
+    
+    Check the correct cmd code in BIO_callback_ctrl
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5516">https://github.com/openssl/openssl/pull/5516</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bio_lib.c                               |  22 ++--
+ doc/man3/BIO_set_callback.pod                      |  18 ++--
+ test/bio_callback_test.c                           | 117 +++++++++++++++++++++
+ test/build.info                                    |   5 +
+ .../{04-test_bioprint.t =&gt; 04-test_bio_callback.t} |   4 +-
+ 5 files changed, 146 insertions(+), 20 deletions(-)
+ create mode 100644 test/bio_callback_test.c
+ copy test/recipes/{04-test_bioprint.t =&gt; 04-test_bio_callback.t} (71%)
+
+diff --git a/crypto/bio/bio_lib.c b/crypto/bio/bio_lib.c
+index 557d609..95eef7d 100644
+--- a/crypto/bio/bio_lib.c
++++ b/crypto/bio/bio_lib.c
+@@ -34,9 +34,8 @@ static long bio_call_callback(BIO *b, int oper, const char *argp, size_t len,
+     long ret;
+     int bareoper;
+ 
+-    if (b-&gt;callback_ex != NULL) {
++    if (b-&gt;callback_ex != NULL)
+         return b-&gt;callback_ex(b, oper, argp, len, argi, argl, inret, processed);
+-    }
+ 
+     /* Strip off any BIO_CB_RETURN flag */
+     bareoper = oper &amp; ~BIO_CB_RETURN;
+@@ -51,17 +50,17 @@ static long bio_call_callback(BIO *b, int oper, const char *argp, size_t len,
+             return -1;
+ 
+         argi = (int)len;
++    }
+ 
+-        if (inret &amp;&amp; (oper &amp; BIO_CB_RETURN)) {
+-            if (*processed &gt; INT_MAX)
+-                return -1;
+-            inret = *processed;
+-        }
++    if (inret &amp;&amp; (oper &amp; BIO_CB_RETURN) &amp;&amp; bareoper != BIO_CB_CTRL) {
++        if (*processed &gt; INT_MAX)
++            return -1;
++        inret = *processed;
+     }
+ 
+     ret = b-&gt;callback(b, oper, argp, argi, argl, inret);
+ 
+-    if (ret &gt;= 0 &amp;&amp; (HAS_LEN_OPER(bareoper) || bareoper == BIO_CB_PUTS)) {
++    if (ret &gt;= 0 &amp;&amp; (oper &amp; BIO_CB_RETURN) &amp;&amp; bareoper != BIO_CB_CTRL) {
+         *processed = (size_t)ret;
+         ret = 1;
+     }
+@@ -260,7 +259,7 @@ static int bio_read_intern(BIO *b, void *data, size_t dlen, size_t *readbytes)
+ 
+     if ((b-&gt;callback != NULL || b-&gt;callback_ex != NULL) &amp;&amp;
+         ((ret = (int)bio_call_callback(b, BIO_CB_READ, data, dlen, 0, 0L, 1L,
+-                                       readbytes)) &lt;= 0))
++                                       NULL)) &lt;= 0))
+         return ret;
+ 
+     if (!b-&gt;init) {
+@@ -333,7 +332,7 @@ static int bio_write_intern(BIO *b, const void *data, size_t dlen,
+ 
+     if ((b-&gt;callback != NULL || b-&gt;callback_ex != NULL) &amp;&amp;
+         ((ret = (int)bio_call_callback(b, BIO_CB_WRITE, data, dlen, 0, 0L, 1L,
+-                                       written)) &lt;= 0))
++                                       NULL)) &lt;= 0))
+         return ret;
+ 
+     if (!b-&gt;init) {
+@@ -542,7 +541,8 @@ long BIO_callback_ctrl(BIO *b, int cmd, BIO_info_cb *fp)
+     if (b == NULL)
+         return 0;
+ 
+-    if ((b-&gt;method == NULL) || (b-&gt;method-&gt;callback_ctrl == NULL)) {
++    if ((b-&gt;method == NULL) || (b-&gt;method-&gt;callback_ctrl == NULL)
++            || (cmd != BIO_CTRL_SET_CALLBACK)) {
+         BIOerr(BIO_F_BIO_CALLBACK_CTRL, BIO_R_UNSUPPORTED_METHOD);
+         return -2;
+     }
+diff --git a/doc/man3/BIO_set_callback.pod b/doc/man3/BIO_set_callback.pod
+index 71a041e..0a9b6ed 100644
+--- a/doc/man3/BIO_set_callback.pod
++++ b/doc/man3/BIO_set_callback.pod
+@@ -114,7 +114,7 @@ is called before the free operation.
+ 
+ =item B&lt;BIO_read_ex(b, data, dlen, readbytes)&gt;
+ 
+- callback_ex(b, BIO_CB_READ, data, dlen, 0, 0L, 1L, readbytes)
++ callback_ex(b, BIO_CB_READ, data, dlen, 0, 0L, 1L, NULL)
+ 
+ or
+ 
+@@ -123,7 +123,7 @@ or
+ is called before the read and
+ 
+  callback_ex(b, BIO_CB_READ | BIO_CB_RETURN, data, dlen, 0, 0L, retvalue,
+-             readbytes)
++             &amp;readbytes)
+ 
+ or
+ 
+@@ -133,7 +133,7 @@ after.
+ 
+ =item B&lt;BIO_write(b, data, dlen, written)&gt;
+ 
+- callback_ex(b, BIO_CB_WRITE, data, dlen, 0, 0L, 1L, written)
++ callback_ex(b, BIO_CB_WRITE, data, dlen, 0, 0L, 1L, NULL)
+ 
+ or
+ 
+@@ -142,7 +142,7 @@ or
+ is called before the write and
+ 
+  callback_ex(b, BIO_CB_WRITE | BIO_CB_RETURN, data, dlen, 0, 0L, retvalue,
+-             written)
++             &amp;written)
+ 
+ or
+ 
+@@ -161,7 +161,7 @@ or
+ is called before the operation and
+ 
+  callback_ex(b, BIO_CB_GETS | BIO_CB_RETURN, buf, size, 0, 0L, retvalue,
+-             readbytes)
++             &amp;readbytes)
+ 
+ or
+ 
+@@ -179,11 +179,11 @@ or
+ 
+ is called before the operation and
+ 
+- callback_ex(b, BIO_CB_PUTS | BIO_CB_RETURN, buf, 0, 0, 0L, retvalue, written)
++ callback_ex(b, BIO_CB_PUTS | BIO_CB_RETURN, buf, 0, 0, 0L, retvalue, &amp;written)
+ 
+ or
+ 
+- callback(b, BIO_CB_WRITE|BIO_CB_RETURN, buf, 0, 0L, retvalue)
++ callback(b, BIO_CB_PUTS|BIO_CB_RETURN, buf, 0, 0L, retvalue)
+ 
+ after.
+ 
+@@ -205,6 +205,10 @@ or
+ 
+ after.
+ 
++Note: B&lt;cmd&gt; == B&lt;BIO_CTRL_SET_CALLBACK&gt; is special, because B&lt;parg&gt; is not the
++argument of type B&lt;BIO_info_cb&gt; itself.  In this case B&lt;parg&gt; is a pointer to
++the actual call parameter, see B&lt;BIO_callback_ctrl&gt;.
++
+ =back
+ 
+ =head1 EXAMPLE
+diff --git a/test/bio_callback_test.c b/test/bio_callback_test.c
+new file mode 100644
+index 0000000..f1712b3
+--- /dev/null
++++ b/test/bio_callback_test.c
+@@ -0,0 +1,117 @@
++/*
++ * Copyright 2018 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;openssl/bio.h&gt;
++
++#include &quot;testutil.h&quot;
++
++#define MAXCOUNT 5
++static int         my_param_count;
++static BIO        *my_param_b[MAXCOUNT];
++static int         my_param_oper[MAXCOUNT];
++static const char *my_param_argp[MAXCOUNT];
++static int         my_param_argi[MAXCOUNT];
++static long        my_param_argl[MAXCOUNT];
++static long        my_param_ret[MAXCOUNT];
++
++static long my_bio_callback(BIO *b, int oper, const char *argp, int argi,
++                            long argl, long ret)
++{
++    if (my_param_count &gt;= MAXCOUNT)
++        return -1;
++    my_param_b[my_param_count]    = b;
++    my_param_oper[my_param_count] = oper;
++    my_param_argp[my_param_count] = argp;
++    my_param_argi[my_param_count] = argi;
++    my_param_argl[my_param_count] = argl;
++    my_param_ret[my_param_count]  = ret;
++    my_param_count++;
++    return ret;
++}
++
++static int test_bio_callback(void)
++{
++    int ok = 0;
++    BIO *bio;
++    int i;
++    char *test1 = &quot;test&quot;;
++    char *test2 = &quot;hello&quot;;
++
++    my_param_count = 0;
++
++    bio = BIO_new(BIO_s_mem());
++    if (bio == NULL)
++        goto err;
++
++    BIO_set_callback(bio, my_bio_callback);
++    i = BIO_write(bio, test1, 4);
++    if (!TEST_int_eq(i, 4)
++            || !TEST_int_eq(my_param_count, 2)
++            || !TEST_ptr_eq(my_param_b[0], bio)
++            || !TEST_int_eq(my_param_oper[0], BIO_CB_WRITE)
++            || !TEST_ptr_eq(my_param_argp[0], test1)
++            || !TEST_int_eq(my_param_argi[0], 4)
++            || !TEST_long_eq(my_param_argl[0], 0L)
++            || !TEST_long_eq(my_param_ret[0], 1L)
++            || !TEST_ptr_eq(my_param_b[1], bio)
++            || !TEST_int_eq(my_param_oper[1], BIO_CB_WRITE | BIO_CB_RETURN)
++            || !TEST_ptr_eq(my_param_argp[1], test1)
++            || !TEST_int_eq(my_param_argi[1], 4)
++            || !TEST_long_eq(my_param_argl[1], 0L)
++            || !TEST_long_eq(my_param_ret[1], 4L))
++        goto err;
++
++    i = BIO_puts(bio, test2);
++    if (!TEST_int_eq(i, 5)
++            || !TEST_int_eq(my_param_count, 4)
++            || !TEST_ptr_eq(my_param_b[2], bio)
++            || !TEST_int_eq(my_param_oper[2], BIO_CB_PUTS)
++            || !TEST_ptr_eq(my_param_argp[2], test2)
++            || !TEST_int_eq(my_param_argi[2], 0)
++            || !TEST_long_eq(my_param_argl[2], 0L)
++            || !TEST_long_eq(my_param_ret[2], 1L)
++            || !TEST_ptr_eq(my_param_b[3], bio)
++            || !TEST_int_eq(my_param_oper[3], BIO_CB_PUTS | BIO_CB_RETURN)
++            || !TEST_ptr_eq(my_param_argp[3], test2)
++            || !TEST_int_eq(my_param_argi[3], 0)
++            || !TEST_long_eq(my_param_argl[3], 0L)
++            || !TEST_long_eq(my_param_ret[3], 5L))
++        goto err;
++
++    i = BIO_free(bio);
++
++    if (!TEST_int_eq(i, 1)
++            || !TEST_int_eq(my_param_count, 5)
++            || !TEST_ptr_eq(my_param_b[4], bio)
++            || !TEST_int_eq(my_param_oper[4], BIO_CB_FREE)
++            || !TEST_ptr_eq(my_param_argp[4], NULL)
++            || !TEST_int_eq(my_param_argi[4], 0)
++            || !TEST_long_eq(my_param_argl[4], 0L)
++            || !TEST_long_eq(my_param_ret[4], 1L))
++        goto finish;
++
++    ok = 1;
++    goto finish;
++
++err:
++    BIO_free(bio);
++
++finish:
++    /* This helps finding memory leaks with ASAN */
++    memset(my_param_b, 0, sizeof(my_param_b));
++    memset(my_param_argp, 0, sizeof(my_param_argp));
++    return ok;
++}
++
++int setup_tests(void)
++{
++    ADD_TEST(test_bio_callback);
++    return 1;
++}
+diff --git a/test/build.info b/test/build.info
+index 9fcaa7d..a4e6e78 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -40,6 +40,7 @@ INCLUDE_MAIN___test_libtestutil_OLB = /INCLUDE=MAIN
+           packettest asynctest secmemtest srptest memleaktest stack_test \
+           dtlsv1listentest ct_test threadstest afalgtest d2i_test \
+           ssl_test_ctx_test ssl_test x509aux cipherlist_test asynciotest \
++          bio_callback_test \
+           bioprinttest sslapitest dtlstest sslcorrupttest bio_enc_test \
+           pkey_meth_test pkey_meth_kdf_test uitest cipherbytes_test \
+           asn1_encode_test asn1_string_table_test \
+@@ -280,6 +281,10 @@ INCLUDE_MAIN___test_libtestutil_OLB = /INCLUDE=MAIN
+   INCLUDE[asynciotest]=../include
+   DEPEND[asynciotest]=../libcrypto ../libssl libtestutil.a
+ 
++  SOURCE[bio_callback_test]=bio_callback_test.c
++  INCLUDE[bio_callback_test]=../include
++  DEPEND[bio_callback_test]=../libcrypto libtestutil.a
++
+   SOURCE[bioprinttest]=bioprinttest.c
+   INCLUDE[bioprinttest]=../include
+   DEPEND[bioprinttest]=../libcrypto libtestutil.a
+diff --git a/test/recipes/04-test_bioprint.t b/test/recipes/04-test_bio_callback.t
+similarity index 71%
+copy from test/recipes/04-test_bioprint.t
+copy to test/recipes/04-test_bio_callback.t
+index b86e828..1422cb6 100644
+--- a/test/recipes/04-test_bioprint.t
++++ b/test/recipes/04-test_bio_callback.t
+@@ -1,5 +1,5 @@
+ #! /usr/bin/env perl
+-# Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright 2018 The OpenSSL Project Authors. All Rights Reserved.
+ #
+ # Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -9,4 +9,4 @@
+ 
+ use OpenSSL::Test::Simple;
+ 
+-simple_test(&quot;test_bioprint&quot;, &quot;bioprinttest&quot;);
++simple_test(&quot;test_bio_callback&quot;, &quot;bio_callback_test&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018621.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018623.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18622">[ date ]</a>
+              <a href="thread.html#18622">[ thread ]</a>
+              <a href="subject.html#18622">[ subject ]</a>
+              <a href="author.html#18622">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,248 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1629111324.024290.5539.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035067.html">
+   <LINK REL="Next"  HREF="035077.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1629111324.024290.5539.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Mon Aug 16 10:55:24 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035067.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="035077.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35074">[ date ]</a>
+              <a href="thread.html#35074">[ thread ]</a>
+              <a href="subject.html#35074">[ subject ]</a>
+              <a href="author.html#35074">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0ec738433e522c96c7edfe4c9ffdc76d4dfef00a (commit)
+      from  4ccad35756dfa9df657f3853810101fa9d6ca525 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0ec738433e522c96c7edfe4c9ffdc76d4dfef00a
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Fri Aug 6 17:25:13 2021 +0200
+
+    Multiple fixes for getting pub key from legacy DH PKEY
+    
+    There were multiple issues with getting OSSL_PKEY_PARAM_PUB_KEY
+    from a legacy EVP_PKEY DH and DHX keys.
+    
+    Fixes #16247
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16253">https://github.com/openssl/openssl/pull/16253</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/ctrl_params_translate.c | 23 ++++++++++++++++++-----
+ test/evp_extra_test.c              | 34 ++++++++++++++++++++++++++++------
+ 2 files changed, 46 insertions(+), 11 deletions(-)
+
+diff --git a/crypto/evp/ctrl_params_translate.c b/crypto/evp/ctrl_params_translate.c
+index a441c1f4b7..88945e13e6 100644
+--- a/crypto/evp/ctrl_params_translate.c
++++ b/crypto/evp/ctrl_params_translate.c
+@@ -654,9 +654,21 @@ static int default_fixup_args(enum state state,
+             } else if ((state == POST_PARAMS_TO_CTRL || state == PKEY)
+                        &amp;&amp; ctx-&gt;action_type == GET) {
+                 /* For the POST state, only getting needs some work to be done */
+-
++                unsigned int param_data_type = translation-&gt;param_data_type;
++                size_t size = (size_t)ctx-&gt;p1;
++
++                if (state == PKEY)
++                    size = ctx-&gt;sz;
++                if (param_data_type == 0) {
++                    /* we must have a fixup_args function to work */
++                    if (!ossl_assert(translation-&gt;fixup_args != NULL)) {
++                        ERR_raise(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR);
++                        return 0;
++                    }
++                    param_data_type = ctx-&gt;params-&gt;data_type;
++                }
+                 /* When getting, we populate |*params| from |p1| and |p2| */
+-                switch (translation-&gt;param_data_type) {
++                switch (param_data_type) {
+                 case OSSL_PARAM_INTEGER:
+                     return OSSL_PARAM_set_int(ctx-&gt;params, ctx-&gt;p1);
+                 case OSSL_PARAM_UNSIGNED_INTEGER:
+@@ -673,10 +685,10 @@ static int default_fixup_args(enum state state,
+                     return OSSL_PARAM_set_utf8_string(ctx-&gt;params, ctx-&gt;p2);
+                 case OSSL_PARAM_OCTET_STRING:
+                     return OSSL_PARAM_set_octet_string(ctx-&gt;params, ctx-&gt;p2,
+-                                                       (size_t)ctx-&gt;p1);
++                                                       size);
+                 case OSSL_PARAM_OCTET_PTR:
+                     return OSSL_PARAM_set_octet_ptr(ctx-&gt;params, ctx-&gt;p2,
+-                                                    (size_t)ctx-&gt;p1);
++                                                    size);
+                 default:
+                     ERR_raise_data(ERR_LIB_EVP, ERR_R_UNSUPPORTED,
+                                    &quot;[action:%d, state:%d] &quot;
+@@ -1552,6 +1564,7 @@ static int get_payload_public_key(enum state state,
+     ctx-&gt;p2 = NULL;
+     switch (EVP_PKEY_get_base_id(pkey)) {
+ #ifndef OPENSSL_NO_DH
++    case EVP_PKEY_DHX:
+     case EVP_PKEY_DH:
+         switch (ctx-&gt;params-&gt;data_type) {
+         case OSSL_PARAM_OCTET_STRING:
+@@ -2249,7 +2262,7 @@ static const struct translation_st evp_pkey_translations[] = {
+       get_payload_private_key },
+     { GET, -1, -1, -1, 0, NULL, NULL,
+       OSSL_PKEY_PARAM_PUB_KEY,
+-      0 /* no data type, let get_payload_pub_key() handle that */,
++      0 /* no data type, let get_payload_public_key() handle that */,
+       get_payload_public_key },
+ 
+     /* DH and DSA */
+diff --git a/test/evp_extra_test.c b/test/evp_extra_test.c
+index e03e2a252e..418b467f52 100644
+--- a/test/evp_extra_test.c
++++ b/test/evp_extra_test.c
+@@ -2481,13 +2481,21 @@ static int test_EVP_PKEY_set1_DH(void)
+     EVP_PKEY *pkey1 = NULL, *pkey2 = NULL;
+     int ret = 0;
+     BIGNUM *p, *g = NULL;
++    BIGNUM *pubkey = NULL;
++    unsigned char pub[2048 / 8];
++    size_t len = 0;
+ 
+     if (!TEST_ptr(p = BN_new())
+             || !TEST_ptr(g = BN_new())
+-            || !BN_set_word(p, 9999)
+-            || !BN_set_word(g, 2)
++            || !TEST_ptr(pubkey = BN_new())
++            || !TEST_true(BN_set_word(p, 9999))
++            || !TEST_true(BN_set_word(g, 2))
++            || !TEST_true(BN_set_word(pubkey, 4321))
+             || !TEST_ptr(noqdh = DH_new())
+-            || !DH_set0_pqg(noqdh, p, NULL, g))
++            || !TEST_true(DH_set0_pqg(noqdh, p, NULL, g))
++            || !TEST_true(DH_set0_key(noqdh, pubkey, NULL))
++            || !TEST_ptr(pubkey = BN_new())
++            || !TEST_true(BN_set_word(pubkey, 4321)))
+         goto err;
+     p = g = NULL;
+ 
+@@ -2497,21 +2505,35 @@ static int test_EVP_PKEY_set1_DH(void)
+     if (!TEST_ptr(x942dh)
+             || !TEST_ptr(noqdh)
+             || !TEST_ptr(pkey1)
+-            || !TEST_ptr(pkey2))
++            || !TEST_ptr(pkey2)
++            || !TEST_true(DH_set0_key(x942dh, pubkey, NULL)))
+         goto err;
++    pubkey = NULL;
+ 
+-    if(!TEST_true(EVP_PKEY_set1_DH(pkey1, x942dh))
++    if (!TEST_true(EVP_PKEY_set1_DH(pkey1, x942dh))
+             || !TEST_int_eq(EVP_PKEY_get_id(pkey1), EVP_PKEY_DHX))
+         goto err;
+ 
+-    if(!TEST_true(EVP_PKEY_set1_DH(pkey2, noqdh))
++    if (!TEST_true(EVP_PKEY_get_bn_param(pkey1, OSSL_PKEY_PARAM_PUB_KEY,
++                                         &amp;pubkey))
++            || !TEST_ptr(pubkey))
++        goto err;
++
++    if (!TEST_true(EVP_PKEY_set1_DH(pkey2, noqdh))
+             || !TEST_int_eq(EVP_PKEY_get_id(pkey2), EVP_PKEY_DH))
+         goto err;
+ 
++    if (!TEST_true(EVP_PKEY_get_octet_string_param(pkey2,
++                                                   OSSL_PKEY_PARAM_PUB_KEY,
++                                                   pub, sizeof(pub), &amp;len))
++            || !TEST_size_t_ne(len, 0))
++        goto err;
++
+     ret = 1;
+  err:
+     BN_free(p);
+     BN_free(g);
++    BN_free(pubkey);
+     EVP_PKEY_free(pkey1);
+     EVP_PKEY_free(pkey2);
+     DH_free(x942dh);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035067.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="035077.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35074">[ date ]</a>
+              <a href="thread.html#35074">[ thread ]</a>
+              <a href="subject.html#35074">[ subject ]</a>
+              <a href="author.html#35074">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

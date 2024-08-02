@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1566271078.048397.1267.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024544.html">
+   <LINK REL="Next"  HREF="024554.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>kaishen.yy at antfin.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1566271078.048397.1267.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">kaishen.yy at antfin.com
+       </A><BR>
+    <I>Tue Aug 20 03:17:58 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024544.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024554.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24550">[ date ]</a>
+              <a href="thread.html#24550">[ thread ]</a>
+              <a href="subject.html#24550">[ subject ]</a>
+              <a href="author.html#24550">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cf0932cdd94f067ed18ce78bea038d919f69038f (commit)
+      from  c85d5e025797f4e77c2166150bbf8745e9d00696 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cf0932cdd94f067ed18ce78bea038d919f69038f
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Sat Aug 10 16:51:12 2019 +0200
+
+    prevent endless recursion when trace API is used within OPENSSL_init_crypto()
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Yang &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaishen.yy at antfin.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9567">https://github.com/openssl/openssl/pull/9567</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/include/internal/cryptlib_int.h |  1 -
+ crypto/init.c                          |  3 +--
+ crypto/trace.c                         | 25 +++++++++++++++----------
+ 3 files changed, 16 insertions(+), 13 deletions(-)
+ mode change 100644 =&gt; 100755 crypto/trace.c
+
+diff --git a/crypto/include/internal/cryptlib_int.h b/crypto/include/internal/cryptlib_int.h
+index 673a004f0f..69d94be54a 100644
+--- a/crypto/include/internal/cryptlib_int.h
++++ b/crypto/include/internal/cryptlib_int.h
+@@ -27,6 +27,5 @@ void ossl_ctx_thread_stop(void *arg);
+ # define OPENSSL_INIT_ZLIB                   0x00010000L
+ # define OPENSSL_INIT_BASE_ONLY              0x00040000L
+ 
+-int ossl_trace_init(void);
+ void ossl_trace_cleanup(void);
+ void ossl_malloc_setup_failures(void);
+diff --git a/crypto/init.c b/crypto/init.c
+index 04fd33087a..d4da7b27e3 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -44,8 +44,7 @@ static CRYPTO_ONCE base = CRYPTO_ONCE_STATIC_INIT;
+ static int base_inited = 0;
+ DEFINE_RUN_ONCE_STATIC(ossl_init_base)
+ {
+-    if (ossl_trace_init() == 0)
+-        return 0;
++    /* no need to init trace */
+ 
+     OSSL_TRACE(INIT, &quot;ossl_init_base: setting up stop handlers\n&quot;);
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
+diff --git a/crypto/trace.c b/crypto/trace.c
+old mode 100644
+new mode 100755
+index d9524da1a6..cc99fff37c
+--- a/crypto/trace.c
++++ b/crypto/trace.c
+@@ -10,6 +10,7 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;string.h&gt;
+ 
++#include &quot;internal/thread_once.h&quot;
+ #include &lt;openssl/bio.h&gt;
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/trace.h&gt;
+@@ -218,6 +219,13 @@ static int trace_detach_cb(int category, int type, const void *data)
+     return 1;
+ }
+ 
++static int do_ossl_trace_init(void);
++static CRYPTO_ONCE trace_inited = CRYPTO_ONCE_STATIC_INIT;
++DEFINE_RUN_ONCE_STATIC(ossl_trace_init)
++{
++    return do_ossl_trace_init();
++}
++
+ static int set_trace_data(int category, int type, BIO **channel,
+                           const char **prefix, const char **suffix,
+                           int (*attach_cb)(int, int, const void *),
+@@ -227,8 +235,9 @@ static int set_trace_data(int category, int type, BIO **channel,
+     char *curr_prefix = NULL;
+     char *curr_suffix = NULL;
+ 
+-    /* Ensure ossl_trace_init() is called */
+-    OPENSSL_init_crypto(0, NULL);
++    /* Ensure do_ossl_trace_init() is called once */
++    if (!RUN_ONCE(&amp;trace_inited, ossl_trace_init))
++        return 0;
+ 
+     curr_channel = trace_channels[category].bio;
+     curr_prefix = trace_channels[category].prefix;
+@@ -297,19 +306,15 @@ static int set_trace_data(int category, int type, BIO **channel,
+ 
+     return 1;
+ }
+-#endif
+ 
+-int ossl_trace_init(void)
++static int do_ossl_trace_init(void)
+ {
+-#ifndef OPENSSL_NO_TRACE
+     trace_lock = CRYPTO_THREAD_lock_new();
+-    if (trace_lock == NULL)
+-        return 0;
+-#endif
+-
+-    return 1;
++    return trace_lock != NULL;
+ }
+ 
++#endif
++
+ void ossl_trace_cleanup(void)
+ {
+ #ifndef OPENSSL_NO_TRACE
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024544.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024554.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24550">[ date ]</a>
+              <a href="thread.html#24550">[ thread ]</a>
+              <a href="subject.html#24550">[ subject ]</a>
+              <a href="author.html#24550">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

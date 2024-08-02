@@ -1,0 +1,340 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1489278917.928250.29721.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013549.html">
+   <LINK REL="Next"  HREF="013578.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1489278917.928250.29721.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">matt at openssl.org
+       </A><BR>
+    <I>Sun Mar 12 00:35:17 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013549.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="013578.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13561">[ date ]</a>
+              <a href="thread.html#13561">[ thread ]</a>
+              <a href="subject.html#13561">[ subject ]</a>
+              <a href="author.html#13561">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  6a6213556a80ab0a9eb926a1d6023b8bf44f2afd (commit)
+      from  6fe43af8d77b119f8af913c284149bca482ee58c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6a6213556a80ab0a9eb926a1d6023b8bf44f2afd
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Mar 10 10:51:35 2017 +0000
+
+    Fix out-of-memory condition in conf
+    
+    conf has the ability to expand variables in config files. Repeatedly doing
+    this can lead to an exponential increase in the amount of memory required.
+    This places a limit on the length of a value that can result from an
+    expansion.
+    
+    Credit to OSS-Fuzz for finding this problem.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2894">https://github.com/openssl/openssl/pull/2894</A>)
+    (cherry picked from commit 8a585601fea1091022034dd14b961c1ecd5916c3)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/conf/conf.h     |  1 +
+ crypto/conf/conf_def.c | 16 ++++++++++++++--
+ crypto/conf/conf_err.c |  2 ++
+ doc/apps/config.pod    |  3 ++-
+ 4 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/conf/conf.h b/crypto/conf/conf.h
+index 8d926d5..fe49113 100644
+--- a/crypto/conf/conf.h
++++ b/crypto/conf/conf.h
+@@ -259,6 +259,7 @@ void ERR_load_CONF_strings(void);
+ # define CONF_R_NO_VALUE                                  108
+ # define CONF_R_UNABLE_TO_CREATE_NEW_SECTION              103
+ # define CONF_R_UNKNOWN_MODULE_NAME                       113
++# define CONF_R_VARIABLE_EXPANSION_TOO_LONG               116
+ # define CONF_R_VARIABLE_HAS_NO_VALUE                     104
+ 
+ #ifdef  __cplusplus
+diff --git a/crypto/conf/conf_def.c b/crypto/conf/conf_def.c
+index 68c77ce..75e309a 100644
+--- a/crypto/conf/conf_def.c
++++ b/crypto/conf/conf_def.c
+@@ -69,6 +69,12 @@
+ #include &lt;openssl/buffer.h&gt;
+ #include &lt;openssl/err.h&gt;
+ 
++/*
++ * The maximum length we can grow a value to after variable expansion. 64k
++ * should be more than enough for all reasonable uses.
++ */
++#define MAX_CONF_VALUE_LENGTH       65536
++
+ static char *eat_ws(CONF *conf, char *p);
+ static char *eat_alpha_numeric(CONF *conf, char *p);
+ static void clear_comments(CONF *conf, char *p);
+@@ -530,6 +536,8 @@ static int str_copy(CONF *conf, char *section, char **pto, char *from)
+         } else if (IS_EOF(conf, *from))
+             break;
+         else if (*from == '$') {
++            size_t newsize;
++
+             /* try to expand it */
+             rrp = NULL;
+             s = &amp;(from[1]);
+@@ -584,8 +592,12 @@ static int str_copy(CONF *conf, char *section, char **pto, char *from)
+                 CONFerr(CONF_F_STR_COPY, CONF_R_VARIABLE_HAS_NO_VALUE);
+                 goto err;
+             }
+-            if (!BUF_MEM_grow_clean(buf,
+-                        (strlen(p) + buf-&gt;length - (e - from)))) {
++            newsize = strlen(p) + buf-&gt;length - (e - from);
++            if (newsize &gt; MAX_CONF_VALUE_LENGTH) {
++                CONFerr(CONF_F_STR_COPY, CONF_R_VARIABLE_EXPANSION_TOO_LONG);
++                goto err;
++            }
++            if (!BUF_MEM_grow_clean(buf, newsize)) {
+                 CONFerr(CONF_F_STR_COPY, ERR_R_MALLOC_FAILURE);
+                 goto err;
+             }
+diff --git a/crypto/conf/conf_err.c b/crypto/conf/conf_err.c
+index bb5e2fe..b0b6896 100644
+--- a/crypto/conf/conf_err.c
++++ b/crypto/conf/conf_err.c
+@@ -115,6 +115,8 @@ static ERR_STRING_DATA CONF_str_reasons[] = {
+     {ERR_REASON(CONF_R_UNABLE_TO_CREATE_NEW_SECTION),
+      &quot;unable to create new section&quot;},
+     {ERR_REASON(CONF_R_UNKNOWN_MODULE_NAME), &quot;unknown module name&quot;},
++    {ERR_REASON(CONF_R_VARIABLE_EXPANSION_TOO_LONG),
++     &quot;variable expansion too long&quot;},
+     {ERR_REASON(CONF_R_VARIABLE_HAS_NO_VALUE), &quot;variable has no value&quot;},
+     {0, NULL}
+ };
+diff --git a/doc/apps/config.pod b/doc/apps/config.pod
+index e125915..3f607d3 100644
+--- a/doc/apps/config.pod
++++ b/doc/apps/config.pod
+@@ -47,7 +47,8 @@ or B&lt;${section::name}&gt;. By using the form B&lt;$ENV::name&gt; environment
+ variables can be substituted. It is also possible to assign values to
+ environment variables by using the name B&lt;ENV::name&gt;, this will work
+ if the program looks up environment variables using the B&lt;CONF&gt; library
+-instead of calling B&lt;getenv()&gt; directly.
++instead of calling B&lt;getenv()&gt; directly. The value string must not exceed 64k in
++length after variable expansion. Otherwise an error will occur.
+ 
+ It is possible to escape certain characters by using any kind of quote
+ or the B&lt;\&gt; character. By making the last character of a line a B&lt;\&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013549.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="013578.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13561">[ date ]</a>
+              <a href="thread.html#13561">[ thread ]</a>
+              <a href="subject.html#13561">[ subject ]</a>
+              <a href="author.html#13561">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

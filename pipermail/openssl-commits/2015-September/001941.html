@@ -1,0 +1,792 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1443628158.912107.13426.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001940.html">
+   <LINK REL="Next"  HREF="001942.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1443628158.912107.13426.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Wed Sep 30 15:49:18 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001940.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001942.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1941">[ date ]</a>
+              <a href="thread.html#1941">[ thread ]</a>
+              <a href="subject.html#1941">[ subject ]</a>
+              <a href="author.html#1941">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8eed3289b21d25583ed44742db43a2d727b79643 (commit)
+      from  75f648aa06933a5b5436d2ae4a764be68ab22c4d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8eed3289b21d25583ed44742db43a2d727b79643
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Sep 25 13:43:00 2015 +0200
+
+    bn/asm/armv4-mont.pl: boost NEON performance.
+    
+    Close difference gap on Cortex-A9, which resulted in further improvement
+    even on other processors.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/asm/armv4-mont.pl | 622 +++++++++++++++++++++++---------------------
+ 1 file changed, 328 insertions(+), 294 deletions(-)
+
+diff --git a/crypto/bn/asm/armv4-mont.pl b/crypto/bn/asm/armv4-mont.pl
+index bd56f98..48e5230 100644
+--- a/crypto/bn/asm/armv4-mont.pl
++++ b/crypto/bn/asm/armv4-mont.pl
+@@ -38,6 +38,15 @@
+ # for execution on all NEON-capable processors, because gain on
+ # others outweighs the marginal loss on Cortex-A9.
+ 
++# September 2015
++#
++# Align Cortex-A9 performance with November 2013 improvements, i.e.
++# NEON code is now ~20-105% faster than integer-only one on this
++# processor. But this optimization further improved performance even
++# on other processors: NEON code path is ~45-180% faster than original
++# integer-only on Cortex-A8, ~10-210% on Cortex-A15, ~70-450% on
++# Snapdragon S4.
++
+ $flavour = shift;
+ if ($flavour=~/^\w[\w\-]*\.\w+$/) { $output=$flavour; undef $flavour; }
+ else { while (($output=shift) &amp;&amp; ($output!~/^\w[\w\-]*\.\w+$/)) {} }
+@@ -272,19 +281,16 @@ bn_mul_mont:
+ .size	bn_mul_mont,.-bn_mul_mont
+ ___
+ {
+-sub Dlo()   { shift=~m|q([1]?[0-9])|?&quot;d&quot;.($1*2):&quot;&quot;;     }
+-sub Dhi()   { shift=~m|q([1]?[0-9])|?&quot;d&quot;.($1*2+1):&quot;&quot;;   }
+-
+ my ($A0,$A1,$A2,$A3)=map(&quot;d$_&quot;,(0..3));
+ my ($N0,$N1,$N2,$N3)=map(&quot;d$_&quot;,(4..7));
+ my ($Z,$Temp)=(&quot;q4&quot;,&quot;q5&quot;);
+-my ($A0xB,$A1xB,$A2xB,$A3xB,$A4xB,$A5xB,$A6xB,$A7xB)=map(&quot;q$_&quot;,(6..13));
++my @ACC=map(&quot;q$_&quot;,(6..13));
+ my ($Bi,$Ni,$M0)=map(&quot;d$_&quot;,(28..31));
+-my $zero=&amp;Dlo($Z);
+-my $temp=&amp;Dlo($Temp);
++my $zero=&quot;$Z#lo&quot;;
++my $temp=&quot;$Temp#lo&quot;;
+ 
+ my ($rptr,$aptr,$bptr,$nptr,$n0,$num)=map(&quot;r$_&quot;,(0..5));
+-my ($tinptr,$toutptr,$inner,$outer)=map(&quot;r$_&quot;,(6..9));
++my ($tinptr,$toutptr,$inner,$outer,$bnptr)=map(&quot;r$_&quot;,(6..11));
+ 
+ $code.=&lt;&lt;___;
+ #if __ARM_MAX_ARCH__&gt;=7
+@@ -300,59 +306,58 @@ bn_mul8x_mont_neon:
+ 	ldmia	ip,{r4-r5}		@ load rest of parameter block
+ 	mov	ip,sp
+ 
+-	sub		$toutptr,sp,#16
++	cmp	$num,#8
++	bhi	.LNEON_8n
++
++	@ special case for $num==8, everything is in register bank...
++
+ 	vld1.32		{${Bi}[0]}, [$bptr,:32]!
+-	sub		$toutptr,$toutptr,$num,lsl#4
++	veor		$zero,$zero,$zero
++	sub		$toutptr,sp,$num,lsl#4
+ 	vld1.32		{$A0-$A3},  [$aptr]!		@ can't specify :32 :-(
+ 	and		$toutptr,$toutptr,#-64
+ 	vld1.32		{${M0}[0]}, [$n0,:32]
+ 	mov		sp,$toutptr			@ alloca
+-	veor		$zero,$zero,$zero
+-	subs		$inner,$num,#8
+ 	vzip.16		$Bi,$zero
+ 
+-	vmull.u32	$A0xB,$Bi,${A0}[0]
+-	vmull.u32	$A1xB,$Bi,${A0}[1]
+-	vmull.u32	$A2xB,$Bi,${A1}[0]
+-	vshl.i64	$temp,`&amp;Dhi(&quot;$A0xB&quot;)`,#16
+-	vmull.u32	$A3xB,$Bi,${A1}[1]
++	vmull.u32	@ACC[0],$Bi,${A0}[0]
++	vmull.u32	@ACC[1],$Bi,${A0}[1]
++	vmull.u32	@ACC[2],$Bi,${A1}[0]
++	vshl.i64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#hi,#16
++	vmull.u32	@ACC[3],$Bi,${A1}[1]
+ 
+-	vadd.u64	$temp,$temp,`&amp;Dlo(&quot;$A0xB&quot;)`
++	vadd.u64	$Ni,$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#lo
+ 	veor		$zero,$zero,$zero
+-	vmul.u32	$Ni,$temp,$M0
++	vmul.u32	$Ni,$Ni,$M0
+ 
+-	vmull.u32	$A4xB,$Bi,${A2}[0]
++	vmull.u32	@ACC[4],$Bi,${A2}[0]
+ 	 vld1.32	{$N0-$N3}, [$nptr]!
+-	vmull.u32	$A5xB,$Bi,${A2}[1]
+-	vmull.u32	$A6xB,$Bi,${A3}[0]
++	vmull.u32	@ACC[5],$Bi,${A2}[1]
++	vmull.u32	@ACC[6],$Bi,${A3}[0]
+ 	vzip.16		$Ni,$zero
+-	vmull.u32	$A7xB,$Bi,${A3}[1]
+-
+-	bne	.LNEON_1st
++	vmull.u32	@ACC[7],$Bi,${A3}[1]
+ 
+-	@ special case for num=8, everything is in register bank...
+-
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
+ 	sub		$outer,$num,#1
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	vmov		$Temp,$A0xB
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	vmov		$A0xB,$A1xB
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	vmov		$A1xB,$A2xB
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-	vmov		$A2xB,$A3xB
+-	vmov		$A3xB,$A4xB
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	vmov		$<A HREF="../../../mailman/listinfo/openssl-commits.html">Temp, at ACC</A>[0]
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	vmov		@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[1]
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vmov		@ACC[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[2]
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++	vmov		@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[3]
++	vmov		@ACC[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[4]
+ 	vshr.u64	$temp,$temp,#16
+-	vmov		$A4xB,$A5xB
+-	vmov		$A5xB,$A6xB
+-	vadd.u64	$temp,$temp,`&amp;Dhi(&quot;$Temp&quot;)`
+-	vmov		$A6xB,$A7xB
+-	veor		$A7xB,$A7xB
++	vmov		@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[5]
++	vmov		@ACC[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[6]
++	vadd.u64	$temp,$temp,$Temp#hi
++	vmov		@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]
++	veor		@ACC[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]
+ 	vshr.u64	$temp,$temp,#16
+ 
+ 	b	.LNEON_outer8
+@@ -362,279 +367,302 @@ bn_mul8x_mont_neon:
+ 	vld1.32		{${Bi}[0]}, [$bptr,:32]!
+ 	veor		$zero,$zero,$zero
+ 	vzip.16		$Bi,$zero
+-	vadd.u64	`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dlo(&quot;$A0xB&quot;)`,$temp
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,$temp
+ 
+-	vmlal.u32	$A0xB,$Bi,${A0}[0]
+-	vmlal.u32	$A1xB,$Bi,${A0}[1]
+-	vmlal.u32	$A2xB,$Bi,${A1}[0]
+-	vshl.i64	$temp,`&amp;Dhi(&quot;$A0xB&quot;)`,#16
+-	vmlal.u32	$A3xB,$Bi,${A1}[1]
++	vmlal.u32	@ACC[0],$Bi,${A0}[0]
++	vmlal.u32	@ACC[1],$Bi,${A0}[1]
++	vmlal.u32	@ACC[2],$Bi,${A1}[0]
++	vshl.i64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#hi,#16
++	vmlal.u32	@ACC[3],$Bi,${A1}[1]
+ 
+-	vadd.u64	$temp,$temp,`&amp;Dlo(&quot;$A0xB&quot;)`
++	vadd.u64	$Ni,$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#lo
+ 	veor		$zero,$zero,$zero
+ 	subs		$outer,$outer,#1
+-	vmul.u32	$Ni,$temp,$M0
++	vmul.u32	$Ni,$Ni,$M0
+ 
+-	vmlal.u32	$A4xB,$Bi,${A2}[0]
+-	vmlal.u32	$A5xB,$Bi,${A2}[1]
+-	vmlal.u32	$A6xB,$Bi,${A3}[0]
++	vmlal.u32	@ACC[4],$Bi,${A2}[0]
++	vmlal.u32	@ACC[5],$Bi,${A2}[1]
++	vmlal.u32	@ACC[6],$Bi,${A3}[0]
+ 	vzip.16		$Ni,$zero
+-	vmlal.u32	$A7xB,$Bi,${A3}[1]
+-
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	vmov		$Temp,$A0xB
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	vmov		$A0xB,$A1xB
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	vmov		$A1xB,$A2xB
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-	vmov		$A2xB,$A3xB
+-	vmov		$A3xB,$A4xB
++	vmlal.u32	@ACC[7],$Bi,${A3}[1]
++
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	vmov		$<A HREF="../../../mailman/listinfo/openssl-commits.html">Temp, at ACC</A>[0]
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	vmov		@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[1]
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vmov		@ACC[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[2]
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++	vmov		@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[3]
++	vmov		@ACC[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[4]
+ 	vshr.u64	$temp,$temp,#16
+-	vmov		$A4xB,$A5xB
+-	vmov		$A5xB,$A6xB
+-	vadd.u64	$temp,$temp,`&amp;Dhi(&quot;$Temp&quot;)`
+-	vmov		$A6xB,$A7xB
+-	veor		$A7xB,$A7xB
++	vmov		@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[5]
++	vmov		@ACC[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[6]
++	vadd.u64	$temp,$temp,$Temp#hi
++	vmov		@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]
++	veor		@ACC[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]
+ 	vshr.u64	$temp,$temp,#16
+ 
+ 	bne	.LNEON_outer8
+ 
+-	vadd.u64	`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dlo(&quot;$A0xB&quot;)`,$temp
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,$temp
+ 	mov		$toutptr,sp
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A0xB&quot;)`,#16
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#lo,#16
+ 	mov		$inner,$num
+-	vadd.u64	`&amp;Dhi(&quot;$A0xB&quot;)`,`&amp;Dhi(&quot;$A0xB&quot;)`,$temp
+-	add		$tinptr,sp,#16
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A0xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dhi(&quot;$A0xB&quot;)`
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">hi, at ACC</A>[0]#hi,$temp
++	add		$tinptr,sp,#96
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#hi,#16
++	vzip.16		@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#hi
+ 
+-	b	.LNEON_tail2
++	b	.LNEON_tail_entry
+ 
+ .align	4
+-.LNEON_1st:
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
+-	 vld1.32	{$A0-$A3}, [$aptr]!
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
++.LNEON_8n:
++	veor		@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[0]
++	 sub		$toutptr,sp,#128
++	veor		@ACC[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[1]
++	 sub		$toutptr,$toutptr,$num,lsl#4
++	veor		@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[2]
++	 and		$toutptr,$toutptr,#-64
++	veor		@ACC[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[3]
++	 mov		sp,$toutptr			@ alloca
++	veor		@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[4]
++	 add		$toutptr,$toutptr,#256
++	veor		@ACC[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[5]
++	 sub		$inner,$num,#8
++	veor		@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[6]
++	veor		@ACC[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at ACC</A>[7]
++
++.LNEON_8n_init:
++	vst1.64		{@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[1]},[$toutptr,:256]!
+ 	subs		$inner,$inner,#8
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	 vld1.32	{$N0-$N1}, [$nptr]!
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	 vst1.64	{$A0xB-$A1xB}, [$toutptr,:256]!
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-	 vst1.64	{$A2xB-$A3xB}, [$toutptr,:256]!
+-
+-	vmull.u32	$A0xB,$Bi,${A0}[0]
+-	 vld1.32	{$N2-$N3}, [$nptr]!
+-	vmull.u32	$A1xB,$Bi,${A0}[1]
+-	 vst1.64	{$A4xB-$A5xB}, [$toutptr,:256]!
+-	vmull.u32	$A2xB,$Bi,${A1}[0]
+-	vmull.u32	$A3xB,$Bi,${A1}[1]
+-	 vst1.64	{$A6xB-$A7xB}, [$toutptr,:256]!
+-
+-	vmull.u32	$A4xB,$Bi,${A2}[0]
+-	vmull.u32	$A5xB,$Bi,${A2}[1]
+-	vmull.u32	$A6xB,$Bi,${A3}[0]
+-	vmull.u32	$A7xB,$Bi,${A3}[1]
+-
+-	bne	.LNEON_1st
+-
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
+-	add		$tinptr,sp,#16
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
+-	sub		$aptr,$aptr,$num,lsl#2		@ rewind $aptr
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	 vld1.64	{$Temp}, [sp,:128]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-	sub		$outer,$num,#1
+-
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	vst1.64		{$A0xB-$A1xB}, [$toutptr,:256]!
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	vshr.u64	$temp,$temp,#16
+-	 vld1.64	{$A0xB},       [$tinptr, :128]!
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	vst1.64		{$A2xB-$A3xB}, [$toutptr,:256]!
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-
+-	vst1.64		{$A4xB-$A5xB}, [$toutptr,:256]!
+-	vadd.u64	$temp,$temp,`&amp;Dhi(&quot;$Temp&quot;)`
+-	veor		$Z,$Z,$Z
+-	vst1.64		{$A6xB-$A7xB}, [$toutptr,:256]!
+-	 vld1.64	{$A1xB-$A2xB}, [$tinptr, :256]!
+-	vst1.64		{$Z},          [$toutptr,:128]
+-	vshr.u64	$temp,$temp,#16
+-
+-	b		.LNEON_outer
++	vst1.64		{@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[3]},[$toutptr,:256]!
++	vst1.64		{@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[5]},[$toutptr,:256]!
++	vst1.64		{@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[7]},[$toutptr,:256]!
++	bne		.LNEON_8n_init
++
++	add		$tinptr,sp,#256
++	vld1.32		{$A0-$A3},[$aptr]!
++	add		$bnptr,sp,#8
++	vld1.32		{${M0}[0]},[$n0,:32]
++	mov		$outer,$num
++	b		.LNEON_8n_outer
+ 
+ .align	4
+-.LNEON_outer:
+-	vld1.32		{${Bi}[0]}, [$bptr,:32]!
+-	sub		$nptr,$nptr,$num,lsl#2		@ rewind $nptr
+-	vld1.32		{$A0-$A3},  [$aptr]!
++.LNEON_8n_outer:
++	vld1.32		{${Bi}[0]},[$bptr,:32]!	@ *b++
+ 	veor		$zero,$zero,$zero
+-	mov		$toutptr,sp
+ 	vzip.16		$Bi,$zero
++	add		$toutptr,sp,#128
++	vld1.32		{$N0-$N3},[$nptr]!
++
++	vmlal.u32	@ACC[0],$Bi,${A0}[0]
++	vmlal.u32	@ACC[1],$Bi,${A0}[1]
++	 veor		$zero,$zero,$zero
++	vmlal.u32	@ACC[2],$Bi,${A1}[0]
++	 vshl.i64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#hi,#16
++	vmlal.u32	@ACC[3],$Bi,${A1}[1]
++	 vadd.u64	$Ni,$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#lo
++	vmlal.u32	@ACC[4],$Bi,${A2}[0]
++	 vmul.u32	$Ni,$Ni,$M0
++	vmlal.u32	@ACC[5],$Bi,${A2}[1]
++	vst1.32		{$Bi},[sp,:64]		@ put aside smashed b[8*i+0]
++	vmlal.u32	@ACC[6],$Bi,${A3}[0]
++	 vzip.16	$Ni,$zero
++	vmlal.u32	@ACC[7],$Bi,${A3}[1]
++___
++for ($i=0; $i&lt;7;) {
++$code.=&lt;&lt;___;
++	vld1.32		{${Bi}[0]},[$bptr,:32]!	@ *b++
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
++	veor		$temp,$temp,$temp
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vzip.16		$Bi,$temp
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	 vshr.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,#16
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	 vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#hi
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	 vshr.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,#16
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++	 vadd.u64	@ACC[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo
++	vst1.32		{$Ni},[$bnptr,:64]!	@ put aside smashed m[8*i+$i]
++___
++	push(@ACC,shift(@ACC));	$i++;
++$code.=&lt;&lt;___;
++	vmlal.u32	@ACC[0],$Bi,${A0}[0]
++	vld1.64		{@ACC[7]},[$tinptr,:128]!
++	vmlal.u32	@ACC[1],$Bi,${A0}[1]
++	 veor		$zero,$zero,$zero
++	vmlal.u32	@ACC[2],$Bi,${A1}[0]
++	 vshl.i64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#hi,#16
++	vmlal.u32	@ACC[3],$Bi,${A1}[1]
++	 vadd.u64	$Ni,$<A HREF="../../../mailman/listinfo/openssl-commits.html">Ni, at ACC</A>[0]#lo
++	vmlal.u32	@ACC[4],$Bi,${A2}[0]
++	 vmul.u32	$Ni,$Ni,$M0
++	vmlal.u32	@ACC[5],$Bi,${A2}[1]
++	vst1.32		{$Bi},[$bnptr,:64]!	@ put aside smashed b[8*i+$i]
++	vmlal.u32	@ACC[6],$Bi,${A3}[0]
++	 vzip.16	$Ni,$zero
++	vmlal.u32	@ACC[7],$Bi,${A3}[1]
++___
++}
++$code.=&lt;&lt;___;
++	vld1.32		{$Bi},[sp,:64]		@ pull smashed b[8*i+0]
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
++	vld1.32		{$A0-$A3},[$aptr]!
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	 vshr.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,#16
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	 vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#hi
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	 vshr.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,#16
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++	 vadd.u64	@ACC[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo
++	vst1.32		{$Ni},[$bnptr,:64]	@ put aside smashed m[8*i+$i]
++	add		$bnptr,sp,#8		@ rewind
++___
++	push(@ACC,shift(@ACC));
++$code.=&lt;&lt;___;
+ 	sub		$inner,$num,#8
+-	vadd.u64	`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dlo(&quot;$A0xB&quot;)`,$temp
+-
+-	vmlal.u32	$A0xB,$Bi,${A0}[0]
+-	 vld1.64	{$A3xB-$A4xB},[$tinptr,:256]!
+-	vmlal.u32	$A1xB,$Bi,${A0}[1]
+-	vmlal.u32	$A2xB,$Bi,${A1}[0]
+-	 vld1.64	{$A5xB-$A6xB},[$tinptr,:256]!
+-	vmlal.u32	$A3xB,$Bi,${A1}[1]
+-
+-	vshl.i64	$temp,`&amp;Dhi(&quot;$A0xB&quot;)`,#16
+-	veor		$zero,$zero,$zero
+-	vadd.u64	$temp,$temp,`&amp;Dlo(&quot;$A0xB&quot;)`
+-	 vld1.64	{$A7xB},[$tinptr,:128]!
+-	vmul.u32	$Ni,$temp,$M0
+-
+-	vmlal.u32	$A4xB,$Bi,${A2}[0]
+-	 vld1.32	{$N0-$N3}, [$nptr]!
+-	vmlal.u32	$A5xB,$Bi,${A2}[1]
+-	vmlal.u32	$A6xB,$Bi,${A3}[0]
+-	vzip.16		$Ni,$zero
+-	vmlal.u32	$A7xB,$Bi,${A3}[1]
+-
+-.LNEON_inner:
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
+-	 vld1.32	{$A0-$A3}, [$aptr]!
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
+-	 subs		$inner,$inner,#8
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-	vst1.64		{$A0xB-$A1xB}, [$toutptr,:256]!
+-
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	 vld1.64	{$A0xB},       [$tinptr, :128]!
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	vst1.64		{$A2xB-$A3xB}, [$toutptr,:256]!
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	 vld1.64	{$A1xB-$A2xB}, [$tinptr, :256]!
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-	vst1.64		{$A4xB-$A5xB}, [$toutptr,:256]!
+-
+-	vmlal.u32	$A0xB,$Bi,${A0}[0]
+-	 vld1.64	{$A3xB-$A4xB}, [$tinptr, :256]!
+-	vmlal.u32	$A1xB,$Bi,${A0}[1]
+-	vst1.64		{$A6xB-$A7xB}, [$toutptr,:256]!
+-	vmlal.u32	$A2xB,$Bi,${A1}[0]
+-	 vld1.64	{$A5xB-$A6xB}, [$tinptr, :256]!
+-	vmlal.u32	$A3xB,$Bi,${A1}[1]
+-	 vld1.32	{$N0-$N3}, [$nptr]!
+-
+-	vmlal.u32	$A4xB,$Bi,${A2}[0]
+-	 vld1.64	{$A7xB},       [$tinptr, :128]!
+-	vmlal.u32	$A5xB,$Bi,${A2}[1]
+-	vmlal.u32	$A6xB,$Bi,${A3}[0]
+-	vmlal.u32	$A7xB,$Bi,${A3}[1]
+-
+-	bne	.LNEON_inner
+-
+-	vmlal.u32	$A0xB,$Ni,${N0}[0]
+-	add		$tinptr,sp,#16
+-	vmlal.u32	$A1xB,$Ni,${N0}[1]
+-	sub		$aptr,$aptr,$num,lsl#2		@ rewind $aptr
+-	vmlal.u32	$A2xB,$Ni,${N1}[0]
+-	 vld1.64	{$Temp}, [sp,:128]
+-	vmlal.u32	$A3xB,$Ni,${N1}[1]
+-	subs		$outer,$outer,#1
++	b		.LNEON_8n_inner
+ 
+-	vmlal.u32	$A4xB,$Ni,${N2}[0]
+-	vst1.64		{$A0xB-$A1xB}, [$toutptr,:256]!
+-	vmlal.u32	$A5xB,$Ni,${N2}[1]
+-	 vld1.64	{$A0xB},       [$tinptr, :128]!
+-	vshr.u64	$temp,$temp,#16
+-	vst1.64		{$A2xB-$A3xB}, [$toutptr,:256]!
+-	vmlal.u32	$A6xB,$Ni,${N3}[0]
+-	 vld1.64	{$A1xB-$A2xB}, [$tinptr, :256]!
+-	vmlal.u32	$A7xB,$Ni,${N3}[1]
+-
+-	vst1.64		{$A4xB-$A5xB}, [$toutptr,:256]!
+-	vadd.u64	$temp,$temp,`&amp;Dhi(&quot;$Temp&quot;)`
+-	vst1.64		{$A6xB-$A7xB}, [$toutptr,:256]!
+-	vshr.u64	$temp,$temp,#16
+-
+-	bne	.LNEON_outer
++.align	4
++.LNEON_8n_inner:
++	subs		$inner,$inner,#8
++	vmlal.u32	@ACC[0],$Bi,${A0}[0]
++	vld1.64		{@ACC[7]},[$tinptr,:128]
++	vmlal.u32	@ACC[1],$Bi,${A0}[1]
++	vld1.32		{$Ni},[$bnptr,:64]!	@ pull smashed m[8*i+0]
++	vmlal.u32	@ACC[2],$Bi,${A1}[0]
++	vld1.32		{$N0-$N3},[$nptr]!
++	vmlal.u32	@ACC[3],$Bi,${A1}[1]
++	it		ne
++	addne		$tinptr,$tinptr,#16	@ don't advance in last iteration
++	vmlal.u32	@ACC[4],$Bi,${A2}[0]
++	vmlal.u32	@ACC[5],$Bi,${A2}[1]
++	vmlal.u32	@ACC[6],$Bi,${A3}[0]
++	vmlal.u32	@ACC[7],$Bi,${A3}[1]
++___
++for ($i=1; $i&lt;8; $i++) {
++$code.=&lt;&lt;___;
++	vld1.32		{$Bi},[$bnptr,:64]!	@ pull smashed b[8*i+$i]
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++	vst1.64		{@ACC[0]},[$toutptr,:128]!
++___
++	push(@ACC,shift(@ACC));
++$code.=&lt;&lt;___;
++	vmlal.u32	@ACC[0],$Bi,${A0}[0]
++	vld1.64		{@ACC[7]},[$tinptr,:128]
++	vmlal.u32	@ACC[1],$Bi,${A0}[1]
++	vld1.32		{$Ni},[$bnptr,:64]!	@ pull smashed m[8*i+$i]
++	vmlal.u32	@ACC[2],$Bi,${A1}[0]
++	it		ne
++	addne		$tinptr,$tinptr,#16	@ don't advance in last iteration
++	vmlal.u32	@ACC[3],$Bi,${A1}[1]
++	vmlal.u32	@ACC[4],$Bi,${A2}[0]
++	vmlal.u32	@ACC[5],$Bi,${A2}[1]
++	vmlal.u32	@ACC[6],$Bi,${A3}[0]
++	vmlal.u32	@ACC[7],$Bi,${A3}[1]
++___
++}
++$code.=&lt;&lt;___;
++	it		eq
++	subeq		$aptr,$aptr,$num,lsl#2	@ rewind
++	vmlal.u32	@ACC[0],$Ni,${N0}[0]
++	vld1.32		{$Bi},[sp,:64]		@ pull smashed b[8*i+0]
++	vmlal.u32	@ACC[1],$Ni,${N0}[1]
++	vld1.32		{$A0-$A3},[$aptr]!
++	vmlal.u32	@ACC[2],$Ni,${N1}[0]
++	add		$bnptr,sp,#8		@ rewind
++	vmlal.u32	@ACC[3],$Ni,${N1}[1]
++	vmlal.u32	@ACC[4],$Ni,${N2}[0]
++	vmlal.u32	@ACC[5],$Ni,${N2}[1]
++	vmlal.u32	@ACC[6],$Ni,${N3}[0]
++	vst1.64		{@ACC[0]},[$toutptr,:128]!
++	vmlal.u32	@ACC[7],$Ni,${N3}[1]
++
++	bne		.LNEON_8n_inner
++___
++	push(@ACC,shift(@ACC));
++$code.=&lt;&lt;___;
++	add		$tinptr,sp,#128
++	vst1.64		{@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[1]},[$toutptr,:256]!
++	veor		q2,q2,q2		@ $N0-$N1
++	vst1.64		{@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[3]},[$toutptr,:256]!
++	veor		q3,q3,q3		@ $N2-$N3
++	vst1.64		{@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[5]},[$toutptr,:256]!
++	vst1.64		{@ACC[6]},[$toutptr,:128]
++
++	subs		$outer,$outer,#8
++	vld1.64		{@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[1]},[$tinptr,:256]!
++	vld1.64		{@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[3]},[$tinptr,:256]!
++	vld1.64		{@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[5]},[$tinptr,:256]!
++	vld1.64		{@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[7]},[$tinptr,:256]!
++
++	itt		ne
++	subne		$nptr,$nptr,$num,lsl#2	@ rewind
++	bne		.LNEON_8n_outer
++
++	add		$toutptr,sp,#128
++	vst1.64		{q2-q3}, [sp,:256]!	@ start wiping stack frame
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#lo,#16
++	vst1.64		{q2-q3},[sp,:256]!
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">hi, at ACC</A>[0]#hi,$temp
++	vst1.64		{q2-q3}, [sp,:256]!
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#hi,#16
++	vst1.64		{q2-q3}, [sp,:256]!
++	vzip.16		@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#hi
+ 
+-	mov		$toutptr,sp
+ 	mov		$inner,$num
++	b		.LNEON_tail_entry
+ 
++.align	4
+ .LNEON_tail:
+-	vadd.u64	`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dlo(&quot;$A0xB&quot;)`,$temp
+-	vld1.64		{$A3xB-$A4xB}, [$tinptr, :256]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A0xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A0xB&quot;)`,`&amp;Dhi(&quot;$A0xB&quot;)`,$temp
+-	vld1.64		{$A5xB-$A6xB}, [$tinptr, :256]!
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A0xB&quot;)`,#16
+-	vld1.64		{$A7xB},       [$tinptr, :128]!
+-	vzip.16		`&amp;Dlo(&quot;$A0xB&quot;)`,`&amp;Dhi(&quot;$A0xB&quot;)`
+-
+-.LNEON_tail2:
+-	vadd.u64	`&amp;Dlo(&quot;$A1xB&quot;)`,`&amp;Dlo(&quot;$A1xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A0xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A1xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A1xB&quot;)`,`&amp;Dhi(&quot;$A1xB&quot;)`,$temp
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A1xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A1xB&quot;)`,`&amp;Dhi(&quot;$A1xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A2xB&quot;)`,`&amp;Dlo(&quot;$A2xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A1xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A2xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A2xB&quot;)`,`&amp;Dhi(&quot;$A2xB&quot;)`,$temp
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A2xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A2xB&quot;)`,`&amp;Dhi(&quot;$A2xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A3xB&quot;)`,`&amp;Dlo(&quot;$A3xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A2xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A3xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A3xB&quot;)`,`&amp;Dhi(&quot;$A3xB&quot;)`,$temp
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A3xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A3xB&quot;)`,`&amp;Dhi(&quot;$A3xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A4xB&quot;)`,`&amp;Dlo(&quot;$A4xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A3xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A4xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A4xB&quot;)`,`&amp;Dhi(&quot;$A4xB&quot;)`,$temp
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A4xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A4xB&quot;)`,`&amp;Dhi(&quot;$A4xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A5xB&quot;)`,`&amp;Dlo(&quot;$A5xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A4xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A5xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A5xB&quot;)`,`&amp;Dhi(&quot;$A5xB&quot;)`,$temp
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A5xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A5xB&quot;)`,`&amp;Dhi(&quot;$A5xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A6xB&quot;)`,`&amp;Dlo(&quot;$A6xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A5xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A6xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A6xB&quot;)`,`&amp;Dhi(&quot;$A6xB&quot;)`,$temp
+-	vld1.64		{$A0xB}, [$tinptr, :128]!
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A6xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A6xB&quot;)`,`&amp;Dhi(&quot;$A6xB&quot;)`
+-
+-	vadd.u64	`&amp;Dlo(&quot;$A7xB&quot;)`,`&amp;Dlo(&quot;$A7xB&quot;)`,$temp
+-	vst1.32		{`&amp;Dlo(&quot;$A6xB&quot;)`[0]}, [$toutptr, :32]!
+-	vshr.u64	$temp,`&amp;Dlo(&quot;$A7xB&quot;)`,#16
+-	vadd.u64	`&amp;Dhi(&quot;$A7xB&quot;)`,`&amp;Dhi(&quot;$A7xB&quot;)`,$temp
+-	vld1.64		{$A1xB-$A2xB},	[$tinptr, :256]!
+-	vshr.u64	$temp,`&amp;Dhi(&quot;$A7xB&quot;)`,#16
+-	vzip.16		`&amp;Dlo(&quot;$A7xB&quot;)`,`&amp;Dhi(&quot;$A7xB&quot;)`
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#lo,$temp
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#lo,#16
++	vld1.64		{@ACC[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[3]}, [$tinptr, :256]!
++	vadd.u64	@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">hi, at ACC</A>[0]#hi,$temp
++	vld1.64		{@ACC[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[5]}, [$tinptr, :256]!
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[0]#hi,#16
++	vld1.64		{@ACC[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[7]}, [$tinptr, :256]!
++	vzip.16		@ACC[0]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[0]#hi
++
++.LNEON_tail_entry:
++___
++for ($i=1; $i&lt;8; $i++) {
++$code.=&lt;&lt;___;
++	vadd.u64	@ACC[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[1]#lo,$temp
++	vst1.32		{@ACC[0]#lo[0]}, [$toutptr, :32]!
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[1]#lo,#16
++	vadd.u64	@ACC[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">hi, at ACC</A>[1]#hi,$temp
++	vshr.u64	$<A HREF="../../../mailman/listinfo/openssl-commits.html">temp, at ACC</A>[1]#hi,#16
++	vzip.16		@ACC[1]#<A HREF="../../../mailman/listinfo/openssl-commits.html">lo, at ACC</A>[1]#hi
++___
++	push(@ACC,shift(@ACC));
++}
++	push(@ACC,shift(@ACC));
++$code.=&lt;&lt;___;
++	vld1.64		{@ACC[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">- at ACC</A>[1]}, [$tinptr, :256]!
+ 	subs		$inner,$inner,#8
+-	vst1.32		{`&amp;Dlo(&quot;$A7xB&quot;)`[0]}, [$toutptr, :32]!
+-
++	vst1.32		{@ACC[7]#lo[0]},   [$toutptr, :32]!
+ 	bne	.LNEON_tail
+ 
+ 	vst1.32	{${temp}[0]}, [$toutptr, :32]		@ top-most bit
+@@ -708,8 +736,14 @@ $code.=&lt;&lt;___;
+ #endif
+ ___
+ 
+-$code =~ s/\`([^\`]*)\`/eval $1/gem;
+-$code =~ s/\bbx\s+lr\b/.word\t0xe12fff1e/gm;	# make it possible to compile with -march=armv4
+-$code =~ s/\bret\b/bx	lr/gm;
+-print $code;
++foreach (split(&quot;\n&quot;,$code)) {
++	s/\`([^\`]*)\`/eval $1/ge;
++
++	s/\bq([0-9]+)#(lo|hi)/sprintf &quot;d%d&quot;,2*$1+($2 eq &quot;hi&quot;)/ge	or
++	s/\bret\b/bx    lr/g						or
++	s/\bbx\s+lr\b/.word\t0xe12fff1e/g;	# make it possible to compile with -march=armv4
++
++	print $_,&quot;\n&quot;;
++}
++
+ close STDOUT;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001940.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001942.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1941">[ date ]</a>
+              <a href="thread.html#1941">[ thread ]</a>
+              <a href="subject.html#1941">[ subject ]</a>
+              <a href="author.html#1941">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

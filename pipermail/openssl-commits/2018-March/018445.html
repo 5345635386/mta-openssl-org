@@ -1,0 +1,143 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1520616375.026599.20580.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018444.html">
+   <LINK REL="Next"  HREF="018447.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>kaduk at mit.edu</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1520616375.026599.20580.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kaduk at mit.edu
+       </A><BR>
+    <I>Fri Mar  9 17:26:15 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018444.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018447.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18445">[ date ]</a>
+              <a href="thread.html#18445">[ thread ]</a>
+              <a href="subject.html#18445">[ subject ]</a>
+              <a href="author.html#18445">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ee36b963aef8dc18d2016970d808a7287e6d38fc (commit)
+      from  b0143b97529959470c90df157368c2925180e3c3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ee36b963aef8dc18d2016970d808a7287e6d38fc
+Author: Benjamin Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bkaduk at akamai.com</A>&gt;
+Date:   Tue Mar 14 14:41:08 2017 -0500
+
+    Reuse extension_is_relevant() in should_add_extension()
+    
+    At the core of things is the concept that each extension is only
+    defined in certain context(s) -- the ClientHello, EncryptedExtensions,
+    etc., and sometimes only for a specific protocol or protocol range;
+    we want to enforce that we only parse or generate extensions in the
+    context(s) for which they are defined.  There is some subtlety here,
+    in that the protocol version in use is not known when generating the
+    ClientHello (but it is known when the ClientHello extensions are
+    being parsed!), so the SSL_IS_TLS13() macro must be used with caution.
+    Nonetheless, by making assertions about whether we are acting in a
+    server role and whether the current context is (not) a ClientHello,
+    we can consolidate almost all of the logic for determining whether
+    an extension is permitted in a given protocol message, whether we
+    are generating or parsing that message.
+    
+    The only logic that remains separate relates to generating the ClientHello,
+    as it depends on an external factor (the maximum permitted TLS version) that
+    is not defined in the parsing context.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2945">https://github.com/openssl/openssl/pull/2945</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/extensions.c | 22 ++++++++++++----------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/ssl/statem/extensions.c b/ssl/statem/extensions.c
+index 8a8e524..0641a25 100644
+--- a/ssl/statem/extensions.c
++++ b/ssl/statem/extensions.c
+@@ -516,11 +516,20 @@ int extension_is_relevant(SSL *s, unsigned int extctx, unsigned int thisctx)
+                 &amp;&amp; (extctx &amp; SSL_EXT_TLS_IMPLEMENTATION_ONLY) != 0)
+             || (s-&gt;version == SSL3_VERSION
+                     &amp;&amp; (extctx &amp; SSL_EXT_SSL3_ALLOWED) == 0)
++            /*
++             * Note that SSL_IS_TLS13() means &quot;TLS 1.3 has been negotiated&quot;,
++             * which is never true when generating the ClientHello.
++             * However, version negotiation *has* occurred by the time the
++             * ClientHello extensions are being parsed.
++             * Be careful to allow TLS 1.3-only extensions when generating
++             * the ClientHello.
++             */
+             || (is_tls13 &amp;&amp; (extctx &amp; SSL_EXT_TLS1_2_AND_BELOW_ONLY) != 0)
+-            || (!is_tls13 &amp;&amp; (extctx &amp; SSL_EXT_TLS1_3_ONLY) != 0)
++            || (!is_tls13 &amp;&amp; (extctx &amp; SSL_EXT_TLS1_3_ONLY) != 0
++                &amp;&amp; (thisctx &amp; SSL_EXT_CLIENT_HELLO) == 0)
++            || (s-&gt;server &amp;&amp; !is_tls13 &amp;&amp; (extctx &amp; SSL_EXT_TLS1_3_ONLY) != 0)
+             || (s-&gt;hit &amp;&amp; (extctx &amp; SSL_EXT_IGNORE_ON_RESUMPTION) != 0))
+         return 0;
+-
+     return 1;
+ }
+ 
+@@ -762,14 +771,7 @@ int should_add_extension(SSL *s, unsigned int extctx, unsigned int thisctx,
+         return 0;
+ 
+     /* Check if this extension is defined for our protocol. If not, skip */
+-    if ((SSL_IS_DTLS(s) &amp;&amp; (extctx &amp; SSL_EXT_TLS_IMPLEMENTATION_ONLY) != 0)
+-            || (s-&gt;version == SSL3_VERSION
+-                    &amp;&amp; (extctx &amp; SSL_EXT_SSL3_ALLOWED) == 0)
+-            || (SSL_IS_TLS13(s)
+-                &amp;&amp; (extctx &amp; SSL_EXT_TLS1_2_AND_BELOW_ONLY) != 0)
+-            || (!SSL_IS_TLS13(s)
+-                &amp;&amp; (extctx &amp; SSL_EXT_TLS1_3_ONLY) != 0
+-                &amp;&amp; (thisctx &amp; SSL_EXT_CLIENT_HELLO) == 0)
++    if (!extension_is_relevant(s, extctx, thisctx)
+             || ((extctx &amp; SSL_EXT_TLS1_3_ONLY) != 0
+                 &amp;&amp; (thisctx &amp; SSL_EXT_CLIENT_HELLO) != 0
+                 &amp;&amp; (SSL_IS_DTLS(s) || max_version &lt; TLS1_3_VERSION)))
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018444.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018447.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18445">[ date ]</a>
+              <a href="thread.html#18445">[ thread ]</a>
+              <a href="subject.html#18445">[ subject ]</a>
+              <a href="author.html#18445">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

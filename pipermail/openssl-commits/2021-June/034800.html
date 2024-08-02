@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1624581585.705957.18362.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034799.html">
+   <LINK REL="Next"  HREF="034801.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1624581585.705957.18362.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Fri Jun 25 00:39:45 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034799.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034801.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34800">[ date ]</a>
+              <a href="thread.html#34800">[ thread ]</a>
+              <a href="subject.html#34800">[ subject ]</a>
+              <a href="author.html#34800">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  11efa7d45ba08fe4d8a11332680b1021934733cf (commit)
+      from  454d69271cf65edb1f6d0ca2a06f9b755f6cb937 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 11efa7d45ba08fe4d8a11332680b1021934733cf
+Author: Petr Gotthard &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">petr.gotthard at centrum.cz</A>&gt;
+Date:   Wed May 5 18:32:55 2021 +0200
+
+    BIO_new_from_core_bio: Fix heap-use-after-free after attach
+    
+    The providers have to call up_ref to keep the cbio pointer, just like
+    the internal bio_prov.c does.
+    
+    OSSL_STORE_attach passes a cbio pointer to the provider and then calls
+    ossl_core_bio_free(cbio). If up_ref is not called, the cbio gets
+    freed way too early.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15163">https://github.com/openssl/openssl/pull/15163</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bss_core.c | 17 +++++++++++++++++
+ test/bio_core_test.c  | 12 ++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/crypto/bio/bss_core.c b/crypto/bio/bss_core.c
+index 89b1ef7395..de774e2b00 100644
+--- a/crypto/bio/bss_core.c
++++ b/crypto/bio/bss_core.c
+@@ -17,6 +17,8 @@ typedef struct {
+     OSSL_FUNC_BIO_gets_fn *c_bio_gets;
+     OSSL_FUNC_BIO_puts_fn *c_bio_puts;
+     OSSL_FUNC_BIO_ctrl_fn *c_bio_ctrl;
++    OSSL_FUNC_BIO_up_ref_fn *c_bio_up_ref;
++    OSSL_FUNC_BIO_free_fn *c_bio_free;
+ } BIO_CORE_GLOBALS;
+ 
+ static void bio_core_globals_free(void *vbcg)
+@@ -97,7 +99,10 @@ static int bio_core_new(BIO *bio)
+ 
+ static int bio_core_free(BIO *bio)
+ {
++    BIO_CORE_GLOBALS *bcgbl = get_globals(bio-&gt;libctx);
++
+     BIO_set_init(bio, 0);
++    bcgbl-&gt;c_bio_free(BIO_get_data(bio));
+ 
+     return 1;
+ }
+@@ -134,6 +139,10 @@ BIO *BIO_new_from_core_bio(OSSL_LIB_CTX *libctx, OSSL_CORE_BIO *corebio)
+     if ((outbio = BIO_new_ex(libctx, BIO_s_core())) == NULL)
+         return NULL;
+ 
++    if (!bcgbl-&gt;c_bio_up_ref(corebio)) {
++        BIO_free(outbio);
++        return NULL;
++    }
+     BIO_set_data(outbio, corebio);
+     return outbio;
+ }
+@@ -164,6 +173,14 @@ int ossl_bio_init_core(OSSL_LIB_CTX *libctx, const OSSL_DISPATCH *fns)
+             if (bcgbl-&gt;c_bio_ctrl == NULL)
+                 bcgbl-&gt;c_bio_ctrl = OSSL_FUNC_BIO_ctrl(fns);
+             break;
++        case OSSL_FUNC_BIO_UP_REF:
++            if (bcgbl-&gt;c_bio_up_ref == NULL)
++                bcgbl-&gt;c_bio_up_ref = OSSL_FUNC_BIO_up_ref(fns);
++            break;
++        case OSSL_FUNC_BIO_FREE:
++            if (bcgbl-&gt;c_bio_free == NULL)
++                bcgbl-&gt;c_bio_free = OSSL_FUNC_BIO_free(fns);
++            break;
+         }
+     }
+ 
+diff --git a/test/bio_core_test.c b/test/bio_core_test.c
+index ae326cef92..77e846735f 100644
+--- a/test/bio_core_test.c
++++ b/test/bio_core_test.c
+@@ -43,12 +43,24 @@ static long tst_bio_core_ctrl(OSSL_CORE_BIO *bio, int cmd, long num, void *ptr)
+     return BIO_ctrl(bio-&gt;bio, cmd, num, ptr);
+ }
+ 
++static int tst_bio_core_up_ref(OSSL_CORE_BIO *bio)
++{
++    return BIO_up_ref(bio-&gt;bio);
++}
++
++static int tst_bio_core_free(OSSL_CORE_BIO *bio)
++{
++    return BIO_free(bio-&gt;bio);
++}
++
+ static const OSSL_DISPATCH biocbs[] = {
+     { OSSL_FUNC_BIO_READ_EX, (void (*)(void))tst_bio_core_read_ex },
+     { OSSL_FUNC_BIO_WRITE_EX, (void (*)(void))tst_bio_core_write_ex },
+     { OSSL_FUNC_BIO_GETS, (void (*)(void))tst_bio_core_gets },
+     { OSSL_FUNC_BIO_PUTS, (void (*)(void))tst_bio_core_puts },
+     { OSSL_FUNC_BIO_CTRL, (void (*)(void))tst_bio_core_ctrl },
++    { OSSL_FUNC_BIO_UP_REF, (void (*)(void))tst_bio_core_up_ref },
++    { OSSL_FUNC_BIO_FREE, (void (*)(void))tst_bio_core_free },
+     { 0, NULL }
+ };
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034799.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034801.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34800">[ date ]</a>
+              <a href="thread.html#34800">[ thread ]</a>
+              <a href="subject.html#34800">[ subject ]</a>
+              <a href="author.html#34800">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

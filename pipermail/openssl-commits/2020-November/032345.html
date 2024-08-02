@@ -1,0 +1,201 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1606410408.618374.30562.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032344.html">
+   <LINK REL="Next"  HREF="032357.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tmraz at fedoraproject.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1606410408.618374.30562.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tmraz at fedoraproject.org
+       </A><BR>
+    <I>Thu Nov 26 17:06:48 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032344.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032357.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32345">[ date ]</a>
+              <a href="thread.html#32345">[ thread ]</a>
+              <a href="subject.html#32345">[ subject ]</a>
+              <a href="author.html#32345">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8dc34b1f579f71f24aa385d33112da4a91db7079 (commit)
+      from  2b407d050868c24ee36172e1abcfbfa0f003a98d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8dc34b1f579f71f24aa385d33112da4a91db7079
+Author: Daniel Bevenius &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">daniel.bevenius at gmail.com</A>&gt;
+Date:   Wed Nov 11 05:23:11 2020 +0100
+
+    EVP: don't touch the lock for evp_pkey_downgrade
+    
+    This commit tries to address a locking issue in evp_pkey_reset_unlocked
+    which can occur when it is called from evp_pkey_downgrade.
+    
+    evp_pkey_downgrade will acquire a lock for pk-&gt;lock and if successful
+    then call evp_pkey_reset_unlocked. evp_pkey_reset_unlocked will call
+    memset on pk, and then create a new lock and set pk-&gt;lock to point to
+    that new lock. I believe there are two problems with this.
+    
+    The first is that after the call to memset, another thread would try to
+    acquire a lock for NULL as that is what the value of pk-&gt;lock would be
+    at that point.
+    
+    The second issue is that after the new lock has been assigned to
+    pk-&gt;lock, that lock is different from the one currently locked so
+    another thread trying to acquire the lock will succeed which can lead to
+    strange behaviour. More details and a reproducer can be found in the
+    Refs link below.
+    
+    This changes the evp_pkey_reset_unlocked to not touch the lock
+    and the creation of a new lock is done in EVP_PKEY_new.
+    
+    Refs:
+    <A HREF="https://github.com/danbev/learning-libcrypto/blob/master/notes/issues.md#openssl-investigationtroubleshooting">https://github.com/danbev/learning-libcrypto/blob/master/notes/issues.md#openssl-investigationtroubleshooting</A>
+    <A HREF="https://github.com/nodejs/node/issues/29817">https://github.com/nodejs/node/issues/29817</A>
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13374">https://github.com/openssl/openssl/pull/13374</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/p_lib.c | 36 ++++++++++++++++++------------------
+ 1 file changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index a0c131d0c0..ad7a0ebee7 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -1345,7 +1345,7 @@ size_t EVP_PKEY_get1_encoded_public_key(EVP_PKEY *pkey, unsigned char **ppub)
+ /*
+  * This reset function must be used very carefully, as it literally throws
+  * away everything in an EVP_PKEY without freeing them, and may cause leaks
+- * of memory, locks, what have you.
++ * of memory, what have you.
+  * The only reason we have this is to have the same code for EVP_PKEY_new()
+  * and evp_pkey_downgrade().
+  */
+@@ -1354,17 +1354,21 @@ static int evp_pkey_reset_unlocked(EVP_PKEY *pk)
+     if (pk == NULL)
+         return 0;
+ 
+-    memset(pk, 0, sizeof(*pk));
++    if (pk-&gt;lock != NULL) {
++      const size_t offset = (unsigned char *)&amp;pk-&gt;lock - (unsigned char *)pk;
++
++      memset(pk, 0, offset);
++      memset((unsigned char *)pk + offset + sizeof(pk-&gt;lock),
++             0,
++             sizeof(*pk) - offset - sizeof(pk-&gt;lock));
++    }
++    /* EVP_PKEY_new uses zalloc so no need to call memset if pk-&gt;lock is NULL */
++
+     pk-&gt;type = EVP_PKEY_NONE;
+     pk-&gt;save_type = EVP_PKEY_NONE;
+     pk-&gt;references = 1;
+     pk-&gt;save_parameters = 1;
+ 
+-    pk-&gt;lock = CRYPTO_THREAD_lock_new();
+-    if (pk-&gt;lock == NULL) {
+-        ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+-        return 0;
+-    }
+     return 1;
+ }
+ 
+@@ -1380,6 +1384,12 @@ EVP_PKEY *EVP_PKEY_new(void)
+     if (!evp_pkey_reset_unlocked(ret))
+         goto err;
+ 
++    ret-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ret-&gt;lock == NULL) {
++        EVPerr(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
+ #ifndef FIPS_MODULE
+     if (!CRYPTO_new_ex_data(CRYPTO_EX_INDEX_EVP_PKEY, ret, &amp;ret-&gt;ex_data)) {
+         ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+@@ -1880,7 +1890,6 @@ int evp_pkey_copy_downgraded(EVP_PKEY **dest, const EVP_PKEY *src)
+ int evp_pkey_downgrade(EVP_PKEY *pk)
+ {
+     EVP_PKEY tmp_copy;              /* Stack allocated! */
+-    CRYPTO_RWLOCK *tmp_lock = NULL; /* Temporary lock */
+     int rv = 0;
+ 
+     if (!ossl_assert(pk != NULL))
+@@ -1908,12 +1917,9 @@ int evp_pkey_downgrade(EVP_PKEY *pk)
+ 
+     if (evp_pkey_reset_unlocked(pk)
+         &amp;&amp; evp_pkey_copy_downgraded(&amp;pk, &amp;tmp_copy)) {
+-        /* Grab the temporary lock to avoid lock leak */
+-        tmp_lock = pk-&gt;lock;
+ 
+         /* Restore the common attributes, then empty |tmp_copy| */
+         pk-&gt;references = tmp_copy.references;
+-        pk-&gt;lock = tmp_copy.lock; /* |pk| now owns THE lock */
+         pk-&gt;attributes = tmp_copy.attributes;
+         pk-&gt;save_parameters = tmp_copy.save_parameters;
+         pk-&gt;ex_data = tmp_copy.ex_data;
+@@ -1945,16 +1951,10 @@ int evp_pkey_downgrade(EVP_PKEY *pk)
+         evp_pkey_free_it(&amp;tmp_copy);
+         rv = 1;
+     } else {
+-        /* Grab the temporary lock to avoid lock leak */
+-        tmp_lock = pk-&gt;lock;
+-
+         /* Restore the original key */
+-        *pk = tmp_copy;          /* |pk| now owns THE lock */
++        *pk = tmp_copy;
+     }
+ 
+-    /* Free the temporary lock.  It should never be NULL */
+-    CRYPTO_THREAD_lock_free(tmp_lock);
+-
+  end:
+     if (!CRYPTO_THREAD_unlock(pk-&gt;lock))
+         return 0;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032344.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032357.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32345">[ date ]</a>
+              <a href="thread.html#32345">[ thread ]</a>
+              <a href="subject.html#32345">[ subject ]</a>
+              <a href="author.html#32345">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

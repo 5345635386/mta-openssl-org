@@ -1,0 +1,3039 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452192555.638267.3380.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002625.html">
+   <LINK REL="Next"  HREF="002630.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452192555.638267.3380.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Thu Jan  7 18:49:15 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002625.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002630.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2626">[ date ]</a>
+              <a href="thread.html#2626">[ thread ]</a>
+              <a href="subject.html#2626">[ subject ]</a>
+              <a href="author.html#2626">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  170b735820ac6a3857733fccf889cde9d723ddc8 (commit)
+      from  a8eba56ef62af2f9a5b46825c994665cd3789c2e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 170b735820ac6a3857733fccf889cde9d723ddc8
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Tue Dec 29 14:12:36 2015 -0500
+
+    DANE support for X509_verify_cert()
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x509_err.c      |    2 +
+ crypto/x509/x509_vfy.c      |  408 ++++++++++-
+ include/openssl/x509.h      |    2 +
+ include/openssl/x509_vfy.h  |    2 +
+ test/Makefile               |   27 +-
+ test/danetest.c             |  543 ++++++++++++++
+ test/danetest.in            | 1675 +++++++++++++++++++++++++++++++++++++++++++
+ test/danetest.pem           |   14 +
+ test/recipes/80-test_dane.t |   13 +
+ 9 files changed, 2674 insertions(+), 12 deletions(-)
+ create mode 100644 test/danetest.c
+ create mode 100644 test/danetest.in
+ create mode 100644 test/danetest.pem
+ create mode 100644 test/recipes/80-test_dane.t
+
+diff --git a/crypto/x509/x509_err.c b/crypto/x509/x509_err.c
+index 668af28..114affc 100644
+--- a/crypto/x509/x509_err.c
++++ b/crypto/x509/x509_err.c
+@@ -74,6 +74,7 @@ static ERR_STRING_DATA X509_str_functs[] = {
+     {ERR_FUNC(X509_F_BUILD_CHAIN), &quot;build_chain&quot;},
+     {ERR_FUNC(X509_F_BY_FILE_CTRL), &quot;by_file_ctrl&quot;},
+     {ERR_FUNC(X509_F_CHECK_POLICY), &quot;check_policy&quot;},
++    {ERR_FUNC(X509_F_DANE_I2D), &quot;dane_i2d&quot;},
+     {ERR_FUNC(X509_F_DIR_CTRL), &quot;dir_ctrl&quot;},
+     {ERR_FUNC(X509_F_GET_CERT_BY_SUBJECT), &quot;get_cert_by_subject&quot;},
+     {ERR_FUNC(X509_F_NETSCAPE_SPKI_B64_DECODE), &quot;NETSCAPE_SPKI_b64_decode&quot;},
+@@ -134,6 +135,7 @@ static ERR_STRING_DATA X509_str_functs[] = {
+ 
+ static ERR_STRING_DATA X509_str_reasons[] = {
+     {ERR_REASON(X509_R_AKID_MISMATCH), &quot;akid mismatch&quot;},
++    {ERR_REASON(X509_R_BAD_SELECTOR), &quot;bad selector&quot;},
+     {ERR_REASON(X509_R_BAD_X509_FILETYPE), &quot;bad x509 filetype&quot;},
+     {ERR_REASON(X509_R_BASE64_DECODE_ERROR), &quot;base64 decode error&quot;},
+     {ERR_REASON(X509_R_CANT_CHECK_DH_KEY), &quot;cant check dh key&quot;},
+diff --git a/crypto/x509/x509_vfy.c b/crypto/x509/x509_vfy.c
+index 1c509a9..73339f3 100644
+--- a/crypto/x509/x509_vfy.c
++++ b/crypto/x509/x509_vfy.c
+@@ -114,6 +114,7 @@
+ 
+ static int build_chain(X509_STORE_CTX *ctx);
+ static int verify_chain(X509_STORE_CTX *ctx);
++static int dane_verify(X509_STORE_CTX *ctx);
+ static int null_callback(int ok, X509_STORE_CTX *e);
+ static int check_issued(X509_STORE_CTX *ctx, X509 *x, X509 *issuer);
+ static X509 *find_issuer(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *x);
+@@ -125,6 +126,7 @@ static int check_revocation(X509_STORE_CTX *ctx);
+ static int check_cert(X509_STORE_CTX *ctx);
+ static int check_policy(X509_STORE_CTX *ctx);
+ static int get_issuer_sk(X509 **issuer, X509_STORE_CTX *ctx, X509 *x);
++static int check_dane_issuer(X509_STORE_CTX *ctx, int depth);
+ 
+ static int get_crl_score(X509_STORE_CTX *ctx, X509 **pissuer,
+                          unsigned int *preasons, X509_CRL *crl, X509 *x);
+@@ -237,6 +239,7 @@ static int verify_chain(X509_STORE_CTX *ctx)
+ 
+ int X509_verify_cert(X509_STORE_CTX *ctx)
+ {
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
+ 
+     if (ctx-&gt;cert == NULL) {
+         X509err(X509_F_X509_VERIFY_CERT, X509_R_NO_CERT_SET_FOR_US_TO_VERIFY);
+@@ -264,6 +267,14 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     X509_up_ref(ctx-&gt;cert);
+     ctx-&gt;num_untrusted = 1;
+ 
++    /*
++     * If dane-&gt;trecs is an empty stack, we'll fail, since the user enabled
++     * DANE.  If none of the TLSA records were usable, and it makes sense to
++     * keep going with an unauthenticated handshake, they can handle that in
++     * the verify callback, or not set SSL_VERIFY_PEER.
++     */
++    if (DANETLS_ENABLED(dane))
++        return dane_verify(ctx);
+     return verify_chain(ctx);
+ }
+ 
+@@ -565,9 +576,18 @@ static int check_trust(X509_STORE_CTX *ctx, int num_untrusted)
+     X509 *x = NULL;
+     X509 *mx;
+     int (*cb) (int xok, X509_STORE_CTX *xctx) = ctx-&gt;verify_cb;
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
+     int num = sk_X509_num(ctx-&gt;chain);
+     int trust;
+ 
++    if (DANETLS_HAS_TA(dane) &amp;&amp; num_untrusted &gt; 0) {
++        switch (trust = check_dane_issuer(ctx, num_untrusted)) {
++        case X509_TRUST_TRUSTED:
++        case X509_TRUST_REJECTED:
++            return trust;
++        }
++    }
++
+     /*
+      * Check trusted certificates in chain at depth num_untrusted and up.
+      * Note, that depths 0..num_untrusted-1 may also contain trusted
+@@ -637,7 +657,14 @@ static int check_trust(X509_STORE_CTX *ctx, int num_untrusted)
+     return X509_TRUST_UNTRUSTED;
+ 
+  trusted:
+-    return X509_TRUST_TRUSTED;
++    if (!DANETLS_ENABLED(dane))
++        return X509_TRUST_TRUSTED;
++    if (dane-&gt;pdpth &lt; 0)
++        dane-&gt;pdpth = num_untrusted;
++    /* With DANE, PKIX alone is not trusted until we have both */
++    if (dane-&gt;mdpth &gt;= 0)
++        return X509_TRUST_TRUSTED;
++    return X509_TRUST_UNTRUSTED;
+ }
+ 
+ static int check_revocation(X509_STORE_CTX *ctx)
+@@ -1524,6 +1551,17 @@ static int internal_verify(X509_STORE_CTX *ctx)
+     ctx-&gt;error_depth = n;
+     xi = sk_X509_value(ctx-&gt;chain, n);
+ 
++    /*
++     * With DANE-verified bare public key TA signatures, it remains only to
++     * check the timestamps of the top certificate.  We report the issuer as
++     * NULL, since all we have is a bare key.
++     */
++    if (ctx-&gt;bare_ta_signed) {
++        xs = xi;
++        xi = NULL;
++        goto check_cert;
++    }
++
+     if (ctx-&gt;check_issued(ctx, xi, xi))
+         xs = xi;
+     else {
+@@ -2074,6 +2112,7 @@ int X509_STORE_CTX_init(X509_STORE_CTX *ctx, X509_STORE *store, X509 *x509,
+     ctx-&gt;tree = NULL;
+     ctx-&gt;parent = NULL;
+     ctx-&gt;dane = NULL;
++    ctx-&gt;bare_ta_signed = 0;
+     /* Zero ex_data to make sure we're cleanup-safe */
+     memset(&amp;ctx-&gt;ex_data, 0, sizeof(ctx-&gt;ex_data));
+ 
+@@ -2270,15 +2309,311 @@ void X509_STORE_CTX_set0_dane(X509_STORE_CTX *ctx, struct dane_st *dane)
+     ctx-&gt;dane = dane;
+ }
+ 
++static unsigned char *dane_i2d(
++    X509 *cert,
++    uint8_t selector,
++    unsigned int *i2dlen)
++{
++    unsigned char *buf = NULL;
++    int len;
++
++    /*
++     * Extract ASN.1 DER form of certificate or public key.
++     */
++    switch (selector) {
++    case DANETLS_SELECTOR_CERT:
++        len = i2d_X509(cert, &amp;buf);
++        break;
++    case DANETLS_SELECTOR_SPKI:
++        len = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), &amp;buf);
++        break;
++    default:
++        X509err(X509_F_DANE_I2D, X509_R_BAD_SELECTOR);
++        return NULL;
++    }
++
++    if (len &lt; 0 || buf == NULL) {
++        X509err(X509_F_DANE_I2D, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++
++    *i2dlen = (unsigned int)len;
++    return buf;
++}
++
++#define DANETLS_NONE 256        /* impossible uint8_t */
++
++static int dane_match(X509_STORE_CTX *ctx, X509 *cert, int depth)
++{
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
++    unsigned usage = DANETLS_NONE;
++    unsigned selector = DANETLS_NONE;
++    unsigned ordinal = DANETLS_NONE;
++    unsigned mtype = DANETLS_NONE;
++    unsigned char *i2dbuf = NULL;
++    unsigned int i2dlen = 0;
++    unsigned char mdbuf[EVP_MAX_MD_SIZE];
++    unsigned char *cmpbuf = NULL;
++    unsigned int cmplen = 0;
++    int i;
++    int recnum;
++    int matched = 0;
++    danetls_record *t = NULL;
++    uint32_t mask;
++
++    mask = (depth == 0) ? DANETLS_EE_MASK : DANETLS_TA_MASK;
++
++    /*
++     * The trust store is not applicable with DANE-TA(2)
++     */
++    if (depth &gt;= ctx-&gt;num_untrusted)
++        mask &amp;= DANETLS_PKIX_MASK;
++
++    /*
++     * If we've previously matched a PKIX-?? record, no need to test any
++     * furher PKIX-?? records,  it remains to just build the PKIX chain.
++     * Had the match been a DANE-?? record, we'd be done already.
++     */
++    if (dane-&gt;mdpth &gt;= 0)
++        mask &amp;= ~DANETLS_PKIX_MASK;
++
++    /*-
++     * <A HREF="https://tools.ietf.org/html/rfc7671#section-5.1">https://tools.ietf.org/html/rfc7671#section-5.1</A>
++     * <A HREF="https://tools.ietf.org/html/rfc7671#section-5.2">https://tools.ietf.org/html/rfc7671#section-5.2</A>
++     * <A HREF="https://tools.ietf.org/html/rfc7671#section-5.3">https://tools.ietf.org/html/rfc7671#section-5.3</A>
++     * <A HREF="https://tools.ietf.org/html/rfc7671#section-5.4">https://tools.ietf.org/html/rfc7671#section-5.4</A>
++     *
++     * We handle DANE-EE(3) records first as they require no chain building
++     * and no expiration or hostname checks.  We also process digests with
++     * higher ordinals first and ignore lower priorities except Full(0) which
++     * is always processed (last).  If none match, we then process PKIX-EE(1).
++     *
++     * NOTE: This relies on DANE usages sorting before the corresponding PKIX
++     * usages in SSL_dane_tlsa_add(), and also on descending sorting of digest
++     * priorities.  See twin comment in ssl/ssl_lib.c.
++     *
++     * We expect that most TLSA RRsets will have just a single usage, so we
++     * don't go out of our way to cache multiple selector-specific i2d buffers
++     * across usages, but if the selector happens to remain the same as switch
++     * usages, that's OK.  Thus, a set of &quot;3 1 1&quot;, &quot;3 0 1&quot;, &quot;1 1 1&quot;, &quot;1 0 1&quot;,
++     * records would result in us generating each of the certificate and public
++     * key DER forms twice, but more typically we'd just see multiple &quot;3 1 1&quot;
++     * or multiple &quot;3 0 1&quot; records.
++     *
++     * As soon as we find a match at any given depth, we stop, because either
++     * we've matched a DANE-?? record and the peer is authenticated, or, after
++     * exhausing all DANE-?? records, we've matched a PKIX-?? record, which is
++     * sufficient for DANE, and what remains to do is ordinary PKIX validation.
++     */
++    recnum = (dane-&gt;umask &amp; mask) ? sk_danetls_record_num(dane-&gt;trecs) : 0;
++    for (i = 0; matched == 0 &amp;&amp; i &lt; recnum; ++i) {
++        t = sk_danetls_record_value(dane-&gt;trecs, i);
++        if ((DANETLS_USAGE_BIT(t-&gt;usage) &amp; mask) == 0)
++            continue;
++        if (t-&gt;usage != usage) {
++            usage = t-&gt;usage;
++
++            /* Reset digest agility for each usage/selector pair */
++            mtype = DANETLS_NONE;
++            ordinal = dane-&gt;dctx-&gt;mdord[t-&gt;mtype];
++        }
++        if (t-&gt;selector != selector) {
++            selector = t-&gt;selector;
++
++            /* Update per-selector state */
++            OPENSSL_free(i2dbuf);
++            i2dbuf = dane_i2d(cert, selector, &amp;i2dlen);
++            if (i2dbuf == NULL)
++                return -1;
++
++            /* Reset digest agility for each usage/selector pair */
++            mtype = DANETLS_NONE;
++            ordinal = dane-&gt;dctx-&gt;mdord[t-&gt;mtype];
++        } else if (t-&gt;mtype != DANETLS_MATCHING_FULL) {
++            /*-
++             * Digest agility:
++             *
++             *     &lt;<A HREF="https://tools.ietf.org/html/rfc7671#section-9">https://tools.ietf.org/html/rfc7671#section-9</A>&gt;
++             *
++             * For a fixed selector, after processing all records with the
++             * highest mtype ordinal, ignore all mtypes with lower ordinals
++             * other than &quot;Full&quot;.
++             */
++            if (dane-&gt;dctx-&gt;mdord[t-&gt;mtype] &lt; ordinal)
++                continue;
++        }
++
++        /*
++         * Each time we hit a (new selector or) mtype, re-compute the relevant
++         * digest, more complex caching is not worth the code space.
++         */
++        if (t-&gt;mtype != mtype) {
++            const EVP_MD *md = dane-&gt;dctx-&gt;mdevp[mtype = t-&gt;mtype];
++            cmpbuf = i2dbuf;
++            cmplen = i2dlen;
++
++            if (md != NULL) {
++		cmpbuf = mdbuf;
++		if (!EVP_Digest(i2dbuf, i2dlen, cmpbuf, &amp;cmplen, md, 0)) {
++		    matched = -1;
++                    break;
++                }
++            }
++        }
++
++        /*
++         * Squirrel away the certificate and depth if we have a match.  Any
++         * DANE match is dispositive, but with PKIX we still need to build a
++         * full chain.
++         */
++        if (cmplen == t-&gt;dlen &amp;&amp;
++            memcmp(cmpbuf, t-&gt;data, cmplen) == 0) {
++            if (DANETLS_USAGE_BIT(usage) &amp; DANETLS_DANE_MASK)
++                matched = 1;
++            if (matched || dane-&gt;mdpth &lt; 0) {
++                dane-&gt;mdpth = depth;
++                dane-&gt;mtlsa = t;
++                OPENSSL_free(dane-&gt;mcert);
++                dane-&gt;mcert = cert;
++                X509_up_ref(cert);
++            }
++            break;
++        }
++    }
++
++    /* Clear the one-element DER cache */
++    OPENSSL_free(i2dbuf);
++    return matched;
++}
++
++static int check_dane_issuer(X509_STORE_CTX *ctx, int depth)
++{
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
++    int matched = 0;
++    X509 *cert;
++
++    if (!DANETLS_HAS_TA(dane) || depth == 0)
++        return  X509_TRUST_UNTRUSTED;
++
++    /*
++     * Record any DANE trust anchor matches, for the first depth to test, if
++     * there's one at that depth. (This'll be false for length 1 chains looking
++     * for an exact match for the leaf certificate).
++     */
++    cert = sk_X509_value(ctx-&gt;chain, depth);
++    if (cert != NULL &amp;&amp; (matched = dane_match(ctx, cert, depth)) &lt; 0)
++        return  X509_TRUST_REJECTED;
++    if (matched &gt; 0) {
++        ctx-&gt;num_untrusted = depth - 1;
++        return  X509_TRUST_TRUSTED;
++    }
++
++    return  X509_TRUST_UNTRUSTED;
++}
++
++static int check_dane_pkeys(X509_STORE_CTX *ctx)
++{
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
++    danetls_record *t;
++    int num = ctx-&gt;num_untrusted;
++    X509 *cert = sk_X509_value(ctx-&gt;chain, num - 1);
++    int recnum = sk_danetls_record_num(dane-&gt;trecs);
++    int i;
++
++    for (i = 0; i &lt; recnum; ++i) {
++        t = sk_danetls_record_value(dane-&gt;trecs, i);
++        if (t-&gt;usage != DANETLS_USAGE_DANE_TA ||
++            t-&gt;selector != DANETLS_SELECTOR_SPKI ||
++            t-&gt;mtype != DANETLS_MATCHING_FULL ||
++            X509_verify(cert, t-&gt;spki) &lt;= 0)
++            continue;
++
++        /* Clear PKIX-?? matches that failed to panned out to a full chain */
++        X509_free(dane-&gt;mcert);
++        dane-&gt;mcert = NULL;
++
++        /* Record match via a bare TA public key */
++        ctx-&gt;bare_ta_signed = 1;
++        dane-&gt;mdpth = num - 1;
++        dane-&gt;mtlsa = t;
++
++        /* Prune any excess chain certificates */
++        num = sk_X509_num(ctx-&gt;chain);
++        for (; num &gt; ctx-&gt;num_untrusted; --num)
++            X509_free(sk_X509_pop(ctx-&gt;chain));
++
++        return X509_TRUST_TRUSTED;
++    }
++
++    return X509_TRUST_UNTRUSTED;
++}
++
++static void dane_reset(struct dane_st *dane)
++{
++    /*
++     * Reset state to verify another chain, or clear after failure.
++     */
++    X509_free(dane-&gt;mcert);
++    dane-&gt;mcert = NULL;
++    dane-&gt;mtlsa = NULL;
++    dane-&gt;mdpth = -1;
++    dane-&gt;pdpth = -1;
++}
++
++static int dane_verify(X509_STORE_CTX *ctx)
++{
++    X509 *cert = ctx-&gt;cert;
++    int (*cb)(int xok, X509_STORE_CTX *xctx) = ctx-&gt;verify_cb;
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
++    int matched;
++    int done;
++
++    dane_reset(dane);
++
++    matched = dane_match(ctx, ctx-&gt;cert, 0);
++    done = matched != 0 || (!DANETLS_HAS_TA(dane) &amp;&amp; dane-&gt;mdpth &lt; 0);
++
++    if (done)
++        X509_get_pubkey_parameters(NULL, ctx-&gt;chain);
++
++    if (matched &gt; 0) {
++        ctx-&gt;error_depth = 0;
++        ctx-&gt;current_cert = cert;
++        return cb(1, ctx);
++    }
++
++    if (matched &lt; 0) {
++        ctx-&gt;error_depth = 0;
++        ctx-&gt;current_cert = cert;
++        ctx-&gt;error = X509_V_ERR_OUT_OF_MEM;
++        return -1;
++    }
++
++    if (done) {
++        /* Fail early, TA-based success is not possible */
++        ctx-&gt;current_cert = cert;
++        ctx-&gt;error_depth = 0;
++        ctx-&gt;error = X509_V_ERR_CERT_UNTRUSTED;
++        return cb(0, ctx);
++    }
++
++    /*
++     * Chain verification for usages 0/1/2.  TLSA record matching of depth &gt; 0
++     * certificates happens in-line with building the rest of the chain.
++     */
++    return verify_chain(ctx);
++}
++
+ static int build_chain(X509_STORE_CTX *ctx)
+ {
++    struct dane_st *dane = (struct dane_st *)ctx-&gt;dane;
+     int (*cb) (int, X509_STORE_CTX *) = ctx-&gt;verify_cb;
+     int num = sk_X509_num(ctx-&gt;chain);
+     X509 *cert = sk_X509_value(ctx-&gt;chain, num - 1);
+     int ss = cert_self_signed(cert);
+     STACK_OF(X509) *sktmp = NULL;
+     unsigned int search;
+-    int may_trusted = 1;
++    int may_trusted = 0;
+     int may_alternate = 0;
+     int trust = X509_TRUST_UNTRUSTED;
+     int alt_untrusted = 0;
+@@ -2294,14 +2629,19 @@ static int build_chain(X509_STORE_CTX *ctx)
+ #define S_DOALTERNATE      (1 &lt;&lt; 2)     /* Retry with pruned alternate chain */
+     /*
+      * Set up search policy, untrusted if possible, trusted-first if enabled.
+-     * If not trusted-first, and alternate chains are not disabled, try
+-     * building an alternate chain if no luck with untrusted first.
++     * If we're doing DANE and not doing PKIX-TA/PKIX-EE, we never look in the
++     * trust_store, otherwise we might look there first.  If not trusted-first,
++     * and alternate chains are not disabled, try building an alternate chain
++     * if no luck with untrusted first.
+      */
+     search = (ctx-&gt;untrusted != NULL) ? S_DOUNTRUSTED : 0;
+-    if (search == 0 || ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_TRUSTED_FIRST)
+-        search |= S_DOTRUSTED;
+-    else if (!(ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_NO_ALT_CHAINS))
+-        may_alternate = 1;
++    if (DANETLS_HAS_PKIX(dane) || !DANETLS_HAS_DANE(dane)) {
++        if (search == 0 || ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_TRUSTED_FIRST)
++            search |= S_DOTRUSTED;
++        else if (!(ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_NO_ALT_CHAINS))
++            may_alternate = 1;
++        may_trusted = 1;
++    }
+ 
+     /*
+      * Shallow-copy the stack of untrusted certificates (with TLS, this is
+@@ -2313,6 +2653,17 @@ static int build_chain(X509_STORE_CTX *ctx)
+         return 0;
+     }
+ 
++    /* Include any untrusted full certificates from DNS */
++    if (DANETLS_ENABLED(dane) &amp;&amp; dane-&gt;certs != NULL) {
++        for (i = 0; i &lt; sk_X509_num(dane-&gt;certs); ++i) {
++            if (!sk_X509_push(sktmp, sk_X509_value(dane-&gt;certs, i))) {
++                sk_X509_free(sktmp);
++                X509err(X509_F_BUILD_CHAIN, ERR_R_MALLOC_FAILURE);
++                return 0;
++            }
++        }
++    }
++
+     /*
+      * Still absurdly large, but arithmetically safe, a lower hard upper bound
+      * might be reasonable.
+@@ -2381,6 +2732,10 @@ static int build_chain(X509_STORE_CTX *ctx)
+                  * case we may prune some more untrusted certificates and try
+                  * again.  Thus the S_DOALTERNATE bit may yet be turned on
+                  * again with an even shorter untrusted chain!
++                 *
++                 * If in the process we threw away our matching PKIX-TA trust
++                 * anchor, reset DANE trust.  We might find a suitable trusted
++                 * certificate among the ones from the trust store.
+                  */
+                 if ((search &amp; S_DOALTERNATE) != 0) {
+                     OPENSSL_assert(num &gt; i &amp;&amp; i &gt; 0 &amp;&amp; ss == 0);
+@@ -2388,6 +2743,16 @@ static int build_chain(X509_STORE_CTX *ctx)
+                     for (; num &gt; i; --num)
+                         X509_free(sk_X509_pop(ctx-&gt;chain));
+                     ctx-&gt;num_untrusted = num;
++
++                    if (DANETLS_ENABLED(dane) &amp;&amp;
++                        dane-&gt;mdpth &gt;= ctx-&gt;num_untrusted) {
++                        dane-&gt;mdpth = -1;
++                        X509_free(dane-&gt;mcert);
++                        dane-&gt;mcert = NULL;
++                    }
++                    if (DANETLS_ENABLED(dane) &amp;&amp;
++                        dane-&gt;pdpth &gt;= ctx-&gt;num_untrusted)
++                        dane-&gt;pdpth = -1;
+                 }
+ 
+                 /*
+@@ -2426,6 +2791,13 @@ static int build_chain(X509_STORE_CTX *ctx)
+                  * trust.  If not done, and not self-signed look deeper.
+                  * Whether or not we're doing &quot;trusted first&quot;, we no longer
+                  * look for untrusted certificates from the peer's chain.
++                 *
++                 * At this point ctx-&gt;num_trusted and num must reflect the
++                 * correct number of untrusted certificates, since the DANE
++                 * logic in check_trust() depends on distinguishing CAs from
++                 * &quot;the wire&quot; from CAs from the trust store.  In particular, the
++                 * certificate at depth &quot;num&quot; should be the new trusted
++                 * certificate with ctx-&gt;num_untrusted &lt;= num.
+                  */
+                 if (ok) {
+                     OPENSSL_assert(ctx-&gt;num_untrusted &lt;= num);
+@@ -2497,14 +2869,27 @@ static int build_chain(X509_STORE_CTX *ctx)
+              * certificates over and over.
+              */
+             (void) sk_X509_delete_ptr(sktmp, x);
++
++            /*
++             * Check for DANE-TA trust of the topmost untrusted certificate.
++             */
++            switch (trust = check_dane_issuer(ctx, ctx-&gt;num_untrusted - 1)) {
++            case X509_TRUST_TRUSTED:
++            case X509_TRUST_REJECTED:
++                search = 0;
++                continue;
++            }
+         }
+     }
+     sk_X509_free(sktmp);
+ 
+     /*
+-     * Last chance to make a trusted chain, check for direct leaf PKIX trust.
++     * Last chance to make a trusted chain, either bare DANE-TA public-key
++     * signers, or else direct leaf PKIX trust.
+      */
+     if (sk_X509_num(ctx-&gt;chain) &lt;= depth) {
++        if (trust == X509_TRUST_UNTRUSTED &amp;&amp; DANETLS_HAS_DANE_TA(dane))
++            trust = check_dane_pkeys(ctx);
+         if (trust == X509_TRUST_UNTRUSTED &amp;&amp;
+             sk_X509_num(ctx-&gt;chain) == ctx-&gt;num_untrusted)
+             trust = check_trust(ctx, 1);
+@@ -2522,6 +2907,9 @@ static int build_chain(X509_STORE_CTX *ctx)
+         ctx-&gt;error_depth = num-1;
+         if (num &gt; depth)
+             ctx-&gt;error = X509_V_ERR_CERT_CHAIN_TOO_LONG;
++        else if (DANETLS_ENABLED(dane) &amp;&amp;
++                 (!DANETLS_HAS_PKIX(dane) || dane-&gt;pdpth &gt;= 0))
++            ctx-&gt;error = X509_V_ERR_CERT_UNTRUSTED;
+         else if (ss &amp;&amp; sk_X509_num(ctx-&gt;chain) == 1)
+             ctx-&gt;error = X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT;
+         else if (ss)
+@@ -2530,6 +2918,8 @@ static int build_chain(X509_STORE_CTX *ctx)
+             ctx-&gt;error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY;
+         else
+             ctx-&gt;error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT;
++        if (DANETLS_ENABLED(dane))
++            dane_reset(dane);
+         return cb(0, ctx);
+     }
+ }
+diff --git a/include/openssl/x509.h b/include/openssl/x509.h
+index 0b00abf..0f66329 100644
+--- a/include/openssl/x509.h
++++ b/include/openssl/x509.h
+@@ -1073,6 +1073,7 @@ void ERR_load_X509_strings(void);
+ # define X509_F_BUILD_CHAIN                               106
+ # define X509_F_BY_FILE_CTRL                              101
+ # define X509_F_CHECK_POLICY                              145
++# define X509_F_DANE_I2D                                  107
+ # define X509_F_DIR_CTRL                                  102
+ # define X509_F_GET_CERT_BY_SUBJECT                       103
+ # define X509_F_NETSCAPE_SPKI_B64_DECODE                  129
+@@ -1119,6 +1120,7 @@ void ERR_load_X509_strings(void);
+ 
+ /* Reason codes. */
+ # define X509_R_AKID_MISMATCH                             110
++# define X509_R_BAD_SELECTOR                              133
+ # define X509_R_BAD_X509_FILETYPE                         100
+ # define X509_R_BASE64_DECODE_ERROR                       118
+ # define X509_R_CANT_CHECK_DH_KEY                         114
+diff --git a/include/openssl/x509_vfy.h b/include/openssl/x509_vfy.h
+index c96ab68..7ea11ea 100644
+--- a/include/openssl/x509_vfy.h
++++ b/include/openssl/x509_vfy.h
+@@ -264,6 +264,8 @@ struct x509_store_ctx_st {      /* X509_STORE_CTX */
+     X509_STORE_CTX *parent;
+     CRYPTO_EX_DATA ex_data;
+     struct dane_st *dane;
++    /* signed via bare TA public key, rather than CA certificate */
++    int bare_ta_signed;
+ } /* X509_STORE_CTX */ ;
+ 
+ void X509_STORE_CTX_set_depth(X509_STORE_CTX *ctx, int depth);
+diff --git a/test/Makefile b/test/Makefile
+index 3a04fef..8103558 100644
+--- a/test/Makefile
++++ b/test/Makefile
+@@ -59,6 +59,7 @@ RANDTEST=	randtest
+ DHTEST=		dhtest
+ DSATEST=	dsatest
+ SSLTEST=	ssltest
++DANETEST=	danetest
+ RSATEST=	rsa_test
+ ENGINETEST=	enginetest
+ EVPTEST=	evp_test
+@@ -90,7 +91,7 @@ EXE=	$(NPTEST)$(EXE_EXT) $(BNTEST)$(EXE_EXT) $(ECTEST)$(EXE_EXT) \
+ 	$(DESTEST)$(EXE_EXT) $(SHA1TEST)$(EXE_EXT) $(SHA256TEST)$(EXE_EXT) $(SHA512TEST)$(EXE_EXT) \
+ 	$(MDC2TEST)$(EXE_EXT) $(RMDTEST)$(EXE_EXT) \
+ 	$(RANDTEST)$(EXE_EXT) $(DHTEST)$(EXE_EXT) $(ENGINETEST)$(EXE_EXT) \
+-	$(GOST2814789TEST)$(EXE_EXT) \
++	$(GOST2814789TEST)$(EXE_EXT) $(DANETEST)$(EXE_EXT) \
+ 	$(BFTEST)$(EXE_EXT) $(CASTTEST)$(EXE_EXT) $(SSLTEST)$(EXE_EXT) \
+ 	$(EXPTEST)$(EXE_EXT) $(DSATEST)$(EXE_EXT) $(RSATEST)$(EXE_EXT) \
+ 	$(EVPTEST)$(EXE_EXT) $(EVPEXTRATEST)$(EXE_EXT) $(IGETEST)$(EXE_EXT) \
+@@ -108,7 +109,7 @@ OBJ=	$(NPTEST).o $(BNTEST).o $(ECTEST).o \
+ 	$(HMACTEST).o $(WPTEST).o \
+ 	$(RC2TEST).o $(RC4TEST).o $(RC5TEST).o \
+ 	$(DESTEST).o $(SHA1TEST).o $(SHA256TEST).o $(SHA512TEST).o \
+-	$(MDC2TEST).o $(RMDTEST).o \
++	$(MDC2TEST).o $(RMDTEST).o $(DANETEST).o \
+ 	$(RANDTEST).o $(DHTEST).o $(ENGINETEST).o $(CASTTEST).o \
+ 	$(BFTEST).o  $(SSLTEST).o  $(DSATEST).o  $(EXPTEST).o $(RSATEST).o \
+ 	$(EVPTEST).o $(EVPEXTRATEST).o $(IGETEST).o $(JPAKETEST).o $(V3NAMETEST).o \
+@@ -120,7 +121,7 @@ SRC=	$(NPTEST).c $(BNTEST).c $(ECTEST).c \
+ 	$(ECDSATEST).c $(ECDHTEST).c $(GMDIFFTEST).c $(PBELUTEST).c $(IDEATEST).c \
+ 	$(MD2TEST).c  $(MD4TEST).c $(MD5TEST).c \
+ 	$(HMACTEST).c $(WPTEST).c \
+-	$(RC2TEST).c $(RC4TEST).c $(RC5TEST).c \
++	$(RC2TEST).c $(RC4TEST).c $(RC5TEST).c $(DANETEST).c \
+ 	$(DESTEST).c $(SHA1TEST).c $(MDC2TEST).c $(RMDTEST).c \
+ 	$(RANDTEST).c $(DHTEST).c $(ENGINETEST).c $(CASTTEST).c \
+ 	$(BFTEST).c  $(SSLTEST).c $(DSATEST).c   $(EXPTEST).c $(RSATEST).c \
+@@ -317,6 +318,9 @@ $(METHTEST)$(EXE_EXT): $(METHTEST).o $(DLIBCRYPTO)
+ $(SSLTEST)$(EXE_EXT): $(SSLTEST).o $(DLIBSSL) $(DLIBCRYPTO)
+ 	@target=$(SSLTEST); $(BUILD_CMD)
+ 
++$(DANETEST)$(EXE_EXT): $(DANETEST).o $(DLIBSSL) $(DLIBCRYPTO)
++	@target=$(DANETEST); $(BUILD_CMD)
++
+ $(ENGINETEST)$(EXE_EXT): $(ENGINETEST).o $(DLIBCRYPTO)
+ 	@target=$(ENGINETEST); $(BUILD_CMD)
+ 
+@@ -435,6 +439,23 @@ clienthellotest.o: clienthellotest.c
+ constant_time_test.o: ../e_os.h ../include/internal/constant_time_locl.h
+ constant_time_test.o: ../include/openssl/e_os2.h
+ constant_time_test.o: ../include/openssl/opensslconf.h constant_time_test.c
++danetest.o: ../e_os.h ../include/internal/dane.h ../include/openssl/asn1.h
++danetest.o: ../include/openssl/bio.h ../include/openssl/buffer.h
++danetest.o: ../include/openssl/comp.h ../include/openssl/conf.h
++danetest.o: ../include/openssl/crypto.h ../include/openssl/dtls1.h
++danetest.o: ../include/openssl/e_os2.h ../include/openssl/ec.h
++danetest.o: ../include/openssl/engine.h ../include/openssl/err.h
++danetest.o: ../include/openssl/evp.h ../include/openssl/hmac.h
++danetest.o: ../include/openssl/lhash.h ../include/openssl/obj_mac.h
++danetest.o: ../include/openssl/objects.h ../include/openssl/opensslconf.h
++danetest.o: ../include/openssl/opensslv.h ../include/openssl/ossl_typ.h
++danetest.o: ../include/openssl/pem.h ../include/openssl/pem2.h
++danetest.o: ../include/openssl/pkcs7.h ../include/openssl/safestack.h
++danetest.o: ../include/openssl/sha.h ../include/openssl/srtp.h
++danetest.o: ../include/openssl/ssl.h ../include/openssl/ssl2.h
++danetest.o: ../include/openssl/ssl3.h ../include/openssl/stack.h
++danetest.o: ../include/openssl/symhacks.h ../include/openssl/tls1.h
++danetest.o: ../include/openssl/x509.h ../include/openssl/x509_vfy.h danetest.c
+ destest.o: ../include/openssl/des.h ../include/openssl/e_os2.h
+ destest.o: ../include/openssl/opensslconf.h destest.c
+ dhtest.o: ../e_os.h ../include/openssl/bio.h ../include/openssl/bn.h
+diff --git a/test/danetest.c b/test/danetest.c
+new file mode 100644
+index 0000000..063b944
+--- /dev/null
++++ b/test/danetest.c
+@@ -0,0 +1,543 @@
++/* danetest.c */
++/* ====================================================================
++ * Copyright (c) 2015 The OpenSSL Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * 3. All advertising materials mentioning features or use of this
++ *    software must display the following acknowledgment:
++ *    &quot;This product includes software developed by the OpenSSL Project
++ *    for use in the OpenSSL Toolkit. (<A HREF="http://www.openssl.org/">http://www.openssl.org/</A>)&quot;
++ *
++ * 4. The names &quot;OpenSSL Toolkit&quot; and &quot;OpenSSL Project&quot; must not be used to
++ *    endorse or promote products derived from this software without
++ *    prior written permission. For written permission, please contact
++ *    <A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-core at openssl.org.</A>
++ *
++ * 5. Products derived from this software may not be called &quot;OpenSSL&quot;
++ *    nor may &quot;OpenSSL&quot; appear in their names without prior written
++ *    permission of the OpenSSL Project.
++ *
++ * 6. Redistributions of any form whatsoever must retain the following
++ *    acknowledgment:
++ *    &quot;This product includes software developed by the OpenSSL Project
++ *    for use in the OpenSSL Toolkit (<A HREF="http://www.openssl.org/">http://www.openssl.org/</A>)&quot;
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE OpenSSL PROJECT ``AS IS'' AND ANY
++ * EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE OpenSSL PROJECT OR
++ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
++ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
++ * OF THE POSSIBILITY OF SUCH DAMAGE.
++ * ====================================================================
++ */
++
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;ctype.h&gt;
++#include &lt;limits.h&gt;
++#include &lt;errno.h&gt;
++
++#include &lt;openssl/crypto.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &lt;openssl/x509.h&gt;
++#include &lt;openssl/ssl.h&gt;
++#include &lt;openssl/err.h&gt;
++#include &lt;openssl/conf.h&gt;
++#ifndef OPENSSL_NO_ENGINE
++#include &lt;openssl/engine.h&gt;
++#endif
++
++#include &quot;../e_os.h&quot;
++
++static const char *progname;
++
++/*
++ * Forward declaration, of function that uses internal interfaces, from headers
++ * included at the end of this module.
++ */
++static void store_ctx_dane_init(X509_STORE_CTX *, SSL *);
++
++static int saved_errno;
++
++static void save_errno(void)
++{
++    saved_errno = errno;
++}
++
++static int restore_errno(void)
++{
++    int ret = errno;
++    errno = saved_errno;
++    return ret;
++}
++
++static void usage(void)
++{
++    fprintf(stderr, &quot;usage: %s: danetest basedomain CAfile tlsafile\n&quot;, progname);
++}
++
++static void print_errors(void)
++{
++    unsigned long err;
++    char buffer[1024];
++    const char *file;
++    const char *data;
++    int line;
++    int flags;
++
++    while ((err = ERR_get_error_line_data(&amp;file, &amp;line, &amp;data, &amp;flags)) != 0) {
++        ERR_error_string_n(err, buffer, sizeof(buffer));
++        if (flags &amp; ERR_TXT_STRING)
++            fprintf(stderr, &quot;Error: %s:%s:%d:%s\n&quot;, buffer, file, line, data);
++        else
++            fprintf(stderr, &quot;Error: %s:%s:%d\n&quot;, buffer, file, line);
++    }
++}
++
++static int verify_chain(SSL *ssl, STACK_OF(X509) *chain)
++{
++    int ret;
++    X509_STORE_CTX *store_ctx;
++    SSL_CTX *ssl_ctx = SSL_get_SSL_CTX(ssl);
++    X509_STORE *store = SSL_CTX_get_cert_store(ssl_ctx);
++    int store_ctx_idx = SSL_get_ex_data_X509_STORE_CTX_idx();
++    X509 *cert = sk_X509_value(chain, 0);
++
++    if ((store_ctx = X509_STORE_CTX_new()) == NULL)
++        return -1;
++
++    if (!X509_STORE_CTX_init(store_ctx, store, cert, chain))
++	return 0;
++    X509_STORE_CTX_set_ex_data(store_ctx, store_ctx_idx, ssl);
++
++    X509_STORE_CTX_set_default(store_ctx,
++            SSL_is_server(ssl) ? &quot;ssl_client&quot; : &quot;ssl_server&quot;);
++    X509_VERIFY_PARAM_set1(X509_STORE_CTX_get0_param(store_ctx),
++            SSL_get0_param(ssl));
++    store_ctx_dane_init(store_ctx, ssl);
++
++    if (SSL_get_verify_callback(ssl))
++	X509_STORE_CTX_set_verify_cb(store_ctx, SSL_get_verify_callback(ssl));
++
++    ret = X509_verify_cert(store_ctx);
++
++    SSL_set_verify_result(ssl, X509_STORE_CTX_get_error(store_ctx));
++    X509_STORE_CTX_cleanup(store_ctx);
++    X509_STORE_CTX_free(store_ctx);
++
++    return (ret);
++}
++
++static STACK_OF(X509) *load_chain(FILE *fp, int nelem)
++{
++    int count;
++    char *name = 0;
++    char *header = 0;
++    unsigned char *data = 0;
++    long len;
++    char *errtype = 0;		/* if error: cert or pkey? */
++    STACK_OF(X509) *chain;
++    typedef X509 *(*d2i_X509_t)(X509 **, const unsigned char **, long);
++
++    if ((chain = sk_X509_new_null()) == 0) {
++	perror(&quot;malloc&quot;);
++	exit(1);
++    }
++
++    for (count = 0;
++	 count &lt; nelem &amp;&amp; errtype == 0
++         &amp;&amp; PEM_read(fp, &amp;name, &amp;header, &amp;data, &amp;len);
++	 ++count) {
++	const unsigned char *p = data;
++
++	if (strcmp(name, PEM_STRING_X509) == 0
++	    || strcmp(name, PEM_STRING_X509_TRUSTED) == 0
++	    || strcmp(name, PEM_STRING_X509_OLD) == 0) {
++	    d2i_X509_t d = strcmp(name, PEM_STRING_X509_TRUSTED) ?
++		d2i_X509_AUX : d2i_X509;
++	    X509 *cert = d(0, &amp;p, len);
++
++	    if (cert == 0 || (p - data) != len)
++		errtype = &quot;certificate&quot;;
++	    else if (sk_X509_push(chain, cert) == 0) {
++		perror(&quot;malloc&quot;);
++		goto err;
++	    }
++	} else {
++	    fprintf(stderr, &quot;unexpected chain file object: %s\n&quot;, name);
++	    goto err;
++	}
++
++	/*
++	 * If any of these were null, PEM_read() would have failed.
++	 */
++	OPENSSL_free(name);
++	OPENSSL_free(header);
++	OPENSSL_free(data);
++    }
++
++    if (errtype) {
++	fprintf(stderr, &quot;error reading: malformed %s\n&quot;, errtype);
++        goto err;
++    }
++    
++    if (count == nelem) {
++        ERR_clear_error();
++        return chain;
++    }
++
++err:
++    /* Some other PEM read error */
++    sk_X509_pop_free(chain, X509_free);
++    print_errors();
++    return NULL;
++}
++
++static char *read_to_eol(FILE *f)
++{
++    static char buf[1024];
++    int n;
++
++    if (fgets(buf, sizeof(buf), f)== NULL)
++        return NULL;
++
++    n = strlen(buf);
++
++    if (buf[n-1] != '\n') {
++        if (n+1 == sizeof(buf)) {
++            fprintf(stderr, &quot;%s: warning: input too long\n&quot;, progname);
++        } else {
++            fprintf(stderr, &quot;%s: warning: EOF before newline\n&quot;, progname);
++        }
++        return NULL;
++    }
++
++    /* Trim trailing whitespace */
++    while (n &gt; 0 &amp;&amp; isspace(buf[n-1]))
++        buf[--n] = '\0';
++
++    return buf;
++}
++
++/*
++ * Hex decoder that tolerates optional whitespace
++ */
++static ossl_ssize_t hexdecode(const char *in, void *result)
++{
++    unsigned char **out = (unsigned char **)result;
++    unsigned char *ret = OPENSSL_malloc(strlen(in)/2);
++    unsigned char *cp = ret;
++    uint8_t byte;
++    int nibble = 0;
++
++    if (ret == NULL)
++        return -1;
++
++    for (byte = 0; *in; ++in) {
++        char c;
++
++        if (isspace(*in))
++            continue;
++        c = tolower(*in);
++        if ('0' &lt;= c &amp;&amp; c &lt;= '9') {
++            byte |= c - '0';
++        } else if ('a' &lt;= c &amp;&amp; c &lt;= 'f') {
++            byte |= c - 'a' + 10;
++        } else {
++            OPENSSL_free(ret);
++            return 0;
++        }
++        if ((nibble ^= 1) == 0) {
++            *cp++ = byte;
++            byte = 0;
++        } else {
++            byte &lt;&lt;= 4;
++        }
++    }
++    if (nibble != 0) {
++        OPENSSL_free(ret);
++        return 0;
++    }
++
++    return cp - (*out = ret);
++}
++
++static ossl_ssize_t checked_uint8(const char *in, void *out)
++{
++    uint8_t *result = (uint8_t *)out;
++    const char *cp = in;
++    char *endp;
++    long v;
++    int e;
++
++    save_errno();
++    v = strtol(cp, &amp;endp, 10);
++    e = restore_errno();
++
++    if (((v == LONG_MIN || v == LONG_MAX) &amp;&amp; e == ERANGE) ||
++        endp == cp || !isspace(*endp) ||
++        v != (*(uint8_t *)result = (uint8_t) v)) {
++        return -1;
++    }
++    for (cp = endp; isspace(*cp); ++cp)
++        continue;
++    return cp - in;
++}
++
++static int tlsa_import_rr(SSL *ssl, const char *rrdata)
++{
++    int ret;
++    uint8_t usage;
++    uint8_t selector;
++    uint8_t mtype;
++    unsigned char *data = NULL;
++    const char *cp = rrdata;
++    ossl_ssize_t len = 0;
++    struct tlsa_field {
++        void *var;
++        const char *name;
++        ossl_ssize_t (*parser)(const char *, void *);
++    } tlsa_fields[] = {
++        { &amp;usage, &quot;usage&quot;, checked_uint8 },
++        { &amp;selector, &quot;selector&quot;, checked_uint8 },
++        { &amp;mtype, &quot;mtype&quot;, checked_uint8 },
++        { &amp;data, &quot;data&quot;, hexdecode },
++        { NULL, }
++    };
++    struct tlsa_field *f;
++
++    for (f = tlsa_fields; f-&gt;var; ++f) {
++        if ((len = f-&gt;parser(cp += len, f-&gt;var)) &lt;= 0) {
++            fprintf(stderr, &quot;%s: warning: bad TLSA %s field in: %s\n&quot;,
++                    progname, f-&gt;name, rrdata);
++            return 0;
++        }
++    }
++    ret = SSL_dane_tlsa_add(ssl, usage, selector, mtype, data, len);
++    OPENSSL_free(data);
++
++    if (ret == 0) {
++        print_errors();
++        fprintf(stderr, &quot;%s: warning: unusable TLSA rrdata: %s\n&quot;,
++                progname, rrdata);
++        return 0;
++    }
++    if (ret &lt; 0) {
++        fprintf(stderr, &quot;%s: warning: error loading TLSA rrdata: %s\n&quot;,
++                progname, rrdata);
++        return 0;
++    }
++    return ret;
++}
++
++static int allws(const char *cp)
++{
++    while (*cp)
++        if (!isspace(*cp++))
++            return 0;
++    return 1;
++}
++
++static int test_tlsafile(SSL_CTX *ctx, const char *basename,
++                         FILE *f, const char *path)
++{
++    char *line;
++    int testno = 0;
++    int ret = 1;
++    SSL *ssl;
++
++    while (ret &gt; 0 &amp;&amp; (line = read_to_eol(f)) != NULL) {
++        STACK_OF(X509) *chain;
++        int ntlsa;
++        int ncert;
++        int want;
++        int want_depth;
++        int off;
++        int i;
++        int ok;
++        int err;
++        int mdpth;
++
++        if (*line == '\0' || *line == '#')
++            continue;
++
++        ++testno;
++        if (sscanf(line, &quot;%d %d %d %d%n&quot;, &amp;ntlsa, &amp;ncert, &amp;want, &amp;want_depth, &amp;off) != 4
++            || !allws(line + off)) {
++            fprintf(stderr, &quot;Expected tlsa count, cert count and result&quot;
++                    &quot; at test %d of %s\n&quot;, testno, path);
++            return 0;
++        }
++
++        if ((ssl = SSL_new(ctx)) == NULL)
++            return -1;
++        SSL_set_connect_state(ssl);
++        if (SSL_dane_enable(ssl, basename) &lt;= 0) {
++            SSL_free(ssl);
++            return -1;
++        }
++
++        for (i = 0; i &lt; ntlsa; ++i) {
++            if ((line = read_to_eol(f)) == NULL || !tlsa_import_rr(ssl, line)) {
++                SSL_free(ssl);
++                return 0;
++            }
++        }
++
++        /* Don't report old news */
++        ERR_clear_error();
++        chain = load_chain(f, ncert);
++        if (chain == NULL) {
++            SSL_free(ssl);
++            return -1;
++        }
++
++        ok = verify_chain(ssl, chain);
++        sk_X509_pop_free(chain, X509_free);
++        err = SSL_get_verify_result(ssl);
++        mdpth = SSL_get0_dane_authority(ssl, NULL, NULL);
++        SSL_free(ssl);
++
++        if (ok &lt; 0) {
++            ret = 0;
++            fprintf(stderr, &quot;verify_chain internal error in %s test %d\n&quot;,
++                    path, testno);
++            print_errors();
++            continue;
++        }
++        if (err != want || (want == 0 &amp;&amp; !ok)) {
++            ret = 0;
++            if (err != want) {
++                if (want == X509_V_OK)
++                    fprintf(stderr, &quot;Verification failure in %s test %d: %d: %s\n&quot;,
++                            path, testno, err, X509_verify_cert_error_string(err));
++                else
++                    fprintf(stderr, &quot;Unexpected error in %s test %d: %d: wanted %d\n&quot;,
++                            path, testno, err, want);
++            } else {
++                fprintf(stderr, &quot;Verification failure in %s test %d: ok=0\n&quot;,
++                        path, testno);
++            }
++            print_errors();
++            continue;
++        }
++        if (mdpth != want_depth) {
++            ret = 0;
++            fprintf(stderr, &quot;Wrong match depth, in %s test %d: wanted %d, got: %d\n&quot;,
++                    path, testno, want_depth, mdpth);
++        }
++        fprintf(stderr, &quot;%s: test %d successful\n&quot;, path, testno);
++    }
++    ERR_clear_error();
++
++    return ret;
++}
++
++int main(int argc, char *argv[])
++{
++    progname = argv[0];
++    FILE *f;
++    BIO *bio_err;
++    SSL_CTX *ctx = NULL;
++    const char *basedomain;
++    const char *CAfile;
++    const char *tlsafile;
++    int ret = 1;
++
++    if (argc != 4) {
++        usage();
++        EXIT(1);
++    }
++    basedomain = argv[1];
++    CAfile = argv[2];
++    tlsafile = argv[3];
++
++    f = fopen(tlsafile, &quot;r&quot;);
++    if (f == NULL) {
++        fprintf(stderr, &quot;%s: Error opening tlsa record file: '%s': %s\n&quot;,
++                progname, tlsafile, strerror(errno));
++        return 0;
++    }
++
++    bio_err = BIO_new_fp(stderr, BIO_NOCLOSE | BIO_FP_TEXT);
++
++    /* enable memory leak checking unless explicitly disabled */
++    if (!((getenv(&quot;OPENSSL_DEBUG_MEMORY&quot;) != NULL)
++          &amp;&amp; (0 == strcmp(getenv(&quot;OPENSSL_DEBUG_MEMORY&quot;), &quot;off&quot;)))) {
++        CRYPTO_malloc_debug_init();
++        CRYPTO_set_mem_debug_options(V_CRYPTO_MDEBUG_ALL);
++    } else {
++        /* OPENSSL_DEBUG_MEMORY=off */
++        CRYPTO_set_mem_debug_functions(0, 0, 0, 0, 0);
++    }
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
++
++    SSL_library_init();
++    SSL_load_error_strings();
++
++    ctx = SSL_CTX_new(TLS_client_method());
++    if (SSL_CTX_dane_enable(ctx) &lt;= 0) {
++        print_errors();
++        goto end;
++    }
++    if (!SSL_CTX_load_verify_locations(ctx, CAfile, NULL)) {
++        print_errors();
++        goto end;
++    }
++    if ((SSL_CTX_dane_mtype_set(ctx, EVP_sha512(), 2, 1)) &lt;= 0) {
++        print_errors();
++        goto end;
++    }
++    if ((SSL_CTX_dane_mtype_set(ctx, EVP_sha256(), 1, 2)) &lt;= 0) {
++        print_errors();
++        goto end;
++    }
++
++    if (test_tlsafile(ctx, argv[1], f, tlsafile) &lt;= 0) {
++        print_errors();
++        goto end;
++    }
++
++    ret = 0;
++
++end:
++
++    (void) fclose(f);
++    SSL_CTX_free(ctx);
++
++#ifndef OPENSSL_NO_ENGINE
++    ENGINE_cleanup();
++#endif
++    CONF_modules_unload(1);
++    CRYPTO_cleanup_all_ex_data();
++    ERR_free_strings();
++    ERR_remove_thread_state(NULL);
++    EVP_cleanup();
++    CRYPTO_mem_leaks(bio_err);
++    BIO_free(bio_err);
++    EXIT(ret);
++}
++
++#include &lt;internal/dane.h&gt;
++
++static void store_ctx_dane_init(X509_STORE_CTX *store_ctx, SSL *ssl)
++{
++    X509_STORE_CTX_set0_dane(store_ctx, SSL_get0_dane(ssl));
++}
+diff --git a/test/danetest.in b/test/danetest.in
+new file mode 100644
+index 0000000..a9a01c0
+--- /dev/null
++++ b/test/danetest.in
+@@ -0,0 +1,1675 @@
++# Blank and comment lines ignored.
++# The first line in each block takes the form:
++#
++#       &lt;TLSA-count&gt; &lt;cert-count&gt; &lt;desired-verify-result&gt; &lt;desired-match-depth&gt;
++#
++# It is followed by &lt;TLSA-count&gt; lines of the form:
++#
++#       &lt;usage&gt; &lt;selector&gt; &lt;mtype&gt; &lt;hex-data&gt;
++#
++# and finally, by &lt;cert-count&gt; certificates.
++
++# Test chain matching TLSA records
++# --
++# subject= CN = example.com
++# 3 0 0 308201943082013BA003020102020102300A06082A8648CE3D04030230143112301006035504030C094973737565722043413020170D3135313231333233323335325A180F33303135303431353233323335325A30163114301206035504030C0B6578616D706C652E636F6D3059301306072A8648CE3D020106082A8648CE3D03010703420004664995F47BDE35E7B4DE48B258E9E8A07ADEBBDB863B3D06F481A1946C83DA9F56CFF4D9389B855D2F364B1585B0C734FCFA263026964FF5A4308B3FC879BDB8A37A3078301D0603551D0E041604145B20CA417D9088C7A4C017CB6C0C1C739BB07D8A301F0603551D230418301680147AB75A3CD295CA5DF7C5150916E18FF5CC376A1530090603551D130402300030130603551D25040C300A06082B0601050507030130160603551D11040F300D820B6578616D706C652E636F6D300A06082A8648CE3D0403020347003044021F21C9032A5C8A93872D3F4AEF321A9574DD956D43BD93C369944C72D6902858022100C8B3290D7AF37E571A84D704DBAD339D2987D41852DC5936F212947063911181
++# 3 0 1 BEDC04764CECAE80AEE454D332758F50847DCA424216466E4012E0DEAE1F2E5F
++# 3 0 2 F756CCD61F3CA50D017653911701CA0052AF0B29E273DD263DD23643D86D4369D03686BD1369EF54BB2DC2DAE3CE4F05AF39D54648F94D54AA86B259AEAD9923
++# 3 1 0 3059301306072A8648CE3D020106082A8648CE3D03010703420004664995F47BDE35E7B4DE48B258E9E8A07ADEBBDB863B3D06F481A1946C83DA9F56CFF4D9389B855D2F364B1585B0C734FCFA263026964FF5A4308B3FC879BDB8
++# 3 1 1 3111668338043DE264D0256A702248696C9484B6221A42740F920187B4C61838
++# 3 1 2 CB861AF6DDED185EE04472A9092052CCC735120C34785E72C996C94B122EBA6F329BE630B1B4C6E2756E7A75392C21E253C6AEACC31FD45FF4595DED375FAF62
++# -- 
++# subject= CN = Issuer CA
++# 2 0 0 308201683082010DA003020102020102300A06082A8648CE3D04030230123110300E06035504030C07526F6F742043413020170D3135313231333233323030395A180F33303135303431353233323030395A30143112301006035504030C094973737565722043413059301306072A8648CE3D020106082A8648CE3D030107034200047D4BAE18B49F5DC69D0A3C85C66A3E2119DE92CFAD081FAD55C12D510EC97B6C00E13695A8D9713548FE60DF15573390433E2A1BD92DB4B7AA016EC6185DC5AFA350304E301D0603551D0E041604147AB75A3CD295CA5DF7C5150916E18FF5CC376A15301F0603551D23041830168014E4BD405F052A820DDF9883F93D7D3F90AAEC723F300C0603551D13040530030101FF300A06082A8648CE3D0403020349003046022100831DCD882DA8785D50E41020898C0248879DDDF72D701D1DC1DE6BE08155B43E022100B84B2FB519C4CD3CBC791603D4488F7707597DB7980D9C173E7FDD0ECD7CA308
++# 2 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBD
++# 2 0 2 6BC0C0F2500320A49392910965263A3EBDD594173D3E36CCE38A003D2EC3FAFBC315EDB776CD3139637DF494FB60359601542A4F821BF0542F926E6270C9762C
++# 2 1 0 3059301306072A8648CE3D020106082A8648CE3D030107034200047D4BAE18B49F5DC69D0A3C85C66A3E2119DE92CFAD081FAD55C12D510EC97B6C00E13695A8D9713548FE60DF15573390433E2A1BD92DB4B7AA016EC6185DC5AF
++# 2 1 1 65A457617072DA3E7F1152471EB3D406526530097D0A9AA34EB47C990A1FCDA3
++# 2 1 2 1F484106F765B6F1AC483CC509CDAD36486A83D1BA115F562516F407C1109303658408B455824DA0785A252B205DBEECB1AFB5DB869E8AAC242091B63F258F05
++# --
++# subject= CN = Root CA
++# 2 0 0 308201643082010BA003020102020101300A06082A8648CE3D04030230123110300E06035504030C07526F6F742043413020170D3135313231333233313330385A180F33303135303431353233313330385A30123110300E06035504030C07526F6F742043413059301306072A8648CE3D020106082A8648CE3D03010703420004D1DA578FD18FB86456B0D91B5656BDD68D4DDBD250E337571127C75E0560F41D0AF91BFAF8805F80C28C026A14D4FE8C30A9673B9EC0C05A84AA810D1341B76CA350304E301D0603551D0E04160414E4BD405F052A820DDF9883F93D7D3F90AAEC723F301F0603551D23041830168014E4BD405F052A820DDF9883F93D7D3F90AAEC723F300C0603551D13040530030101FF300A06082A8648CE3D040302034700304402206869E6AA9F9B4D4BF308091A5A7AB2C30E3619B0D75E528819468E4BB926F4C9022017F1B8458611966FBC109CAED3582966BF25FC0598EABA6C793C58DCC3537CC5
++# 2 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3C
++# 2 0 2 361029F20A3B59DAFAAF05D41811EFC1A9439B972BC6B9D7F13BC5469570E49ACAE0CB0C877C75D58346590EA950AC7A39AED6E8AA8004EA7F5DE3AB9462047E
++# 2 1 0 3059301306072A8648CE3D020106082A8648CE3D03010703420004D1DA578FD18FB86456B0D91B5656BDD68D4DDBD250E337571127C75E0560F41D0AF91BFAF8805F80C28C026A14D4FE8C30A9673B9EC0C05A84AA810D1341B76C
++# 2 1 1 91D942E4A2D4226DDAF28CADAA7F13018E4ED0D9A43A529247E51C965188576C
++# 2 1 2 5F414D4D7BFDF22E39952D9F46C51370FDD050F10C55B4CDB42E40FA98611FDE23EEE9B23315EE1ECDB198C7419E9A2D6742860E4806AF45164507799C3B452E
++
++# Renumber:
++# &lt;&lt; 'EOF' perl -pe 'BEGIN {$t = 0; $/=&quot;\n\n&quot;} if (s/\A\s*# \d+\s*?\n//sm) {printf &quot;# %d\n&quot;, ++$t}'
++
++## -- Anonymous and &quot;never valid&quot; leaf certificate DANE-EE(3) tests
++
++# 1
++1 1 0 0
++3 0 1 588FD5F414E3327EAFE3169DC040AE161247D1296BF38304AB9CF464850A1365
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 2
++1 1 0 0
++3 1 1 05C66146D7909EAE2379825F6D0F5284146B79598DA12E403DC29C33147CF33E
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 3
++1 1 0 0
++3 0 2 42BEE929852C8063A0D619B53D0DD35703BBAD2FC25F2055F737C7A14DDFEA544491F8C00F50FA083BD0AD1B5C98529994FF811BBA5E5170CC6EE9F3ED5563E1
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 4
++1 1 0 0
++3 1 2 D91A3E5DC34879CD77AD1E989F56FA78FACADF05EF8D445EDF5652BD58EE392C87C02F84C0119D62309041F2D5128A73399DF25D1F47BCD497357EAF1A1009A3
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 5
++1 1 27 -1
++3 0 1 588FD5F414E3327EAFE3169DC040AE161247D1296BF38304AB9CF464850A1366
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 6
++1 1 27 -1
++3 1 1 05C66146D7909EAE2379825F6D0F5284146B79598DA12E403DC29C33147CF33F
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 7
++1 1 27 -1
++3 0 2 42BEE929852C8063A0D619B53D0DD35703BBAD2FC25F2055F737C7A14DDFEA544491F8C00F50FA083BD0AD1B5C98529994FF811BBA5E5170CC6EE9F3ED5563E2
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++# 8
++1 1 27 -1
++3 1 2 D91A3E5DC34879CD77AD1E989F56FA78FACADF05EF8D445EDF5652BD58EE392C87C02F84C0119D62309041F2D5128A73399DF25D1F47BCD497357EAF1A1009A4
++subject=
++issuer=
++notBefore=Dec 14 00:10:34 2015 GMT
++notAfter=Dec 13 00:10:34 2015 GMT
++-----BEGIN CERTIFICATE-----
++MIHsMIGToAMCAQICAQEwCgYIKoZIzj0EAwIwADAeFw0xNTEyMTQwMDEwMzRaFw0x
++NTEyMTMwMDEwMzRaMAAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATFpP+gCO68
++A2m5dHmflHnLRzYFRPr8AsQgT7PfMeiKGk8YyFgx6T+YXFsjEJRUG0MWtcscnAyV
++CIb+EUPzn2EJMAoGCCqGSM49BAMCA0gAMEUCIGrnt6hw3yEIHpqYlgIKr4VgmEh1
++yBKzbWcWMavIefhyAiEAsIia0rOBTuZL3dWn9qmN6kPLQ1BJRpy1CkQEy97uH9Y=
++-----END CERTIFICATE-----
++
++## -- DANE-?? chain tests --
++
++# 9
++1 3 0 0
++3 0 1 BEDC04764CECAE80AEE454D332758F50847DCA424216466E4012E0DEAE1F2E5F
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 10
++1 3 0 0
++3 1 1 3111668338043DE264D0256A702248696C9484B6221A42740F920187B4C61838
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 11
++1 3 0 0
++3 0 2 F756CCD61F3CA50D017653911701CA0052AF0B29E273DD263DD23643D86D4369D03686BD1369EF54BB2DC2DAE3CE4F05AF39D54648F94D54AA86B259AEAD9923
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 12
++1 3 0 0
++3 1 2 CB861AF6DDED185EE04472A9092052CCC735120C34785E72C996C94B122EBA6F329BE630B1B4C6E2756E7A75392C21E253C6AEACC31FD45FF4595DED375FAF62
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 13
++1 3 0 1
++2 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBD
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 14
++1 3 0 1
++2 1 1 65A457617072DA3E7F1152471EB3D406526530097D0A9AA34EB47C990A1FCDA3
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 15
++1 3 0 1
++2 0 2 6BC0C0F2500320A49392910965263A3EBDD594173D3E36CCE38A003D2EC3FAFBC315EDB776CD3139637DF494FB60359601542A4F821BF0542F926E6270C9762C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 16
++1 3 0 1
++2 1 2 1F484106F765B6F1AC483CC509CDAD36486A83D1BA115F562516F407C1109303658408B455824DA0785A252B205DBEECB1AFB5DB869E8AAC242091B63F258F05
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 17
++1 3 0 2
++2 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 18
++1 3 0 2
++2 1 1 91D942E4A2D4226DDAF28CADAA7F13018E4ED0D9A43A529247E51C965188576C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 19
++1 3 0 2
++2 0 2 361029F20A3B59DAFAAF05D41811EFC1A9439B972BC6B9D7F13BC5469570E49ACAE0CB0C877C75D58346590EA950AC7A39AED6E8AA8004EA7F5DE3AB9462047E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 20
++1 3 0 2
++2 1 2 5F414D4D7BFDF22E39952D9F46C51370FDD050F10C55B4CDB42E40FA98611FDE23EEE9B23315EE1ECDB198C7419E9A2D6742860E4806AF45164507799C3B452E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++## -- PKIX-?? chain tests --
++
++# 21
++1 2 0 0
++1 0 1 BEDC04764CECAE80AEE454D332758F50847DCA424216466E4012E0DEAE1F2E5F
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 22
++1 2 0 0
++1 1 1 3111668338043DE264D0256A702248696C9484B6221A42740F920187B4C61838
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 23
++1 3 0 0
++1 0 2 F756CCD61F3CA50D017653911701CA0052AF0B29E273DD263DD23643D86D4369D03686BD1369EF54BB2DC2DAE3CE4F05AF39D54648F94D54AA86B259AEAD9923
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 24
++1 3 0 0
++1 1 2 CB861AF6DDED185EE04472A9092052CCC735120C34785E72C996C94B122EBA6F329BE630B1B4C6E2756E7A75392C21E253C6AEACC31FD45FF4595DED375FAF62
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 25
++1 2 0 1
++0 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBD
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 26
++1 2 0 1
++0 1 1 65A457617072DA3E7F1152471EB3D406526530097D0A9AA34EB47C990A1FCDA3
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 27
++1 3 0 1
++0 0 2 6BC0C0F2500320A49392910965263A3EBDD594173D3E36CCE38A003D2EC3FAFBC315EDB776CD3139637DF494FB60359601542A4F821BF0542F926E6270C9762C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 28
++1 3 0 1
++0 1 2 1F484106F765B6F1AC483CC509CDAD36486A83D1BA115F562516F407C1109303658408B455824DA0785A252B205DBEECB1AFB5DB869E8AAC242091B63F258F05
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 29
++1 2 0 2
++0 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 30
++1 2 0 2
++0 1 1 91D942E4A2D4226DDAF28CADAA7F13018E4ED0D9A43A529247E51C965188576C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 31
++1 3 0 2
++0 0 2 361029F20A3B59DAFAAF05D41811EFC1A9439B972BC6B9D7F13BC5469570E49ACAE0CB0C877C75D58346590EA950AC7A39AED6E8AA8004EA7F5DE3AB9462047E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 32
++1 3 0 2
++0 1 2 5F414D4D7BFDF22E39952D9F46C51370FDD050F10C55B4CDB42E40FA98611FDE23EEE9B23315EE1ECDB198C7419E9A2D6742860E4806AF45164507799C3B452E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++## -- PKIX-?? chain failures --
++
++# 33
++# Missing intermediate CA
++1 1 20 -1
++1 0 1 BEDC04764CECAE80AEE454D332758F50847DCA424216466E4012E0DEAE1F2E5F
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++
++# 34
++# Missing PKIX intermediate, provided via DNS
++2 1 0 0
++1 1 1 3111668338043DE264D0256A702248696C9484B6221A42740F920187B4C61838
++0 0 0 308201683082010DA003020102020102300A06082A8648CE3D04030230123110300E06035504030C07526F6F742043413020170D3135313231333233323030395A180F33303135303431353233323030395A30143112301006035504030C094973737565722043413059301306072A8648CE3D020106082A8648CE3D030107034200047D4BAE18B49F5DC69D0A3C85C66A3E2119DE92CFAD081FAD55C12D510EC97B6C00E13695A8D9713548FE60DF15573390433E2A1BD92DB4B7AA016EC6185DC5AFA350304E301D0603551D0E041604147AB75A3CD295CA5DF7C5150916E18FF5CC376A15301F0603551D23041830168014E4BD405F052A820DDF9883F93D7D3F90AAEC723F300C0603551D13040530030101FF300A06082A8648CE3D0403020349003046022100831DCD882DA8785D50E41020898C0248879DDDF72D701D1DC1DE6BE08155B43E022100B84B2FB519C4CD3CBC791603D4488F7707597DB7980D9C173E7FDD0ECD7CA308
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++
++# 35
++# Wrong leaf digest
++1 3 27 -1
++1 0 2 F756CCD61F3CA50D017653911701CA0052AF0B29E273DD263DD23643D86D4369D03686BD1369EF54BB2DC2DAE3CE4F05AF39D54648F94D54AA86B259AEAD9924
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 36
++# Wrong intermediate digest
++1 2 27 -1
++0 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBE
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 37
++# Wrong root digest
++1 2 27 -1
++0 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3D
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++## -- Mixed usage cases
++
++# 38
++# DANE-EE beats DANE-TA
++1 3 0 0
++3 1 2 CB861AF6DDED185EE04472A9092052CCC735120C34785E72C996C94B122EBA6F329BE630B1B4C6E2756E7A75392C21E253C6AEACC31FD45FF4595DED375FAF62
++2 1 2 5F414D4D7BFDF22E39952D9F46C51370FDD050F10C55B4CDB42E40FA98611FDE23EEE9B23315EE1ECDB198C7419E9A2D6742860E4806AF45164507799C3B452E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 39
++# DANE-TA depth 1 beats DANE-TA depth 2
++1 3 0 1
++2 1 2 1F484106F765B6F1AC483CC509CDAD36486A83D1BA115F562516F407C1109303658408B455824DA0785A252B205DBEECB1AFB5DB869E8AAC242091B63F258F05
++2 1 2 5F414D4D7BFDF22E39952D9F46C51370FDD050F10C55B4CDB42E40FA98611FDE23EEE9B23315EE1ECDB198C7419E9A2D6742860E4806AF45164507799C3B452E
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 40
++# DANE-TA depth 2 beats PKIX-TA depth 1
++1 3 0 2
++2 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3C
++0 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBD
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 41
++# DANE-TA depth 2 beats PKIX-EE depth 0
++1 3 0 2
++2 0 1 FE7C8E01110627A782765E468D8CB4D2CC7907EAC4BA5974CD92B540ED2AAC3C
++0 0 1 0DAA76425A1FC398C55A643D5A2485AE4CC2B64B9515A75054722B2E83C31BBD
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
++
++# 42
++# DANE-TA Full(0) root &quot;from DNS&quot;:
++1 2 0 2
++2 0 0 308201643082010BA003020102020101300A06082A8648CE3D04030230123110300E06035504030C07526F6F742043413020170D3135313231333233313330385A180F33303135303431353233313330385A30123110300E06035504030C07526F6F742043413059301306072A8648CE3D020106082A8648CE3D03010703420004D1DA578FD18FB86456B0D91B5656BDD68D4DDBD250E337571127C75E0560F41D0AF91BFAF8805F80C28C026A14D4FE8C30A9673B9EC0C05A84AA810D1341B76CA350304E301D0603551D0E04160414E4BD405F052A820DDF9883F93D7D3F90AAEC723F301F0603551D23041830168014E4BD405F052A820DDF9883F93D7D3F90AAEC723F300C0603551D13040530030101FF300A06082A8648CE3D040302034700304402206869E6AA9F9B4D4BF308091A5A7AB2C30E3619B0D75E528819468E4BB926F4C9022017F1B8458611966FBC109CAED3582966BF25FC0598EABA6C793C58DCC3537CC5
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
++# 43
++# DANE-TA Full(0) intermediate &quot;from DNS&quot;:
++1 1 0 1
++2 0 0 308201683082010DA003020102020102300A06082A8648CE3D04030230123110300E06035504030C07526F6F742043413020170D3135313231333233323030395A180F33303135303431353233323030395A30143112301006035504030C094973737565722043413059301306072A8648CE3D020106082A8648CE3D030107034200047D4BAE18B49F5DC69D0A3C85C66A3E2119DE92CFAD081FAD55C12D510EC97B6C00E13695A8D9713548FE60DF15573390433E2A1BD92DB4B7AA016EC6185DC5AFA350304E301D0603551D0E041604147AB75A3CD295CA5DF7C5150916E18FF5CC376A15301F0603551D23041830168014E4BD405F052A820DDF9883F93D7D3F90AAEC723F300C0603551D13040530030101FF300A06082A8648CE3D0403020349003046022100831DCD882DA8785D50E41020898C0248879DDDF72D701D1DC1DE6BE08155B43E022100B84B2FB519C4CD3CBC791603D4488F7707597DB7980D9C173E7FDD0ECD7CA308
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++
++# 44
++# DANE-TA(3) SPKI(1) Full(0) intermediate &quot;from DNS&quot;:
++1 1 0 0
++2 1 0 3059301306072A8648CE3D020106082A8648CE3D030107034200047D4BAE18B49F5DC69D0A3C85C66A3E2119DE92CFAD081FAD55C12D510EC97B6C00E13695A8D9713548FE60DF15573390433E2A1BD92DB4B7AA016EC6185DC5AF
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++
++# 45
++# DANE-TA(3) SPKI(1) Full(0) root &quot;from DNS&quot;:
++1 2 0 1
++2 1 0 3059301306072A8648CE3D020106082A8648CE3D03010703420004D1DA578FD18FB86456B0D91B5656BDD68D4DDBD250E337571127C75E0560F41D0AF91BFAF8805F80C28C026A14D4FE8C30A9673B9EC0C05A84AA810D1341B76C
++subject= /CN=example.com
++issuer= /CN=Issuer CA
++notBefore=Dec 13 23:23:52 2015 GMT
++notAfter=Apr 15 23:23:52 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBlDCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlJc3N1ZXIg
++Q0EwIBcNMTUxMjEzMjMyMzUyWhgPMzAxNTA0MTUyMzIzNTJaMBYxFDASBgNVBAMM
++C2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkmV9HveNee0
++3kiyWOnooHreu9uGOz0G9IGhlGyD2p9Wz/TZOJuFXS82SxWFsMc0/PomMCaWT/Wk
++MIs/yHm9uKN6MHgwHQYDVR0OBBYEFFsgykF9kIjHpMAXy2wMHHObsH2KMB8GA1Ud
++IwQYMBaAFHq3WjzSlcpd98UVCRbhj/XMN2oVMAkGA1UdEwQCMAAwEwYDVR0lBAww
++CgYIKwYBBQUHAwEwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wCgYIKoZIzj0EAwID
++RwAwRAIfIckDKlyKk4ctP0rvMhqVdN2VbUO9k8NplExy1pAoWAIhAMizKQ16835X
++GoTXBNutM50ph9QYUtxZNvISlHBjkRGB
++-----END CERTIFICATE-----
++subject= /CN=Issuer CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:20:09 2015 GMT
++notAfter=Apr 15 23:20:09 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBaDCCAQ2gAwIBAgIBAjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMjAwOVoYDzMwMTUwNDE1MjMyMDA5WjAUMRIwEAYDVQQDDAlJ
++c3N1ZXIgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR9S64YtJ9dxp0KPIXG
++aj4hGd6Sz60IH61VwS1RDsl7bADhNpWo2XE1SP5g3xVXM5BDPiob2S20t6oBbsYY
++XcWvo1AwTjAdBgNVHQ4EFgQUerdaPNKVyl33xRUJFuGP9cw3ahUwHwYDVR0jBBgw
++FoAU5L1AXwUqgg3fmIP5PX0/kKrscj8wDAYDVR0TBAUwAwEB/zAKBggqhkjOPQQD
++AgNJADBGAiEAgx3NiC2oeF1Q5BAgiYwCSIed3fctcB0dwd5r4IFVtD4CIQC4Sy+1
++GcTNPLx5FgPUSI93B1l9t5gNnBc+f90OzXyjCA==
++-----END CERTIFICATE-----
++
+diff --git a/test/danetest.pem b/test/danetest.pem
+new file mode 100644
+index 0000000..68d4f44
+--- /dev/null
++++ b/test/danetest.pem
+@@ -0,0 +1,14 @@
++subject= /CN=Root CA
++issuer= /CN=Root CA
++notBefore=Dec 13 23:13:08 2015 GMT
++notAfter=Apr 15 23:13:08 3015 GMT
++-----BEGIN CERTIFICATE-----
++MIIBZDCCAQugAwIBAgIBATAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdSb290IENB
++MCAXDTE1MTIxMzIzMTMwOFoYDzMwMTUwNDE1MjMxMzA4WjASMRAwDgYDVQQDDAdS
++b290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0dpXj9GPuGRWsNkbVla9
++1o1N29JQ4zdXESfHXgVg9B0K+Rv6+IBfgMKMAmoU1P6MMKlnO57AwFqEqoENE0G3
++bKNQME4wHQYDVR0OBBYEFOS9QF8FKoIN35iD+T19P5Cq7HI/MB8GA1UdIwQYMBaA
++FOS9QF8FKoIN35iD+T19P5Cq7HI/MAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwID
++RwAwRAIgaGnmqp+bTUvzCAkaWnqyww42GbDXXlKIGUaOS7km9MkCIBfxuEWGEZZv
++vBCcrtNYKWa/JfwFmOq6bHk8WNzDU3zF
++-----END CERTIFICATE-----
+diff --git a/test/recipes/80-test_dane.t b/test/recipes/80-test_dane.t
+new file mode 100644
+index 0000000..060bfcf
+--- /dev/null
++++ b/test/recipes/80-test_dane.t
+@@ -0,0 +1,13 @@
++#! /usr/bin/perl
++
++use strict;
++use warnings;
++use OpenSSL::Test qw/:DEFAULT top_dir top_file/;
++
++setup(&quot;test_dane&quot;);
++
++plan tests =&gt; 1;                # The number of tests being performed
++
++ok(run(test([&quot;danetest&quot;, &quot;example.com&quot;,
++             top_file(&quot;test&quot;, &quot;danetest.pem&quot;),
++             top_file(&quot;test&quot;, &quot;danetest.in&quot;)])), &quot;dane tests&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002625.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002630.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2626">[ date ]</a>
+              <a href="thread.html#2626">[ thread ]</a>
+              <a href="subject.html#2626">[ subject ]</a>
+              <a href="author.html#2626">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

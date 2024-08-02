@@ -1,0 +1,161 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1580227624.141550.22953.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027264.html">
+   <LINK REL="Next"  HREF="027273.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1580227624.141550.22953.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jan 28 16:07:04 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027264.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027273.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27266">[ date ]</a>
+              <a href="thread.html#27266">[ thread ]</a>
+              <a href="subject.html#27266">[ subject ]</a>
+              <a href="author.html#27266">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e56ba0e1229d3eacb443fa4935a4da7701dfb1f3 (commit)
+      from  0cb3f4f985aa52688ddc90075f480ba612d34fe3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e56ba0e1229d3eacb443fa4935a4da7701dfb1f3
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Mon Jan 13 00:27:40 2020 +0100
+
+    Adapt X509_PUBKEY_set() for use with provided implementations
+    
+    We do this by letting a serializer serialize the provider side key to
+    a DER blob formatted according to the SubjectPublicKeyInfo structure
+    (see RFC 5280), and deserialize it in libcrypto using the usual d2i
+    function.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10851">https://github.com/openssl/openssl/pull/10851</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_pubkey.c | 43 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index 44b08e8bdf..42b94d9198 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -16,6 +16,7 @@
+ #include &quot;crypto/x509.h&quot;
+ #include &lt;openssl/rsa.h&gt;
+ #include &lt;openssl/dsa.h&gt;
++#include &lt;openssl/serializer.h&gt;
+ 
+ struct X509_pubkey_st {
+     X509_ALGOR *algor;
+@@ -66,11 +67,15 @@ int X509_PUBKEY_set(X509_PUBKEY **x, EVP_PKEY *pkey)
+     if (x == NULL)
+         return 0;
+ 
+-    if ((pk = X509_PUBKEY_new()) == NULL)
+-        goto error;
++    if (pkey == NULL)
++        goto unsupported;
+ 
+-    if (pkey != NULL &amp;&amp; pkey-&gt;ameth) {
+-        if (pkey-&gt;ameth-&gt;pub_encode) {
++    if (pkey-&gt;ameth != NULL) {
++        if ((pk = X509_PUBKEY_new()) == NULL) {
++            X509err(X509_F_X509_PUBKEY_SET, ERR_R_MALLOC_FAILURE);
++            goto error;
++        }
++        if (pkey-&gt;ameth-&gt;pub_encode != NULL) {
+             if (!pkey-&gt;ameth-&gt;pub_encode(pk, pkey)) {
+                 X509err(X509_F_X509_PUBKEY_SET,
+                         X509_R_PUBLIC_KEY_ENCODE_ERROR);
+@@ -80,15 +85,37 @@ int X509_PUBKEY_set(X509_PUBKEY **x, EVP_PKEY *pkey)
+             X509err(X509_F_X509_PUBKEY_SET, X509_R_METHOD_NOT_SUPPORTED);
+             goto error;
+         }
+-    } else {
+-        X509err(X509_F_X509_PUBKEY_SET, X509_R_UNSUPPORTED_ALGORITHM);
+-        goto error;
++    } else if (pkey-&gt;pkeys[0].keymgmt != NULL) {
++        BIO *bmem = BIO_new(BIO_s_mem());
++        const char *serprop = &quot;format=der,type=public&quot;;
++        OSSL_SERIALIZER_CTX *sctx =
++            OSSL_SERIALIZER_CTX_new_by_EVP_PKEY(pkey, serprop);
++
++        if (OSSL_SERIALIZER_to_bio(sctx, bmem)) {
++            const unsigned char *der = NULL;
++            long derlen = BIO_get_mem_data(bmem, (char **)&amp;der);
++
++            pk = d2i_X509_PUBKEY(NULL, &amp;der, derlen);
++        }
++
++        OSSL_SERIALIZER_CTX_free(sctx);
++        BIO_free(bmem);
+     }
+ 
++    if (pk == NULL)
++        goto unsupported;
++
+     X509_PUBKEY_free(*x);
++    if (!EVP_PKEY_up_ref(pkey)) {
++        X509err(X509_F_X509_PUBKEY_SET, ERR_R_INTERNAL_ERROR);
++        goto error;
++    }
+     *x = pk;
+     pk-&gt;pkey = pkey;
+-    return EVP_PKEY_up_ref(pkey);
++    return 1;
++
++ unsupported:
++    X509err(X509_F_X509_PUBKEY_SET, X509_R_UNSUPPORTED_ALGORITHM);
+ 
+  error:
+     X509_PUBKEY_free(pk);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027264.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027273.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27266">[ date ]</a>
+              <a href="thread.html#27266">[ thread ]</a>
+              <a href="subject.html#27266">[ subject ]</a>
+              <a href="author.html#27266">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

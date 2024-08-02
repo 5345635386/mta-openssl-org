@@ -1,0 +1,263 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1440775101.762824.26619.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001673.html">
+   <LINK REL="Next"  HREF="001678.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1440775101.762824.26619.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Fri Aug 28 15:18:21 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001673.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001678.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1674">[ date ]</a>
+              <a href="thread.html#1674">[ thread ]</a>
+              <a href="subject.html#1674">[ subject ]</a>
+              <a href="author.html#1674">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  55500ea7c46c27a150a46832e1260891aaad8e52 (commit)
+      from  f00a10b89734e84fe80f98ad9e2e77b557c701ae (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 55500ea7c46c27a150a46832e1260891aaad8e52
+Author: Alessandro Ghedini &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alessandro at ghedini.me</A>&gt;
+Date:   Thu Aug 27 23:07:07 2015 -0400
+
+    GH354: Memory leak fixes
+    
+    Fix more potential leaks in X509_verify_cert()
+    Fix memory leak in ClientHello test
+    Fix memory leak in gost2814789 test
+    Fix potential memory leak in PKCS7_verify()
+    Fix potential memory leaks in X509_add1_reject_object()
+    Refactor to use &quot;goto err&quot; in cleanup.
+    
+    Signed-off-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+    Reviewed-by: Emilia K&#228;sper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/x_x509a.c    |  7 +++++--
+ crypto/pkcs7/pk7_smime.c | 26 ++++++--------------------
+ crypto/x509/x509_vfy.c   |  4 ++--
+ test/clienthellotest.c   |  1 +
+ test/gost2814789test.c   |  3 +++
+ 5 files changed, 17 insertions(+), 24 deletions(-)
+
+diff --git a/crypto/asn1/x_x509a.c b/crypto/asn1/x_x509a.c
+index d81ccfb..e299b1f 100644
+--- a/crypto/asn1/x_x509a.c
++++ b/crypto/asn1/x_x509a.c
+@@ -172,11 +172,14 @@ int X509_add1_reject_object(X509 *x, ASN1_OBJECT *obj)
+     if ((objtmp = OBJ_dup(obj)) == NULL)
+         return 0;
+     if ((aux = aux_get(x)) == NULL)
+-        return 0;
++        goto err;
+     if (aux-&gt;reject == NULL
+         &amp;&amp; (aux-&gt;reject = sk_ASN1_OBJECT_new_null()) == NULL)
+-        return 0;
++        goto err;
+     return sk_ASN1_OBJECT_push(aux-&gt;reject, objtmp);
++ err:
++    ASN1_OBJECT_free(objtmp);
++    return 0;
+ }
+ 
+ void X509_trust_clear(X509 *x)
+diff --git a/crypto/pkcs7/pk7_smime.c b/crypto/pkcs7/pk7_smime.c
+index e52e746..91557af 100644
+--- a/crypto/pkcs7/pk7_smime.c
++++ b/crypto/pkcs7/pk7_smime.c
+@@ -255,8 +255,8 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+     X509_STORE_CTX cert_ctx;
+     char buf[4096];
+     int i, j = 0, k, ret = 0;
+-    BIO *p7bio;
+-    BIO *tmpin, *tmpout;
++    BIO *p7bio = NULL;
++    BIO *tmpin = NULL, *tmpout = NULL;
+ 
+     if (!p7) {
+         PKCS7err(PKCS7_F_PKCS7_VERIFY, PKCS7_R_INVALID_NULL_POINTER);
+@@ -274,18 +274,11 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+         return 0;
+     }
+ 
+-    /*
+-     * Very old Netscape illegally included empty content with
+-     * a detached signature. To not support that, enable the
+-     * following flag.
+-     */
+-#ifdef OPENSSL_DONT_SUPPORT_OLD_NETSCAPE
+     /* Check for data and content: two sets of data */
+     if (!PKCS7_get_detached(p7) &amp;&amp; indata) {
+         PKCS7err(PKCS7_F_PKCS7_VERIFY, PKCS7_R_CONTENT_AND_DATA_PRESENT);
+         return 0;
+     }
+-#endif
+ 
+     sinfos = PKCS7_get_signer_info(p7);
+ 
+@@ -295,7 +288,6 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+     }
+ 
+     signers = PKCS7_get0_signers(p7, certs, flags);
+-
+     if (!signers)
+         return 0;
+ 
+@@ -308,14 +300,12 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+                 if (!X509_STORE_CTX_init(&amp;cert_ctx, store, signer,
+                                          p7-&gt;d.sign-&gt;cert)) {
+                     PKCS7err(PKCS7_F_PKCS7_VERIFY, ERR_R_X509_LIB);
+-                    sk_X509_free(signers);
+-                    return 0;
++                    goto err;
+                 }
+                 X509_STORE_CTX_set_default(&amp;cert_ctx, &quot;smime_sign&quot;);
+             } else if (!X509_STORE_CTX_init(&amp;cert_ctx, store, signer, NULL)) {
+                 PKCS7err(PKCS7_F_PKCS7_VERIFY, ERR_R_X509_LIB);
+-                sk_X509_free(signers);
+-                return 0;
++                goto err;
+             }
+             if (!(flags &amp; PKCS7_NOCRL))
+                 X509_STORE_CTX_set0_crls(&amp;cert_ctx, p7-&gt;d.sign-&gt;crl);
+@@ -328,8 +318,7 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+                          PKCS7_R_CERTIFICATE_VERIFY_ERROR);
+                 ERR_add_error_data(2, &quot;Verify error:&quot;,
+                                    X509_verify_cert_error_string(j));
+-                sk_X509_free(signers);
+-                return 0;
++                goto err;
+             }
+             /* Check for revocation status here */
+         }
+@@ -348,7 +337,7 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+         tmpin = BIO_new_mem_buf(ptr, len);
+         if (tmpin == NULL) {
+             PKCS7err(PKCS7_F_PKCS7_VERIFY, ERR_R_MALLOC_FAILURE);
+-            return 0;
++            goto err;
+         }
+     } else
+         tmpin = indata;
+@@ -398,15 +387,12 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+     ret = 1;
+ 
+  err:
+-
+     if (tmpin == indata) {
+         if (indata)
+             BIO_pop(p7bio);
+     }
+     BIO_free_all(p7bio);
+-
+     sk_X509_free(signers);
+-
+     return ret;
+ }
+ 
+diff --git a/crypto/x509/x509_vfy.c b/crypto/x509/x509_vfy.c
+index 6b1f7fe..a3077b5 100644
+--- a/crypto/x509/x509_vfy.c
++++ b/crypto/x509/x509_vfy.c
+@@ -243,7 +243,7 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+         if (ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_TRUSTED_FIRST) {
+             ok = ctx-&gt;get_issuer(&amp;xtmp, ctx, x);
+             if (ok &lt; 0)
+-                return ok;
++                goto end;
+             /*
+              * If successful for now free up cert so it will be picked up
+              * again later.
+@@ -341,7 +341,7 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+             ok = ctx-&gt;get_issuer(&amp;xtmp, ctx, x);
+ 
+             if (ok &lt; 0)
+-                return ok;
++                goto end;
+             if (ok == 0)
+                 break;
+             x = xtmp;
+diff --git a/test/clienthellotest.c b/test/clienthellotest.c
+index acc56f8..318d6e8 100644
+--- a/test/clienthellotest.c
++++ b/test/clienthellotest.c
+@@ -213,6 +213,7 @@ int main(int argc, char *argv[])
+     EVP_cleanup();
+     CRYPTO_cleanup_all_ex_data();
+     CRYPTO_mem_leaks(err);
++    BIO_free(err);
+ 
+     return testresult?0:1;
+ }
+diff --git a/test/gost2814789test.c b/test/gost2814789test.c
+index b2cd41f..953e1e1 100644
+--- a/test/gost2814789test.c
++++ b/test/gost2814789test.c
+@@ -1411,6 +1411,7 @@ int main(int argc, char *argv[])
+             }
+             siglen = 4;
+             OPENSSL_assert(EVP_DigestSignFinal(&amp;mctx, bTest, &amp;siglen));
++            EVP_PKEY_free(mac_key);
+             EVP_MD_CTX_cleanup(&amp;mctx);
+             enlu = (int)tcs[t].ullLen;
+             enlf = 0;
+@@ -1434,6 +1435,8 @@ int main(int argc, char *argv[])
+     printf(&quot; passed\n&quot;);
+     fflush(NULL);
+ 
++    NCONF_free(pConfig);
++
+     return EXIT_SUCCESS;
+ }
+ #endif
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001673.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001678.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1674">[ date ]</a>
+              <a href="thread.html#1674">[ thread ]</a>
+              <a href="subject.html#1674">[ subject ]</a>
+              <a href="author.html#1674">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

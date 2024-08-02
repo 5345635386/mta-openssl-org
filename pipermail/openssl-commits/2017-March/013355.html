@@ -1,0 +1,297 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1488468915.992133.29041.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013353.html">
+   <LINK REL="Next"  HREF="013363.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1488468915.992133.29041.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Thu Mar  2 15:35:15 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013353.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="013363.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13355">[ date ]</a>
+              <a href="thread.html#13355">[ thread ]</a>
+              <a href="subject.html#13355">[ subject ]</a>
+              <a href="author.html#13355">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  398b0bbdf71d852daf2e79d842cd0d307ec9f8f6 (commit)
+      from  8cfc21f53af5187497a8567bb2801c36472d7016 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 398b0bbdf71d852daf2e79d842cd0d307ec9f8f6
+Author: Robert Scheck &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">robert at fedoraproject.org</A>&gt;
+Date:   Mon Feb 27 00:44:14 2017 +0100
+
+    Add LDAP support (RFC 4511) to s_client (&quot;-starttls ldap&quot;)
+    
+    Based on initial patch by Alex Bergmann &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alex at linlab.net</A>&gt; and new function
+    ldap_ExtendedResponse_parse() by Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;. Thanks
+    very much to both.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2293">https://github.com/openssl/openssl/pull/2293</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/s_client.c       | 156 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ doc/man1/s_client.pod |   2 +-
+ 2 files changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/apps/s_client.c b/apps/s_client.c
+index 6e790cf..351b5b9 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -96,6 +96,7 @@ static void print_stuff(BIO *berr, SSL *con, int full);
+ #ifndef OPENSSL_NO_OCSP
+ static int ocsp_resp_cb(SSL *s, void *arg);
+ #endif
++static int ldap_ExtendedResponse_parse(const char *buf, long rem);
+ 
+ static int saved_errno;
+ 
+@@ -748,7 +749,8 @@ typedef enum PROTOCOL_choice {
+     PROTO_POSTGRES,
+     PROTO_LMTP,
+     PROTO_NNTP,
+-    PROTO_SIEVE
++    PROTO_SIEVE,
++    PROTO_LDAP
+ } PROTOCOL_CHOICE;
+ 
+ static const OPT_PAIR services[] = {
+@@ -764,6 +766,7 @@ static const OPT_PAIR services[] = {
+     {&quot;lmtp&quot;, PROTO_LMTP},
+     {&quot;nntp&quot;, PROTO_NNTP},
+     {&quot;sieve&quot;, PROTO_SIEVE},
++    {&quot;ldap&quot;, PROTO_LDAP},
+     {NULL, 0}
+ };
+ 
+@@ -2281,6 +2284,75 @@ int s_client_main(int argc, char **argv)
+             }
+         }
+         break;
++    case PROTO_LDAP:
++        {
++            /* StartTLS Operation according to RFC 4511 */
++            static char ldap_tls_genconf[] = &quot;asn1=SEQUENCE:LDAPMessage\n&quot;
++                &quot;[LDAPMessage]\n&quot;
++                &quot;messageID=INTEGER:1\n&quot;
++                &quot;extendedReq=EXPLICIT:23A,IMPLICIT:0C,&quot;
++                &quot;FORMAT:ASCII,OCT:1.3.6.1.4.1.1466.20037\n&quot;;
++            long errline = -1;
++            char *genstr = NULL;
++            int result = -1;
++            ASN1_TYPE *atyp = NULL;
++            BIO *ldapbio = BIO_new(BIO_s_mem());
++            CONF *cnf = NCONF_new(NULL);
++
++            if (cnf == NULL) {
++                BIO_free(ldapbio);
++                goto end;
++            }
++            BIO_puts(ldapbio, ldap_tls_genconf);
++            if (NCONF_load_bio(cnf, ldapbio, &amp;errline) &lt;= 0) {
++                BIO_free(ldapbio);
++                NCONF_free(cnf);
++                if (errline &lt;= 0) {
++                    BIO_printf(bio_err, &quot;NCONF_load_bio failed\n&quot;);
++                    goto end;
++                } else {
++                    BIO_printf(bio_err, &quot;Error on line %ld\n&quot;, errline);
++                    goto end;
++                }
++            }
++            BIO_free(ldapbio);
++            genstr = NCONF_get_string(cnf, &quot;default&quot;, &quot;asn1&quot;);
++            if (genstr == NULL) {
++                NCONF_free(cnf);
++                BIO_printf(bio_err, &quot;NCONF_get_string failed\n&quot;);
++                goto end;
++            }
++            atyp = ASN1_generate_nconf(genstr, cnf);
++            if (atyp == NULL) {
++                NCONF_free(cnf);
++                BIO_printf(bio_err, &quot;ASN1_generate_nconf failed\n&quot;);
++                goto end;
++            }
++            NCONF_free(cnf);
++
++            /* Send SSLRequest packet */
++            BIO_write(sbio, atyp-&gt;value.sequence-&gt;data,
++                      atyp-&gt;value.sequence-&gt;length);
++            (void)BIO_flush(sbio);
++            ASN1_TYPE_free(atyp);
++
++            mbuf_len = BIO_read(sbio, mbuf, BUFSIZZ);
++            if (mbuf_len &lt; 0) {
++                BIO_printf(bio_err, &quot;BIO_read failed\n&quot;);
++                goto end;
++            }
++            result = ldap_ExtendedResponse_parse(mbuf, mbuf_len);
++            if (result &lt; 0) {
++                BIO_printf(bio_err, &quot;ldap_ExtendedResponse_parse failed\n&quot;);
++                goto shut;
++            } else if (result &gt; 0) {
++                BIO_printf(bio_err, &quot;STARTTLS failed, LDAP Result Code: %i\n&quot;,
++                           result);
++                goto shut;
++            }
++            mbuf_len = 0;
++        }
++        break;
+     }
+ 
+     for (;;) {
+@@ -2920,4 +2992,86 @@ static int ocsp_resp_cb(SSL *s, void *arg)
+ }
+ # endif
+ 
++static int ldap_ExtendedResponse_parse(const char *buf, long rem)
++{
++    const unsigned char *cur, *end;
++    long len;
++    int tag, xclass, inf, ret = -1;
++
++    cur = (const unsigned char *)buf;
++    end = cur + rem;
++
++    /*
++     * From RFC 4511:
++     *
++     *    LDAPMessage ::= SEQUENCE {
++     *         messageID       MessageID,
++     *         protocolOp      CHOICE {
++     *              ...
++     *              extendedResp          ExtendedResponse,
++     *              ... },
++     *         controls       [0] Controls OPTIONAL }
++     *
++     *    ExtendedResponse ::= [APPLICATION 24] SEQUENCE {
++     *         COMPONENTS OF LDAPResult,
++     *         responseName     [10] LDAPOID OPTIONAL,
++     *         responseValue    [11] OCTET STRING OPTIONAL }
++     *
++     *    LDAPResult ::= SEQUENCE {
++     *         resultCode         ENUMERATED {
++     *              success                      (0),
++     *              ...
++     *              other                        (80),
++     *              ...  },
++     *         matchedDN          LDAPDN,
++     *         diagnosticMessage  LDAPString,
++     *         referral           [3] Referral OPTIONAL }
++     */
++
++    /* pull SEQUENCE */
++    inf = ASN1_get_object(&amp;cur, &amp;len, &amp;tag, &amp;xclass, rem);
++    if (inf != V_ASN1_CONSTRUCTED || tag != V_ASN1_SEQUENCE ||
++        (rem = end - cur, len &gt; rem)) {
++        BIO_printf(bio_err, &quot;Unexpected LDAP response\n&quot;);
++        goto end;
++    }
++
++    /* pull MessageID */
++    inf = ASN1_get_object(&amp;cur, &amp;len, &amp;tag, &amp;xclass, rem);
++    if (inf != V_ASN1_UNIVERSAL || tag != V_ASN1_INTEGER ||
++        (rem = end - cur, len &gt; rem)) {
++        BIO_printf(bio_err, &quot;No MessageID\n&quot;);
++        goto end;
++    }
++
++    cur += len; /* shall we check for MessageId match or just skip? */
++
++    /* pull [APPLICATION 24] */
++    rem = end - cur;
++    inf = ASN1_get_object(&amp;cur, &amp;len, &amp;tag, &amp;xclass, rem);
++    if (inf != V_ASN1_CONSTRUCTED || xclass != V_ASN1_APPLICATION ||
++        tag != 24) {
++        BIO_printf(bio_err, &quot;Not ExtendedResponse\n&quot;);
++        goto end;
++    }
++
++    /* pull resultCode */
++    rem = end - cur;
++    inf = ASN1_get_object(&amp;cur, &amp;len, &amp;tag, &amp;xclass, rem);
++    if (inf != V_ASN1_UNIVERSAL || tag != V_ASN1_ENUMERATED || len == 0 ||
++        (rem = end - cur, len &gt; rem)) {
++        BIO_printf(bio_err, &quot;Not LDAPResult\n&quot;);
++        goto end;
++    }
++
++    /* len should always be one, but just in case... */
++    for (ret = 0, inf = 0; inf &lt; len; inf++) {
++        ret &lt;&lt;= 8;
++        ret |= cur[inf];
++    }
++    /* There is more data, but we don't care... */
++ end:
++    return ret;
++}
++
+ #endif                          /* OPENSSL_NO_SOCK */
+diff --git a/doc/man1/s_client.pod b/doc/man1/s_client.pod
+index 290b515..0c9329d 100644
+--- a/doc/man1/s_client.pod
++++ b/doc/man1/s_client.pod
+@@ -445,7 +445,7 @@ command for more information.
+ send the protocol-specific message(s) to switch to TLS for communication.
+ B&lt;protocol&gt; is a keyword for the intended protocol.  Currently, the only
+ supported keywords are &quot;smtp&quot;, &quot;pop3&quot;, &quot;imap&quot;, &quot;ftp&quot;, &quot;xmpp&quot;, &quot;xmpp-server&quot;,
+-&quot;irc&quot;, &quot;postgres&quot;, &quot;lmtp&quot;, &quot;nntp&quot; and &quot;sieve&quot;.
++&quot;irc&quot;, &quot;postgres&quot;, &quot;lmtp&quot;, &quot;nntp&quot;, &quot;sieve&quot; and &quot;ldap&quot;.
+ 
+ =item B&lt;-xmpphost hostname&gt;
+ 
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013353.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="013363.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13355">[ date ]</a>
+              <a href="thread.html#13355">[ thread ]</a>
+              <a href="subject.html#13355">[ subject ]</a>
+              <a href="author.html#13355">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

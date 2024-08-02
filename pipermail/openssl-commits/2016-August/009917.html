@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471655368.904525.17284.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009897.html">
+   <LINK REL="Next"  HREF="009929.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471655368.904525.17284.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Sat Aug 20 01:09:28 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009897.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009929.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9917">[ date ]</a>
+              <a href="thread.html#9917">[ thread ]</a>
+              <a href="subject.html#9917">[ subject ]</a>
+              <a href="author.html#9917">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8b8d963db5bb619fbada014f294fd09a855a2650 (commit)
+      from  9e313563da23f3dc0a6db557f708726234e3f653 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8b8d963db5bb619fbada014f294fd09a855a2650
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Fri Aug 19 21:04:41 2016 -0400
+
+    Add BIO_get_new_index()
+    
+    Reviewed-by: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/b_addr.c         |  4 +++-
+ crypto/bio/bio_lcl.h        |  1 +
+ crypto/bio/bio_lib.c        |  2 ++
+ crypto/bio/bio_meth.c       | 12 ++++++++++
+ doc/crypto/BIO_meth_new.pod |  7 +++++-
+ include/openssl/bio.h       | 58 +++++++++++++++++++++++----------------------
+ util/libcrypto.num          |  1 +
+ 7 files changed, 55 insertions(+), 30 deletions(-)
+
+diff --git a/crypto/bio/b_addr.c b/crypto/bio/b_addr.c
+index 4e8785f..17ab3e4 100644
+--- a/crypto/bio/b_addr.c
++++ b/crypto/bio/b_addr.c
+@@ -19,6 +19,7 @@
+ #include &lt;ctype.h&gt;
+ 
+ CRYPTO_RWLOCK *bio_lookup_lock;
++extern CRYPTO_RWLOCK  *bio_type_lock;
+ static CRYPTO_ONCE bio_lookup_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ /*
+@@ -605,7 +606,8 @@ static int addrinfo_wrap(int family, int socktype,
+ DEFINE_RUN_ONCE_STATIC(do_bio_lookup_init)
+ {
+     bio_lookup_lock = CRYPTO_THREAD_lock_new();
+-    return (bio_lookup_lock != NULL);
++    bio_type_lock = CRYPTO_THREAD_lock_new();
++    return bio_lookup_lock != NULL &amp;&amp; bio_type_lock != NULL;
+ }
+ 
+ /*-
+diff --git a/crypto/bio/bio_lcl.h b/crypto/bio/bio_lcl.h
+index f5a886c..5d0b827 100644
+--- a/crypto/bio/bio_lcl.h
++++ b/crypto/bio/bio_lcl.h
+@@ -137,6 +137,7 @@ typedef unsigned int socklen_t;
+ # endif
+ 
+ extern CRYPTO_RWLOCK *bio_lookup_lock;
++extern CRYPTO_RWLOCK *bio_type_lock;
+ 
+ int BIO_ADDR_make(BIO_ADDR *ap, const struct sockaddr *sa);
+ const struct sockaddr *BIO_ADDR_sockaddr(const BIO_ADDR *ap);
+diff --git a/crypto/bio/bio_lib.c b/crypto/bio/bio_lib.c
+index 98f3707..8a00103 100644
+--- a/crypto/bio/bio_lib.c
++++ b/crypto/bio/bio_lib.c
+@@ -594,5 +594,7 @@ void bio_cleanup(void)
+     bio_sock_cleanup_int();
+     CRYPTO_THREAD_lock_free(bio_lookup_lock);
+     bio_lookup_lock = NULL;
++    CRYPTO_THREAD_lock_free(bio_type_lock);
++    bio_type_lock = NULL;
+ #endif
+ }
+diff --git a/crypto/bio/bio_meth.c b/crypto/bio/bio_meth.c
+index d172047..7754b00 100644
+--- a/crypto/bio/bio_meth.c
++++ b/crypto/bio/bio_meth.c
+@@ -9,6 +9,18 @@
+ 
+ #include &quot;bio_lcl.h&quot;
+ 
++CRYPTO_RWLOCK *bio_type_lock;
++static int bio_count = BIO_TYPE_START;
++
++int BIO_get_new_index()
++{
++    int newval;
++
++    if (!CRYPTO_atomic_add(&amp;bio_count, 1, &amp;newval, bio_type_lock))
++        return -1;
++    return newval;
++}
++
+ BIO_METHOD *BIO_meth_new(int type, const char *name)
+ {
+     BIO_METHOD *biom = OPENSSL_zalloc(sizeof(BIO_METHOD));
+diff --git a/doc/crypto/BIO_meth_new.pod b/doc/crypto/BIO_meth_new.pod
+index 65e48cb..bf33161 100644
+--- a/doc/crypto/BIO_meth_new.pod
++++ b/doc/crypto/BIO_meth_new.pod
+@@ -2,6 +2,7 @@
+ 
+ =head1 NAME
+ 
++BIO_get_new_index,
+ BIO_meth_new, BIO_meth_free, BIO_meth_get_write, BIO_meth_set_write,
+ BIO_meth_get_read, BIO_meth_set_read, BIO_meth_get_puts, BIO_meth_set_puts,
+ BIO_meth_get_gets, BIO_meth_set_gets, BIO_meth_get_ctrl, BIO_meth_set_ctrl,
+@@ -13,6 +14,7 @@ BIO_meth_set_callback_ctrl  - Routines to build up BIO methods
+ 
+  #include &lt;openssl/bio.h&gt;
+ 
++ int BIO_get_new_index(void);
+  BIO_METHOD *BIO_meth_new(int type, const char *name);
+  void BIO_meth_free(BIO_METHOD *biom);
+  int (*BIO_meth_get_write(BIO_METHOD *biom)) (BIO *, const char *, int);
+@@ -47,7 +49,10 @@ types. It provides a set of of functions used by OpenSSL for the implementation
+ of the various BIO capabilities. See the L&lt;bio&gt; page for more information.
+ 
+ BIO_meth_new() creates a new B&lt;BIO_METHOD&gt; structure. It should be given a
+-unique integer B&lt;type&gt; and a string that represents its B&lt;name&gt;. The set of
++unique integer B&lt;type&gt; and a string that represents its B&lt;name&gt;.
++Use BIO_get_new_index() to get the value for B&lt;type&gt;.
++
++The set of
+ standard OpenSSL provided BIO types is provided in B&lt;bio.h&gt;. Some examples
+ include B&lt;BIO_TYPE_BUFFER&gt; and B&lt;BIO_TYPE_CIPHER&gt;. Filter BIOs should have a
+ type which have the &quot;filter&quot; bit set (B&lt;BIO_TYPE_FILTER&gt;). Source/sink BIOs
+diff --git a/include/openssl/bio.h b/include/openssl/bio.h
+index f847348..d733f47 100644
+--- a/include/openssl/bio.h
++++ b/include/openssl/bio.h
+@@ -31,38 +31,39 @@
+ extern &quot;C&quot; {
+ #endif
+ 
++/* There are the classes of BIOs */
++# define BIO_TYPE_DESCRIPTOR     0x0100 /* socket, fd, connect or accept */
++# define BIO_TYPE_FILTER         0x0200
++# define BIO_TYPE_SOURCE_SINK    0x0400
++
+ /* These are the 'types' of BIOs */
+-# define BIO_TYPE_NONE           0
+-# define BIO_TYPE_MEM            (1|0x0400)
+-# define BIO_TYPE_FILE           (2|0x0400)
+-
+-# define BIO_TYPE_FD             (4|0x0400|0x0100)
+-# define BIO_TYPE_SOCKET         (5|0x0400|0x0100)
+-# define BIO_TYPE_NULL           (6|0x0400)
+-# define BIO_TYPE_SSL            (7|0x0200)
+-# define BIO_TYPE_MD             (8|0x0200)/* passive filter */
+-# define BIO_TYPE_BUFFER         (9|0x0200)/* filter */
+-# define BIO_TYPE_CIPHER         (10|0x0200)/* filter */
+-# define BIO_TYPE_BASE64         (11|0x0200)/* filter */
+-# define BIO_TYPE_CONNECT        (12|0x0400|0x0100)/* socket - connect */
+-# define BIO_TYPE_ACCEPT         (13|0x0400|0x0100)/* socket for accept */
+-/* # define BIO_TYPE_PROXY_CLIENT   (14|0x0200)*/ /* client proxy BIO */
+-/* # define BIO_TYPE_PROXY_SERVER   (15|0x0200)*/ /* server proxy BIO */
+-# define BIO_TYPE_NBIO_TEST      (16|0x0200)/* server proxy BIO */
+-# define BIO_TYPE_NULL_FILTER    (17|0x0200)
+-# define BIO_TYPE_BER            (18|0x0200)/* BER -&gt; bin filter */
+-# define BIO_TYPE_BIO            (19|0x0400)/* (half a) BIO pair */
+-# define BIO_TYPE_LINEBUFFER     (20|0x0200)/* filter */
+-# define BIO_TYPE_DGRAM          (21|0x0400|0x0100)
++# define BIO_TYPE_NONE             0
++# define BIO_TYPE_MEM            ( 1|BIO_TYPE_SOURCE_SINK)
++# define BIO_TYPE_FILE           ( 2|BIO_TYPE_SOURCE_SINK)
++
++# define BIO_TYPE_FD             ( 4|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
++# define BIO_TYPE_SOCKET         ( 5|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
++# define BIO_TYPE_NULL           ( 6|BIO_TYPE_SOURCE_SINK)
++# define BIO_TYPE_SSL            ( 7|BIO_TYPE_FILTER)
++# define BIO_TYPE_MD             ( 8|BIO_TYPE_FILTER)
++# define BIO_TYPE_BUFFER         ( 9|BIO_TYPE_FILTER)
++# define BIO_TYPE_CIPHER         (10|BIO_TYPE_FILTER)
++# define BIO_TYPE_BASE64         (11|BIO_TYPE_FILTER)
++# define BIO_TYPE_CONNECT        (12|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
++# define BIO_TYPE_ACCEPT         (13|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
++
++# define BIO_TYPE_NBIO_TEST      (16|BIO_TYPE_FILTER)/* server proxy BIO */
++# define BIO_TYPE_NULL_FILTER    (17|BIO_TYPE_FILTER)
++# define BIO_TYPE_BIO            (19|BIO_TYPE_SOURCE_SINK)/* half a BIO pair */
++# define BIO_TYPE_LINEBUFFER     (20|BIO_TYPE_FILTER)
++# define BIO_TYPE_DGRAM          (21|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
++# define BIO_TYPE_ASN1           (22|BIO_TYPE_FILTER)
++# define BIO_TYPE_COMP           (23|BIO_TYPE_FILTER)
+ # ifndef OPENSSL_NO_SCTP
+-#  define BIO_TYPE_DGRAM_SCTP     (24|0x0400|0x0100)
++#  define BIO_TYPE_DGRAM_SCTP    (24|BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR)
+ # endif
+-# define BIO_TYPE_ASN1           (22|0x0200)/* filter */
+-# define BIO_TYPE_COMP           (23|0x0200)/* filter */
+ 
+-# define BIO_TYPE_DESCRIPTOR     0x0100/* socket, fd, connect or accept */
+-# define BIO_TYPE_FILTER         0x0200
+-# define BIO_TYPE_SOURCE_SINK    0x0400
++#define BIO_TYPE_START           128
+ 
+ /*
+  * BIO_FILENAME_READ|BIO_CLOSE to open or close on free.
+@@ -177,6 +178,7 @@ extern &quot;C&quot; {
+ typedef union bio_addr_st BIO_ADDR;
+ typedef struct bio_addrinfo_st BIO_ADDRINFO;
+ 
++int BIO_get_new_index(void);
+ void BIO_set_flags(BIO *b, int flags);
+ int BIO_test_flags(const BIO *b, int flags);
+ void BIO_clear_flags(BIO *b, int flags);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 83b35ef..c0d6309 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4198,3 +4198,4 @@ X509_CRL_get0_lastUpdate                4144	1_1_0	EXIST::FUNCTION:
+ X509_get0_notBefore                     4145	1_1_0	EXIST::FUNCTION:
+ X509_get0_notAfter                      4146	1_1_0	EXIST::FUNCTION:
+ X509_CRL_get0_nextUpdate                4147	1_1_0	EXIST::FUNCTION:
++BIO_get_new_index                       4148	1_1_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009897.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009929.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9917">[ date ]</a>
+              <a href="thread.html#9917">[ thread ]</a>
+              <a href="subject.html#9917">[ subject ]</a>
+              <a href="author.html#9917">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,259 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1569222907.062800.29455.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025254.html">
+   <LINK REL="Next"  HREF="025258.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1569222907.062800.29455.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Mon Sep 23 07:15:07 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025254.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="025258.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25257">[ date ]</a>
+              <a href="thread.html#25257">[ thread ]</a>
+              <a href="subject.html#25257">[ subject ]</a>
+              <a href="author.html#25257">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  320408382046db015c9a9cc04ae91c2bcd0e5c4c (commit)
+      from  15dbf3a5a1ec27315753ef5a9148f6ad69277909 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 320408382046db015c9a9cc04ae91c2bcd0e5c4c
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat Sep 21 20:57:51 2019 +0200
+
+    Rework cipher / digest fetching for legacy nids with multiple name support
+    
+    With multiple names, it's no longer viable to just grab the &quot;first&quot; in
+    the set and use that to find the legacy NID.  Instead, all names for
+    an algorithm must be checked, and if we encounter more than one NID
+    asssociated with those names, we consider it an error and make that
+    method unloadable.
+    
+    This ensures that all methods that do have an internal NID associated
+    will get that NID in their structure, thereby ensuring that other
+    parts of libcrypto that haven't gone away from using NIDs for
+    comparison will continue to work as expected.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9969">https://github.com/openssl/openssl/pull/9969</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/digest.c    | 44 ++++++++++++++++++++++++++++++++++----------
+ crypto/evp/evp_enc.c   | 44 ++++++++++++++++++++++++++++++++++----------
+ crypto/evp/evp_fetch.c | 10 ++++++++++
+ crypto/evp/evp_locl.h  |  3 +++
+ 4 files changed, 81 insertions(+), 20 deletions(-)
+
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index f39a443c89..92012f917e 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -636,6 +636,31 @@ EVP_MD *evp_md_new(void)
+     return md;
+ }
+ 
++/*
++ * FIPS module note: since internal fetches will be entirely
++ * provider based, we know that none of its code depends on legacy
++ * NIDs or any functionality that use them.
++ */
++#ifndef FIPS_MODE
++/* TODO(3.x) get rid of the need for legacy NIDs */
++static void set_legacy_nid(const char *name, void *vlegacy_nid)
++{
++    int nid;
++    int *legacy_nid = vlegacy_nid;
++
++    if (*legacy_nid == -1)       /* We found a clash already */
++        return;
++    if ((nid = OBJ_sn2nid(name)) == NID_undef
++        &amp;&amp; (nid = OBJ_ln2nid(name)) == NID_undef)
++        return;
++    if (*legacy_nid != NID_undef &amp;&amp; *legacy_nid != nid) {
++        *legacy_nid = -1;
++        return;
++    }
++    *legacy_nid = nid;
++}
++#endif
++
+ static void *evp_md_from_dispatch(int name_id,
+                                   const OSSL_DISPATCH *fns,
+                                   OSSL_PROVIDER *prov, void *unused)
+@@ -648,21 +673,20 @@ static void *evp_md_from_dispatch(int name_id,
+         EVPerr(0, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    md-&gt;name_id = name_id;
+ 
+ #ifndef FIPS_MODE
+-    {
+-        /*
+-         * FIPS module note: since internal fetches will be entirely
+-         * provider based, we know that none of its code depends on legacy
+-         * NIDs or any functionality that use them.
+-         *
+-         * TODO(3.x) get rid of the need for legacy NIDs
+-         */
+-        md-&gt;type = OBJ_sn2nid(evp_first_name(prov, name_id));
++    /* TODO(3.x) get rid of the need for legacy NIDs */
++    md-&gt;type = NID_undef;
++    evp_doall_names(prov, name_id, set_legacy_nid, &amp;md-&gt;type);
++    if (md-&gt;type == -1) {
++        ERR_raise(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR);
++        EVP_MD_free(md);
++        return NULL;
+     }
+ #endif
+ 
++    md-&gt;name_id = name_id;
++
+     for (; fns-&gt;function_id != 0; fns++) {
+         switch (fns-&gt;function_id) {
+         case OSSL_FUNC_DIGEST_NEWCTX:
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index 8290494cb0..4e61d75bbd 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -1293,6 +1293,31 @@ EVP_CIPHER *evp_cipher_new(void)
+     return cipher;
+ }
+ 
++/*
++ * FIPS module note: since internal fetches will be entirely
++ * provider based, we know that none of its code depends on legacy
++ * NIDs or any functionality that use them.
++ */
++#ifndef FIPS_MODE
++/* TODO(3.x) get rid of the need for legacy NIDs */
++static void set_legacy_nid(const char *name, void *vlegacy_nid)
++{
++    int nid;
++    int *legacy_nid = vlegacy_nid;
++
++    if (*legacy_nid == -1)       /* We found a clash already */
++        return;
++    if ((nid = OBJ_sn2nid(name)) == NID_undef
++        &amp;&amp; (nid = OBJ_ln2nid(name)) == NID_undef)
++        return;
++    if (*legacy_nid != NID_undef &amp;&amp; *legacy_nid != nid) {
++        *legacy_nid = -1;
++        return;
++    }
++    *legacy_nid = nid;
++}
++#endif
++
+ static void *evp_cipher_from_dispatch(const int name_id,
+                                       const OSSL_DISPATCH *fns,
+                                       OSSL_PROVIDER *prov,
+@@ -1305,21 +1330,20 @@ static void *evp_cipher_from_dispatch(const int name_id,
+         EVPerr(0, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    cipher-&gt;name_id = name_id;
+ 
+ #ifndef FIPS_MODE
+-    {
+-        /*
+-         * FIPS module note: since internal fetches will be entirely
+-         * provider based, we know that none of its code depends on legacy
+-         * NIDs or any functionality that use them.
+-         *
+-         * TODO(3.x) get rid of the need for legacy NIDs
+-         */
+-        cipher-&gt;nid = OBJ_sn2nid(evp_first_name(prov, name_id));
++    /* TODO(3.x) get rid of the need for legacy NIDs */
++    cipher-&gt;nid = NID_undef;
++    evp_doall_names(prov, name_id, set_legacy_nid, &amp;cipher-&gt;nid);
++    if (cipher-&gt;nid == -1) {
++        ERR_raise(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR);
++        EVP_CIPHER_free(cipher);
++        return NULL;
+     }
+ #endif
+ 
++    cipher-&gt;name_id = name_id;
++
+     for (; fns-&gt;function_id != 0; fns++) {
+         switch (fns-&gt;function_id) {
+         case OSSL_FUNC_CIPHER_NEWCTX:
+diff --git a/crypto/evp/evp_fetch.c b/crypto/evp/evp_fetch.c
+index 6e31af79f2..cd2bacea5d 100644
+--- a/crypto/evp/evp_fetch.c
++++ b/crypto/evp/evp_fetch.c
+@@ -393,3 +393,13 @@ int evp_is_a(OSSL_PROVIDER *prov, int number, const char *name)
+ 
+     return ossl_namemap_name2num(namemap, name) == number;
+ }
++
++void evp_doall_names(OSSL_PROVIDER *prov, int number,
++                     void (*fn)(const char *name, void *data),
++                     void *data)
++{
++    OPENSSL_CTX *libctx = ossl_provider_library_context(prov);
++    OSSL_NAMEMAP *namemap = ossl_namemap_stored(libctx);
++
++    ossl_namemap_doall_names(namemap, number, fn, data);
++}
+diff --git a/crypto/evp/evp_locl.h b/crypto/evp/evp_locl.h
+index 3437e04b67..116c8e6ce0 100644
+--- a/crypto/evp/evp_locl.h
++++ b/crypto/evp/evp_locl.h
+@@ -251,3 +251,6 @@ void evp_pkey_ctx_free_old_ops(EVP_PKEY_CTX *ctx);
+ /* OSSL_PROVIDER * is only used to get the library context */
+ const char *evp_first_name(OSSL_PROVIDER *prov, int name_id);
+ int evp_is_a(OSSL_PROVIDER *prov, int number, const char *name);
++void evp_doall_names(OSSL_PROVIDER *prov, int number,
++                     void (*fn)(const char *name, void *data),
++                     void *data);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025254.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="025258.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25257">[ date ]</a>
+              <a href="thread.html#25257">[ thread ]</a>
+              <a href="subject.html#25257">[ subject ]</a>
+              <a href="author.html#25257">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,220 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599730565.046118.15438.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030571.html">
+   <LINK REL="Next"  HREF="030575.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tmraz at fedoraproject.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599730565.046118.15438.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tmraz at fedoraproject.org
+       </A><BR>
+    <I>Thu Sep 10 09:36:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030571.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030575.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30574">[ date ]</a>
+              <a href="thread.html#30574">[ thread ]</a>
+              <a href="subject.html#30574">[ subject ]</a>
+              <a href="author.html#30574">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3101ab603cd82cdbc81de0902b2b4718e8f1279b (commit)
+      from  b830e0042972a237c6677c071f1fcde5c1afbea7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3101ab603cd82cdbc81de0902b2b4718e8f1279b
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Sep 3 11:50:30 2020 +0100
+
+    Fix an EVP_MD_CTX leak
+    
+    If we initialise an EVP_MD_CTX with a legacy MD, and then reuse the same
+    EVP_MD_CTX with a provided MD then we end up leaking the md_data.
+    
+    We need to ensure we free the md_data if we change to a provided MD.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12779">https://github.com/openssl/openssl/pull/12779</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/digest.c   | 45 +++++++++++++++++++++++++--------------------
+ crypto/evp/m_sigver.c | 10 ++++++++++
+ include/crypto/evp.h  |  2 ++
+ 3 files changed, 37 insertions(+), 20 deletions(-)
+
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index 19fddb74ab..07bf12e5ae 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -22,24 +22,9 @@
+ #include &quot;internal/provider.h&quot;
+ #include &quot;evp_local.h&quot;
+ 
+-/* This call frees resources associated with the context */
+-int EVP_MD_CTX_reset(EVP_MD_CTX *ctx)
+-{
+-    if (ctx == NULL)
+-        return 1;
+-
+-#ifndef FIPS_MODULE
+-    /* TODO(3.0): Temporarily no support for EVP_DigestSign* in FIPS module */
+-    /*
+-     * pctx should be freed by the user of EVP_MD_CTX
+-     * if EVP_MD_CTX_FLAG_KEEP_PKEY_CTX is set
+-     */
+-    if (!EVP_MD_CTX_test_flags(ctx, EVP_MD_CTX_FLAG_KEEP_PKEY_CTX)) {
+-        EVP_PKEY_CTX_free(ctx-&gt;pctx);
+-        ctx-&gt;pctx = NULL;
+-    }
+-#endif
+ 
++void evp_md_ctx_clear_digest(EVP_MD_CTX *ctx, int force)
++{
+     EVP_MD_free(ctx-&gt;fetched_digest);
+     ctx-&gt;fetched_digest = NULL;
+     ctx-&gt;reqdigest = NULL;
+@@ -61,16 +46,36 @@ int EVP_MD_CTX_reset(EVP_MD_CTX *ctx)
+         &amp;&amp; !EVP_MD_CTX_test_flags(ctx, EVP_MD_CTX_FLAG_CLEANED))
+         ctx-&gt;digest-&gt;cleanup(ctx);
+     if (ctx-&gt;digest &amp;&amp; ctx-&gt;digest-&gt;ctx_size &amp;&amp; ctx-&gt;md_data
+-        &amp;&amp; !EVP_MD_CTX_test_flags(ctx, EVP_MD_CTX_FLAG_REUSE)) {
++            &amp;&amp; (!EVP_MD_CTX_test_flags(ctx, EVP_MD_CTX_FLAG_REUSE) || force))
+         OPENSSL_clear_free(ctx-&gt;md_data, ctx-&gt;digest-&gt;ctx_size);
+-    }
++    if (force)
++        ctx-&gt;digest = NULL;
+ 
+ #if !defined(FIPS_MODULE) &amp;&amp; !defined(OPENSSL_NO_ENGINE)
+     ENGINE_finish(ctx-&gt;engine);
++    ctx-&gt;engine = NULL;
+ #endif
++}
+ 
+-    /* TODO(3.0): End of legacy code */
++/* This call frees resources associated with the context */
++int EVP_MD_CTX_reset(EVP_MD_CTX *ctx)
++{
++    if (ctx == NULL)
++        return 1;
++
++#ifndef FIPS_MODULE
++    /* TODO(3.0): Temporarily no support for EVP_DigestSign* in FIPS module */
++    /*
++     * pctx should be freed by the user of EVP_MD_CTX
++     * if EVP_MD_CTX_FLAG_KEEP_PKEY_CTX is set
++     */
++    if (!EVP_MD_CTX_test_flags(ctx, EVP_MD_CTX_FLAG_KEEP_PKEY_CTX)) {
++        EVP_PKEY_CTX_free(ctx-&gt;pctx);
++        ctx-&gt;pctx = NULL;
++    }
++#endif
+ 
++    evp_md_ctx_clear_digest(ctx, 0);
+     OPENSSL_cleanse(ctx, sizeof(*ctx));
+ 
+     return 1;
+diff --git a/crypto/evp/m_sigver.c b/crypto/evp/m_sigver.c
+index a60d6e770b..e2bb613a20 100644
+--- a/crypto/evp/m_sigver.c
++++ b/crypto/evp/m_sigver.c
+@@ -176,6 +176,12 @@ static int do_sigver_init(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
+         }
+ 
+         if (mdname != NULL) {
++            /*
++             * We're about to get a new digest so clear anything associated with
++             * an old digest.
++             */
++            evp_md_ctx_clear_digest(ctx, 1);
++
+             /*
+              * This might be requested by a later call to EVP_MD_CTX_md().
+              * In that case the &quot;explicit fetch&quot; rules apply for that
+@@ -185,6 +191,10 @@ static int do_sigver_init(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
+              */
+             ctx-&gt;digest = ctx-&gt;reqdigest = ctx-&gt;fetched_digest =
+                 EVP_MD_fetch(locpctx-&gt;libctx, mdname, props);
++            if (ctx-&gt;digest == NULL) {
++                ERR_raise(ERR_LIB_EVP, EVP_R_INITIALIZATION_ERROR);
++                goto err;
++            }
+         }
+     }
+ 
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 9d9b0a7298..bdff97f639 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -808,3 +808,5 @@ int evp_pkey_ctx_use_cached_data(EVP_PKEY_CTX *ctx);
+ void evp_method_store_flush(OPENSSL_CTX *libctx);
+ int evp_set_default_properties_int(OPENSSL_CTX *libctx, const char *propq,
+                                    int loadconfig);
++
++void evp_md_ctx_clear_digest(EVP_MD_CTX *ctx, int force);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030571.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030575.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30574">[ date ]</a>
+              <a href="thread.html#30574">[ thread ]</a>
+              <a href="subject.html#30574">[ subject ]</a>
+              <a href="author.html#30574">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

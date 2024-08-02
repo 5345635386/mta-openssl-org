@@ -1,0 +1,221 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1477642964.958757.15629.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011227.html">
+   <LINK REL="Next"  HREF="011239.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1477642964.958757.15629.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri Oct 28 08:22:44 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011227.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="011239.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11236">[ date ]</a>
+              <a href="thread.html#11236">[ thread ]</a>
+              <a href="subject.html#11236">[ subject ]</a>
+              <a href="author.html#11236">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a34ac5b8b9c1a3281b4ee545c46177f485fb4949 (commit)
+       via  4880672a9b41a09a0984b55e219f02a2de7ab75e (commit)
+      from  875e3f934e8586039e79efb6ed1262c80803aa42 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a34ac5b8b9c1a3281b4ee545c46177f485fb4949
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Oct 27 13:46:57 2016 +0100
+
+    Add a test for BIO_read() returning 0 in SSL_read() (and also for write)
+    
+    A BIO_read() 0 return indicates that a failure occurred that may be
+    retryable. An SSL_read() 0 return indicates a non-retryable failure. Check
+    that if BIO_read() returns 0, SSL_read() returns &lt;0. Same for SSL_write().
+    
+    The asyncio test filter BIO already returns 0 on a retryable failure so we
+    build on that.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit 4880672a9b41a09a0984b55e219f02a2de7ab75e
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Oct 21 13:25:19 2016 +0100
+
+    A zero return from BIO_read()/BIO_write() could be retryable
+    
+    A zero return from BIO_read()/BIO_write() could mean that an IO operation
+    is retryable. A zero return from SSL_read()/SSL_write() means that the
+    connection has been closed down (either cleanly or not). Therefore we
+    should not propagate a zero return value from BIO_read()/BIO_write() back
+    up the stack to SSL_read()/SSL_write(). This could result in a retryable
+    failure being treated as fatal.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/record/rec_layer_s3.c | 18 +++++++++++++++---
+ test/asynciotest.c        | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/ssl/record/rec_layer_s3.c b/ssl/record/rec_layer_s3.c
+index 0775095..9c8c23c 100644
+--- a/ssl/record/rec_layer_s3.c
++++ b/ssl/record/rec_layer_s3.c
+@@ -177,6 +177,12 @@ const char *SSL_rstate_string(const SSL *s)
+     }
+ }
+ 
++/*
++ * Return values are as per SSL_read(), i.e.
++ * &gt;0 The number of read bytes
++ *  0 Failure (not retryable)
++ * &lt;0 Failure (may be retryable)
++ */
+ int ssl3_read_n(SSL *s, int n, int max, int extend, int clearold)
+ {
+     /*
+@@ -306,7 +312,7 @@ int ssl3_read_n(SSL *s, int n, int max, int extend, int clearold)
+             if (s-&gt;mode &amp; SSL_MODE_RELEASE_BUFFERS &amp;&amp; !SSL_IS_DTLS(s))
+                 if (len + left == 0)
+                     ssl3_release_read_buffer(s);
+-            return (i);
++            return -1;
+         }
+         left += i;
+         /*
+@@ -874,7 +880,13 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
+     return -1;
+ }
+ 
+-/* if s-&gt;s3-&gt;wbuf.left != 0, we need to call this */
++/* if s-&gt;s3-&gt;wbuf.left != 0, we need to call this
++ *
++ * Return values are as per SSL_read(), i.e.
++ * &gt;0 The number of read bytes
++ *  0 Failure (not retryable)
++ * &lt;0 Failure (may be retryable)
++ */
+ int ssl3_write_pending(SSL *s, int type, const unsigned char *buf,
+                        unsigned int len)
+ {
+@@ -924,7 +936,7 @@ int ssl3_write_pending(SSL *s, int type, const unsigned char *buf,
+                  */
+                 SSL3_BUFFER_set_left(&amp;wb[currbuf], 0);
+             }
+-            return (i);
++            return -1;
+         }
+         SSL3_BUFFER_add_offset(&amp;wb[currbuf], i);
+         SSL3_BUFFER_add_left(&amp;wb[currbuf], -i);
+diff --git a/test/asynciotest.c b/test/asynciotest.c
+index 720cc7c..23d0907 100644
+--- a/test/asynciotest.c
++++ b/test/asynciotest.c
+@@ -234,12 +234,17 @@ static int async_puts(BIO *bio, const char *str)
+     return async_write(bio, str, strlen(str));
+ }
+ 
++#define MAX_ATTEMPTS    100
++
+ int main(int argc, char *argv[])
+ {
+     SSL_CTX *serverctx = NULL, *clientctx = NULL;
+     SSL *serverssl = NULL, *clientssl = NULL;
+     BIO *s_to_c_fbio = NULL, *c_to_s_fbio = NULL;
+-    int test, err = 1;
++    int test, err = 1, ret;
++    size_t i, j;
++    const char testdata[] = &quot;Test data&quot;;
++    char buf[sizeof(testdata)];
+ 
+     CRYPTO_set_mem_debug(1);
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
+@@ -287,6 +292,42 @@ int main(int argc, char *argv[])
+             goto end;
+         }
+ 
++        /*
++         * Send and receive some test data. Do the whole thing twice to ensure
++         * we hit at least one async event in both reading and writing
++         */
++        for (j = 0; j &lt; 2; j++) {
++            /*
++             * Write some test data. It should never take more than 2 attempts
++             * (the first one might be a retryable fail). A zero return from
++             * SSL_write() is a non-retryable failure, so fail immediately if
++             * we get that.
++             */
++            for (ret = -1, i = 0; ret &lt; 0 &amp;&amp; i &lt; 2 * sizeof(testdata); i++)
++                ret = SSL_write(clientssl, testdata, sizeof(testdata));
++            if (ret &lt;= 0) {
++                printf(&quot;Test %d failed: Failed to write app data\n&quot;, test);
++                goto end;
++            }
++            /*
++             * Now read the test data. It may take more attemps here because
++             * it could fail once for each byte read, including all overhead
++             * bytes from the record header/padding etc. Fail immediately if we
++             * get a zero return from SSL_read().
++             */
++            for (ret = -1, i = 0; ret &lt; 0 &amp;&amp; i &lt; MAX_ATTEMPTS; i++)
++                ret = SSL_read(serverssl, buf, sizeof(buf));
++            if (ret &lt;= 0) {
++                printf(&quot;Test %d failed: Failed to read app data\n&quot;, test);
++                goto end;
++            }
++            if (ret != sizeof(testdata)
++                    || memcmp(buf, testdata, sizeof(testdata)) != 0) {
++                printf(&quot;Test %d failed: Unexpected app data received\n&quot;, test);
++                goto end;
++            }
++        }
++
+         /* Also frees the BIOs */
+         SSL_free(clientssl);
+         SSL_free(serverssl);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011227.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="011239.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11236">[ date ]</a>
+              <a href="thread.html#11236">[ thread ]</a>
+              <a href="subject.html#11236">[ subject ]</a>
+              <a href="author.html#11236">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

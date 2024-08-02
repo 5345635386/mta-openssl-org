@@ -1,0 +1,245 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499278618.923991.21054.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015364.html">
+   <LINK REL="Next"  HREF="015367.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>kaduk at mit.edu</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499278618.923991.21054.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kaduk at mit.edu
+       </A><BR>
+    <I>Wed Jul  5 18:16:58 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015364.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="015367.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15365">[ date ]</a>
+              <a href="thread.html#15365">[ thread ]</a>
+              <a href="subject.html#15365">[ subject ]</a>
+              <a href="author.html#15365">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c8feba723a33e15201009d716d9ead02e653dfe6 (commit)
+      from  7b5b2c461475ad2c810fec093dd9c2927876ec25 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c8feba723a33e15201009d716d9ead02e653dfe6
+Author: Benjamin Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bkaduk at akamai.com</A>&gt;
+Date:   Tue May 9 18:39:50 2017 -0500
+
+    Error out when forcing an unsupported TLS version
+    
+    If the result of a SSL_{CTX_,}set_{min,max}_proto_version() call
+    leaves the min and max version identical, and support for that version
+    is compiled out of the library, return an error.  Such an object has
+    no hope of successfully completing a handshake, and this error may
+    be easier to decipher than the resulting handshake failure.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3422">https://github.com/openssl/openssl/pull/3422</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c | 130 ++++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 122 insertions(+), 8 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index 9add3be..cef8e41 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -400,6 +400,116 @@ static int dane_tlsa_add(SSL_DANE *dane,
+     return 1;
+ }
+ 
++/*
++ * Return 0 if there is only one version configured and it was disabled
++ * at configure time.  Return 1 otherwise.
++ */
++static int ssl_check_allowed_versions(int min_version, int max_version)
++{
++    int minisdtls = 0, maxisdtls = 0;
++
++    /* Figure out if we're doing DTLS versions or TLS versions */
++    if (min_version == DTLS1_BAD_VER
++        || min_version &gt;&gt; 8 == DTLS1_VERSION_MAJOR)
++        minisdtls = 1;
++    if (max_version == DTLS1_BAD_VER
++        || max_version &gt;&gt; 8 == DTLS1_VERSION_MAJOR)
++        maxisdtls = 1;
++    /* A wildcard version of 0 could be DTLS or TLS. */
++    if ((minisdtls &amp;&amp; !maxisdtls &amp;&amp; max_version != 0)
++        || (maxisdtls &amp;&amp; !minisdtls &amp;&amp; min_version != 0)) {
++        /* Mixing DTLS and TLS versions will lead to sadness; deny it. */
++        return 0;
++    }
++
++    if (minisdtls || maxisdtls) {
++        /* Do DTLS version checks. */
++        if (min_version == 0)
++            /* Ignore DTLS1_BAD_VER */
++            min_version = DTLS1_VERSION;
++        if (max_version == 0)
++            max_version = DTLS1_2_VERSION;
++#ifdef OPENSSL_NO_DTLS1_2
++        if (max_version == DTLS1_2_VERSION)
++            max_version = DTLS1_VERSION;
++#endif
++#ifdef OPENSSL_NO_DTLS1
++        if (min_version == DTLS1_VERSION)
++            min_version = DTLS1_2_VERSION;
++#endif
++	/* Done massaging versions; do the check. */
++	if (0
++#ifdef OPENSSL_NO_DTLS1
++            || (DTLS_VERSION_GE(min_version, DTLS1_VERSION)
++                &amp;&amp; DTLS_VERSION_GE(DTLS1_VERSION, max_version))
++#endif
++#ifdef OPENSSL_NO_DTLS1_2
++            || (DTLS_VERSION_GE(min_version, DTLS1_2_VERSION)
++                &amp;&amp; DTLS_VERSION_GE(DTLS1_2_VERSION, max_version))
++#endif
++            )
++            return 0;
++    } else {
++        /* Regular TLS version checks. */
++	if (min_version == 0)
++	    min_version = SSL3_VERSION;
++	if (max_version == 0)
++	    max_version = TLS1_3_VERSION;
++#ifdef OPENSSL_NO_TLS1_3
++	if (max_version == TLS1_3_VERSION)
++	    max_version = TLS1_2_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1_2
++	if (max_version == TLS1_2_VERSION)
++	    max_version = TLS1_1_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1_1
++	if (max_version == TLS1_1_VERSION)
++	    max_version = TLS1_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1
++	if (max_version == TLS1_VERSION)
++	    max_version = SSL3_VERSION;
++#endif
++#ifdef OPENSSL_NO_SSL3
++	if (min_version == SSL3_VERSION)
++	    min_version = TLS1_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1
++	if (min_version == TLS1_VERSION)
++	    min_version = TLS1_1_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1_1
++	if (min_version == TLS1_1_VERSION)
++	    min_version = TLS1_2_VERSION;
++#endif
++#ifdef OPENSSL_NO_TLS1_2
++	if (min_version == TLS1_2_VERSION)
++	    min_version = TLS1_3_VERSION;
++#endif
++	/* Done massaging versions; do the check. */
++	if (0
++#ifdef OPENSSL_NO_SSL3
++            || (min_version &lt;= SSL3_VERSION &amp;&amp; SSL3_VERSION &lt;= max_version)
++#endif
++#ifdef OPENSSL_NO_TLS1
++            || (min_version &lt;= TLS1_VERSION &amp;&amp; TLS1_VERSION &lt;= max_version)
++#endif
++#ifdef OPENSSL_NO_TLS1_1
++            || (min_version &lt;= TLS1_1_VERSION &amp;&amp; TLS1_1_VERSION &lt;= max_version)
++#endif
++#ifdef OPENSSL_NO_TLS1_2
++            || (min_version &lt;= TLS1_2_VERSION &amp;&amp; TLS1_2_VERSION &lt;= max_version)
++#endif
++#ifdef OPENSSL_NO_TLS1_3
++            || (min_version &lt;= TLS1_3_VERSION &amp;&amp; TLS1_3_VERSION &lt;= max_version)
++#endif
++            )
++            return 0;
++    }
++    return 1;
++}
++
+ static void clear_ciphers(SSL *s)
+ {
+     /* clear the current cipher */
+@@ -2009,11 +2119,13 @@ long SSL_ctrl(SSL *s, int cmd, long larg, void *parg)
+         else
+             return 0;
+     case SSL_CTRL_SET_MIN_PROTO_VERSION:
+-        return ssl_set_version_bound(s-&gt;ctx-&gt;method-&gt;version, (int)larg,
+-                                     &amp;s-&gt;min_proto_version);
++        return ssl_check_allowed_versions(larg, s-&gt;max_proto_version)
++               &amp;&amp; ssl_set_version_bound(s-&gt;ctx-&gt;method-&gt;version, (int)larg,
++                                        &amp;s-&gt;min_proto_version);
+     case SSL_CTRL_SET_MAX_PROTO_VERSION:
+-        return ssl_set_version_bound(s-&gt;ctx-&gt;method-&gt;version, (int)larg,
+-                                     &amp;s-&gt;max_proto_version);
++        return ssl_check_allowed_versions(s-&gt;min_proto_version, larg)
++               &amp;&amp; ssl_set_version_bound(s-&gt;ctx-&gt;method-&gt;version, (int)larg,
++                                        &amp;s-&gt;max_proto_version);
+     default:
+         return (s-&gt;method-&gt;ssl_ctrl(s, cmd, larg, parg));
+     }
+@@ -2143,11 +2255,13 @@ long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
+     case SSL_CTRL_CLEAR_CERT_FLAGS:
+         return (ctx-&gt;cert-&gt;cert_flags &amp;= ~larg);
+     case SSL_CTRL_SET_MIN_PROTO_VERSION:
+-        return ssl_set_version_bound(ctx-&gt;method-&gt;version, (int)larg,
+-                                     &amp;ctx-&gt;min_proto_version);
++        return ssl_check_allowed_versions(larg, ctx-&gt;max_proto_version)
++               &amp;&amp; ssl_set_version_bound(ctx-&gt;method-&gt;version, (int)larg,
++                                        &amp;ctx-&gt;min_proto_version);
+     case SSL_CTRL_SET_MAX_PROTO_VERSION:
+-        return ssl_set_version_bound(ctx-&gt;method-&gt;version, (int)larg,
+-                                     &amp;ctx-&gt;max_proto_version);
++        return ssl_check_allowed_versions(ctx-&gt;min_proto_version, larg)
++               &amp;&amp; ssl_set_version_bound(ctx-&gt;method-&gt;version, (int)larg,
++                                        &amp;ctx-&gt;max_proto_version);
+     default:
+         return (ctx-&gt;method-&gt;ssl_ctx_ctrl(ctx, cmd, larg, parg));
+     }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015364.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="015367.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15365">[ date ]</a>
+              <a href="thread.html#15365">[ thread ]</a>
+              <a href="subject.html#15365">[ subject ]</a>
+              <a href="author.html#15365">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

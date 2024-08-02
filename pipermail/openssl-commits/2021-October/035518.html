@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  openssl-3.0 update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1635165273.879686.4886.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035517.html">
+   <LINK REL="Next"  HREF="035520.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  openssl-3.0 update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1635165273.879686.4886.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  openssl-3.0 update">tomas at openssl.org
+       </A><BR>
+    <I>Mon Oct 25 12:34:33 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035517.html">[openssl]  openssl-3.0 update
+</A></li>
+        <LI>Next message: <A HREF="035520.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35518">[ date ]</a>
+              <a href="thread.html#35518">[ thread ]</a>
+              <a href="subject.html#35518">[ subject ]</a>
+              <a href="author.html#35518">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch openssl-3.0 has been updated
+       via  1461059fe97b9abfb1c5414b314790f0bd65e0a0 (commit)
+      from  c5eae99ae7a9efaf2f554221638b9f0d13761c79 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1461059fe97b9abfb1c5414b314790f0bd65e0a0
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Fri Oct 22 14:22:57 2021 +0200
+
+    X509_PUBKEY_dup: Do not just up-ref the EVP_PKEY
+    
+    We try EVP_PKEY_dup() and if it fails we re-decode it using the
+    legacy method as provided keys should be duplicable.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16648">https://github.com/openssl/openssl/pull/16648</A>)
+    
+    (cherry picked from commit 7e35458b511f042d9a37d49227b01096c444e575)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_pubkey.c | 20 +++++++++++++++++---
+ test/enginetest.c      | 19 +++++++++++++++++++
+ test/evp_extra_test.c  |  2 +-
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index 0c07c39a1f..bc90ddd89b 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -289,14 +289,28 @@ X509_PUBKEY *X509_PUBKEY_dup(const X509_PUBKEY *a)
+             || (pubkey-&gt;algor = X509_ALGOR_dup(a-&gt;algor)) == NULL
+             || (pubkey-&gt;public_key = ASN1_BIT_STRING_new()) == NULL
+             || !ASN1_BIT_STRING_set(pubkey-&gt;public_key,
+-                                    a-&gt;public_key-&gt;data, a-&gt;public_key-&gt;length)
+-            || (a-&gt;pkey != NULL &amp;&amp; !EVP_PKEY_up_ref(a-&gt;pkey))) {
++                                    a-&gt;public_key-&gt;data,
++                                    a-&gt;public_key-&gt;length)) {
+         x509_pubkey_ex_free((ASN1_VALUE **)&amp;pubkey,
+                             ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL));
+         ERR_raise(ERR_LIB_X509, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    pubkey-&gt;pkey = a-&gt;pkey;
++
++    if (a-&gt;pkey != NULL) {
++        ERR_set_mark();
++        pubkey-&gt;pkey = EVP_PKEY_dup(a-&gt;pkey);
++        if (pubkey-&gt;pkey == NULL) {
++            pubkey-&gt;flag_force_legacy = 1;
++            if (x509_pubkey_decode(&amp;pubkey-&gt;pkey, pubkey) &lt;= 0) {
++                x509_pubkey_ex_free((ASN1_VALUE **)&amp;pubkey,
++                                    ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL));
++                ERR_clear_last_mark();
++                return NULL;
++            }
++        }
++        ERR_pop_to_mark();
++    }
+     return pubkey;
+ }
+ 
+diff --git a/test/enginetest.c b/test/enginetest.c
+index d865488770..04e61743a1 100644
+--- a/test/enginetest.c
++++ b/test/enginetest.c
+@@ -23,6 +23,7 @@
+ # include &lt;openssl/engine.h&gt;
+ # include &lt;openssl/rsa.h&gt;
+ # include &lt;openssl/err.h&gt;
++# include &lt;openssl/x509.h&gt;
+ 
+ static void display_engine_list(void)
+ {
+@@ -357,6 +358,7 @@ static int test_x509_dup_w_engine(void)
+ {
+     ENGINE *e = NULL;
+     X509 *cert = NULL, *dupcert = NULL;
++    X509_PUBKEY *pubkey, *duppubkey = NULL;
+     int ret = 0;
+     BIO *b = NULL;
+     RSA_METHOD *rsameth = NULL;
+@@ -370,6 +372,16 @@ static int test_x509_dup_w_engine(void)
+         goto err;
+     X509_free(dupcert);
+     dupcert = NULL;
++
++    if (!TEST_ptr(pubkey = X509_get_X509_PUBKEY(cert))
++        || !TEST_ptr(duppubkey = X509_PUBKEY_dup(pubkey))
++        || !TEST_ptr_ne(duppubkey, pubkey)
++        || !TEST_ptr_ne(X509_PUBKEY_get0(duppubkey), X509_PUBKEY_get0(pubkey)))
++        goto err;
++
++    X509_PUBKEY_free(duppubkey);
++    duppubkey = NULL;
++
+     X509_free(cert);
+     cert = NULL;
+ 
+@@ -395,11 +407,18 @@ static int test_x509_dup_w_engine(void)
+     if (!TEST_ptr(dupcert = X509_dup(cert)))
+         goto err;
+ 
++    if (!TEST_ptr(pubkey = X509_get_X509_PUBKEY(cert))
++        || !TEST_ptr(duppubkey = X509_PUBKEY_dup(pubkey))
++        || !TEST_ptr_ne(duppubkey, pubkey)
++        || !TEST_ptr_ne(X509_PUBKEY_get0(duppubkey), X509_PUBKEY_get0(pubkey)))
++        goto err;
++
+     ret = 1;
+ 
+  err:
+     X509_free(cert);
+     X509_free(dupcert);
++    X509_PUBKEY_free(duppubkey);
+     if (e != NULL) {
+         ENGINE_unregister_RSA(e);
+         ENGINE_free(e);
+diff --git a/test/evp_extra_test.c b/test/evp_extra_test.c
+index 2c604daae9..58c4a590e7 100644
+--- a/test/evp_extra_test.c
++++ b/test/evp_extra_test.c
+@@ -2278,7 +2278,7 @@ static int test_X509_PUBKEY_dup(void)
+ 
+     if (!TEST_ptr(X509_PUBKEY_get0(xq))
+             || !TEST_ptr(X509_PUBKEY_get0(xp))
+-            || !TEST_ptr_eq(X509_PUBKEY_get0(xq), X509_PUBKEY_get0(xp)))
++            || !TEST_ptr_ne(X509_PUBKEY_get0(xq), X509_PUBKEY_get0(xp)))
+         goto done;
+ 
+     X509_PUBKEY_free(xq);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035517.html">[openssl]  openssl-3.0 update
+</A></li>
+	<LI>Next message: <A HREF="035520.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35518">[ date ]</a>
+              <a href="thread.html#35518">[ thread ]</a>
+              <a href="subject.html#35518">[ subject ]</a>
+              <a href="author.html#35518">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

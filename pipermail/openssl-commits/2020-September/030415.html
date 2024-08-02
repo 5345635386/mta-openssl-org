@@ -1,0 +1,539 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1598979244.152839.23936.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030411.html">
+   <LINK REL="Next"  HREF="030423.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1598979244.152839.23936.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Tue Sep  1 16:54:04 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030411.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030423.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30415">[ date ]</a>
+              <a href="thread.html#30415">[ thread ]</a>
+              <a href="subject.html#30415">[ subject ]</a>
+              <a href="author.html#30415">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  1a5ae1da14f24a170c200c653c8b81e4a2966d3e (commit)
+      from  807b0a1dbb65fcf0d432184326e76e9f745dc3f1 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1a5ae1da14f24a170c200c653c8b81e4a2966d3e
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Wed Aug 26 10:11:14 2020 +0200
+
+    Add -verbosity option to apps/cmp.c and add log output also in crypto/cmp
+    
+    * In the cmp app so far the -verbosity option had been missing.
+    * Extend log output helpful for debugging CMP applications
+      in setup_ssl_ctx() of the cmp app, ossl_cmp_msg_add_extraCerts(),
+      OSSL_CMP_validate_msg(), and OSSL_CMP_MSG_http_perform().
+    * Correct suppression of log output with insufficient severity.
+    * Add logging/severity level OSSL_CMP_LOG_TRACE = OSSL_CMP_LOG_MAX.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12739">https://github.com/openssl/openssl/pull/12739</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/cmp.c                     | 94 +++++++++++++++++++++++++++---------------
+ crypto/cmp/cmp_ctx.c           |  4 +-
+ crypto/cmp/cmp_http.c          |  9 ++--
+ crypto/cmp/cmp_protect.c       | 24 +++++++----
+ crypto/cmp/cmp_vfy.c           | 12 +++++-
+ doc/man1/openssl-cmp.pod.in    |  8 ++++
+ doc/man3/OSSL_CMP_log_open.pod |  3 ++
+ include/openssl/cmp_util.h     |  2 +
+ util/other.syms                |  1 +
+ 9 files changed, 110 insertions(+), 47 deletions(-)
+
+diff --git a/apps/cmp.c b/apps/cmp.c
+index 97fa322b11..4a8b6e75fb 100644
+--- a/apps/cmp.c
++++ b/apps/cmp.c
+@@ -51,6 +51,7 @@ static char *opt_config = NULL;
+ #define SECTION_NAME_MAX 40 /* max length of section name */
+ #define DEFAULT_SECTION &quot;default&quot;
+ static char *opt_section = CMP_SECTION;
++static int opt_verbosity = OSSL_CMP_LOG_INFO;
+ 
+ #undef PROG
+ #define PROG cmp_main
+@@ -194,7 +195,7 @@ static X509_VERIFY_PARAM *vpm = NULL;
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+-    OPT_CONFIG, OPT_SECTION,
++    OPT_CONFIG, OPT_SECTION, OPT_VERBOSITY,
+ 
+     OPT_CMD, OPT_INFOTYPE, OPT_GENINFO,
+ 
+@@ -257,6 +258,8 @@ const OPTIONS cmp_options[] = {
+      &quot;Configuration file to use. \&quot;\&quot; = none. Default from env variable OPENSSL_CONF&quot;},
+     {&quot;section&quot;, OPT_SECTION, 's',
+      &quot;Section(s) in config file to get options from. \&quot;\&quot; = 'default'. Default 'cmp'&quot;},
++    {&quot;verbosity&quot;, OPT_VERBOSITY, 'n',
++     &quot;Log level; 3=ERR, 4=WARN, 6=INFO, 7=DEBUG, 8=TRACE. Default 6 = INFO&quot;},
+ 
+     OPT_SECTION(&quot;Generic message&quot;),
+     {&quot;cmd&quot;, OPT_CMD, 's', &quot;CMP request to send: ir/cr/kur/p10cr/rr/genm&quot;},
+@@ -507,7 +510,7 @@ typedef union {
+     long *num_long;
+ } varref;
+ static varref cmp_vars[] = { /* must be in same order as enumerated above! */
+-    {&amp;opt_config}, {&amp;opt_section},
++    {&amp;opt_config}, {&amp;opt_section}, {(char **)&amp;opt_verbosity},
+ 
+     {&amp;opt_cmd_s}, {&amp;opt_infotype_s}, {&amp;opt_geninfo},
+ 
+@@ -564,28 +567,32 @@ static varref cmp_vars[] = { /* must be in same order as enumerated above! */
+     {NULL}
+ };
+ 
+-#ifndef NDEBUG
+-# define FUNC (strcmp(OPENSSL_FUNC, &quot;(unknown function)&quot;) == 0  \
+-               ? &quot;CMP&quot; : &quot;OPENSSL_FUNC&quot;)
+-# define PRINT_LOCATION(bio) BIO_printf(bio, &quot;%s:%s:%d:&quot;, \
+-                                        FUNC, OPENSSL_FILE, OPENSSL_LINE)
+-#else
+-# define PRINT_LOCATION(bio) ((void)0)
+-#endif
+-#define CMP_print(bio, prefix, msg, a1, a2, a3) \
+-    (PRINT_LOCATION(bio), \
+-     BIO_printf(bio, &quot;CMP %s: &quot; msg &quot;\n&quot;, prefix, a1, a2, a3))
+-#define CMP_INFO(msg, a1, a2, a3)  CMP_print(bio_out, &quot;info&quot;, msg, a1, a2, a3)
++#define FUNC (strcmp(OPENSSL_FUNC, &quot;(unknown function)&quot;) == 0   \
++              ? &quot;CMP&quot; : OPENSSL_FUNC)
++#define CMP_print(bio, level, prefix, msg, a1, a2, a3) \
++    ((void)(level &gt; opt_verbosity ? 0 : \
++            (BIO_printf(bio, &quot;%s:%s:%d:CMP %s: &quot; msg &quot;\n&quot;, \
++                        FUNC, OPENSSL_FILE, OPENSSL_LINE, prefix, a1, a2, a3))))
++#define CMP_DEBUG(m, a1, a2, a3) \
++    CMP_print(bio_out, OSSL_CMP_LOG_DEBUG, &quot;debug&quot;, m, a1, a2, a3)
++#define CMP_debug(msg)             CMP_DEBUG(msg&quot;%s%s%s&quot;, &quot;&quot;, &quot;&quot;, &quot;&quot;)
++#define CMP_debug1(msg, a1)        CMP_DEBUG(msg&quot;%s%s&quot;,   a1, &quot;&quot;, &quot;&quot;)
++#define CMP_debug2(msg, a1, a2)    CMP_DEBUG(msg&quot;%s&quot;,     a1, a2, &quot;&quot;)
++#define CMP_debug3(msg, a1, a2, a3) CMP_DEBUG(msg,        a1, a2, a3)
++#define CMP_INFO(msg, a1, a2, a3) \
++    CMP_print(bio_out, OSSL_CMP_LOG_INFO, &quot;info&quot;, msg, a1, a2, a3)
+ #define CMP_info(msg)              CMP_INFO(msg&quot;%s%s%s&quot;, &quot;&quot;, &quot;&quot;, &quot;&quot;)
+ #define CMP_info1(msg, a1)         CMP_INFO(msg&quot;%s%s&quot;,   a1, &quot;&quot;, &quot;&quot;)
+ #define CMP_info2(msg, a1, a2)     CMP_INFO(msg&quot;%s&quot;,     a1, a2, &quot;&quot;)
+ #define CMP_info3(msg, a1, a2, a3) CMP_INFO(msg,         a1, a2, a3)
+-#define CMP_WARN(m, a1, a2, a3)    CMP_print(bio_out, &quot;warning&quot;, m, a1, a2, a3)
++#define CMP_WARN(m, a1, a2, a3) \
++    CMP_print(bio_out, OSSL_CMP_LOG_WARNING, &quot;warning&quot;, m, a1, a2, a3)
+ #define CMP_warn(msg)              CMP_WARN(msg&quot;%s%s%s&quot;, &quot;&quot;, &quot;&quot;, &quot;&quot;)
+ #define CMP_warn1(msg, a1)         CMP_WARN(msg&quot;%s%s&quot;,   a1, &quot;&quot;, &quot;&quot;)
+ #define CMP_warn2(msg, a1, a2)     CMP_WARN(msg&quot;%s&quot;,     a1, a2, &quot;&quot;)
+ #define CMP_warn3(msg, a1, a2, a3) CMP_WARN(msg,         a1, a2, a3)
+-#define CMP_ERR(msg, a1, a2, a3)   CMP_print(bio_err, &quot;error&quot;, msg, a1, a2, a3)
++#define CMP_ERR(msg, a1, a2, a3) \
++    CMP_print(bio_err, OSSL_CMP_LOG_ERR, &quot;error&quot;, msg, a1, a2, a3)
+ #define CMP_err(msg)               CMP_ERR(msg&quot;%s%s%s&quot;, &quot;&quot;, &quot;&quot;, &quot;&quot;)
+ #define CMP_err1(msg, a1)          CMP_ERR(msg&quot;%s%s&quot;,   a1, &quot;&quot;, &quot;&quot;)
+ #define CMP_err2(msg, a1, a2)      CMP_ERR(msg&quot;%s&quot;,     a1, a2, &quot;&quot;)
+@@ -597,6 +604,16 @@ static int print_to_bio_out(const char *func, const char *file, int line,
+     return OSSL_CMP_print_to_bio(bio_out, func, file, line, level, msg);
+ }
+ 
++static int set_verbosity(int level)
++{
++    if (level &lt; OSSL_CMP_LOG_EMERG || level &gt; OSSL_CMP_LOG_MAX) {
++        CMP_err1(&quot;Logging verbosity level %d out of range (0 .. 8)&quot;, level);
++        return 0;
++    }
++    opt_verbosity = level;
++    return 1;
++}
++
+ static char *next_item(char *opt) /* in list separated by comma and/or space */
+ {
+     /* advance to separator (comma or whitespace), if any */
+@@ -1476,11 +1493,14 @@ static SSL_CTX *setup_ssl_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+                 goto err;
+             }
+         }
+-        if (!SSL_CTX_build_cert_chain(ssl_ctx,
+-                                      SSL_BUILD_CHAIN_FLAG_UNTRUSTED |
+-                                      SSL_BUILD_CHAIN_FLAG_NO_ROOT)) {
+-            CMP_warn(&quot;could not build cert chain for own TLS cert&quot;);
++        CMP_debug(&quot;trying to build cert chain for own TLS cert&quot;);
++        if (SSL_CTX_build_cert_chain(ssl_ctx,
++                                     SSL_BUILD_CHAIN_FLAG_UNTRUSTED |
++                                     SSL_BUILD_CHAIN_FLAG_NO_ROOT)) {
++            CMP_debug(&quot;succeeded building cert chain for own TLS cert&quot;);
++        } else {
+             OSSL_CMP_CTX_print_errors(ctx);
++            CMP_warn(&quot;could not build cert chain for own TLS cert&quot;);
+         }
+ 
+         /* If present we append to the list also the certs from opt_tls_extra */
+@@ -2224,12 +2244,14 @@ static int read_config(void)
+     const OPTIONS *opt;
+     int provider_option;
+     int verification_option;
+-
++    int start = OPT_VERBOSITY;
+     /*
+-     * starting with offset OPT_SECTION because OPT_CONFIG and OPT_SECTION would
+-     * not make sense within the config file. They have already been handled.
++     * starting with offset OPT_VERBOSITY because OPT_CONFIG and OPT_SECTION
++     * would not make sense within the config file.
++     * Moreover, these two options and OPT_VERBOSITY have already been handled.
+      */
+-    for (i = OPT_SECTION - OPT_HELP, opt = &amp;cmp_options[OPT_SECTION];
++
++    for (i = start - OPT_HELP, opt = &amp;cmp_options[start];
+          opt-&gt;name; i++, opt++) {
+         if (!strcmp(opt-&gt;name, OPT_SECTION_STR)
+                 || !strcmp(opt-&gt;name, OPT_MORE_STR)) {
+@@ -2255,11 +2277,6 @@ static int read_config(void)
+                 continue; /* option not provided */
+             }
+             break;
+-            /*
+-             * do not use '&lt;' in cmp_options. Incorrect treatment
+-             * somewhere in args_verify() can wrongly set badarg = 1
+-             */
+-        case '&lt;':
+         case 's':
+         case 'M':
+             txt = conf_get_string(conf, opt_section, opt-&gt;name);
+@@ -2368,8 +2385,8 @@ static int get_opts(int argc, char **argv)
+             opt_help(cmp_options);
+             return -1;
+         case OPT_CONFIG: /* has already been handled */
+-            break;
+         case OPT_SECTION: /* has already been handled */
++        case OPT_VERBOSITY: /* has already been handled */
+             break;
+         case OPT_SERVER:
+             opt_server = opt_str(&quot;server&quot;);
+@@ -2700,15 +2717,20 @@ int cmp_main(int argc, char **argv)
+     }
+ 
+     /*
+-     * handle OPT_CONFIG and OPT_SECTION upfront to take effect for other opts
++     * handle options -config, -section, and -verbosity upfront
++     * to take effect for other options
+      */
+     for (i = 1; i &lt; argc - 1; i++) {
+         if (*argv[i] == '-') {
+             if (!strcmp(argv[i] + 1, cmp_options[OPT_CONFIG - OPT_HELP].name))
+-                opt_config = argv[i + 1];
++                opt_config = argv[++i];
+             else if (!strcmp(argv[i] + 1,
+                              cmp_options[OPT_SECTION - OPT_HELP].name))
+-                opt_section = argv[i + 1];
++                opt_section = argv[++i];
++            else if (strcmp(argv[i] + 1,
++                            cmp_options[OPT_VERBOSITY - OPT_HELP].name) == 0
++                     &amp;&amp; !set_verbosity(atoi(argv[++i])))
++                goto err;
+         }
+     }
+     if (opt_section[0] == '\0') /* empty string */
+@@ -2783,6 +2805,7 @@ int cmp_main(int argc, char **argv)
+     cmp_ctx = OSSL_CMP_CTX_new(app_get0_libctx(), app_get0_propq());
+     if (cmp_ctx == NULL)
+         goto err;
++    OSSL_CMP_CTX_set_log_verbosity(cmp_ctx, opt_verbosity);
+     if (!OSSL_CMP_CTX_set_log_cb(cmp_ctx, print_to_bio_out)) {
+         CMP_err1(&quot;cannot set up error reporting and logging for %s&quot;, prog);
+         goto err;
+@@ -2943,6 +2966,11 @@ int cmp_main(int argc, char **argv)
+                                                OSSL_CMP_PKISI_BUFLEN);
+ 
+             CMP_print(bio_err,
++                      status == OSSL_CMP_PKISTATUS_accepted
++                      ? OSSL_CMP_LOG_INFO :
++                      status == OSSL_CMP_PKISTATUS_rejection
++                      || status == OSSL_CMP_PKISTATUS_waiting
++                      ? OSSL_CMP_LOG_ERR : OSSL_CMP_LOG_WARNING,
+                       status == OSSL_CMP_PKISTATUS_accepted ? &quot;info&quot; :
+                       status == OSSL_CMP_PKISTATUS_rejection ? &quot;server error&quot; :
+                       status == OSSL_CMP_PKISTATUS_waiting ? &quot;internal error&quot;
+diff --git a/crypto/cmp/cmp_ctx.c b/crypto/cmp/cmp_ctx.c
+index e731f15958..57878a8f8d 100644
+--- a/crypto/cmp/cmp_ctx.c
++++ b/crypto/cmp/cmp_ctx.c
+@@ -420,6 +420,8 @@ int OSSL_CMP_CTX_set_log_cb(OSSL_CMP_CTX *ctx, OSSL_CMP_log_cb_t cb)
+ /* Print OpenSSL and CMP errors via the log cb of the ctx or ERR_print_errors */
+ void OSSL_CMP_CTX_print_errors(const OSSL_CMP_CTX *ctx)
+ {
++    if (ctx != NULL &amp;&amp; OSSL_CMP_LOG_ERR &gt; ctx-&gt;log_verbosity)
++        return; /* suppress output since severity is not sufficient */
+     OSSL_CMP_print_errors_cb(ctx == NULL ? NULL : ctx-&gt;log_cb);
+ }
+ 
+@@ -954,7 +956,7 @@ int OSSL_CMP_CTX_set_option(OSSL_CMP_CTX *ctx, int opt, int val)
+ 
+     switch (opt) {
+     case OSSL_CMP_OPT_LOG_VERBOSITY:
+-        if (val &gt; OSSL_CMP_LOG_DEBUG) {
++        if (val &gt; OSSL_CMP_LOG_MAX) {
+             CMPerr(0, CMP_R_VALUE_TOO_LARGE);
+             return 0;
+         }
+diff --git a/crypto/cmp/cmp_http.c b/crypto/cmp/cmp_http.c
+index 3804f2498f..f3cd06fb23 100644
+--- a/crypto/cmp/cmp_http.c
++++ b/crypto/cmp/cmp_http.c
+@@ -40,6 +40,7 @@ OSSL_CMP_MSG *OSSL_CMP_MSG_http_perform(OSSL_CMP_CTX *ctx,
+     char server_port[32] = { '\0' };
+     STACK_OF(CONF_VALUE) *headers = NULL;
+     const char *const content_type_pkix = &quot;application/pkixcmp&quot;;
++    int tls_used;
+     OSSL_CMP_MSG *res;
+ 
+     if (ctx == NULL || req == NULL) {
+@@ -53,16 +54,18 @@ OSSL_CMP_MSG *OSSL_CMP_MSG_http_perform(OSSL_CMP_CTX *ctx,
+     if (ctx-&gt;serverPort != 0)
+         BIO_snprintf(server_port, sizeof(server_port), &quot;%d&quot;, ctx-&gt;serverPort);
+ 
++    tls_used = OSSL_CMP_CTX_get_http_cb_arg(ctx) != NULL;
++    ossl_cmp_log2(DEBUG, ctx, &quot;connecting to CMP server %s%s&quot;,
++                  ctx-&gt;server, tls_used ? &quot; using TLS&quot; : &quot;&quot;);
+     res = (OSSL_CMP_MSG *)
+         OSSL_HTTP_post_asn1(ctx-&gt;server, server_port, ctx-&gt;serverPath,
+-                            OSSL_CMP_CTX_get_http_cb_arg(ctx) != NULL,
+-                            ctx-&gt;proxy, ctx-&gt;no_proxy, NULL, NULL,
++                            tls_used, ctx-&gt;proxy, ctx-&gt;no_proxy, NULL, NULL,
+                             ctx-&gt;http_cb, OSSL_CMP_CTX_get_http_cb_arg(ctx),
+                             headers, content_type_pkix, (const ASN1_VALUE *)req,
+                             ASN1_ITEM_rptr(OSSL_CMP_MSG),
+                             0, 0, ctx-&gt;msg_timeout, content_type_pkix,
+                             ASN1_ITEM_rptr(OSSL_CMP_MSG));
+-
++    ossl_cmp_debug(ctx, &quot;disconnected from CMP server&quot;);
+     sk_CONF_VALUE_pop_free(headers, X509V3_conf_free);
+     return res;
+ }
+diff --git a/crypto/cmp/cmp_protect.c b/crypto/cmp/cmp_protect.c
+index 212ef92f50..140b1720c8 100644
+--- a/crypto/cmp/cmp_protect.c
++++ b/crypto/cmp/cmp_protect.c
+@@ -147,16 +147,24 @@ int ossl_cmp_msg_add_extraCerts(OSSL_CMP_CTX *ctx, OSSL_CMP_MSG *msg)
+             return 0;
+         /* if we have untrusted certs, try to add intermediate certs */
+         if (ctx-&gt;untrusted_certs != NULL) {
+-            STACK_OF(X509) *chain =
+-                ossl_cmp_build_cert_chain(ctx-&gt;libctx, ctx-&gt;propq,
+-                                          ctx-&gt;untrusted_certs, ctx-&gt;cert);
+-            int res = X509_add_certs(msg-&gt;extraCerts, chain,
+-                                     X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP
+-                                     | X509_ADD_FLAG_NO_SS);
+-
++            STACK_OF(X509) *chain;
++            int res;
++
++            ossl_cmp_debug(ctx,
++                           &quot;trying to build chain for own CMP signer cert&quot;);
++            chain = ossl_cmp_build_cert_chain(ctx-&gt;libctx, ctx-&gt;propq,
++                                              ctx-&gt;untrusted_certs, ctx-&gt;cert);
++            res = X509_add_certs(msg-&gt;extraCerts, chain,
++                                 X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP
++                                 | X509_ADD_FLAG_NO_SS);
+             sk_X509_pop_free(chain, X509_free);
+-            if (res == 0)
++            if (res == 0) {
++                ossl_cmp_err(ctx,
++                             &quot;could not build chain for own CMP signer cert&quot;);
+                 return 0;
++            }
++            ossl_cmp_debug(ctx,
++                           &quot;succeeded building chain for own CMP signer cert&quot;);
+         }
+     }
+ 
+diff --git a/crypto/cmp/cmp_vfy.c b/crypto/cmp/cmp_vfy.c
+index b50a3fe83a..86e39d262e 100644
+--- a/crypto/cmp/cmp_vfy.c
++++ b/crypto/cmp/cmp_vfy.c
+@@ -552,6 +552,7 @@ int OSSL_CMP_validate_msg(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *msg)
+ {
+     X509 *scrt;
+ 
++    ossl_cmp_debug(ctx, &quot;validating CMP message&quot;);
+     if (ctx == NULL || msg == NULL
+             || msg-&gt;header == NULL || msg-&gt;body == NULL) {
+         CMPerr(0, CMP_R_NULL_ARGUMENT);
+@@ -593,8 +594,11 @@ int OSSL_CMP_validate_msg(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *msg)
+             default:
+                 break;
+             }
++            ossl_cmp_debug(ctx,
++                           &quot;sucessfully validated PBM-based CMP message protection&quot;);
+             return 1;
+         }
++        ossl_cmp_warn(ctx, &quot;verifying PBM-based CMP message protection failed&quot;);
+         break;
+ 
+         /*
+@@ -615,9 +619,13 @@ int OSSL_CMP_validate_msg(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *msg)
+                 return 1;
+         } else { /* use pinned sender cert */
+             /* use ctx-&gt;srvCert for signature check even if not acceptable */
+-            if (verify_signature(ctx, msg, scrt))
++            if (verify_signature(ctx, msg, scrt)) {
++                ossl_cmp_debug(ctx,
++                               &quot;sucessfully validated signature-based CMP message protection&quot;);
++
+                 return 1;
+-            ossl_cmp_warn(ctx, &quot;msg signature verification failed&quot;);
++            }
++            ossl_cmp_warn(ctx, &quot;CMP message signature verification failed&quot;);
+             CMPerr(0, CMP_R_SRVCERT_DOES_NOT_VALIDATE_MSG);
+         }
+         break;
+diff --git a/doc/man1/openssl-cmp.pod.in b/doc/man1/openssl-cmp.pod.in
+index a6a769af9d..77d38d9d75 100644
+--- a/doc/man1/openssl-cmp.pod.in
++++ b/doc/man1/openssl-cmp.pod.in
+@@ -81,6 +81,7 @@ B&lt;openssl&gt; B&lt;cmp&gt;
+ [B&lt;-tls_trusted&gt; I&lt;filenames&gt;]
+ [B&lt;-tls_host&gt; I&lt;name&gt;]
+ 
++[B&lt;-verbosity&gt; I&lt;level&gt;]
+ [B&lt;-batch&gt;]
+ [B&lt;-repeat&gt; I&lt;number&gt;]
+ [B&lt;-reqin&gt;] I&lt;filenames&gt;
+@@ -770,6 +771,13 @@ If not given it defaults to the B&lt;-server&gt; address.
+ 
+ =over 4
+ 
++=item B&lt;-verbosity&gt; I&lt;level&gt;
++
++Level of verbosity for logging, error output, etc.
++0 = EMERG, 1 = ALERT, 2 = CRIT, 3 = ERR, 4 = WARN, 5 = NOTE,
++6 = INFO, 7 = DEBUG, 8 = TRACE.
++Defaults to 6 = INFO.
++
+ =item B&lt;-batch&gt;
+ 
+ Do not interactively prompt for input, for instance when a password is needed.
+diff --git a/doc/man3/OSSL_CMP_log_open.pod b/doc/man3/OSSL_CMP_log_open.pod
+index fdc416c0cf..5c6b924bda 100644
+--- a/doc/man3/OSSL_CMP_log_open.pod
++++ b/doc/man3/OSSL_CMP_log_open.pod
+@@ -13,6 +13,8 @@ OSSL_CMP_LOG_WARNING,
+ OSSL_CMP_LOG_NOTICE,
+ OSSL_CMP_LOG_INFO,
+ OSSL_CMP_LOG_DEBUG,
++OSSL_CMP_LOG_TRACE,
++
+ OSSL_CMP_log_cb_t,
+ OSSL_CMP_print_to_bio,
+ OSSL_CMP_print_errors_cb
+@@ -35,6 +37,7 @@ OSSL_CMP_print_errors_cb
+  #define OSSL_CMP_LOG_NOTICE  5
+  #define OSSL_CMP_LOG_INFO    6
+  #define OSSL_CMP_LOG_DEBUG   7
++ #define OSSL_CMP_LOG_TRACE   8
+ 
+  typedef int (*OSSL_CMP_log_cb_t)(const char *component,
+                                   const char *file, int line,
+diff --git a/include/openssl/cmp_util.h b/include/openssl/cmp_util.h
+index a243d7e742..becbc9208e 100644
+--- a/include/openssl/cmp_util.h
++++ b/include/openssl/cmp_util.h
+@@ -38,6 +38,8 @@ typedef int OSSL_CMP_severity;
+ #  define OSSL_CMP_LOG_NOTICE  5
+ #  define OSSL_CMP_LOG_INFO    6
+ #  define OSSL_CMP_LOG_DEBUG   7
++#  define OSSL_CMP_LOG_TRACE   8
++#  define OSSL_CMP_LOG_MAX     OSSL_CMP_LOG_TRACE
+ typedef int (*OSSL_CMP_log_cb_t)(const char *func, const char *file, int line,
+                                  OSSL_CMP_severity level, const char *msg);
+ 
+diff --git a/util/other.syms b/util/other.syms
+index 964e09f0bd..6dcc9b260c 100644
+--- a/util/other.syms
++++ b/util/other.syms
+@@ -388,6 +388,7 @@ OSSL_CMP_LOG_EMERG                      define
+ OSSL_CMP_LOG_ERR                        define
+ OSSL_CMP_LOG_INFO                       define
+ OSSL_CMP_LOG_NOTICE                     define
++OSSL_CMP_LOG_TRACE                      define
+ OSSL_CMP_LOG_WARNING                    define
+ OSSL_CMP_MSTR_HELPER                    define
+ OSSL_CMP_MSTR                           define
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030411.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030423.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30415">[ date ]</a>
+              <a href="thread.html#30415">[ thread ]</a>
+              <a href="subject.html#30415">[ subject ]</a>
+              <a href="author.html#30415">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

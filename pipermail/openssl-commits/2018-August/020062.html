@@ -1,0 +1,258 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1535298567.660166.12834.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020059.html">
+   <LINK REL="Next"  HREF="020066.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1535298567.660166.12834.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Sun Aug 26 15:49:27 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020059.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="020066.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20062">[ date ]</a>
+              <a href="thread.html#20062">[ thread ]</a>
+              <a href="subject.html#20062">[ subject ]</a>
+              <a href="author.html#20062">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7d38ca3f8bca58bf7b69e78c1f1ab69e5f429dff (commit)
+       via  a88e328c3a098e7c64e94c6b426ff45e76eface1 (commit)
+      from  d573ff17939458f7b14d56770641c11a83b98d10 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7d38ca3f8bca58bf7b69e78c1f1ab69e5f429dff
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Aug 17 12:30:36 2018 +0200
+
+    x509v3/v3_purp.c: refine lock-free check in x509v3_cache_extensions.
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6996">https://github.com/openssl/openssl/pull/6996</A>)
+
+commit a88e328c3a098e7c64e94c6b426ff45e76eface1
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Aug 17 12:13:01 2018 +0200
+
+    internal/tsan_assist.h: add tsan_ld_acq and tsan_st_rel.
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6996">https://github.com/openssl/openssl/pull/6996</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509v3/v3_purp.c        | 16 +++++----
+ include/internal/tsan_assist.h | 78 +++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 76 insertions(+), 18 deletions(-)
+
+diff --git a/crypto/x509v3/v3_purp.c b/crypto/x509v3/v3_purp.c
+index 5a535e2..70b0397 100644
+--- a/crypto/x509v3/v3_purp.c
++++ b/crypto/x509v3/v3_purp.c
+@@ -354,9 +354,11 @@ static void x509v3_cache_extensions(X509 *x)
+     X509_EXTENSION *ex;
+     int i;
+ 
++#ifdef tsan_ld_acq
+     /* fast lock-free check, see end of the function for details. */
+-    if (tsan_load((TSAN_QUALIFIER int *)&amp;x-&gt;ex_cached))
++    if (tsan_ld_acq((TSAN_QUALIFIER int *)&amp;x-&gt;ex_cached))
+         return;
++#endif
+ 
+     CRYPTO_THREAD_write_lock(x-&gt;lock);
+     if (x-&gt;ex_flags &amp; EXFLAG_SET) {
+@@ -498,13 +500,15 @@ static void x509v3_cache_extensions(X509 *x)
+     }
+     x509_init_sig_info(x);
+     x-&gt;ex_flags |= EXFLAG_SET;
+-    CRYPTO_THREAD_unlock(x-&gt;lock);
++#ifdef tsan_st_rel
++    tsan_st_rel((TSAN_QUALIFIER int *)&amp;x-&gt;ex_cached, 1);
+     /*
+-     * It has to be placed after memory barrier, which is implied by unlock.
+-     * Worst thing that can happen is that another thread proceeds to lock
+-     * and checks x-&gt;ex_flags &amp; EXFLAGS_SET. See beginning of the function.
++     * Above store triggers fast lock-free check in the beginning of the
++     * function. But one has to ensure that the structure is &quot;stable&quot;, i.e.
++     * all stores are visible on all processors. Hence the release fence.
+      */
+-    tsan_store((TSAN_QUALIFIER int *)&amp;x-&gt;ex_cached, 1);
++#endif
++    CRYPTO_THREAD_unlock(x-&gt;lock);
+ }
+ 
+ /*-
+diff --git a/include/internal/tsan_assist.h b/include/internal/tsan_assist.h
+index f6870a2..2c76383 100644
+--- a/include/internal/tsan_assist.h
++++ b/include/internal/tsan_assist.h
+@@ -8,8 +8,9 @@
+  */
+  
+ /*
+- * Goal here is to facilitate writing &quot;thread-opportunistic&quot; code that
+- * withstands Thread Sanitizer's scrutiny. &quot;Thread-opportunistic&quot; is when
++ * Contemporary compilers implement lock-free atomic memory access
++ * primitives that facilitate writing &quot;thread-opportunistic&quot; or even real
++ * multi-threading low-overhead code. &quot;Thread-opportunistic&quot; is when
+  * exact result is not required, e.g. some statistics, or execution flow
+  * doesn't have to be unambiguous. Simplest example is lazy &quot;constant&quot;
+  * initialization when one can synchronize on variable itself, e.g.
+@@ -28,12 +29,22 @@
+  * bother. Having Thread Sanitizer accept &quot;thread-opportunistic&quot; code
+  * allows to move on trouble-shooting real bugs.
+  *
+- * We utilize the fact that compilers that implement Thread Sanitizer
+- * implement even atomic operations. Then it's assumed that
+- * ATOMIC_{LONG|INT}_LOCK_FREE are assigned same value as
+- * ATOMIC_POINTER_LOCK_FREE. And check for &gt;= 2 ensures that correspodning
++ * Resolving Thread Sanitizer nits was the initial purpose for this module,
++ * but it was later extended with more nuanced primitives that are useful
++ * even in &quot;non-opportunistic&quot; scenarios. Most notably verifying if a shared
++ * structure is fully initialized and bypassing the initialization lock.
++ * It's suggested to view macros defined in this module as &quot;annotations&quot; for
++ * thread-safe lock-free code, &quot;Thread-Safe ANnotations&quot;...
++ *
++ * It's assumed that ATOMIC_{LONG|INT}_LOCK_FREE are assigned same value as
++ * ATOMIC_POINTER_LOCK_FREE. And check for &gt;= 2 ensures that corresponding
+  * code is inlined. It should be noted that statistics counters become
+  * accurate in such case.
++ *
++ * Special note about TSAN_QUALIFIER. It might be undesired to use it in
++ * a shared header. Because whether operation on specific variable or member
++ * is atomic or not might be irrelevant in other modules. In such case one
++ * can use TSAN_QUALIFIER in cast specifically when it has to count.
+  */
+ 
+ #if defined(__STDC_VERSION__) &amp;&amp; __STDC_VERSION__ &gt;= 201112L \
+@@ -46,6 +57,8 @@
+ #  define tsan_load(ptr) atomic_load_explicit((ptr), memory_order_relaxed)
+ #  define tsan_store(ptr, val) atomic_store_explicit((ptr), (val), memory_order_relaxed)
+ #  define tsan_counter(ptr) atomic_fetch_add_explicit((ptr), 1, memory_order_relaxed)
++#  define tsan_ld_acq(ptr) atomic_load_explicit((ptr), memory_order_acquire)
++#  define tsan_st_rel(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+ # endif
+ 
+ #elif defined(__GNUC__) &amp;&amp; defined(__ATOMIC_RELAXED)
+@@ -56,21 +69,57 @@
+ #  define tsan_load(ptr) __atomic_load_n((ptr), __ATOMIC_RELAXED)
+ #  define tsan_store(ptr, val) __atomic_store_n((ptr), (val), __ATOMIC_RELAXED)
+ #  define tsan_counter(ptr) __atomic_fetch_add((ptr), 1, __ATOMIC_RELAXED)
++#  define tsan_ld_acq(ptr) __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
++#  define tsan_st_rel(ptr, val) __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+ # endif
+ 
+-#elif defined(_MSC_VER) &amp;&amp; _MSC_VER&gt;=1200
+-
++#elif defined(_MSC_VER) &amp;&amp; _MSC_VER&gt;=1200 \
++      &amp;&amp; (defined(_M_IX86) || defined(_M_AMD64) || defined(_M_X64) || \
++          defined(_M_ARM64) || (defined(_M_ARM) &amp;&amp; _M_ARM &gt;= 7))
++/*
++ * There is subtle dependency on /volatile:&lt;iso|ms&gt; command-line option.
++ * &quot;ms&quot; implies same semantic as memory_order_acquire for loads and
++ * memory_order_release for stores, while &quot;iso&quot; - memory_order_relaxed for
++ * either. Real complication is that defaults are different on x86 and ARM.
++ * There is explanation for that, &quot;ms&quot; is backward compatible with earlier
++ * compiler versions, while multi-processor ARM can be viewed as brand new
++ * platform to MSC and its users, and with non-relaxed semantic taking toll
++ * with additional instructions and penalties, it kind of makes sense to
++ * default to &quot;iso&quot;...
++ */
+ # define TSAN_QUALIFIER volatile
+-# define tsan_load(ptr) (*(ptr))
+-# define tsan_store(ptr, val) (*(ptr) = (val))
++# if defined(_M_ARM) || defined(_M_ARM64)
++#  define _InterlockedExchangeAdd _InterlockedExchangeAdd_nf
++#  pragma intrinsic(_InterlockedExchangeAdd_nf)
++#  pragma intrinsic(__iso_volatile_load32, __iso_volatile_store32)
++#  ifdef _WIN64
++#   define _InterlockedExchangeAdd64 _InterlockedExchangeAdd64_nf
++#   pragma intrinsic(_InterlockedExchangeAdd64_nf)
++#   pragma intrinsic(__iso_volatile_load64, __iso_volatile_store64)
++#   define tsan_load(ptr) (sizeof(*(ptr)) == 8 ? __iso_volatile_load64(ptr) \
++                                               : __iso_volatile_load32(ptr))
++#   define tsan_store(ptr, val) (sizeof(*(ptr)) == 8 ? __iso_volatile_store64((ptr), (val)) \
++                                                     : __iso_volatile_store32((ptr), (val)))
++#  else
++#   define tsan_load(ptr) __iso_volatile_load32(ptr)
++#   define tsan_store(ptr, val) __iso_volatile_store32((ptr), (val))
++#  endif
++# else
++#  define tsan_load(ptr) (*(ptr))
++#  define tsan_store(ptr, val) (*(ptr) = (val))
++# endif
+ # pragma intrinsic(_InterlockedExchangeAdd)
+ # ifdef _WIN64
+ #  pragma intrinsic(_InterlockedExchangeAdd64)
+-#  define tsan_counter(ptr) (sizeof(*ptr) == 8 ? _InterlockedExchangeAdd64((ptr), 1) \
+-                                               : _InterlockedExchangeAdd((ptr), 1))
++#  define tsan_counter(ptr) (sizeof(*(ptr)) == 8 ? _InterlockedExchangeAdd64((ptr), 1) \
++                                                 : _InterlockedExchangeAdd((ptr), 1))
+ # else
+ #  define tsan_counter(ptr) _InterlockedExchangeAdd((ptr), 1)
+ # endif
++# if !defined(_ISO_VOLATILE)
++#  define tsan_ld_acq(ptr) (*(ptr))
++#  define tsan_st_rel(ptr, val) (*(ptr) = (val))
++# endif
+ 
+ #endif
+ 
+@@ -80,5 +129,10 @@
+ # define tsan_load(ptr) (*(ptr))
+ # define tsan_store(ptr, val) (*(ptr) = (val))
+ # define tsan_counter(ptr) ((*(ptr))++)
++/*
++ * Lack of tsan_ld_acq and tsan_ld_rel means that compiler support is not
++ * sophisticated enough to support them. Code that relies on them should be
++ * protected with #ifdef tsan_ld_acq with locked fallback.
++ */
+ 
+ #endif
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020059.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="020066.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20062">[ date ]</a>
+              <a href="thread.html#20062">[ thread ]</a>
+              <a href="subject.html#20062">[ subject ]</a>
+              <a href="author.html#20062">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

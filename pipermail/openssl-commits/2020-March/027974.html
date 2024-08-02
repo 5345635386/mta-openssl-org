@@ -1,0 +1,401 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1584779443.082229.29771.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027971.html">
+   <LINK REL="Next"  HREF="027978.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1584779443.082229.29771.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sat Mar 21 08:30:43 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027971.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027978.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27974">[ date ]</a>
+              <a href="thread.html#27974">[ thread ]</a>
+              <a href="subject.html#27974">[ subject ]</a>
+              <a href="author.html#27974">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  d3b2f8760a56da3e70c30e5614181f3798e4ad54 (commit)
+       via  4b9e90f42a367a880af2dae6f6c4b455a0d2c0f4 (commit)
+      from  9a1c170d6309bb814ba8d720503069337f628b32 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit d3b2f8760a56da3e70c30e5614181f3798e4ad54
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Mar 17 14:41:59 2020 +0100
+
+    evp_test: the tests using MDC2 need the legacy provider
+    
+    This was always a potential, we just haven't seen this need before now.
+    
+    Reviewed-by: Paul Yang &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaishen.yy at antfin.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11343">https://github.com/openssl/openssl/pull/11343</A>)
+
+commit 4b9e90f42a367a880af2dae6f6c4b455a0d2c0f4
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Mar 17 14:37:47 2020 +0100
+
+    EVP: fetch the EVP_KEYMGMT earlier
+    
+    Instead of fetching the EVP_KEYMGMT in the init for every different
+    operation, do it when creating the EVP_PKEY_CTX.
+    
+    This allows certain control functions to be called between the
+    creation of the EVP_PKEY_CTX and the call of the operation's init
+    function.
+    
+    Use case: EVP_PKEY_CTX_set1_id(), which is allowed to be called very
+    early with the legacy implementation, this should still be allowed
+    with provider implementations.
+    
+    Reviewed-by: Paul Yang &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaishen.yy at antfin.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11343">https://github.com/openssl/openssl/pull/11343</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/exchange.c                     |  2 +-
+ crypto/evp/p_lib.c                        | 21 +++++++++++++--------
+ crypto/evp/pmeth_gn.c                     | 22 +++-------------------
+ crypto/evp/pmeth_lib.c                    | 23 ++++++++++++++---------
+ crypto/evp/signature.c                    |  2 +-
+ include/crypto/evp.h                      |  8 +++-----
+ test/recipes/30-test_evp_data/evppkey.txt |  9 +++++++++
+ 7 files changed, 44 insertions(+), 43 deletions(-)
+
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index ec5ba03f09..3e66e721d5 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -197,7 +197,7 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+      */
+     ERR_set_mark();
+ 
+-    if (ctx-&gt;engine != NULL || ctx-&gt;keytype == NULL)
++    if (ctx-&gt;keymgmt == NULL)
+         goto legacy;
+ 
+     /*
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 3012790cee..a2bb2b7190 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -1105,13 +1105,15 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+         *keymgmt = NULL;
+     }
+ 
+-    /* If no keymgmt was given or found, get a default keymgmt */
++    /*
++     * If no keymgmt was given or found, get a default keymgmt.  We do so by
++     * letting EVP_PKEY_CTX_new_from_pkey() do it for us, then we steal it.
++     */
+     if (tmp_keymgmt == NULL) {
+         EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_pkey(libctx, pk, propquery);
+ 
+-        if (ctx != NULL &amp;&amp; ctx-&gt;keytype != NULL)
+-            tmp_keymgmt = allocated_keymgmt =
+-                EVP_KEYMGMT_fetch(ctx-&gt;libctx, ctx-&gt;keytype, propquery);
++        tmp_keymgmt = ctx-&gt;keymgmt;
++        ctx-&gt;keymgmt = NULL;
+         EVP_PKEY_CTX_free(ctx);
+     }
+ 
+@@ -1249,14 +1251,17 @@ void *evp_pkey_upgrade_to_provider(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+         if (pk-&gt;ameth-&gt;export_to == NULL)
+             return NULL;
+ 
+-        /* If no keymgmt was given, get a default keymgmt */
++        /*
++         * If no keymgmt was given or found, get a default keymgmt.  We do
++         * so by letting EVP_PKEY_CTX_new_from_pkey() do it for us, then we
++         * steal it.
++         */
+         if (tmp_keymgmt == NULL) {
+             EVP_PKEY_CTX *ctx =
+                 EVP_PKEY_CTX_new_from_pkey(libctx, pk, propquery);
+ 
+-            if (ctx != NULL &amp;&amp; ctx-&gt;keytype != NULL)
+-                tmp_keymgmt = allocated_keymgmt =
+-                    EVP_KEYMGMT_fetch(ctx-&gt;libctx, ctx-&gt;keytype, propquery);
++            tmp_keymgmt = ctx-&gt;keymgmt;
++            ctx-&gt;keymgmt = NULL;
+             EVP_PKEY_CTX_free(ctx);
+         }
+ 
+diff --git a/crypto/evp/pmeth_gn.c b/crypto/evp/pmeth_gn.c
+index 03f1426d85..1bf95af2ac 100644
+--- a/crypto/evp/pmeth_gn.c
++++ b/crypto/evp/pmeth_gn.c
+@@ -30,22 +30,9 @@ static int gen_init(EVP_PKEY_CTX *ctx, int operation)
+     evp_pkey_ctx_free_old_ops(ctx);
+     ctx-&gt;operation = operation;
+ 
+-    if (ctx-&gt;engine != NULL || ctx-&gt;keytype == NULL)
++    if (ctx-&gt;keymgmt == NULL || ctx-&gt;keymgmt-&gt;gen_init == NULL)
+         goto legacy;
+ 
+-    if (ctx-&gt;keymgmt == NULL) {
+-        ctx-&gt;keymgmt =
+-            EVP_KEYMGMT_fetch(ctx-&gt;libctx, ctx-&gt;keytype, ctx-&gt;propquery);
+-        if (ctx-&gt;keymgmt == NULL
+-            || ctx-&gt;keymgmt-&gt;gen_init == NULL) {
+-            EVP_KEYMGMT_free(ctx-&gt;keymgmt);
+-            ctx-&gt;keymgmt = NULL;
+-            goto legacy;
+-        }
+-    }
+-    if (ctx-&gt;keymgmt-&gt;gen_init == NULL)
+-        goto not_supported;
+-
+     switch (operation) {
+     case EVP_PKEY_OP_PARAMGEN:
+         ctx-&gt;op.keymgmt.genctx =
+@@ -156,7 +143,7 @@ int EVP_PKEY_gen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey)
+         return -1;
+     }
+ 
+-    if (ctx-&gt;keymgmt == NULL)
++    if (ctx-&gt;keymgmt == NULL || ctx-&gt;op.keymgmt.genctx == NULL)
+         goto legacy;
+ 
+     ret = 1;
+@@ -309,13 +296,10 @@ static int fromdata_init(EVP_PKEY_CTX *ctx, int operation)
+         goto not_supported;
+ 
+     evp_pkey_ctx_free_old_ops(ctx);
+-    ctx-&gt;operation = operation;
+-    if (ctx-&gt;keymgmt == NULL)
+-        ctx-&gt;keymgmt = EVP_KEYMGMT_fetch(ctx-&gt;libctx, ctx-&gt;keytype,
+-                                         ctx-&gt;propquery);
+     if (ctx-&gt;keymgmt == NULL)
+         goto not_supported;
+ 
++    ctx-&gt;operation = operation;
+     return 1;
+ 
+  not_supported:
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index b8f4f740f0..f5e1131f06 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -138,12 +138,13 @@ EVP_PKEY_METHOD *EVP_PKEY_meth_new(int id, int flags)
+ 
+ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+                                  EVP_PKEY *pkey, ENGINE *e,
+-                                 const char *name, const char *propquery,
++                                 const char *keytype, const char *propquery,
+                                  int id)
+ 
+ {
+     EVP_PKEY_CTX *ret;
+     const EVP_PKEY_METHOD *pmeth = NULL;
++    EVP_KEYMGMT *keymgmt = NULL;
+ 
+     /*
+      * When using providers, the context is bound to the algo implementation
+@@ -160,11 +161,7 @@ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+         /* If we have an engine, something went wrong somewhere... */
+         if (!ossl_assert(e == NULL))
+             return NULL;
+-        name = evp_first_name(pkey-&gt;keymgmt-&gt;prov, pkey-&gt;keymgmt-&gt;name_id);
+-        /*
+-         * TODO: I wonder if the EVP_PKEY should have the name and propquery
+-         * that were used when building it....  /RL
+-         */
++        keytype = evp_first_name(pkey-&gt;keymgmt-&gt;prov, pkey-&gt;keymgmt-&gt;name_id);
+         goto common;
+     }
+ #ifndef FIPS_MODE
+@@ -187,10 +184,10 @@ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+      * since that can only happen internally, it's safe to make an
+      * assertion.
+      */
+-    if (!ossl_assert(e == NULL || name == NULL))
++    if (!ossl_assert(e == NULL || keytype == NULL))
+         return NULL;
+     if (e == NULL)
+-        name = OBJ_nid2sn(id);
++        keytype = OBJ_nid2sn(id);
+ 
+ # ifndef OPENSSL_NO_ENGINE
+     if (e == NULL &amp;&amp; pkey != NULL)
+@@ -225,6 +222,13 @@ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+     /* END legacy */
+ #endif /* FIPS_MODE */
+  common:
++    /*
++     * If there's no engine and there's a name, we try fetching a provider
++     * implementation.
++     */
++    if (e == NULL &amp;&amp; keytype != NULL)
++        keymgmt = EVP_KEYMGMT_fetch(libctx, keytype, propquery);
++
+     ret = OPENSSL_zalloc(sizeof(*ret));
+     if (ret == NULL) {
+ #if !defined(OPENSSL_NO_ENGINE) &amp;&amp; !defined(FIPS_MODE)
+@@ -234,8 +238,9 @@ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+         return NULL;
+     }
+     ret-&gt;libctx = libctx;
+-    ret-&gt;keytype = name;
+     ret-&gt;propquery = propquery;
++    ret-&gt;keytype = keytype;
++    ret-&gt;keymgmt = keymgmt;
+     ret-&gt;engine = e;
+     ret-&gt;pmeth = pmeth;
+     ret-&gt;operation = EVP_PKEY_OP_UNDEFINED;
+diff --git a/crypto/evp/signature.c b/crypto/evp/signature.c
+index acbe76592f..1f5e570ff8 100644
+--- a/crypto/evp/signature.c
++++ b/crypto/evp/signature.c
+@@ -359,7 +359,7 @@ static int evp_pkey_signature_init(EVP_PKEY_CTX *ctx, int operation)
+      */
+     ERR_set_mark();
+ 
+-    if (ctx-&gt;engine != NULL || ctx-&gt;keytype == NULL)
++    if (ctx-&gt;keymgmt == NULL)
+         goto legacy;
+ 
+     /*
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index c9d3075b82..2e0322fa98 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -23,14 +23,12 @@ struct evp_pkey_ctx_st {
+     int operation;
+ 
+     /*
+-     * Library context, Key type name and properties associated
+-     * with this context
++     * Library context, property query, keytype and keymgmt associated with
++     * this context
+      */
+     OPENSSL_CTX *libctx;
+-    const char *keytype;
+     const char *propquery;
+-
+-    /* cached key manager */
++    const char *keytype;
+     EVP_KEYMGMT *keymgmt;
+ 
+     union {
+diff --git a/test/recipes/30-test_evp_data/evppkey.txt b/test/recipes/30-test_evp_data/evppkey.txt
+index 1c85fdfaee..7633291756 100644
+--- a/test/recipes/30-test_evp_data/evppkey.txt
++++ b/test/recipes/30-test_evp_data/evppkey.txt
+@@ -312,12 +312,14 @@ Result = VERIFY_ERROR
+ # DigestInfo-wrapped MDC-2 signature
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0123456789ABCDEF&quot;
+ Output = 3a46e5e80635d3b5586187b44b08fd02ca0bd36a637a8afeb46a1c1eb18d05b3196e00edf85378109015bcd3d0cfcefc2919c5b8e3ac42884b360188b1395ed34df7d2749f36b91c320d290311d78b36f390481eff42ace0275385c05176d022e4b625cf0ed85082d4b25da9e8a86011f6ac1cb8d8b812cc2bbd6c240caa8445aa74f8e971c935dbf3447df0411eb9e5cdee0851d1e0fea7041916c77efc09dc54e8dd4b7ba8f8d85ef43d4f12abde99886f4ebd5f021fc1b476cc23dc6a94fbbe77c954eee496fb6b4b5c534daa4e819143ce8de511a8bcb65759750c17edaca6fb31ac271c1ca3a27705f780ae86c67009e76fcba9067dde3556ff59c44111
+ 
+ VerifyRecover = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = 3a46e5e80635d3b5586187b44b08fd02ca0bd36a637a8afeb46a1c1eb18d05b3196e00edf85378109015bcd3d0cfcefc2919c5b8e3ac42884b360188b1395ed34df7d2749f36b91c320d290311d78b36f390481eff42ace0275385c05176d022e4b625cf0ed85082d4b25da9e8a86011f6ac1cb8d8b812cc2bbd6c240caa8445aa74f8e971c935dbf3447df0411eb9e5cdee0851d1e0fea7041916c77efc09dc54e8dd4b7ba8f8d85ef43d4f12abde99886f4ebd5f021fc1b476cc23dc6a94fbbe77c954eee496fb6b4b5c534daa4e819143ce8de511a8bcb65759750c17edaca6fb31ac271c1ca3a27705f780ae86c67009e76fcba9067dde3556ff59c44111
+ Output = &quot;0123456789ABCDEF&quot;
+@@ -325,12 +327,14 @@ Output = &quot;0123456789ABCDEF&quot;
+ # Legacy OCTET STRING MDC-2 signature
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0123456789ABCDEF&quot;
+ Output = 6cde46bbfc6a3b772c3d884640709be9f2fb70fcf199c14eaff7811369ea99733f984a9c48cd372578fa37cedeef24c93286d6d64f438df051e625ab2e125a7d9974a76240873e43efc3acbcbdccc2ee63769cdbf983b334ccb982273315c222b3bbdc3e928ac8a141a7412f1f794cfcabcc069a2ae4975d7bb68bea145d789634c9e0b02d324b5efd599c9bf2b1d32d077aba59aa0ad4a82cbbb90eaa9214e4f57104cf049c4139e2ddecf6edf219cd986f4d79cf25128c58667562c9d22be0291430d6cc7dad977d56e08315fcec133ea95d8db550f89735b4d5f233eaff0c86fce2b99f3f508e920f882c31f3e13f8775a3c8fa585c4f4c69eca89f648b7e
+ 
+ VerifyRecover = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = 6cde46bbfc6a3b772c3d884640709be9f2fb70fcf199c14eaff7811369ea99733f984a9c48cd372578fa37cedeef24c93286d6d64f438df051e625ab2e125a7d9974a76240873e43efc3acbcbdccc2ee63769cdbf983b334ccb982273315c222b3bbdc3e928ac8a141a7412f1f794cfcabcc069a2ae4975d7bb68bea145d789634c9e0b02d324b5efd599c9bf2b1d32d077aba59aa0ad4a82cbbb90eaa9214e4f57104cf049c4139e2ddecf6edf219cd986f4d79cf25128c58667562c9d22be0291430d6cc7dad977d56e08315fcec133ea95d8db550f89735b4d5f233eaff0c86fce2b99f3f508e920f882c31f3e13f8775a3c8fa585c4f4c69eca89f648b7e
+ Output = &quot;0123456789ABCDEF&quot;
+@@ -338,6 +342,7 @@ Output = &quot;0123456789ABCDEF&quot;
+ # Legacy OCTET STRING MDC-2 signature, digest mismatch
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0000000000000000&quot;
+ Output = 6cde46bbfc6a3b772c3d884640709be9f2fb70fcf199c14eaff7811369ea99733f984a9c48cd372578fa37cedeef24c93286d6d64f438df051e625ab2e125a7d9974a76240873e43efc3acbcbdccc2ee63769cdbf983b334ccb982273315c222b3bbdc3e928ac8a141a7412f1f794cfcabcc069a2ae4975d7bb68bea145d789634c9e0b02d324b5efd599c9bf2b1d32d077aba59aa0ad4a82cbbb90eaa9214e4f57104cf049c4139e2ddecf6edf219cd986f4d79cf25128c58667562c9d22be0291430d6cc7dad977d56e08315fcec133ea95d8db550f89735b4d5f233eaff0c86fce2b99f3f508e920f882c31f3e13f8775a3c8fa585c4f4c69eca89f648b7e
+@@ -346,6 +351,7 @@ Result = VERIFY_ERROR
+ # Legacy OCTET STRING MDC-2 signature, wrong input digest length
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0123456789ABCDE&quot;
+ Output = 6cde46bbfc6a3b772c3d884640709be9f2fb70fcf199c14eaff7811369ea99733f984a9c48cd372578fa37cedeef24c93286d6d64f438df051e625ab2e125a7d9974a76240873e43efc3acbcbdccc2ee63769cdbf983b334ccb982273315c222b3bbdc3e928ac8a141a7412f1f794cfcabcc069a2ae4975d7bb68bea145d789634c9e0b02d324b5efd599c9bf2b1d32d077aba59aa0ad4a82cbbb90eaa9214e4f57104cf049c4139e2ddecf6edf219cd986f4d79cf25128c58667562c9d22be0291430d6cc7dad977d56e08315fcec133ea95d8db550f89735b4d5f233eaff0c86fce2b99f3f508e920f882c31f3e13f8775a3c8fa585c4f4c69eca89f648b7e
+@@ -354,6 +360,7 @@ Result = VERIFY_ERROR
+ # Legacy OCTET STRING MDC-2 signature, wrong signature digest length
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0123456789ABCDEF&quot;
+ Output = 08da512483ece70be57f28a75271612800ae30ffbadc62609bc88b80d497a1fc13c300fdfcab6dc80cf55373c10adcc249ae80479b87fa3e391a2cd4a74babd1c22a4976812d544dcd6729b161bbc48fd067cf635b05f9edaddaeb6f67f2117d6b54a23c5e6f08a246abfe0356a67d7f3929306515e6d9962f8ce205120ecdcd2d4e3783cd0b4a1f0196a1b13924d0d3649233312695c3c336ae04e0b1efddabcc878b57622db60f6f747a1124c38426dacf1425c92d304c2bb1052f987c1dd73e4cc4b20d23396d4f05f52f98cf5065c3fb7dc319425f1f6f1878b87f57afbd24fbff98909494581aadd04d80a639b85ce8684ea58409d8dbbbaacf256bb5c4
+@@ -361,6 +368,7 @@ Result = VERIFY_ERROR
+ 
+ VerifyRecover = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = 08da512483ece70be57f28a75271612800ae30ffbadc62609bc88b80d497a1fc13c300fdfcab6dc80cf55373c10adcc249ae80479b87fa3e391a2cd4a74babd1c22a4976812d544dcd6729b161bbc48fd067cf635b05f9edaddaeb6f67f2117d6b54a23c5e6f08a246abfe0356a67d7f3929306515e6d9962f8ce205120ecdcd2d4e3783cd0b4a1f0196a1b13924d0d3649233312695c3c336ae04e0b1efddabcc878b57622db60f6f747a1124c38426dacf1425c92d304c2bb1052f987c1dd73e4cc4b20d23396d4f05f52f98cf5065c3fb7dc319425f1f6f1878b87f57afbd24fbff98909494581aadd04d80a639b85ce8684ea58409d8dbbbaacf256bb5c4
+ Result = KEYOP_ERROR
+@@ -368,6 +376,7 @@ Result = KEYOP_ERROR
+ # Legacy OCTET STRING MDC-2 signature, wrong input and signature digest length
+ Verify = RSA-2048
+ Availablein = default
++Availablein = legacy
+ Ctrl = digest:MDC2
+ Input = &quot;0123456789ABCDE&quot;
+ Output = 08da512483ece70be57f28a75271612800ae30ffbadc62609bc88b80d497a1fc13c300fdfcab6dc80cf55373c10adcc249ae80479b87fa3e391a2cd4a74babd1c22a4976812d544dcd6729b161bbc48fd067cf635b05f9edaddaeb6f67f2117d6b54a23c5e6f08a246abfe0356a67d7f3929306515e6d9962f8ce205120ecdcd2d4e3783cd0b4a1f0196a1b13924d0d3649233312695c3c336ae04e0b1efddabcc878b57622db60f6f747a1124c38426dacf1425c92d304c2bb1052f987c1dd73e4cc4b20d23396d4f05f52f98cf5065c3fb7dc319425f1f6f1878b87f57afbd24fbff98909494581aadd04d80a639b85ce8684ea58409d8dbbbaacf256bb5c4
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027971.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027978.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27974">[ date ]</a>
+              <a href="thread.html#27974">[ thread ]</a>
+              <a href="subject.html#27974">[ subject ]</a>
+              <a href="author.html#27974">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

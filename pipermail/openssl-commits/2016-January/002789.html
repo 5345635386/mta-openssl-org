@@ -1,0 +1,388 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452578447.205421.28820.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002788.html">
+   <LINK REL="Next"  HREF="002792.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452578447.205421.28820.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Tue Jan 12 06:00:47 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002788.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002792.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2789">[ date ]</a>
+              <a href="thread.html#2789">[ thread ]</a>
+              <a href="subject.html#2789">[ subject ]</a>
+              <a href="author.html#2789">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  bd4850df648bee9d8e0595b7e1147266e6f55a3e (commit)
+      from  2bec39eb86986349d2538fffc821f2e1106cee14 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit bd4850df648bee9d8e0595b7e1147266e6f55a3e
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Mon Jan 11 20:40:38 2016 -0500
+
+    RT4227: Range-check in apps.
+    
+    Implement range-checking in all counts in apps.  Turns out only a couple
+    of cases were missing.  And make the range-checking code more strict.
+    Replace almost all opt_ulong() calls with opt_long()
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/dsaparam.c |   2 +-
+ apps/enc.c      |   6 ++-
+ apps/opt.c      | 126 +++++++++++++++++++++++++-------------------------------
+ apps/pkcs8.c    |   8 ++--
+ apps/rand.c     |   4 +-
+ 5 files changed, 67 insertions(+), 79 deletions(-)
+
+diff --git a/apps/dsaparam.c b/apps/dsaparam.c
+index 1689350..c8c383f 100644
+--- a/apps/dsaparam.c
++++ b/apps/dsaparam.c
+@@ -180,7 +180,7 @@ int dsaparam_main(int argc, char **argv)
+     argv = opt_rest();
+ 
+     if (argc == 1) {
+-        if (!opt_int(argv[0], &amp;num))
++        if (!opt_int(argv[0], &amp;num) || num &lt; 0)
+             goto end;
+         /* generate a key */
+         numbits = num;
+diff --git a/apps/enc.c b/apps/enc.c
+index 58d2550..17cc8e8 100644
+--- a/apps/enc.c
++++ b/apps/enc.c
+@@ -58,6 +58,7 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;limits.h&gt;
+ #include &quot;apps.h&quot;
+ #include &lt;openssl/bio.h&gt;
+ #include &lt;openssl/err.h&gt;
+@@ -142,7 +143,7 @@ int enc_main(int argc, char **argv)
+     int ret = 1, inl, nopad = 0;
+     unsigned char key[EVP_MAX_KEY_LENGTH], iv[EVP_MAX_IV_LENGTH];
+     unsigned char *buff = NULL, salt[PKCS5_SALT_LEN];
+-    unsigned long n;
++    long n;
+ #ifdef ZLIB
+     int do_zlib = 0;
+     BIO *bzl = NULL;
+@@ -236,7 +237,8 @@ int enc_main(int argc, char **argv)
+             k = i &gt;= 1 &amp;&amp; p[i] == 'k';
+             if (k)
+                 p[i] = '\0';
+-            if (!opt_ulong(opt_arg(), &amp;n))
++            if (!opt_long(opt_arg(), &amp;n)
++                    || n &lt; 0 || (k &amp;&amp; n &gt;= LONG_MAX / 1024))
+                 goto opthelp;
+             if (k)
+                 n *= 1024;
+diff --git a/apps/opt.c b/apps/opt.c
+index 853c981..1bd3965 100644
+--- a/apps/opt.c
++++ b/apps/opt.c
+@@ -57,6 +57,7 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;errno.h&gt;
+ #include &lt;ctype.h&gt;
++#include &lt;limits.h&gt;
+ #include &lt;openssl/bio.h&gt;
+ 
+ #define MAX_OPT_HELP_WIDTH 30
+@@ -350,30 +351,16 @@ int opt_pair(const char *name, const OPT_PAIR* pairs, int *result)
+     return 0;
+ }
+ 
+-/* See if cp looks like a hex number, in case user left off the 0x */
+-static int scanforhex(const char *cp)
+-{
+-    if (*cp == '0' &amp;&amp; (cp[1] == 'x' || cp[1] == 'X'))
+-        return 16;
+-    for (; *cp; cp++)
+-        /* Look for a hex digit that isn't a regular digit. */
+-        if (isxdigit(*cp) &amp;&amp; !isdigit(*cp))
+-            return 16;
+-    return 0;
+-}
+-
+ /* Parse an int, put it into *result; return 0 on failure, else 1. */
+ int opt_int(const char *value, int *result)
+ {
+-    const char *fmt = &quot;%d&quot;;
+-    int base = scanforhex(value);
+-
+-    if (base == 16)
+-        fmt = &quot;%x&quot;;
+-    else if (*value == '0')
+-        fmt = &quot;%o&quot;;
+-    if (sscanf(value, fmt, result) != 1) {
+-        BIO_printf(bio_err, &quot;%s: Can't parse \&quot;%s\&quot; as a number\n&quot;,
++    long l;
++
++    if (!opt_long(value, &amp;l))
++        return 0;
++    *result = (int)l;
++    if (*result != l) {
++        BIO_printf(bio_err, &quot;%s: Value \&quot;%s\&quot; outside integer range\n&quot;,
+                    prog, value);
+         return 0;
+     }
+@@ -383,15 +370,22 @@ int opt_int(const char *value, int *result)
+ /* Parse a long, put it into *result; return 0 on failure, else 1. */
+ int opt_long(const char *value, long *result)
+ {
+-    char *endptr;
+-    int base = scanforhex(value);
+-
+-    *result = strtol(value, &amp;endptr, base);
+-    if (*endptr) {
+-        BIO_printf(bio_err,
+-                   &quot;%s: Bad char %c in number %s\n&quot;, prog, *endptr, value);
++    int oerrno = errno;
++    long l;
++    char *endp;
++
++    l = strtol(value, &amp;endp, 0);
++    if (*endp
++            || endp == value
++            || ((l == LONG_MAX || l == LONG_MIN) &amp;&amp; errno == ERANGE)
++            || (l == 0 &amp;&amp; errno != 0)) {
++        BIO_printf(bio_err, &quot;%s: Can't parse \&quot;%s\&quot; as a number\n&quot;,
++                   prog, value);
++        errno = oerrno;
+         return 0;
+     }
++    *result = l;
++    errno = oerrno;
+     return 1;
+ }
+ 
+@@ -400,15 +394,22 @@ int opt_long(const char *value, long *result)
+  */
+ int opt_ulong(const char *value, unsigned long *result)
+ {
++    int oerrno = errno;
+     char *endptr;
+-    int base = scanforhex(value);
+-
+-    *result = strtoul(value, &amp;endptr, base);
+-    if (*endptr) {
+-        BIO_printf(bio_err,
+-                   &quot;%s: Bad char %c in number %s\n&quot;, prog, *endptr, value);
++    unsigned long l;
++
++    l = strtoul(value, &amp;endptr, 0);
++    if (*endptr
++            || endptr == value
++            || ((l == ULONG_MAX) &amp;&amp; errno == ERANGE)
++            || (l == 0 &amp;&amp; errno != 0)) {
++        BIO_printf(bio_err, &quot;%s: Can't parse \&quot;%s\&quot; as an unsigned number\n&quot;,
++                   prog, value);
++        errno = oerrno;
+         return 0;
+     }
++    *result = l;
++    errno = oerrno;
+     return 1;
+ }
+ 
+@@ -421,7 +422,7 @@ enum range { OPT_V_ENUM };
+ 
+ int opt_verify(int opt, X509_VERIFY_PARAM *vpm)
+ {
+-    unsigned long ul;
++    long l;
+     int i;
+     ASN1_OBJECT *otmp;
+     X509_PURPOSE *xptmp;
+@@ -468,9 +469,10 @@ int opt_verify(int opt, X509_VERIFY_PARAM *vpm)
+             X509_VERIFY_PARAM_set_depth(vpm, i);
+         break;
+     case OPT_V_ATTIME:
+-        opt_ulong(opt_arg(), &amp;ul);
+-        if (ul)
+-            X509_VERIFY_PARAM_set_time(vpm, (time_t)ul);
++        /* If we have C99 we could use intmax_t for all time_t values */
++        opt_long(opt_arg(), &amp;l);
++        if (l)
++            X509_VERIFY_PARAM_set_time(vpm, (time_t)l);
+         break;
+     case OPT_V_VERIFY_HOSTNAME:
+         if (!X509_VERIFY_PARAM_set1_host(vpm, opt_arg(), 0))
+@@ -558,11 +560,9 @@ int opt_verify(int opt, X509_VERIFY_PARAM *vpm)
+ int opt_next(void)
+ {
+     char *p;
+-    char *endptr;
+     const OPTIONS *o;
+-    int dummy;
+-    int base;
+-    long val;
++    int ival;
++    unsigned long uval;
+ 
+     /* Look at current arg; at end of the list? */
+     arg = NULL;
+@@ -613,10 +613,6 @@ int opt_next(void)
+         }
+ 
+         /* Syntax-check value. */
+-        /*
+-         * Do some basic syntax-checking on the value.  These tests aren't
+-         * perfect (ignore range overflow) but they catch common failures.
+-         */
+         switch (o-&gt;valtype) {
+         default:
+         case 's':
+@@ -645,35 +641,27 @@ int opt_next(void)
+             return -1;
+         case 'p':
+         case 'n':
+-            base = scanforhex(arg);
+-            val = strtol(arg, &amp;endptr, base);
+-            if (*endptr == '\0') {
+-                if (o-&gt;valtype == 'p' &amp;&amp; val &lt;= 0) {
+-                    BIO_printf(bio_err,
+-                               &quot;%s: Non-positive number \&quot;%s\&quot; for -%s\n&quot;,
+-                               prog, arg, o-&gt;name);
+-                    return -1;
+-                }
+-                break;
++            if (!opt_int(arg, &amp;ival)
++                    || (o-&gt;valtype == 'p' &amp;&amp; ival &lt;= 0)) {
++                BIO_printf(bio_err,
++                           &quot;%s: Non-positive number \&quot;%s\&quot; for -%s\n&quot;,
++                           prog, arg, o-&gt;name);
++                return -1;
+             }
+-            BIO_printf(bio_err,
+-                       &quot;%s: Invalid number \&quot;%s\&quot; for -%s\n&quot;,
+-                       prog, arg, o-&gt;name);
+-            return -1;
++            break;
+         case 'u':
+-            base = scanforhex(arg);
+-            strtoul(arg, &amp;endptr, base);
+-            if (*endptr == '\0')
+-                break;
+-            BIO_printf(bio_err,
+-                       &quot;%s: Invalid number \&quot;%s\&quot; for -%s\n&quot;,
+-                       prog, arg, o-&gt;name);
+-            return -1;
++            if (!opt_ulong(arg, &amp;uval)) {
++                BIO_printf(bio_err,
++                           &quot;%s: Invalid number \&quot;%s\&quot; for -%s\n&quot;,
++                           prog, arg, o-&gt;name);
++                return -1;
++            }
++            break;
+         case 'f':
+         case 'F':
+             if (opt_format(arg,
+                            o-&gt;valtype == 'F' ? OPT_FMT_PEMDER
+-                           : OPT_FMT_ANY, &amp;dummy))
++                           : OPT_FMT_ANY, &amp;ival))
+                 break;
+             BIO_printf(bio_err,
+                        &quot;%s: Invalid format \&quot;%s\&quot; for -%s\n&quot;,
+diff --git a/apps/pkcs8.c b/apps/pkcs8.c
+index 3d7282e..5db78fc 100644
+--- a/apps/pkcs8.c
++++ b/apps/pkcs8.c
+@@ -121,7 +121,7 @@ int pkcs8_main(int argc, char **argv)
+     int informat = FORMAT_PEM, outformat = FORMAT_PEM, topk8 = 0, pbe_nid = -1;
+     int private = 0;
+ #ifndef OPENSSL_NO_SCRYPT
+-    unsigned long scrypt_N = 0, scrypt_r = 0, scrypt_p = 0;
++    long scrypt_N = 0, scrypt_r = 0, scrypt_p = 0;
+ #endif
+ 
+     prog = opt_init(argc, argv, pkcs8_options);
+@@ -210,15 +210,15 @@ int pkcs8_main(int argc, char **argv)
+                 cipher = EVP_aes_256_cbc();
+             break;
+         case OPT_SCRYPT_N:
+-            if (!opt_ulong(opt_arg(), &amp;scrypt_N))
++            if (!opt_long(opt_arg(), &amp;scrypt_N) || scrypt_N &lt;= 0)
+                 goto opthelp;
+             break;
+         case OPT_SCRYPT_R:
+-            if (!opt_ulong(opt_arg(), &amp;scrypt_r))
++            if (!opt_long(opt_arg(), &amp;scrypt_r) || scrypt_r &lt;= 0)
+                 goto opthelp;
+             break;
+         case OPT_SCRYPT_P:
+-            if (!opt_ulong(opt_arg(), &amp;scrypt_p))
++            if (!opt_long(opt_arg(), &amp;scrypt_p) || scrypt_p &lt;= 0)
+                 goto opthelp;
+             break;
+ #endif
+diff --git a/apps/rand.c b/apps/rand.c
+index 150eef4..bd6fdff 100644
+--- a/apps/rand.c
++++ b/apps/rand.c
+@@ -121,9 +121,7 @@ int rand_main(int argc, char **argv)
+     argc = opt_num_rest();
+     argv = opt_rest();
+ 
+-    if (argc != 1)
+-        goto opthelp;
+-    if (sscanf(argv[0], &quot;%d&quot;, &amp;num) != 1 || num &lt; 0)
++    if (argc != 1 || !opt_int(argv[0], &amp;num) || num &lt; 0)
+         goto opthelp;
+ 
+     app_RAND_load_file(NULL, (inrand != NULL));
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002788.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002792.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2789">[ date ]</a>
+              <a href="thread.html#2789">[ thread ]</a>
+              <a href="subject.html#2789">[ subject ]</a>
+              <a href="author.html#2789">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,195 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1431537591.625231.21786.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001089.html">
+   <LINK REL="Next"  HREF="001091.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1431537591.625231.21786.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed May 13 17:19:51 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001089.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001091.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1090">[ date ]</a>
+              <a href="thread.html#1090">[ thread ]</a>
+              <a href="subject.html#1090">[ subject ]</a>
+              <a href="author.html#1090">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  fc3cec53501ec226a493b0b04b9dd0a6f7944b0f (commit)
+      from  580139bd5b46c856b4c613fac6c27b011ec2e949 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit fc3cec53501ec226a493b0b04b9dd0a6f7944b0f
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Fri May 1 23:36:11 2015 -0400
+
+    Fix ocsp bugs
+    
+    Various bugs found by Viktor, Emilia, Matt, etc.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/ocsp.c | 58 +++++++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 37 insertions(+), 21 deletions(-)
+
+diff --git a/apps/ocsp.c b/apps/ocsp.c
+index d4538a8..4d44da8 100644
+--- a/apps/ocsp.c
++++ b/apps/ocsp.c
+@@ -1035,21 +1035,26 @@ static BIO *init_responder(const char *port)
+ }
+ 
+ 
+-static char *urldecode(char *p)
++/*
++ * Decode %xx URL-decoding in-place. Ignores mal-formed sequences.
++ */
++static int urldecode(char *p)
+ {
+     unsigned char *out = (unsigned char *)p;
+-    char *save = p;
++    unsigned char *save = out;
+ 
+     for (; *p; p++) {
+         if (*p != '%')
+             *out++ = *p;
+-        else if (p[1] &amp;&amp; p[2]) {
++        else if (isxdigit(p[1]) &amp;&amp; isxdigit(p[2])) {
+             *out++ = (app_hex(p[1]) &lt;&lt; 4) | app_hex(p[2]);
+             p += 2;
+         }
++        else
++            return -1;
+     }
+-    *p = '\0';
+-    return save;
++    *out = '\0';
++    return (int)(out - save);
+ }
+ 
+ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+@@ -1057,7 +1062,7 @@ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+ {
+     int len;
+     OCSP_REQUEST *req = NULL;
+-    char inbuf[2048];
++    char inbuf[2048], reqbuf[2048];
+     char *p, *q;
+     BIO *cbio = NULL, *getbio = NULL, *b64 = NULL;
+ 
+@@ -1071,40 +1076,51 @@ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+     *pcbio = cbio;
+ 
+     /* Read the request line. */
+-    len = BIO_gets(cbio, inbuf, sizeof inbuf);
++    len = BIO_gets(cbio, reqbuf, sizeof reqbuf);
+     if (len &lt;= 0)
+         return 1;
+-    if (strncmp(inbuf, &quot;GET&quot;, 3) == 0) {
++    if (strncmp(reqbuf, &quot;GET &quot;, 4) == 0) {
+         /* Expecting GET {sp} /URL {sp} HTTP/1.x */
+-        for (p = inbuf + 3; *p == ' ' || *p == '\t'; ++p)
++        for (p = reqbuf + 4; *p == ' '; ++p)
+             continue;
+-        if (*p) {
+-            /* Move past the slash before the URL part. */
+-            p++;
++        if (*p != '/') {
++            BIO_printf(bio_err, &quot;Invalid request -- bad URL\n&quot;);
++            return 1;
+         }
++        p++;
++
+         /* Splice off the HTTP version identifier. */
+         for (q = p; *q; q++)
+-            if (*q == ' ' || *q == '\t')
++            if (*q == ' ')
+                 break;
+-        if (*q == '\0') {
+-            BIO_printf(bio_err, &quot;Invalid request\n&quot;);
++        if (strncmp(q, &quot; HTTP/1.&quot;, 8) != 0) {
++            BIO_printf(bio_err, &quot;Invalid request -- bad HTTP vesion\n&quot;);
+             return 1;
+         }
+         *q = '\0';
+-        p = urldecode(p);
+-        getbio = BIO_new_mem_buf(p, strlen(p));
+-        b64 = BIO_new(BIO_f_base64());
++        len = urldecode(p);
++        if (len &lt;= 0) {
++            BIO_printf(bio_err, &quot;Invalid request -- bad URL encoding\n&quot;);
++            return 1;
++        }
++        if ((getbio = BIO_new_mem_buf(p, len)) == NULL
++            || (b64 = BIO_new(BIO_f_base64())) == NULL) {
++            BIO_printf(bio_err, &quot;Could not allocate memory\n&quot;);
++            ERR_print_errors(bio_err);
++            return 1;
++        }
+         BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+         getbio = BIO_push(b64, getbio);
+-    } else if (strncmp(inbuf, &quot;POST&quot;, 4) != 0) {
+-        BIO_printf(bio_err, &quot;Invalid request\n&quot;);
++    } else if (strncmp(reqbuf, &quot;POST &quot;, 5) != 0) {
++        BIO_printf(bio_err, &quot;Invalid request -- bad HTTP verb\n&quot;);
+         return 1;
+     }
++
++    /* Read and skip past the headers. */
+     for (;;) {
+         len = BIO_gets(cbio, inbuf, sizeof inbuf);
+         if (len &lt;= 0)
+             return 1;
+-        /* Look for end of headers */
+         if ((inbuf[0] == '\r') || (inbuf[0] == '\n'))
+             break;
+     }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001089.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001091.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1090">[ date ]</a>
+              <a href="thread.html#1090">[ thread ]</a>
+              <a href="subject.html#1090">[ subject ]</a>
+              <a href="author.html#1090">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

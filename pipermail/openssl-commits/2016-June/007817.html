@@ -1,0 +1,450 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1465044095.859185.22345.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007814.html">
+   <LINK REL="Next"  HREF="007819.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Kurt Roeckx</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1465044095.859185.22345.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kurt at openssl.org
+       </A><BR>
+    <I>Sat Jun  4 12:41:35 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007814.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007819.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7817">[ date ]</a>
+              <a href="thread.html#7817">[ thread ]</a>
+              <a href="subject.html#7817">[ subject ]</a>
+              <a href="author.html#7817">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f59d0131cb6fc224aee0a0a92de1f04cdebe97c8 (commit)
+      from  255cf605d67e72b73e6130d4c7bbe68c0eb22d8e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f59d0131cb6fc224aee0a0a92de1f04cdebe97c8
+Author: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+Date:   Sat May 7 22:09:13 2016 +0200
+
+    Add support for fuzzing with AFL
+    
+    Reviewed-by: Ben Laurie &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">ben at links.org</A>&gt;
+    
+    MR: #2740
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Configure        | 21 ++++++++++++++++++---
+ fuzz/README.md   | 25 ++++++++++++++++++++++++-
+ fuzz/asn1.c      |  2 +-
+ fuzz/asn1parse.c |  2 +-
+ fuzz/bignum.c    |  2 +-
+ fuzz/bndiv.c     |  2 +-
+ fuzz/build.info  | 57 ++++++++++++++++++++++++++++++++------------------------
+ fuzz/cms.c       |  2 +-
+ fuzz/conf.c      |  2 +-
+ fuzz/ct.c        |  2 +-
+ fuzz/driver.c    | 51 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ fuzz/fuzzer.h    |  4 ++--
+ fuzz/server.c    |  2 +-
+ 13 files changed, 136 insertions(+), 38 deletions(-)
+ create mode 100644 fuzz/driver.c
+
+diff --git a/Configure b/Configure
+index e8fc933..3064151 100755
+--- a/Configure
++++ b/Configure
+@@ -301,7 +301,8 @@ my @disablables = (
+     &quot;engine&quot;,
+     &quot;err&quot;,
+     &quot;filenames&quot;,
+-    &quot;fuzz&quot;,
++    &quot;fuzz-libfuzzer&quot;,
++    &quot;fuzz-afl&quot;,
+     &quot;gost&quot;,
+     &quot;heartbeats&quot;,
+     &quot;hw(-.+)?&quot;,
+@@ -365,7 +366,8 @@ our %disabled = ( # &quot;what&quot;         =&gt; &quot;comment&quot;
+                   &quot;asan&quot;		=&gt; &quot;default&quot;,
+ 		  &quot;ec_nistp_64_gcc_128&quot; =&gt; &quot;default&quot;,
+ 		  &quot;egd&quot;                 =&gt; &quot;default&quot;,
+-		  &quot;fuzz&quot;		=&gt; &quot;default&quot;,
++		  &quot;fuzz-libfuzzer&quot;	=&gt; &quot;default&quot;,
++		  &quot;fuzz-afl&quot;		=&gt; &quot;default&quot;,
+ 		  &quot;md2&quot;                 =&gt; &quot;default&quot;,
+ 		  &quot;rc5&quot;                 =&gt; &quot;default&quot;,
+ 		  &quot;sctp&quot;                =&gt; &quot;default&quot;,
+@@ -698,6 +700,14 @@ foreach (@argvcopy)
+ 			{
+ 			$withargs{zlib_include}=$1;
+ 			}
++		elsif (/^--with-fuzzer-lib=(.*)$/)
++			{
++			$withargs{fuzzer_lib}=$1;
++			}
++		elsif (/^--with-fuzzer-include=(.*)$/)
++			{
++			$withargs{fuzzer_include}=$1;
++			}
+ 		elsif (/^--with-fipslibdir=(.*)$/)
+ 			{
+ 			$config{fipslibdir}=&quot;$1/&quot;;
+@@ -1042,11 +1052,15 @@ if ($disabled{&quot;dynamic-engine&quot;}) {
+         $config{dynamic_engines} = 1;
+ }
+ 
+-unless ($disabled{fuzz}) {
++unless ($disabled{&quot;fuzz-libfuzzer&quot;}) {
+     push @{$config{dirs}}, &quot;fuzz&quot;;
+     $config{cflags} .= &quot;-fsanitize-coverage=edge,indirect-calls &quot;;
+ }
+ 
++unless ($disabled{&quot;fuzz-afl&quot;}) {
++    push @{$config{dirs}}, &quot;fuzz&quot;;
++}
++
+ unless ($disabled{asan}) {
+     $config{cflags} .= &quot;-fsanitize=address &quot;;
+ }
+@@ -1379,6 +1393,7 @@ if ($builder eq &quot;unified&quot;) {
+             $template-&gt;fill_in(HASH =&gt; { config =&gt; \%config,
+                                          target =&gt; \%target,
+                                          disabled =&gt; \%disabled,
++                                         withargs =&gt; \%withargs,
+                                          builddir =&gt; abs2rel($buildd, $blddir),
+                                          sourcedir =&gt; abs2rel($sourced, $blddir),
+                                          buildtop =&gt; abs2rel($blddir, $blddir),
+diff --git a/fuzz/README.md b/fuzz/README.md
+index 9b6d7d7..e9ec88b 100644
+--- a/fuzz/README.md
++++ b/fuzz/README.md
+@@ -1,5 +1,8 @@
+ # I Can Haz Fuzz?
+ 
++LibFuzzer
++=========
++
+ Or, how to fuzz OpenSSL with [libfuzzer](llvm.org/docs/LibFuzzer.html).
+ 
+ Starting from a vanilla+OpenSSH server Ubuntu install.
+@@ -32,7 +35,10 @@ <A HREF="https://github.com/llvm-mirror/llvm/tree/master/lib/Fuzzer">https://github.com/llvm-mirror/llvm/tree/master/lib/Fuzzer</A> if you prefer):
+ 
+ Configure for fuzzing:
+ 
+-    $ CC=clang ./config enable-fuzz enable-asan enable-ubsan no-shared
++    $ CC=clang ./config enable-fuzz-libfuzzer \
++            --with-fuzzer-include=../../svn-work/Fuzzer \
++            --with-fuzzer-lib=../../svn-work/Fuzzer/libFuzzer \
++            enable-asan enable-ubsan no-shared
+     $ sudo apt-get install make
+     $ LDCMD=clang++ make -j
+     $ fuzz/helper.py &lt;fuzzer&gt; &lt;arguments&gt;
+@@ -45,3 +51,20 @@ If you get a crash, you should find a corresponding input file in
+ `fuzz/corpora/&lt;fuzzer&gt;-crash/`. You can reproduce the crash with
+ 
+     $ fuzz/&lt;fuzzer&gt; &lt;crashfile&gt;
++
++AFL
++===
++
++Configure for fuzzing:
++
++    $ sudo apt-get install afl-clang
++    $ CC=afl-clang-fast ./config enable-fuzz-afl no-shared
++    $ make
++
++Run one of the fuzzers:
++
++    $ afl-fuzz fuzz/&lt;fuzzer&gt; -i fuzz/corpora/&lt;fuzzer&gt; -o fuzz/corpora/&lt;fuzzer&gt;/out &lt;fuzzer&gt; &lt;arguments&gt;
++
++Where `&lt;fuzzer&gt;` is one of the executables in `fuzz/`. Most fuzzers do not
++need any command line arguments, but, for example, `asn1` needs the name of a
++data type.
+diff --git a/fuzz/asn1.c b/fuzz/asn1.c
+index fdf4c5e..66825f1 100644
+--- a/fuzz/asn1.c
++++ b/fuzz/asn1.c
+@@ -60,7 +60,7 @@ static const ASN1_ITEM *item_type[] = {
+     NULL
+ };
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     for (int n = 0; item_type[n] != NULL; ++n) {
+         const uint8_t *b = buf;
+         ASN1_VALUE *o = ASN1_item_d2i(NULL, &amp;b, len, item_type[n]);
+diff --git a/fuzz/asn1parse.c b/fuzz/asn1parse.c
+index 63104fb..2fe420b 100644
+--- a/fuzz/asn1parse.c
++++ b/fuzz/asn1parse.c
+@@ -18,7 +18,7 @@
+ #include &lt;openssl/x509v3.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     static BIO *bio_out;
+ 
+     if (bio_out == NULL)
+diff --git a/fuzz/bignum.c b/fuzz/bignum.c
+index 28a439e..643e6e7 100644
+--- a/fuzz/bignum.c
++++ b/fuzz/bignum.c
+@@ -17,7 +17,7 @@
+ #include &lt;openssl/bn.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     int success = 0;
+     static BN_CTX *ctx;
+     static BN_MONT_CTX *mont;
+diff --git a/fuzz/bndiv.c b/fuzz/bndiv.c
+index c897de9..5212811 100644
+--- a/fuzz/bndiv.c
++++ b/fuzz/bndiv.c
+@@ -17,7 +17,7 @@
+ #include &lt;openssl/bn.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     int success = 0;
+     static BN_CTX *ctx;
+     static BIGNUM *b1;
+diff --git a/fuzz/build.info b/fuzz/build.info
+index 3569418..762ddf8 100644
+--- a/fuzz/build.info
++++ b/fuzz/build.info
+@@ -1,33 +1,42 @@
++{- use File::Spec::Functions;
++   our $ex_inc = $withargs{fuzzer_include} &amp;&amp;
++       (file_name_is_absolute($withargs{fuzzer_include}) ?
++        $withargs{fuzzer_include} : catdir(updir(), $withargs{fuzzer_include}));
++   our $ex_lib = $withargs{fuzzer_lib} &amp;&amp;
++       (file_name_is_absolute($withargs{fuzzer_lib}) ?
++        $withargs{fuzzer_lib} : catfile(updir(), $withargs{fuzzer_lib}));
++   &quot;&quot;
++-}
+ PROGRAMS=asn1 asn1parse bignum bndiv cms conf ct server
+ 
+-SOURCE[asn1]=asn1.c
+-INCLUDE[asn1]=../include ../../../svn-work/Fuzzer
+-DEPEND[asn1]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[asn1]=asn1.c driver.c
++INCLUDE[asn1]=../include {- $ex_inc -}
++DEPEND[asn1]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[asn1parse]=asn1parse.c
+-INCLUDE[asn1parse]=../include ../../../svn-work/Fuzzer
+-DEPEND[asn1parse]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[asn1parse]=asn1parse.c driver.c
++INCLUDE[asn1parse]=../include {- $ex_inc -}
++DEPEND[asn1parse]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[bignum]=bignum.c
+-INCLUDE[bignum]=../include ../../../svn-work/Fuzzer
+-DEPEND[bignum]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[bignum]=bignum.c driver.c
++INCLUDE[bignum]=../include {- $ex_inc -}
++DEPEND[bignum]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[bndiv]=bndiv.c
+-INCLUDE[bndiv]=../include ../../../svn-work/Fuzzer
+-DEPEND[bndiv]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[bndiv]=bndiv.c driver.c
++INCLUDE[bndiv]=../include {- $ex_inc -}
++DEPEND[bndiv]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[cms]=cms.c
+-INCLUDE[cms]=../include ../../../svn-work/Fuzzer
+-DEPEND[cms]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[cms]=cms.c driver.c
++INCLUDE[cms]=../include {- $ex_inc -}
++DEPEND[cms]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[conf]=conf.c
+-INCLUDE[conf]=../include ../../../svn-work/Fuzzer
+-DEPEND[conf]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[conf]=conf.c driver.c
++INCLUDE[conf]=../include {- $ex_inc -}
++DEPEND[conf]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[ct]=ct.c
+-INCLUDE[ct]=../include ../../../svn-work/Fuzzer
+-DEPEND[ct]=../libcrypto ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[ct]=ct.c driver.c
++INCLUDE[ct]=../include {- $ex_inc -}
++DEPEND[ct]=../libcrypto {- $ex_lib -}
+ 
+-SOURCE[server]=server.c
+-INCLUDE[server]=../include ../../../svn-work/Fuzzer
+-DEPEND[server]=../libcrypto ../libssl ../../../svn-work/Fuzzer/libFuzzer
++SOURCE[server]=server.c driver.c
++INCLUDE[server]=../include {- $ex_inc -}
++DEPEND[server]=../libcrypto ../libssl {- $ex_lib -}
+diff --git a/fuzz/cms.c b/fuzz/cms.c
+index 7b4fc3d..71f691f 100644
+--- a/fuzz/cms.c
++++ b/fuzz/cms.c
+@@ -16,7 +16,7 @@
+ #include &lt;openssl/cms.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     BIO *in = BIO_new(BIO_s_mem());
+     OPENSSL_assert((size_t)BIO_write(in, buf, len) == len);
+     CMS_ContentInfo *i = d2i_CMS_bio(in, NULL);
+diff --git a/fuzz/conf.c b/fuzz/conf.c
+index 3e3f7f1..d10d6c7 100644
+--- a/fuzz/conf.c
++++ b/fuzz/conf.c
+@@ -15,7 +15,7 @@
+ #include &lt;openssl/conf.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     CONF *conf = NCONF_new(NULL);
+     BIO *in = BIO_new(BIO_s_mem());
+     long eline;
+diff --git a/fuzz/ct.c b/fuzz/ct.c
+index 7050461..dbb7ab4 100644
+--- a/fuzz/ct.c
++++ b/fuzz/ct.c
+@@ -16,7 +16,7 @@
+ #include &lt;openssl/ct.h&gt;
+ #include &quot;fuzzer.h&quot;
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     const uint8_t **pp = &buf;
+     STACK_OF(SCT) *scts = d2i_SCT_LIST(NULL, pp, len);
+     SCT_LIST_free(scts);
+diff --git a/fuzz/driver.c b/fuzz/driver.c
+new file mode 100644
+index 0000000..de51574
+--- /dev/null
++++ b/fuzz/driver.c
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL licenses, (the &quot;License&quot;);
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ * or in the file LICENSE in the source distribution.
++ */
++#include &lt;stdint.h&gt;
++#include &lt;unistd.h&gt;
++#include &lt;openssl/opensslconf.h&gt;
++#include &quot;fuzzer.h&quot;
++
++#ifndef OPENSSL_NO_FUZZ_LIBFUZZER
++
++int LLVMFuzzerInitialize(int *argc, char ***argv)
++{
++    if (FuzzerInitialize)
++        return FuzzerInitialize(argc, argv);
++    return 0;
++}
++
++int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++    return FuzzerTestOneInput(buf, len);
++}
++
++#elif !defined(OPENSSL_NO_FUZZ_AFL)
++
++#define BUF_SIZE 65536
++
++int main(int argc, char** argv)
++{
++    if (FuzzerInitialize)
++        FuzzerInitialize(&amp;argc, &amp;argv);
++
++    while (__AFL_LOOP(10000)) {
++        uint8_t *buf = malloc(BUF_SIZE);
++        size_t size = read(0, buf, BUF_SIZE);
++
++        FuzzerTestOneInput(buf, size);
++        free(buf);
++    }
++    return 0;
++}
++
++#else
++
++#error &quot;Unsupported fuzzer&quot;
++
++#endif
+diff --git a/fuzz/fuzzer.h b/fuzz/fuzzer.h
+index b3c3428..289aee2 100644
+--- a/fuzz/fuzzer.h
++++ b/fuzz/fuzzer.h
+@@ -8,5 +8,5 @@
+  * or in the file LICENSE in the source distribution.
+  */
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len);
+-int LLVMFuzzerInitialize(int *argc, char ***argv);
++int FuzzerTestOneInput(const uint8_t *buf, size_t len);
++__attribute__((weak)) int FuzzerInitialize(int *argc, char ***argv);
+diff --git a/fuzz/server.c b/fuzz/server.c
+index d3ed1ad..7b376c1 100644
+--- a/fuzz/server.c
++++ b/fuzz/server.c
+@@ -208,7 +208,7 @@ static void Init() {
+     X509_free(cert);
+   }
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {
++int FuzzerTestOneInput(const uint8_t *buf, size_t len) {
+     if (ctx == NULL)
+         Init();
+     // TODO: make this work for OpenSSL. There's a PREDICT define that may do
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007814.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007819.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7817">[ date ]</a>
+              <a href="thread.html#7817">[ thread ]</a>
+              <a href="subject.html#7817">[ subject ]</a>
+              <a href="author.html#7817">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

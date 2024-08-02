@@ -1,0 +1,368 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1431513022.341046.19394.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001061.html">
+   <LINK REL="Next"  HREF="001074.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1431513022.341046.19394.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update">matt at openssl.org
+       </A><BR>
+    <I>Wed May 13 10:30:22 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001061.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="001074.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1070">[ date ]</a>
+              <a href="thread.html#1070">[ thread ]</a>
+              <a href="subject.html#1070">[ subject ]</a>
+              <a href="author.html#1070">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_1-stable has been updated
+       via  5c122908ab42399df020981d0238e59d4ec38098 (commit)
+      from  1c70c783af31d42f2dc1fc81c4759e87f9ea8f31 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5c122908ab42399df020981d0238e59d4ec38098
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Wed May 6 21:31:16 2015 +0100
+
+    Don't allow a CCS when expecting a CertificateVerify
+    
+    Currently we set change_cipher_spec_ok to 1 before calling
+    ssl3_get_cert_verify(). This is because this message is optional and if it
+    is not sent then the next thing we would expect to get is the CCS. However,
+    although it is optional, we do actually know whether we should be receiving
+    one in advance. If we have received a client cert then we should expect
+    a CertificateVerify message. By the time we get to this point we will
+    already have bombed out if we didn't get a Certificate when we should have
+    done, so it is safe just to check whether |peer| is NULL or not. If it is
+    we won't get a CertificateVerify, otherwise we will. Therefore we should
+    change the logic so that we only attempt to get the CertificateVerify if
+    we are expecting one, and not allow a CCS in this scenario.
+    
+    Whilst this is good practice for TLS it is even more important for DTLS.
+    In DTLS messages can be lost. Therefore we may be in a situation where a
+    CertificateVerify message does not arrive even though one was sent. In that
+    case the next message the server will receive will be the CCS. This could
+    also happen if messages get re-ordered in-flight. In DTLS if
+    |change_cipher_spec_ok| is not set and a CCS is received it is ignored.
+    However if |change_cipher_spec_ok| *is* set then a CCS arrival will
+    immediately move the server into the next epoch. Any messages arriving for
+    the previous epoch will be ignored. This means that, in this scenario, the
+    handshake can never complete. The client will attempt to retransmit
+    missing messages, but the server will ignore them because they are the wrong
+    epoch. The server meanwhile will still be waiting for the CertificateVerify
+    which is never going to arrive.
+    
+    RT#2958
+    
+    Reviewed-by: Emilia K&#228;sper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+    (cherry picked from commit a0bd6493369d960abef11c2346b9bbb308b4285a)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/d1_srvr.c | 18 ++++-----------
+ ssl/s3_srvr.c | 74 +++++++++++++++++++----------------------------------------
+ 2 files changed, 28 insertions(+), 64 deletions(-)
+
+diff --git a/ssl/d1_srvr.c b/ssl/d1_srvr.c
+index d63e229..41c7dc5 100644
+--- a/ssl/d1_srvr.c
++++ b/ssl/d1_srvr.c
+@@ -669,15 +669,6 @@ int dtls1_accept(SSL *s)
+ 
+         case SSL3_ST_SR_CERT_VRFY_A:
+         case SSL3_ST_SR_CERT_VRFY_B:
+-            /*
+-             * This *should* be the first time we enable CCS, but be
+-             * extra careful about surrounding code changes. We need
+-             * to set this here because we don't know if we're
+-             * expecting a CertificateVerify or not.
+-             */
+-            if (!s-&gt;s3-&gt;change_cipher_spec)
+-                s-&gt;d1-&gt;change_cipher_spec_ok = 1;
+-            /* we should decide if we expected this one */
+             ret = ssl3_get_cert_verify(s);
+             if (ret &lt;= 0)
+                 goto end;
+@@ -694,11 +685,10 @@ int dtls1_accept(SSL *s)
+         case SSL3_ST_SR_FINISHED_A:
+         case SSL3_ST_SR_FINISHED_B:
+             /*
+-             * Enable CCS for resumed handshakes.
+-             * In a full handshake, we end up here through
+-             * SSL3_ST_SR_CERT_VRFY_B, so change_cipher_spec_ok was
+-             * already set. Receiving a CCS clears the flag, so make
+-             * sure not to re-enable it to ban duplicates.
++             * Enable CCS. Receiving a CCS clears the flag, so make
++             * sure not to re-enable it to ban duplicates. This *should* be the
++             * first time we have received one - but we check anyway to be
++             * cautious.
+              * s-&gt;s3-&gt;change_cipher_spec is set when a CCS is
+              * processed in d1_pkt.c, and remains set until
+              * the client's Finished message is read.
+diff --git a/ssl/s3_srvr.c b/ssl/s3_srvr.c
+index 65d7a35..cb6ef0a 100644
+--- a/ssl/s3_srvr.c
++++ b/ssl/s3_srvr.c
+@@ -692,15 +692,6 @@ int ssl3_accept(SSL *s)
+ 
+         case SSL3_ST_SR_CERT_VRFY_A:
+         case SSL3_ST_SR_CERT_VRFY_B:
+-            /*
+-             * This *should* be the first time we enable CCS, but be
+-             * extra careful about surrounding code changes. We need
+-             * to set this here because we don't know if we're
+-             * expecting a CertificateVerify or not.
+-             */
+-            if (!s-&gt;s3-&gt;change_cipher_spec)
+-                s-&gt;s3-&gt;flags |= SSL3_FLAGS_CCS_OK;
+-            /* we should decide if we expected this one */
+             ret = ssl3_get_cert_verify(s);
+             if (ret &lt;= 0)
+                 goto end;
+@@ -720,11 +711,10 @@ int ssl3_accept(SSL *s)
+         case SSL3_ST_SR_NEXT_PROTO_A:
+         case SSL3_ST_SR_NEXT_PROTO_B:
+             /*
+-             * Enable CCS for resumed handshakes with NPN.
+-             * In a full handshake with NPN, we end up here through
+-             * SSL3_ST_SR_CERT_VRFY_B, where SSL3_FLAGS_CCS_OK was
+-             * already set. Receiving a CCS clears the flag, so make
+-             * sure not to re-enable it to ban duplicates.
++             * Enable CCS for NPN. Receiving a CCS clears the flag, so make
++             * sure not to re-enable it to ban duplicates. This *should* be the
++             * first time we have received one - but we check anyway to be
++             * cautious.
+              * s-&gt;s3-&gt;change_cipher_spec is set when a CCS is
+              * processed in s3_pkt.c, and remains set until
+              * the client's Finished message is read.
+@@ -743,10 +733,8 @@ int ssl3_accept(SSL *s)
+         case SSL3_ST_SR_FINISHED_A:
+         case SSL3_ST_SR_FINISHED_B:
+             /*
+-             * Enable CCS for resumed handshakes without NPN.
+-             * In a full handshake, we end up here through
+-             * SSL3_ST_SR_CERT_VRFY_B, where SSL3_FLAGS_CCS_OK was
+-             * already set. Receiving a CCS clears the flag, so make
++             * Enable CCS for handshakes without NPN. In NPN the CCS flag has
++             * already been set. Receiving a CCS clears the flag, so make
+              * sure not to re-enable it to ban duplicates.
+              * s-&gt;s3-&gt;change_cipher_spec is set when a CCS is
+              * processed in s3_pkt.c, and remains set until
+@@ -2963,39 +2951,31 @@ int ssl3_get_cert_verify(SSL *s)
+     EVP_MD_CTX mctx;
+     EVP_MD_CTX_init(&amp;mctx);
+ 
++    /*
++     * We should only process a CertificateVerify message if we have received
++     * a Certificate from the client. If so then |s-&gt;session-&gt;peer| will be non
++     * NULL. In some instances a CertificateVerify message is not required even
++     * if the peer has sent a Certificate (e.g. such as in the case of static
++     * DH). In that case the ClientKeyExchange processing will skip the
++     * CertificateVerify state so we should not arrive here.
++     */
++    if (s-&gt;session-&gt;peer == NULL) {
++        ret = 1;
++        goto end;
++    }
++
+     n = s-&gt;method-&gt;ssl_get_message(s,
+                                    SSL3_ST_SR_CERT_VRFY_A,
+                                    SSL3_ST_SR_CERT_VRFY_B,
+-                                   -1, SSL3_RT_MAX_PLAIN_LENGTH, &amp;ok);
++                                   SSL3_MT_CERTIFICATE_VERIFY,
++                                   SSL3_RT_MAX_PLAIN_LENGTH, &amp;ok);
+ 
+     if (!ok)
+         return ((int)n);
+ 
+-    if (s-&gt;session-&gt;peer != NULL) {
+-        peer = s-&gt;session-&gt;peer;
+-        pkey = X509_get_pubkey(peer);
+-        type = X509_certificate_type(peer, pkey);
+-    } else {
+-        peer = NULL;
+-        pkey = NULL;
+-    }
+-
+-    if (s-&gt;s3-&gt;tmp.message_type != SSL3_MT_CERTIFICATE_VERIFY) {
+-        s-&gt;s3-&gt;tmp.reuse_message = 1;
+-        if (peer != NULL) {
+-            al = SSL_AD_UNEXPECTED_MESSAGE;
+-            SSLerr(SSL_F_SSL3_GET_CERT_VERIFY, SSL_R_MISSING_VERIFY_MESSAGE);
+-            goto f_err;
+-        }
+-        ret = 1;
+-        goto end;
+-    }
+-
+-    if (peer == NULL) {
+-        SSLerr(SSL_F_SSL3_GET_CERT_VERIFY, SSL_R_NO_CLIENT_CERT_RECEIVED);
+-        al = SSL_AD_UNEXPECTED_MESSAGE;
+-        goto f_err;
+-    }
++    peer = s-&gt;session-&gt;peer;
++    pkey = X509_get_pubkey(peer);
++    type = X509_certificate_type(peer, pkey);
+ 
+     if (!(type &amp; EVP_PKT_SIGN)) {
+         SSLerr(SSL_F_SSL3_GET_CERT_VERIFY,
+@@ -3004,12 +2984,6 @@ int ssl3_get_cert_verify(SSL *s)
+         goto f_err;
+     }
+ 
+-    if (s-&gt;s3-&gt;change_cipher_spec) {
+-        SSLerr(SSL_F_SSL3_GET_CERT_VERIFY, SSL_R_CCS_RECEIVED_EARLY);
+-        al = SSL_AD_UNEXPECTED_MESSAGE;
+-        goto f_err;
+-    }
+-
+     /* we now have a signature that we need to verify */
+     p = (unsigned char *)s-&gt;init_msg;
+     /* Check for broken implementations of GOST ciphersuites */
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001061.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="001074.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1070">[ date ]</a>
+              <a href="thread.html#1070">[ thread ]</a>
+              <a href="subject.html#1070">[ subject ]</a>
+              <a href="author.html#1070">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

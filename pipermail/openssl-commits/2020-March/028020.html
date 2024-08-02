@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1585230763.005359.20171.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028012.html">
+   <LINK REL="Next"  HREF="028028.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1585230763.005359.20171.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Mar 26 13:52:42 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028012.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028028.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28020">[ date ]</a>
+              <a href="thread.html#28020">[ thread ]</a>
+              <a href="subject.html#28020">[ subject ]</a>
+              <a href="author.html#28020">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  9727f4e7fd02e55b637058249cd8e1bc80501c7f (commit)
+       via  148bfd26a4c2d0250b77c57acf30cf5c190a1d29 (commit)
+      from  8158cf209792f7a92f0812ac89a9f54950e8453b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 9727f4e7fd02e55b637058249cd8e1bc80501c7f
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Mar 20 12:37:20 2020 +0000
+
+    Use a fetched cipher for the TLSv1.3 early secret
+    
+    We should use an explicitly fetched cipher to ensure that we are using
+    the correct libctx and property query.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11402">https://github.com/openssl/openssl/pull/11402</A>)
+
+commit 148bfd26a4c2d0250b77c57acf30cf5c190a1d29
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Mar 19 18:23:58 2020 +0000
+
+    Use a fetched cipher when decrypting a ticket in libssl
+    
+    We need to make sure we are using the correct libctx and property query.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11402">https://github.com/openssl/openssl/pull/11402</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_ciph.c          | 46 ++++++++++++++++++++++++++++------------------
+ ssl/ssl_local.h         |  2 ++
+ ssl/t1_lib.c            | 16 ++++++++++++----
+ ssl/tls13_enc.c         | 17 ++++++++++++++++-
+ test/tls13secretstest.c |  6 ++++++
+ 5 files changed, 64 insertions(+), 23 deletions(-)
+
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index 64c791636a..23d156a702 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -439,6 +439,32 @@ static int load_builtin_compressions(void)
+ }
+ #endif
+ 
++int ssl_cipher_get_evp_cipher(SSL_CTX *ctx, const SSL_CIPHER *sslc,
++                              const EVP_CIPHER **enc)
++{
++    int i = ssl_cipher_info_lookup(ssl_cipher_table_cipher, sslc-&gt;algorithm_enc);
++
++    if (i == -1) {
++        *enc = NULL;
++    } else {
++        if (i == SSL_ENC_NULL_IDX) {
++            /*
++             * We assume we don't care about this coming from an ENGINE so
++             * just do a normal EVP_CIPHER_fetch instead of
++             * ssl_evp_cipher_fetch()
++             */
++            *enc = EVP_CIPHER_fetch(ctx-&gt;libctx, &quot;NULL&quot;, ctx-&gt;propq);
++            if (*enc == NULL)
++                return 0;
++        } else {
++            if (!ssl_evp_cipher_up_ref(ctx-&gt;ssl_cipher_methods[i]))
++                return 0;
++            *enc = ctx-&gt;ssl_cipher_methods[i];
++        }
++    }
++    return 1;
++}
++
+ int ssl_cipher_get_evp(SSL_CTX *ctx, const SSL_SESSION *s,
+                        const EVP_CIPHER **enc, const EVP_MD **md,
+                        int *mac_pkey_type, size_t *mac_secret_size,
+@@ -474,24 +500,8 @@ int ssl_cipher_get_evp(SSL_CTX *ctx, const SSL_SESSION *s,
+     if ((enc == NULL) || (md == NULL))
+         return 0;
+ 
+-    i = ssl_cipher_info_lookup(ssl_cipher_table_cipher, c-&gt;algorithm_enc);
+-
+-    if (i == -1) {
+-        *enc = NULL;
+-    } else {
+-        if (i == SSL_ENC_NULL_IDX) {
+-            /*
+-             * We assume we don't care about this coming from an ENGINE so
+-             * just do a normal EVP_CIPHER_fetch instead of
+-             * ssl_evp_cipher_fetch()
+-             */
+-            *enc = EVP_CIPHER_fetch(ctx-&gt;libctx, &quot;NULL&quot;, ctx-&gt;propq);
+-        } else {
+-            if (!ssl_evp_cipher_up_ref(ctx-&gt;ssl_cipher_methods[i]))
+-                return 0;
+-            *enc = ctx-&gt;ssl_cipher_methods[i];
+-        }
+-    }
++    if (!ssl_cipher_get_evp_cipher(ctx, c, enc))
++        return 0;
+ 
+     i = ssl_cipher_info_lookup(ssl_cipher_table_mac, c-&gt;algorithm_mac);
+     if (i == -1) {
+diff --git a/ssl/ssl_local.h b/ssl/ssl_local.h
+index d9092161ff..c48bcb9a9a 100644
+--- a/ssl/ssl_local.h
++++ b/ssl/ssl_local.h
+@@ -2363,6 +2363,8 @@ __owur int bytes_to_cipher_list(SSL *s, PACKET *cipher_suites,
+                                 STACK_OF(SSL_CIPHER) **scsvs, int sslv2format,
+                                 int fatal);
+ void ssl_update_cache(SSL *s, int mode);
++__owur int ssl_cipher_get_evp_cipher(SSL_CTX *ctx, const SSL_CIPHER *sslc,
++                                     const EVP_CIPHER **enc);
+ __owur int ssl_cipher_get_evp(SSL_CTX *ctxc, const SSL_SESSION *s,
+                               const EVP_CIPHER **enc, const EVP_MD **md,
+                               int *mac_pkey_type, size_t *mac_secret_size,
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 76096401be..4ab046b7b3 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -1521,21 +1521,29 @@ SSL_TICKET_STATUS tls_decrypt_ticket(SSL *s, const unsigned char *etick,
+         if (rv == 2)
+             renew_ticket = 1;
+     } else {
++        EVP_CIPHER *aes256cbc = NULL;
++
+         /* Check key name matches */
+         if (memcmp(etick, tctx-&gt;ext.tick_key_name,
+                    TLSEXT_KEYNAME_LENGTH) != 0) {
+             ret = SSL_TICKET_NO_DECRYPT;
+             goto end;
+         }
+-        if (ssl_hmac_init(hctx, tctx-&gt;ext.secure-&gt;tick_hmac_key,
+-                          sizeof(tctx-&gt;ext.secure-&gt;tick_hmac_key),
+-                          &quot;SHA256&quot;) &lt;= 0
+-            || EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL,
++
++        aes256cbc = EVP_CIPHER_fetch(s-&gt;ctx-&gt;libctx, &quot;AES-256-CBC&quot;,
++                                     s-&gt;ctx-&gt;propq);
++        if (aes256cbc == NULL
++            || ssl_hmac_init(hctx, tctx-&gt;ext.secure-&gt;tick_hmac_key,
++                             sizeof(tctx-&gt;ext.secure-&gt;tick_hmac_key),
++                             &quot;SHA256&quot;) &lt;= 0
++            || EVP_DecryptInit_ex(ctx, aes256cbc, NULL,
+                                   tctx-&gt;ext.secure-&gt;tick_aes_key,
+                                   etick + TLSEXT_KEYNAME_LENGTH) &lt;= 0) {
++            EVP_CIPHER_free(aes256cbc);
+             ret = SSL_TICKET_FATAL_ERR_OTHER;
+             goto end;
+         }
++        EVP_CIPHER_free(aes256cbc);
+         if (SSL_IS_TLS13(s))
+             renew_ticket = 1;
+     }
+diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
+index 9ca63b7550..fba12fe5e4 100644
+--- a/ssl/tls13_enc.c
++++ b/ssl/tls13_enc.c
+@@ -599,7 +599,18 @@ int tls13_change_cipher_state(SSL *s, int which)
+                          SSL_F_TLS13_CHANGE_CIPHER_STATE, ERR_R_MALLOC_FAILURE);
+                 goto err;
+             }
+-            cipher = EVP_get_cipherbynid(SSL_CIPHER_get_cipher_nid(sslcipher));
++
++            /*
++             * This ups the ref count on cipher so we better make sure we free
++             * it again
++             */
++            if (!ssl_cipher_get_evp_cipher(s-&gt;ctx, sslcipher, &amp;cipher)) {
++                SSLfatal(s, SSL_AD_INTERNAL_ERROR,
++                         SSL_F_TLS13_CHANGE_CIPHER_STATE,
++                         SSL_R_ALGORITHM_FETCH_FAILED);
++                goto err;
++            }
++
+             md = ssl_md(s-&gt;ctx, sslcipher-&gt;algorithm2);
+             if (md == NULL || !EVP_DigestInit_ex(mdctx, md, NULL)
+                     || !EVP_DigestUpdate(mdctx, hdata, handlen)
+@@ -755,6 +766,10 @@ int tls13_change_cipher_state(SSL *s, int which)
+         s-&gt;statem.enc_write_state = ENC_WRITE_STATE_VALID;
+     ret = 1;
+  err:
++    if ((which &amp; SSL3_CC_EARLY) != 0) {
++        /* We up-refed this so now we need to down ref */
++        ssl_evp_cipher_free(cipher);
++    }
+     OPENSSL_cleanse(secret, sizeof(secret));
+     return ret;
+ }
+diff --git a/test/tls13secretstest.c b/test/tls13secretstest.c
+index 5d614768f8..c6f65eaded 100644
+--- a/test/tls13secretstest.c
++++ b/test/tls13secretstest.c
+@@ -165,6 +165,12 @@ void RECORD_LAYER_reset_write_sequence(RECORD_LAYER *rl)
+ {
+ }
+ 
++int ssl_cipher_get_evp_cipher(SSL_CTX *ctx, const SSL_CIPHER *sslc,
++                                     const EVP_CIPHER **enc)
++{
++    return 0;
++}
++
+ int ssl_cipher_get_evp(SSL_CTX *ctx, const SSL_SESSION *s,
+                        const EVP_CIPHER **enc, const EVP_MD **md,
+                        int *mac_pkey_type, size_t *mac_secret_size,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028012.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028028.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28020">[ date ]</a>
+              <a href="thread.html#28020">[ thread ]</a>
+              <a href="subject.html#28020">[ subject ]</a>
+              <a href="author.html#28020">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

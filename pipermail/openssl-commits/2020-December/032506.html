@@ -1,0 +1,290 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607000825.602676.18177.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032504.html">
+   <LINK REL="Next"  HREF="032507.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607000825.602676.18177.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Thu Dec  3 13:07:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032504.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032507.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32506">[ date ]</a>
+              <a href="thread.html#32506">[ thread ]</a>
+              <a href="subject.html#32506">[ subject ]</a>
+              <a href="author.html#32506">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3bed88a3970605a2ff817065f93b08e965d89e5f (commit)
+      from  902161e8ec7b81849f6dc4d449e17fcaee2d49b1 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3bed88a3970605a2ff817065f93b08e965d89e5f
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Tue Dec 1 14:22:16 2020 +0100
+
+    x509_vfy.c: Restore rejection of expired trusted (root) certificate
+    
+    The certificate path validation procedure specified in RFC 5280 does not
+    include checking the validity period of the trusted (root) certificate.
+    Still it is common good practice to perform this check.
+    Also OpenSSL did this until commit 0e7b1383e, which accidentally killed it.
+    
+    The current commit restores the previous behavior.
+    It also removes the cause of that bug, namely counter-intuitive design
+    of the internal function check_issued(), which was complicated by checks
+    that actually belong to some other internal function, namely find_issuer().
+    
+    Moreover, this commit adds a regression check and proper documentation of
+    the root cert validity period check feature, which had been missing so far.
+    
+    Fixes #13427
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13590">https://github.com/openssl/openssl/pull/13590</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x509_cmp.c                     |  2 ++
+ crypto/x509/x509_vfy.c                     | 42 ++++++++++++++----------------
+ doc/man1/openssl.pod                       | 11 ++++----
+ doc/man3/X509_STORE_set_verify_cb_func.pod |  4 +--
+ test/certs/root-expired.pem                | 18 +++++++++++++
+ test/certs/setup.sh                        |  1 +
+ test/recipes/25-test_verify.t              |  6 ++++-
+ 7 files changed, 53 insertions(+), 31 deletions(-)
+ create mode 100644 test/certs/root-expired.pem
+
+diff --git a/crypto/x509/x509_cmp.c b/crypto/x509/x509_cmp.c
+index da451eccce..9c968b49b0 100644
+--- a/crypto/x509/x509_cmp.c
++++ b/crypto/x509/x509_cmp.c
+@@ -142,6 +142,8 @@ int X509_cmp(const X509 *a, const X509 *b)
+ {
+     int rv;
+ 
++    if (a == b) /* for efficiency */
++        return 0;
+     /* ensure hash is valid */
+     if (X509_check_purpose((X509 *)a, -1, 0) != 1)
+         return -2;
+diff --git a/crypto/x509/x509_vfy.c b/crypto/x509/x509_vfy.c
+index 2da11ecf9d..fc470d950e 100644
+--- a/crypto/x509/x509_vfy.c
++++ b/crypto/x509/x509_vfy.c
+@@ -303,8 +303,20 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     return ret;
+ }
+ 
++static int sk_X509_contains(STACK_OF(X509) *sk, X509 *cert)
++{
++    int i, n = sk_X509_num(sk);
++
++    for (i = 0; i &lt; n; i++)
++        if (X509_cmp(sk_X509_value(sk, i), cert) == 0)
++            return 1;
++    return 0;
++}
++
+ /*
+- * Given a STACK_OF(X509) find the issuer of cert (if any)
++ * Find in given STACK_OF(X509) sk a non-expired issuer cert (if any) of given cert x.
++ * The issuer must not be the same as x and must not yet be in ctx-&gt;chain, where the
++ * exceptional case x is self-issued and ctx-&gt;chain has just one element is allowed.
+  */
+ static X509 *find_issuer(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *x)
+ {
+@@ -317,7 +329,9 @@ static X509 *find_issuer(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *x)
+          * Below check 'issuer != x' is an optimization and safety precaution:
+          * Candidate issuer cert cannot be the same as the subject cert 'x'.
+          */
+-        if (issuer != x &amp;&amp; ctx-&gt;check_issued(ctx, x, issuer)) {
++        if (issuer != x &amp;&amp; ctx-&gt;check_issued(ctx, x, issuer)
++            &amp;&amp; (((x-&gt;ex_flags &amp; EXFLAG_SI) != 0 &amp;&amp; sk_X509_num(ctx-&gt;chain) == 1)
++                || !sk_X509_contains(ctx-&gt;chain, issuer))) {
+             rv = issuer;
+             if (x509_check_cert_time(ctx, rv, -1))
+                 break;
+@@ -326,26 +340,10 @@ static X509 *find_issuer(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *x)
+     return rv;
+ }
+ 
+-/*
+- * Check that the given certificate 'x' is issued by the certificate 'issuer'
+- * and the issuer is not yet in ctx-&gt;chain, where the exceptional case
+- * that 'x' is self-issued and ctx-&gt;chain has just one element is allowed.
+- */
+-static int check_issued(X509_STORE_CTX *ctx, X509 *x, X509 *issuer)
++/* Check that the given certificate 'x' is issued by the certificate 'issuer' */
++static int check_issued(ossl_unused X509_STORE_CTX *ctx, X509 *x, X509 *issuer)
+ {
+-    if (x509_likely_issued(issuer, x) != X509_V_OK)
+-        return 0;
+-    if ((x-&gt;ex_flags &amp; EXFLAG_SI) == 0 || sk_X509_num(ctx-&gt;chain) != 1) {
+-        int i;
+-        X509 *ch;
+-
+-        for (i = 0; i &lt; sk_X509_num(ctx-&gt;chain); i++) {
+-            ch = sk_X509_value(ctx-&gt;chain, i);
+-            if (ch == issuer || X509_cmp(ch, issuer) == 0)
+-                return 0;
+-        }
+-    }
+-    return 1;
++    return x509_likely_issued(issuer, x) == X509_V_OK;
+ }
+ 
+ /* Alternative lookup method: look from a STACK stored in other_ctx */
+@@ -1827,7 +1825,7 @@ static int internal_verify(X509_STORE_CTX *ctx)
+             }
+         }
+ 
+- check_cert_time:
++    check_cert_time: /* in addition to RFC 5280, do also for trusted (root) cert */
+         /* Calls verify callback as needed */
+         if (!x509_check_cert_time(ctx, xs, n))
+             return 0;
+diff --git a/doc/man1/openssl.pod b/doc/man1/openssl.pod
+index 0bb37d415d..ace96274f9 100644
+--- a/doc/man1/openssl.pod
++++ b/doc/man1/openssl.pod
+@@ -847,11 +847,12 @@ For compatibility with previous versions of OpenSSL,
+ a certificate with no trust settings is considered to be valid for all purposes.
+ 
+ The fourth, and final, step is to check the validity of the certificate chain.
+-The validity period is checked against the system time
+-and the C&lt;notBefore&gt; and C&lt;notAfter&gt; dates in each certificate.
+-The B&lt;-attime&gt; flag may be used to specify a time other than &quot;now.&quot;
+-The certificate signatures are also checked at this point
+-(except for the signature of the self-signed &quot;root CA&quot; certificate,
++For each element in the chain, including the root CA certificate,
++the validity period as specified by the C&lt;notBefore&gt; and C&lt;notAfter&gt; fields
++is checked against the current system time.
++The B&lt;-attime&gt; flag may be used to use a reference time other than &quot;now.&quot;
++The certificate signature is checked as well
++(except for the signature of the typically self-signed root CA certificate,
+ which is verified only if the B&lt;-check_ss_sig&gt; option is given).
+ When verifying a certificate signature
+ the keyUsage extension (if present) of the candidate issuer certificate
+diff --git a/doc/man3/X509_STORE_set_verify_cb_func.pod b/doc/man3/X509_STORE_set_verify_cb_func.pod
+index 84b216ffbe..515a427aa3 100644
+--- a/doc/man3/X509_STORE_set_verify_cb_func.pod
++++ b/doc/man3/X509_STORE_set_verify_cb_func.pod
+@@ -145,9 +145,7 @@ I&lt;If no function to get the issuer is provided, the internal default
+ function will be used instead.&gt;
+ 
+ X509_STORE_set_check_issued() sets the function to check that a given
+-certificate B&lt;x&gt; is issued by the issuer certificate B&lt;issuer&gt; and
+-the issuer is not yet in the chain contained in &lt;ctx&gt;, where the exceptional
+-case that B&lt;x&gt; is self-issued and ctx-&gt;chain has just one element is allowed.
++certificate B&lt;x&gt; is issued by the issuer certificate B&lt;issuer&gt;.
+ This function must return 0 on failure (among others if B&lt;x&gt; hasn't
+ been issued with B&lt;issuer&gt;) and 1 on success.
+ I&lt;If no function to get the issuer is provided, the internal default
+diff --git a/test/certs/root-expired.pem b/test/certs/root-expired.pem
+new file mode 100644
+index 0000000000..8204fb3b7b
+--- /dev/null
++++ b/test/certs/root-expired.pem
+@@ -0,0 +1,18 @@
++-----BEGIN CERTIFICATE-----
++MIIC8jCCAdqgAwIBAgIBATANBgkqhkiG9w0BAQsFADASMRAwDgYDVQQDDAdSb290
++IENBMB4XDTIwMTIwMjExNTQ0MVoXDTIwMTIwMTExNTQ0MVowEjEQMA4GA1UEAwwH
++Um9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOHmAPUGvKBG
++OHkPPx5xGRNtAt8rm3Zr/KywIe3WkQhCO6VjNexSW6CiSsXWAJQDl1o9uWco0n3j
++IVyk7cY8jY6E0Z1Uwz3ZdKKWdmdx+cYaUHez/XjuW+DjjIkjwpoi7D7UN54HzcAr
++VREXOjRCHGkNOhiw7RWUXsb9nofGHOeUGpLAXwXBc0PlA94JkckkztiOi34u4DFI
++0YYqalUmeugLNk6XseCkydpcaUsDgAhWg6Mfsiq4wUz+xbFN1MABqu2+ziW97mmt
++9gfNbiuhiVT1aOuYCe3JYGbLM2JKA7Bo1g6rX8E1VX79Ru6669y2oqPthX9337Vo
++IkN+ZiQjr8UCAwEAAaNTMFEwHQYDVR0OBBYEFI71Ja8em2uEPXyAmslTnE1y96NS
++MB8GA1UdIwQYMBaAFI71Ja8em2uEPXyAmslTnE1y96NSMA8GA1UdEwEB/wQFMAMB
++Af8wDQYJKoZIhvcNAQELBQADggEBAIIJIaT7B8PVjb9SrcjS2M5NfgjOftvrPrxf
++KvWs+6m0+2RdHGAHScrIWZsCGSkmuLE96hKqfM33aQLu3gFJmwdO+HcKlEw6Dg0e
++Br0fROcBIqjK5aS2ZQjqUyZR1CQ5F3Arlcd4RIrzsBPwBu7sO5pcEzc2c8A0DDkm
++zenRZ/SpOJAmghk8ek25gJewCsRk2TR8Ln+Qym41FZJlhQb6gxHZX0U7aRasANdQ
++MNSNgQ7HS4pSmticPg+tuKyOO+B9HHJeKRbWe6JLRYz7UyUrmWoMOrfmZFbZ66Xo
++eflbkjIhEAZ/lqR2Wd3TezilUG8QVZN77Y2oQbR1QyoaWeHRkco=
++-----END CERTIFICATE-----
+diff --git a/test/certs/setup.sh b/test/certs/setup.sh
+index dbc2fc71be..d7cdf06e7f 100755
+--- a/test/certs/setup.sh
++++ b/test/certs/setup.sh
+@@ -81,6 +81,7 @@ openssl x509 -in sroot-cert.pem -trustout \
+ # trust variants: +serverAuth, -serverAuth, +clientAuth, -clientAuth, -anyEKU, +anyEKU
+ #
+ ./mkcert.sh genca &quot;CA&quot; ca-key ca-cert root-key root-cert
++DAYS=-1 ./mkcert.sh genroot &quot;Root CA&quot; root-key root-expired
+ ./mkcert.sh genee &quot;CA&quot; ca-key ca-nonca root-key root-cert
+ ./mkcert.sh gen_nonbc_ca &quot;CA&quot; ca-key ca-nonbc root-key root-cert
+ ./mkcert.sh genca &quot;CA&quot; ca-key2 ca-cert2 root-key root-cert
+diff --git a/test/recipes/25-test_verify.t b/test/recipes/25-test_verify.t
+index 9bbabd0fa3..5293530b22 100644
+--- a/test/recipes/25-test_verify.t
++++ b/test/recipes/25-test_verify.t
+@@ -27,7 +27,7 @@ sub verify {
+     run(app([@args]));
+ }
+ 
+-plan tests =&gt; 151;
++plan tests =&gt; 153;
+ 
+ # Canonical success
+ ok(verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [&quot;root-cert&quot;], [&quot;ca-cert&quot;]),
+@@ -141,6 +141,10 @@ ok(!verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [], [qw(ca-cert)], &quot;-partial_chain&quot;),
+    &quot;fail untrusted partial chain&quot;);
+ ok(verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [qw(ca-cert)], [], &quot;-partial_chain&quot;),
+    &quot;accept trusted partial chain&quot;);
++ok(!verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [qw(ca-expired)], [], &quot;-partial_chain&quot;),
++   &quot;reject expired trusted partial chain&quot;); # this check is beyond RFC 5280
++ok(!verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [qw(root-expired)], [qw(ca-cert)]),
++   &quot;reject expired trusted root&quot;); # this check is beyond RFC 5280
+ ok(verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [qw(sca-cert)], [], &quot;-partial_chain&quot;),
+    &quot;accept partial chain with server purpose&quot;);
+ ok(!verify(&quot;ee-cert&quot;, &quot;sslserver&quot;, [qw(cca-cert)], [], &quot;-partial_chain&quot;),
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032504.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032507.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32506">[ date ]</a>
+              <a href="thread.html#32506">[ thread ]</a>
+              <a href="subject.html#32506">[ subject ]</a>
+              <a href="author.html#32506">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

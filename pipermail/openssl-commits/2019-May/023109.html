@@ -1,0 +1,968 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1557971055.563519.19258.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023094.html">
+   <LINK REL="Next"  HREF="023110.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1557971055.563519.19258.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Thu May 16 01:44:15 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023094.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="023110.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23109">[ date ]</a>
+              <a href="thread.html#23109">[ thread ]</a>
+              <a href="subject.html#23109">[ subject ]</a>
+              <a href="author.html#23109">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8bbeaaa4fc12f8b00fbea4dc649ef74b59f73b17 (commit)
+      from  0211740fcc47a954be19cceb65fb57a6f7deb797 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8bbeaaa4fc12f8b00fbea4dc649ef74b59f73b17
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu May 16 11:43:41 2019 +1000
+
+    Added X963KDF API
+    
+    X963 KDF is used for CMS ec keyagree Recipient Info.
+    The X963 KDF that is used by CMS EC Key Agreement has been moved
+    into a EVP_KDF object. This KDF is almost identical to the the SSKDF
+    hash variant, so it has been implemented inside the SSKDF code with
+    its own method table.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8902">https://github.com/openssl/openssl/pull/8902</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ecdh_kdf.c                     |  64 ++++-----------
+ crypto/err/openssl.txt                   |   2 +
+ crypto/evp/c_allkdf.c                    |   1 +
+ crypto/evp/kdf_lib.c                     |   8 +-
+ crypto/include/internal/evp_int.h        |   1 +
+ crypto/kdf/kdf_err.c                     |   2 +
+ crypto/kdf/sskdf.c                       |  43 +++++++++-
+ crypto/objects/obj_dat.h                 |   9 +-
+ crypto/objects/obj_mac.num               |   1 +
+ crypto/objects/objects.txt               |   3 +
+ doc/man3/EVP_KDF_CTX.pod                 |   1 +
+ doc/man7/EVP_KDF_X963.pod                | 136 +++++++++++++++++++++++++++++++
+ include/openssl/kdf.h                    |   2 +
+ include/openssl/kdferr.h                 |   2 +
+ include/openssl/obj_mac.h                |   4 +
+ test/evp_kdf_test.c                      |  94 +++++++++++++++------
+ test/recipes/30-test_evp_data/evpkdf.txt |  98 ++++++++++++++++++++++
+ 17 files changed, 391 insertions(+), 80 deletions(-)
+ create mode 100644 doc/man7/EVP_KDF_X963.pod
+
+diff --git a/crypto/ec/ecdh_kdf.c b/crypto/ec/ecdh_kdf.c
+index f2af38a..f556dc6 100644
+--- a/crypto/ec/ecdh_kdf.c
++++ b/crypto/ec/ecdh_kdf.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2015-2018 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2015-2019 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -10,62 +10,28 @@
+ #include &lt;string.h&gt;
+ #include &lt;openssl/ec.h&gt;
+ #include &lt;openssl/evp.h&gt;
++#include &lt;openssl/kdf.h&gt;
+ #include &quot;ec_lcl.h&quot;
+ 
+ /* Key derivation function from X9.63/SECG */
+-/* Way more than we will ever need */
+-#define ECDH_KDF_MAX    (1 &lt;&lt; 30)
+-
+ int ecdh_KDF_X9_63(unsigned char *out, size_t outlen,
+                    const unsigned char *Z, size_t Zlen,
+                    const unsigned char *sinfo, size_t sinfolen,
+                    const EVP_MD *md)
+ {
+-    EVP_MD_CTX *mctx = NULL;
+-    int rv = 0;
+-    unsigned int i;
+-    size_t mdlen;
+-    unsigned char ctr[4];
+-    if (sinfolen &gt; ECDH_KDF_MAX || outlen &gt; ECDH_KDF_MAX
+-        || Zlen &gt; ECDH_KDF_MAX)
+-        return 0;
+-    mctx = EVP_MD_CTX_new();
+-    if (mctx == NULL)
+-        return 0;
+-    mdlen = EVP_MD_size(md);
+-    for (i = 1;; i++) {
+-        unsigned char mtmp[EVP_MAX_MD_SIZE];
+-        if (!EVP_DigestInit_ex(mctx, md, NULL))
+-            goto err;
+-        ctr[3] = i &amp; 0xFF;
+-        ctr[2] = (i &gt;&gt; 8) &amp; 0xFF;
+-        ctr[1] = (i &gt;&gt; 16) &amp; 0xFF;
+-        ctr[0] = (i &gt;&gt; 24) &amp; 0xFF;
+-        if (!EVP_DigestUpdate(mctx, Z, Zlen))
+-            goto err;
+-        if (!EVP_DigestUpdate(mctx, ctr, sizeof(ctr)))
+-            goto err;
+-        if (!EVP_DigestUpdate(mctx, sinfo, sinfolen))
+-            goto err;
+-        if (outlen &gt;= mdlen) {
+-            if (!EVP_DigestFinal(mctx, out, NULL))
+-                goto err;
+-            outlen -= mdlen;
+-            if (outlen == 0)
+-                break;
+-            out += mdlen;
+-        } else {
+-            if (!EVP_DigestFinal(mctx, mtmp, NULL))
+-                goto err;
+-            memcpy(out, mtmp, outlen);
+-            OPENSSL_cleanse(mtmp, mdlen);
+-            break;
+-        }
+-    }
+-    rv = 1;
+- err:
+-    EVP_MD_CTX_free(mctx);
+-    return rv;
++    int ret;
++    EVP_KDF_CTX *kctx = NULL;
++
++    kctx = EVP_KDF_CTX_new(EVP_get_kdfbyname(SN_x963kdf));
++    ret =
++        kctx != NULL
++        &amp;&amp; EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_MD, md) &gt; 0
++        &amp;&amp; EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_KEY, Z, Zlen) &gt; 0
++        &amp;&amp; EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_SHARED_INFO, sinfo, sinfolen) &gt; 0
++        &amp;&amp; EVP_KDF_derive(kctx, out, outlen) &gt; 0;
++
++    EVP_KDF_CTX_free(kctx);
++    return ret;
+ }
+ 
+ /*-
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 4b9f27b..eee3092 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -925,6 +925,7 @@ KDF_F_SSKDF_MAC2CTRL:136:sskdf_mac2ctrl
+ KDF_F_SSKDF_NEW:137:sskdf_new
+ KDF_F_SSKDF_SIZE:138:sskdf_size
+ KDF_F_TLS1_PRF_ALG:111:tls1_prf_alg
++KDF_F_X963KDF_DERIVE:139:x963kdf_derive
+ OBJ_F_OBJ_ADD_OBJECT:105:OBJ_add_object
+ OBJ_F_OBJ_ADD_SIGID:107:OBJ_add_sigid
+ OBJ_F_OBJ_CREATE:100:OBJ_create
+@@ -2464,6 +2465,7 @@ KDF_R_MISSING_SEED:106:missing seed
+ KDF_R_MISSING_SESSION_ID:113:missing session id
+ KDF_R_MISSING_TYPE:114:missing type
+ KDF_R_MISSING_XCGHASH:115:missing xcghash
++KDF_R_NOT_SUPPORTED:118:not supported
+ KDF_R_UNKNOWN_PARAMETER_TYPE:103:unknown parameter type
+ KDF_R_UNSUPPORTED_MAC_TYPE:117:unsupported mac type
+ KDF_R_VALUE_ERROR:108:value error
+diff --git a/crypto/evp/c_allkdf.c b/crypto/evp/c_allkdf.c
+index 34109ca..2233fd9 100644
+--- a/crypto/evp/c_allkdf.c
++++ b/crypto/evp/c_allkdf.c
+@@ -20,4 +20,5 @@ void openssl_add_all_kdfs_int(void)
+     EVP_add_kdf(&amp;hkdf_kdf_meth);
+     EVP_add_kdf(&amp;sshkdf_kdf_meth);
+     EVP_add_kdf(&amp;ss_kdf_meth);
++    EVP_add_kdf(&amp;x963_kdf_meth);
+ }
+diff --git a/crypto/evp/kdf_lib.c b/crypto/evp/kdf_lib.c
+index be5d7c6..6131d8e 100644
+--- a/crypto/evp/kdf_lib.c
++++ b/crypto/evp/kdf_lib.c
+@@ -22,8 +22,12 @@
+ 
+ EVP_KDF_CTX *EVP_KDF_CTX_new(const EVP_KDF *kdf)
+ {
+-    EVP_KDF_CTX *ctx = OPENSSL_zalloc(sizeof(EVP_KDF_CTX));
++    EVP_KDF_CTX *ctx = NULL;
+ 
++    if (kdf == NULL)
++        return NULL;
++
++    ctx = OPENSSL_zalloc(sizeof(EVP_KDF_CTX));
+     if (ctx == NULL || (ctx-&gt;impl = kdf-&gt;new()) == NULL) {
+         EVPerr(EVP_F_EVP_KDF_CTX_NEW, ERR_R_MALLOC_FAILURE);
+         OPENSSL_free(ctx);
+@@ -38,8 +42,6 @@ EVP_KDF_CTX *EVP_KDF_CTX_new_id(int id)
+ {
+     const EVP_KDF *kdf = EVP_get_kdfbynid(id);
+ 
+-    if (kdf == NULL)
+-        return NULL;
+     return EVP_KDF_CTX_new(kdf);
+ }
+ 
+diff --git a/crypto/include/internal/evp_int.h b/crypto/include/internal/evp_int.h
+index c5d82e6..43932a4 100644
+--- a/crypto/include/internal/evp_int.h
++++ b/crypto/include/internal/evp_int.h
+@@ -172,6 +172,7 @@ extern const EVP_KDF tls1_prf_kdf_meth;
+ extern const EVP_KDF hkdf_kdf_meth;
+ extern const EVP_KDF sshkdf_kdf_meth;
+ extern const EVP_KDF ss_kdf_meth;
++extern const EVP_KDF x963_kdf_meth;
+ 
+ struct evp_md_st {
+     /* nid */
+diff --git a/crypto/kdf/kdf_err.c b/crypto/kdf/kdf_err.c
+index 84c330f..49028ab 100644
+--- a/crypto/kdf/kdf_err.c
++++ b/crypto/kdf/kdf_err.c
+@@ -65,6 +65,7 @@ static const ERR_STRING_DATA KDF_str_functs[] = {
+     {ERR_PACK(ERR_LIB_KDF, KDF_F_SSKDF_NEW, 0), &quot;sskdf_new&quot;},
+     {ERR_PACK(ERR_LIB_KDF, KDF_F_SSKDF_SIZE, 0), &quot;sskdf_size&quot;},
+     {ERR_PACK(ERR_LIB_KDF, KDF_F_TLS1_PRF_ALG, 0), &quot;tls1_prf_alg&quot;},
++    {ERR_PACK(ERR_LIB_KDF, KDF_F_X963KDF_DERIVE, 0), &quot;x963kdf_derive&quot;},
+     {0, NULL}
+ };
+ 
+@@ -84,6 +85,7 @@ static const ERR_STRING_DATA KDF_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_MISSING_SESSION_ID), &quot;missing session id&quot;},
+     {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_MISSING_TYPE), &quot;missing type&quot;},
+     {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_MISSING_XCGHASH), &quot;missing xcghash&quot;},
++    {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_NOT_SUPPORTED), &quot;not supported&quot;},
+     {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_UNKNOWN_PARAMETER_TYPE),
+     &quot;unknown parameter type&quot;},
+     {ERR_PACK(ERR_LIB_KDF, 0, KDF_R_UNSUPPORTED_MAC_TYPE),
+diff --git a/crypto/kdf/sskdf.c b/crypto/kdf/sskdf.c
+index 3dd5b78..92bf995 100644
+--- a/crypto/kdf/sskdf.c
++++ b/crypto/kdf/sskdf.c
+@@ -66,10 +66,16 @@ static const unsigned char kmac_custom_str[] = { 0x4B, 0x44, 0x46 };
+ /*
+  * Refer to <A HREF="https://csrc.nist.gov/publications/detail/sp/800-56c/rev-1/final">https://csrc.nist.gov/publications/detail/sp/800-56c/rev-1/final</A>
+  * Section 4. One-Step Key Derivation using H(x) = hash(x)
++ * Note: X9.63 also uses this code with the only difference being that the
++ * counter is appended to the secret 'z'.
++ * i.e.
++ *   result[i] = Hash(counter || z || info) for One Step OR
++ *   result[i] = Hash(z || counter || info) for X9.63.
+  */
+ static int SSKDF_hash_kdm(const EVP_MD *kdf_md,
+                           const unsigned char *z, size_t z_len,
+                           const unsigned char *info, size_t info_len,
++                          unsigned int append_ctr,
+                           unsigned char *derived_key, size_t derived_key_len)
+ {
+     int ret = 0, hlen;
+@@ -104,8 +110,9 @@ static int SSKDF_hash_kdm(const EVP_MD *kdf_md,
+         c[3] = (unsigned char)(counter &amp; 0xff);
+ 
+         if (!(EVP_MD_CTX_copy_ex(ctx, ctx_init)
+-                &amp;&amp; EVP_DigestUpdate(ctx, c, sizeof(c))
++                &amp;&amp; (append_ctr || EVP_DigestUpdate(ctx, c, sizeof(c)))
+                 &amp;&amp; EVP_DigestUpdate(ctx, z, z_len)
++                &amp;&amp; (!append_ctr || EVP_DigestUpdate(ctx, c, sizeof(c)))
+                 &amp;&amp; EVP_DigestUpdate(ctx, info, info_len)))
+             goto end;
+         if (len &gt;= out_len) {
+@@ -468,7 +475,28 @@ static int sskdf_derive(EVP_KDF_IMPL *impl, unsigned char *key, size_t keylen)
+             return 0;
+         }
+         return SSKDF_hash_kdm(impl-&gt;md, impl-&gt;secret, impl-&gt;secret_len,
+-                              impl-&gt;info, impl-&gt;info_len, key, keylen);
++                              impl-&gt;info, impl-&gt;info_len, 0, key, keylen);
++    }
++}
++
++static int x963kdf_derive(EVP_KDF_IMPL *impl, unsigned char *key, size_t keylen)
++{
++    if (impl-&gt;secret == NULL) {
++        KDFerr(KDF_F_X963KDF_DERIVE, KDF_R_MISSING_SECRET);
++        return 0;
++    }
++
++    if (impl-&gt;mac != NULL) {
++        KDFerr(KDF_F_X963KDF_DERIVE, KDF_R_NOT_SUPPORTED);
++        return 0;
++    } else {
++        /* H(x) = hash */
++        if (impl-&gt;md == NULL) {
++            KDFerr(KDF_F_X963KDF_DERIVE, KDF_R_MISSING_MESSAGE_DIGEST);
++            return 0;
++        }
++        return SSKDF_hash_kdm(impl-&gt;md, impl-&gt;secret, impl-&gt;secret_len,
++                              impl-&gt;info, impl-&gt;info_len, 1, key, keylen);
+     }
+ }
+ 
+@@ -482,3 +510,14 @@ const EVP_KDF ss_kdf_meth = {
+     sskdf_size,
+     sskdf_derive
+ };
++
++const EVP_KDF x963_kdf_meth = {
++    EVP_KDF_X963,
++    sskdf_new,
++    sskdf_free,
++    sskdf_reset,
++    sskdf_ctrl,
++    sskdf_ctrl_str,
++    sskdf_size,
++    x963kdf_derive
++};
+diff --git a/crypto/objects/obj_dat.h b/crypto/objects/obj_dat.h
+index c778d45..6bad090 100644
+--- a/crypto/objects/obj_dat.h
++++ b/crypto/objects/obj_dat.h
+@@ -1080,7 +1080,7 @@ static const unsigned char so[7775] = {
+     0x2A,0x81,0x1C,0xCF,0x55,0x01,0x83,0x75,       /* [ 7766] OBJ_SM2_with_SM3 */
+ };
+ 
+-#define NUM_NID 1206
++#define NUM_NID 1207
+ static const ASN1_OBJECT nid_objs[NUM_NID] = {
+     {&quot;UNDEF&quot;, &quot;undefined&quot;, NID_undef},
+     {&quot;rsadsi&quot;, &quot;RSA Data Security, Inc.&quot;, NID_rsadsi, 6, &amp;so[0]},
+@@ -2288,9 +2288,10 @@ static const ASN1_OBJECT nid_objs[NUM_NID] = {
+     {&quot;SSHKDF&quot;, &quot;sshkdf&quot;, NID_sshkdf},
+     {&quot;SM2-SM3&quot;, &quot;SM2-with-SM3&quot;, NID_SM2_with_SM3, 8, &amp;so[7766]},
+     {&quot;SSKDF&quot;, &quot;sskdf&quot;, NID_sskdf},
++    {&quot;X963KDF&quot;, &quot;x963kdf&quot;, NID_x963kdf},
+ };
+ 
+-#define NUM_SN 1197
++#define NUM_SN 1198
+ static const unsigned int sn_objs[NUM_SN] = {
+      364,    /* &quot;AD_DVCS&quot; */
+      419,    /* &quot;AES-128-CBC&quot; */
+@@ -2591,6 +2592,7 @@ static const unsigned int sn_objs[NUM_SN] = {
+      378,    /* &quot;X500algorithms&quot; */
+       12,    /* &quot;X509&quot; */
+      184,    /* &quot;X9-57&quot; */
++    1206,    /* &quot;X963KDF&quot; */
+      185,    /* &quot;X9cm&quot; */
+      125,    /* &quot;ZLIB&quot; */
+      478,    /* &quot;aRecord&quot; */
+@@ -3491,7 +3493,7 @@ static const unsigned int sn_objs[NUM_SN] = {
+     1093,    /* &quot;x509ExtAdmission&quot; */
+ };
+ 
+-#define NUM_LN 1197
++#define NUM_LN 1198
+ static const unsigned int ln_objs[NUM_LN] = {
+      363,    /* &quot;AD Time Stamping&quot; */
+      405,    /* &quot;ANSI X9.62&quot; */
+@@ -4689,6 +4691,7 @@ static const unsigned int ln_objs[NUM_LN] = {
+      503,    /* &quot;x500UniqueIdentifier&quot; */
+      158,    /* &quot;x509Certificate&quot; */
+      160,    /* &quot;x509Crl&quot; */
++    1206,    /* &quot;x963kdf&quot; */
+      125,    /* &quot;zlib compression&quot; */
+ };
+ 
+diff --git a/crypto/objects/obj_mac.num b/crypto/objects/obj_mac.num
+index 44820a7..e0969fe 100644
+--- a/crypto/objects/obj_mac.num
++++ b/crypto/objects/obj_mac.num
+@@ -1203,3 +1203,4 @@ blake2smac		1202
+ sshkdf		1203
+ SM2_with_SM3		1204
+ sskdf		1205
++x963kdf		1206
+diff --git a/crypto/objects/objects.txt b/crypto/objects/objects.txt
+index 2240916..a84b532 100644
+--- a/crypto/objects/objects.txt
++++ b/crypto/objects/objects.txt
+@@ -1617,6 +1617,9 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+ # NID for SSKDF
+                             : SSKDF              : sskdf
+ 
++# NID for X963-2001 KDF
++                            : X963KDF            : x963kdf
++
+ # RFC 4556
+ 1 3 6 1 5 2 3 : id-pkinit
+ id-pkinit 4                     : pkInitClientAuth      : PKINIT Client Auth
+diff --git a/doc/man3/EVP_KDF_CTX.pod b/doc/man3/EVP_KDF_CTX.pod
+index 2bdefc6..342807f 100644
+--- a/doc/man3/EVP_KDF_CTX.pod
++++ b/doc/man3/EVP_KDF_CTX.pod
+@@ -277,6 +277,7 @@ L&lt;EVP_KDF_PBKDF2(7)&gt;
+ L&lt;EVP_KDF_HKDF(7)&gt;
+ L&lt;EVP_KDF_SS(7)&gt;
+ L&lt;EVP_KDF_SSHKDF(7)&gt;
++L&lt;EVP_KDF_X963(7)&gt;
+ 
+ =head1 HISTORY
+ 
+diff --git a/doc/man7/EVP_KDF_X963.pod b/doc/man7/EVP_KDF_X963.pod
+new file mode 100644
+index 0000000..11789ae
+--- /dev/null
++++ b/doc/man7/EVP_KDF_X963.pod
+@@ -0,0 +1,136 @@
++=pod
++
++=head1 NAME
++
++EVP_KDF_X963 - The X9.63-2001 EVP_KDF implementation
++
++=head1 DESCRIPTION
++
++The EVP_KDF_X963 algorithm implements the key derivation function (X963KDF).
++X963KDF is used by Cryptographic Message Syntax (CMS) for EC KeyAgreement, to
++derive a key using input such as a shared secret key and shared info.
++
++=head2 Numeric identity
++
++B&lt;EVP_KDF_X963&gt; is the numeric identity for this implementation; it
++can be used with the EVP_KDF_CTX_new_id() function.
++
++=head2 Supported controls
++
++The supported controls are:
++
++=over 4
++
++=item B&lt;EVP_KDF_CTRL_SET_MD&gt;
++
++This control works as described in L&lt;EVP_KDF_CTX(3)/CONTROLS&gt;.
++
++=item B&lt;EVP_KDF_CTRL_SET_KEY&gt;
++
++This control expects two arguments: C&lt;unsigned char *secret&gt;, C&lt;size_t secretlen&gt;
++
++The shared secret used for key derivation.  This control sets the secret.
++
++EVP_KDF_ctrl_str() takes two type strings for this control:
++
++=over 4
++
++=item &quot;secret&quot;
++
++The value string is used as is.
++
++=item &quot;hexsecret&quot;
++
++The value string is expected to be a hexadecimal number, which will be
++decoded before being passed on as the control value.
++
++=back
++
++=item B&lt;EVP_KDF_CTRL_SET_SHARED_INFO&gt;
++
++This control expects two arguments: C&lt;unsigned char *info&gt;, C&lt;size_t infolen&gt;
++
++An optional value for shared info. This control sets the shared info.
++
++EVP_KDF_ctrl_str() takes two type strings for this control:
++
++=over 4
++
++=item &quot;info&quot;
++
++The value string is used as is.
++
++=item &quot;hexinfo&quot;
++
++The value string is expected to be a hexadecimal number, which will be
++decoded before being passed on as the control value.
++
++=back
++
++=back
++
++=head1 NOTES
++
++X963KDF is very similar to the SSKDF that uses a digest as the auxilary function,
++X963KDF appends the counter to the secret, whereas SSKDF prepends the counter.
++
++A context for X963KDF can be obtained by calling:
++
++EVP_KDF_CTX *kctx = EVP_KDF_CTX_new_id(EVP_KDF_X963);
++
++The output length of an X963KDF is specified via the C&lt;keylen&gt;
++parameter to the L&lt;EVP_KDF_derive(3)&gt; function.
++
++=head1 EXAMPLE
++
++This example derives 10 bytes, with the secret key &quot;secret&quot; and sharedinfo
++value &quot;label&quot;:
++
++  EVP_KDF_CTX *kctx;
++  unsigned char out[10];
++
++  kctx = EVP_KDF_CTX_new_id(EVP_KDF_X963);
++
++  if (EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_MD, EVP_sha256()) &lt;= 0) {
++      error(&quot;EVP_KDF_CTRL_SET_MD&quot;);
++  }
++  if (EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_KEY, &quot;secret&quot;, (size_t)6) &lt;= 0) {
++      error(&quot;EVP_KDF_CTRL_SET_KEY&quot;);
++  }
++  if (EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_SHARED_INFO, &quot;label&quot;, (size_t)5) &lt;= 0) {
++      error(&quot;EVP_KDF_CTRL_SET_SHARED_INFO&quot;);
++  }
++  if (EVP_KDF_derive(kctx, out, sizeof(out)) &lt;= 0) {
++      error(&quot;EVP_KDF_derive&quot;);
++  }
++
++  EVP_KDF_CTX_free(kctx);
++
++=head1 CONFORMING TO
++
++&quot;SEC 1: Elliptic Curve Cryptography&quot;
++
++=head1 SEE ALSO
++
++L&lt;EVP_KDF_CTX&gt;,
++L&lt;EVP_KDF_CTX_new_id(3)&gt;,
++L&lt;EVP_KDF_CTX_free(3)&gt;,
++L&lt;EVP_KDF_ctrl(3)&gt;,
++L&lt;EVP_KDF_size(3)&gt;,
++L&lt;EVP_KDF_derive(3)&gt;,
++L&lt;EVP_KDF_CTX(3)/CONTROLS&gt;
++
++=head1 HISTORY
++
++This functionality was added to OpenSSL 3.0.0.
++
++=head1 COPYRIGHT
++
++Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L&lt;<A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>&gt;.
++
++=cut
+diff --git a/include/openssl/kdf.h b/include/openssl/kdf.h
+index 6f38066..b13b54c 100644
+--- a/include/openssl/kdf.h
++++ b/include/openssl/kdf.h
+@@ -24,6 +24,7 @@ extern &quot;C&quot; {
+ # define EVP_KDF_HKDF       NID_hkdf
+ # define EVP_KDF_SSHKDF     NID_sshkdf
+ # define EVP_KDF_SS         NID_sskdf
++# define EVP_KDF_X963       NID_x963kdf
+ 
+ EVP_KDF_CTX *EVP_KDF_CTX_new_id(int id);
+ EVP_KDF_CTX *EVP_KDF_CTX_new(const EVP_KDF *kdf);
+@@ -64,6 +65,7 @@ const EVP_KDF *EVP_get_kdfbyname(const char *name);
+ # define EVP_KDF_CTRL_SET_MAC           0x13 /* EVP_MAC * */
+ # define EVP_KDF_CTRL_SET_MAC_SIZE      0x14 /* size_t */
+ # define EVP_KDF_CTRL_SET_SSKDF_INFO    0x15 /* unsigned char *, size_t */
++# define EVP_KDF_CTRL_SET_SHARED_INFO   EVP_KDF_CTRL_SET_SSKDF_INFO
+ 
+ # define EVP_KDF_HKDF_MODE_EXTRACT_AND_EXPAND  0
+ # define EVP_KDF_HKDF_MODE_EXTRACT_ONLY        1
+diff --git a/include/openssl/kdferr.h b/include/openssl/kdferr.h
+index bad8f13..db87f69 100644
+--- a/include/openssl/kdferr.h
++++ b/include/openssl/kdferr.h
+@@ -62,6 +62,7 @@ int ERR_load_KDF_strings(void);
+ # define KDF_F_SSKDF_NEW                                  137
+ # define KDF_F_SSKDF_SIZE                                 138
+ # define KDF_F_TLS1_PRF_ALG                               111
++# define KDF_F_X963KDF_DERIVE                             139
+ 
+ /*
+  * KDF reason codes.
+@@ -79,6 +80,7 @@ int ERR_load_KDF_strings(void);
+ # define KDF_R_MISSING_SESSION_ID                         113
+ # define KDF_R_MISSING_TYPE                               114
+ # define KDF_R_MISSING_XCGHASH                            115
++# define KDF_R_NOT_SUPPORTED                              118
+ # define KDF_R_UNKNOWN_PARAMETER_TYPE                     103
+ # define KDF_R_UNSUPPORTED_MAC_TYPE                       117
+ # define KDF_R_VALUE_ERROR                                108
+diff --git a/include/openssl/obj_mac.h b/include/openssl/obj_mac.h
+index a0d4eed..48d201d 100644
+--- a/include/openssl/obj_mac.h
++++ b/include/openssl/obj_mac.h
+@@ -5004,6 +5004,10 @@
+ #define LN_sskdf                &quot;sskdf&quot;
+ #define NID_sskdf               1205
+ 
++#define SN_x963kdf              &quot;X963KDF&quot;
++#define LN_x963kdf              &quot;x963kdf&quot;
++#define NID_x963kdf             1206
++
+ #define SN_id_pkinit            &quot;id-pkinit&quot;
+ #define NID_id_pkinit           1031
+ #define OBJ_id_pkinit           1L,3L,6L,1L,5L,2L,3L
+diff --git a/test/evp_kdf_test.c b/test/evp_kdf_test.c
+index 51f601e..79177f9 100644
+--- a/test/evp_kdf_test.c
++++ b/test/evp_kdf_test.c
+@@ -23,7 +23,7 @@ static int test_kdf_tls1_prf(void)
+     EVP_KDF_CTX *kctx = NULL;
+     const EVP_KDF *kdf;
+     unsigned char out[16];
+-    const unsigned char expected[sizeof(out)] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0x8e, 0x4d, 0x93, 0x25, 0x30, 0xd7, 0x65, 0xa0,
+         0xaa, 0xe9, 0x74, 0xc3, 0x04, 0x73, 0x5e, 0xcc
+     };
+@@ -50,7 +50,7 @@ static int test_kdf_hkdf(void)
+     int ret;
+     EVP_KDF_CTX *kctx;
+     unsigned char out[10];
+-    const unsigned char expected[sizeof(out)] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0x2a, 0xc4, 0x36, 0x9f, 0x52, 0x59, 0x96, 0xf8, 0xde, 0x13
+     };
+ 
+@@ -75,7 +75,7 @@ static int test_kdf_pbkdf2(void)
+     int ret;
+     EVP_KDF_CTX *kctx;
+     unsigned char out[32];
+-    const unsigned char expected[sizeof(out)] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0xae, 0x4d, 0x0c, 0x95, 0xaf, 0x6b, 0x46, 0xd3,
+         0x2d, 0x0a, 0xdf, 0xf9, 0x28, 0xf0, 0x6d, 0xd0,
+         0x2a, 0x30, 0x3f, 0x8e, 0xf3, 0xc2, 0x51, 0xdf,
+@@ -103,7 +103,7 @@ static int test_kdf_scrypt(void)
+     int ret;
+     EVP_KDF_CTX *kctx;
+     unsigned char out[64];
+-    const unsigned char expected[sizeof(out)] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0xfd, 0xba, 0xbe, 0x1c, 0x9d, 0x34, 0x72, 0x00,
+         0x78, 0x56, 0xe7, 0x19, 0x0d, 0x01, 0xe9, 0xfe,
+         0x7c, 0x6a, 0xd7, 0xcb, 0xc8, 0x23, 0x78, 0x30,
+@@ -144,22 +144,22 @@ static int test_kdf_ss_hash(void)
+ {
+     int ret;
+     EVP_KDF_CTX *kctx = NULL;
+-    const unsigned char z[] = {
++    unsigned char out[14];
++    static const unsigned char z[] = {
+         0x6d,0xbd,0xc2,0x3f,0x04,0x54,0x88,0xe4,0x06,0x27,0x57,0xb0,0x6b,0x9e,
+         0xba,0xe1,0x83,0xfc,0x5a,0x59,0x46,0xd8,0x0d,0xb9,0x3f,0xec,0x6f,0x62,
+         0xec,0x07,0xe3,0x72,0x7f,0x01,0x26,0xae,0xd1,0x2c,0xe4,0xb2,0x62,0xf4,
+         0x7d,0x48,0xd5,0x42,0x87,0xf8,0x1d,0x47,0x4c,0x7c,0x3b,0x18,0x50,0xe9
+     };
+-    const unsigned char other[] = {
++    static const unsigned char other[] = {
+         0xa1,0xb2,0xc3,0xd4,0xe5,0x43,0x41,0x56,0x53,0x69,0x64,0x3c,0x83,0x2e,
+         0x98,0x49,0xdc,0xdb,0xa7,0x1e,0x9a,0x31,0x39,0xe6,0x06,0xe0,0x95,0xde,
+         0x3c,0x26,0x4a,0x66,0xe9,0x8a,0x16,0x58,0x54,0xcd,0x07,0x98,0x9b,0x1e,
+         0xe0,0xec,0x3f,0x8d,0xbe
+     };
+-    const unsigned char expected[] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0xa4,0x62,0xde,0x16,0xa8,0x9d,0xe8,0x46,0x6e,0xf5,0x46,0x0b,0x47,0xb8
+     };
+-    unsigned char out[14];
+ 
+     ret =
+         TEST_ptr(kctx = EVP_KDF_CTX_new_id(EVP_KDF_SS))
+@@ -174,27 +174,75 @@ static int test_kdf_ss_hash(void)
+     return ret;
+ }
+ 
++static int test_kdf_x963(void)
++{
++    int ret;
++    EVP_KDF_CTX *kctx = NULL;
++    unsigned char out[1024 / 8];
++    /*
++     * Test data from <A HREF="https://csrc.nist.gov/CSRC/media/Projects/">https://csrc.nist.gov/CSRC/media/Projects/</A>
++     *  Cryptographic-Algorithm-Validation-Program/documents/components/
++     *  800-135testvectors/ansx963_2001.zip
++     */
++    static const unsigned char z[] = {
++        0x00, 0xaa, 0x5b, 0xb7, 0x9b, 0x33, 0xe3, 0x89, 0xfa, 0x58, 0xce, 0xad,
++        0xc0, 0x47, 0x19, 0x7f, 0x14, 0xe7, 0x37, 0x12, 0xf4, 0x52, 0xca, 0xa9,
++        0xfc, 0x4c, 0x9a, 0xdb, 0x36, 0x93, 0x48, 0xb8, 0x15, 0x07, 0x39, 0x2f,
++        0x1a, 0x86, 0xdd, 0xfd, 0xb7, 0xc4, 0xff, 0x82, 0x31, 0xc4, 0xbd, 0x0f,
++        0x44, 0xe4, 0x4a, 0x1b, 0x55, 0xb1, 0x40, 0x47, 0x47, 0xa9, 0xe2, 0xe7,
++        0x53, 0xf5, 0x5e, 0xf0, 0x5a, 0x2d
++    };
++    static const unsigned char shared[] = {
++        0xe3, 0xb5, 0xb4, 0xc1, 0xb0, 0xd5, 0xcf, 0x1d, 0x2b, 0x3a, 0x2f, 0x99,
++        0x37, 0x89, 0x5d, 0x31
++    };
++    static const unsigned char expected[sizeof(out)] = {
++        0x44, 0x63, 0xf8, 0x69, 0xf3, 0xcc, 0x18, 0x76, 0x9b, 0x52, 0x26, 0x4b,
++        0x01, 0x12, 0xb5, 0x85, 0x8f, 0x7a, 0xd3, 0x2a, 0x5a, 0x2d, 0x96, 0xd8,
++        0xcf, 0xfa, 0xbf, 0x7f, 0xa7, 0x33, 0x63, 0x3d, 0x6e, 0x4d, 0xd2, 0xa5,
++        0x99, 0xac, 0xce, 0xb3, 0xea, 0x54, 0xa6, 0x21, 0x7c, 0xe0, 0xb5, 0x0e,
++        0xef, 0x4f, 0x6b, 0x40, 0xa5, 0xc3, 0x02, 0x50, 0xa5, 0xa8, 0xee, 0xee,
++        0x20, 0x80, 0x02, 0x26, 0x70, 0x89, 0xdb, 0xf3, 0x51, 0xf3, 0xf5, 0x02,
++        0x2a, 0xa9, 0x63, 0x8b, 0xf1, 0xee, 0x41, 0x9d, 0xea, 0x9c, 0x4f, 0xf7,
++        0x45, 0xa2, 0x5a, 0xc2, 0x7b, 0xda, 0x33, 0xca, 0x08, 0xbd, 0x56, 0xdd,
++        0x1a, 0x59, 0xb4, 0x10, 0x6c, 0xf2, 0xdb, 0xbc, 0x0a, 0xb2, 0xaa, 0x8e,
++        0x2e, 0xfa, 0x7b, 0x17, 0x90, 0x2d, 0x34, 0x27, 0x69, 0x51, 0xce, 0xcc,
++        0xab, 0x87, 0xf9, 0x66, 0x1c, 0x3e, 0x88, 0x16
++    };
++
++    ret =
++        TEST_ptr(kctx = EVP_KDF_CTX_new_id(EVP_KDF_X963))
++        &amp;&amp; TEST_int_gt(EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_MD, EVP_sha512()), 0)
++        &amp;&amp; TEST_int_gt(EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_KEY, z, sizeof(z)), 0)
++        &amp;&amp; TEST_int_gt(EVP_KDF_ctrl(kctx, EVP_KDF_CTRL_SET_SHARED_INFO, shared,
++                                    sizeof(shared)), 0)
++        &amp;&amp; TEST_int_gt(EVP_KDF_derive(kctx, out, sizeof(out)), 0)
++        &amp;&amp; TEST_mem_eq(out, sizeof(out), expected, sizeof(expected));
++
++    EVP_KDF_CTX_free(kctx);
++    return ret;
++}
++
+ static int test_kdf_ss_hmac(void)
+ {
+     int ret;
+     EVP_KDF_CTX *kctx;
+     const EVP_MAC *mac;
+-
+-    const unsigned char z[] = {
++    unsigned char out[16];
++    static const unsigned char z[] = {
+         0xb7,0x4a,0x14,0x9a,0x16,0x15,0x46,0xf8,0xc2,0x0b,0x06,0xac,0x4e,0xd4
+     };
+-    const unsigned char other[] = {
++    static const unsigned char other[] = {
+         0x34,0x8a,0x37,0xa2,0x7e,0xf1,0x28,0x2f,0x5f,0x02,0x0d,0xcc
+     };
+-    const unsigned char salt[] = {
++    static const unsigned char salt[] = {
+         0x36,0x38,0x27,0x1c,0xcd,0x68,0xa2,0x5d,0xc2,0x4e,0xcd,0xdd,0x39,0xef,
+         0x3f,0x89
+     };
+-    const unsigned char expected[] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0x44,0xf6,0x76,0xe8,0x5c,0x1b,0x1a,0x8b,0xbc,0x3d,0x31,0x92,0x18,0x63,
+         0x1c,0xa3
+     };
+-    unsigned char out[16];
+ 
+     ret =
+         TEST_ptr(kctx = EVP_KDF_CTX_new_id(EVP_KDF_SS))
+@@ -219,18 +267,17 @@ static int test_kdf_ss_kmac(void)
+     EVP_KDF_CTX *kctx;
+     unsigned char out[64];
+     const EVP_MAC *mac;
+-
+-    const unsigned char z[] = {
++    static const unsigned char z[] = {
+         0xb7,0x4a,0x14,0x9a,0x16,0x15,0x46,0xf8,0xc2,0x0b,0x06,0xac,0x4e,0xd4
+     };
+-    const unsigned char other[] = {
++    static const unsigned char other[] = {
+         0x34,0x8a,0x37,0xa2,0x7e,0xf1,0x28,0x2f,0x5f,0x02,0x0d,0xcc
+     };
+-    const unsigned char salt[] = {
++    static const unsigned char salt[] = {
+         0x36,0x38,0x27,0x1c,0xcd,0x68,0xa2,0x5d,0xc2,0x4e,0xcd,0xdd,0x39,0xef,
+         0x3f,0x89
+     };
+-    const unsigned char expected[] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0xe9,0xc1,0x84,0x53,0xa0,0x62,0xb5,0x3b,0xdb,0xfc,0xbb,0x5a,0x34,0xbd,
+         0xb8,0xe5,0xe7,0x07,0xee,0xbb,0x5d,0xd1,0x34,0x42,0x43,0xd8,0xcf,0xc2,
+         0xc2,0xe6,0x33,0x2f,0x91,0xbd,0xa5,0x86,0xf3,0x7d,0xe4,0x8a,0x65,0xd4,
+@@ -263,7 +310,7 @@ static int test_kdf_sshkdf(void)
+     EVP_KDF_CTX *kctx;
+     unsigned char out[8];
+     /* Test data from NIST CAVS 14.1 test vectors */
+-    const unsigned char key[] = {
++    static const unsigned char key[] = {
+         0x00, 0x00, 0x00, 0x81, 0x00, 0x87, 0x5c, 0x55, 0x1c, 0xef, 0x52, 0x6a,
+         0x4a, 0x8b, 0xe1, 0xa7, 0xdf, 0x27, 0xe9, 0xed, 0x35, 0x4b, 0xac, 0x9a,
+         0xfb, 0x71, 0xf5, 0x3d, 0xba, 0xe9, 0x05, 0x67, 0x9d, 0x14, 0xf9, 0xfa,
+@@ -277,17 +324,17 @@ static int test_kdf_sshkdf(void)
+         0xaa, 0x22, 0x76, 0x93, 0xe1, 0x41, 0xad, 0x16, 0x30, 0xce, 0x13, 0x14,
+         0x4e
+     };
+-    const unsigned char xcghash[] = {
++    static const unsigned char xcghash[] = {
+         0x0e, 0x68, 0x3f, 0xc8, 0xa9, 0xed, 0x7c, 0x2f, 0xf0, 0x2d, 0xef, 0x23,
+         0xb2, 0x74, 0x5e, 0xbc, 0x99, 0xb2, 0x67, 0xda, 0xa8, 0x6a, 0x4a, 0xa7,
+         0x69, 0x72, 0x39, 0x08, 0x82, 0x53, 0xf6, 0x42
+     };
+-    const unsigned char sessid[] = {
++    static const unsigned char sessid[] = {
+         0x0e, 0x68, 0x3f, 0xc8, 0xa9, 0xed, 0x7c, 0x2f, 0xf0, 0x2d, 0xef, 0x23,
+         0xb2, 0x74, 0x5e, 0xbc, 0x99, 0xb2, 0x67, 0xda, 0xa8, 0x6a, 0x4a, 0xa7,
+         0x69, 0x72, 0x39, 0x08, 0x82, 0x53, 0xf6, 0x42
+     };
+-    const unsigned char expected[sizeof(out)] = {
++    static const unsigned char expected[sizeof(out)] = {
+         0x41, 0xff, 0x2e, 0xad, 0x16, 0x83, 0xf1, 0xe6
+     };
+ 
+@@ -340,5 +387,6 @@ int setup_tests(void)
+     ADD_TEST(test_kdf_ss_hmac);
+     ADD_TEST(test_kdf_ss_kmac);
+     ADD_TEST(test_kdf_sshkdf);
++    ADD_TEST(test_kdf_x963);
+     return 1;
+ }
+diff --git a/test/recipes/30-test_evp_data/evpkdf.txt b/test/recipes/30-test_evp_data/evpkdf.txt
+index c66b6da..7100c21 100644
+--- a/test/recipes/30-test_evp_data/evpkdf.txt
++++ b/test/recipes/30-test_evp_data/evpkdf.txt
+@@ -6375,3 +6375,101 @@ Ctrl.digest = digest:SHA512
+ Ctrl.hexsecret = hexsecret:abb7d7554c0de41cada5826a1f79d76f
+ Ctrl.hexinfo = hexinfo:a80b9061879365b1669c87a8
+ Output = 71e29fff69198eca92f5180bcb281fbdaf409ec7c99ca704b1f56e782d3c4db10cb4158e6634d793a46c13bffb6bdb71a01101936ea9b20f7dbe302558b1356c
++
++# Test vectors extracted from
++# <A HREF="https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/800-135testvectors/ansx963_2001.zip">https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/800-135testvectors/ansx963_2001.zip</A>
++Title = X963 KDF tests (from NIST test vectors)
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA1
++Ctrl.hexsecret = hexsecret:fd17198b89ab39c4ab5d7cca363b82f9fd7e23c3984dc8a2
++Ctrl.hexinfo = hexinfo:856a53f3e36a26bbc5792879f307cce2
++Output = 6e5fad865cb4a51c95209b16df0cc490bc2c9064405c5bccd4ee4832a531fbe7f10cb79e2eab6ab1149fbd5a23cfdabc41242269c9df22f628c4424333855b64e95e2d4fb8469c669f17176c07d103376b10b384ec5763d8b8c610409f19aca8eb31f9d85cc61a8d6d4a03d03e5a506b78d6847e93d295ee548c65afedd2efec
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA224
++Ctrl.hexsecret = hexsecret:da67a73072d521a8272c69023573012ddf9b46bff65b3900
++Ctrl.hexinfo = hexinfo:727997aed53e78f74b1d66743a4ea4d2
++Output = dfc3126c5eebf9a58d89730e8d8ff7cc772592f28c10b349b437d9d068698a22e532eae975dfaf9c5c6a9f2935eafb05353013c253444e61f07bc9ddd15948e614bdc7e445ba3b1893f42f87f18fb352d49956009a642c362d45410b43a9ab376e9261210739174759511d1f9e52f6ec73dfed446dbafaf7fd1a57113abc2e8d
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA256
++Ctrl.hexsecret = hexsecret:22518b10e70f2a3f243810ae3254139efbee04aa57c7af7d
++Ctrl.hexinfo = hexinfo:75eef81aa3041e33b80971203d2c0c52
++Output = c498af77161cc59f2962b9a713e2b215152d139766ce34a776df11866a69bf2e52a13d9c7c6fc878c50c5ea0bc7b00e0da2447cfd874f6cf92f30d0097111485500c90c3af8b487872d04685d14c8d1dc8d7fa08beb0ce0ababc11f0bd496269142d43525a78e5bc79a17f59676a5706dc54d54d4d1f0bd7e386128ec26afc21
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA384
++Ctrl.hexsecret = hexsecret:d8554db1b392cd55c3fe957bed76af09c13ac2a9392f88f6
++Output = 671a46aada145162f8ddf1ca586a1cda
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA384
++Ctrl.hexsecret = hexsecret:c051fd22539c9de791d6c43a854b8f80a6bf70190050854a
++Ctrl.hexinfo = hexinfo:1317504aa34759bb4c931e3b78201945
++Output = cf6a84434734ac6949e1d7976743277be789906908ad3ca3a8923da7f476abbeb574306d7243031a85566914bfd247d2519c479953d9d55b6b831e56260806c39af21b74e3ecf470e3bd8332791c8a23c13352514fdef00c2d1a408ba31b2d3f9fdcb373895484649a645d1845eec91b5bfdc5ad28c7824984482002dd4a8677
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:87fc0d8c4477485bb574f5fcea264b30885dc8d90ad82782
++Output = 947665fbb9152153ef460238506a0245
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:00aa5bb79b33e389fa58ceadc047197f14e73712f452caa9fc4c9adb369348b81507392f1a86ddfdb7c4ff8231c4bd0f44e44a1b55b1404747a9e2e753f55ef05a2d
++Ctrl.hexinfo = hexinfo:e3b5b4c1b0d5cf1d2b3a2f9937895d31
++Output = 4463f869f3cc18769b52264b0112b5858f7ad32a5a2d96d8cffabf7fa733633d6e4dd2a599acceb3ea54a6217ce0b50eef4f6b40a5c30250a5a8eeee208002267089dbf351f3f5022aa9638bf1ee419dea9c4ff745a25ac27bda33ca08bd56dd1a59b4106cf2dbbc0ab2aa8e2efa7b17902d34276951ceccab87f9661c3e8816
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:009dcd6ba5c8c803ca21f9996ca5dd86047d4ddc150fddace1b1ebe996c2007e3ee907c8ff03b9ef766e8ceb4dedf7489e5162e2278c0185e4be381bec17dd992cf8
++Ctrl.hexinfo = hexinfo:1e60e51c11a538b0ea8990d69a4c6358
++Output = 4e55036a32f32fc965046fdfbf686c108e43a69f8fc1a64ff1bd77763f2eedc8bf277d78b4ce31243e1adbe2c2d5dd59b47503b5b90b54f9d7a9a5aea49c7f0283cb64c3849a1d157000fd41ef6c1d1a5b62734e7c9a20dcfb57f2da974933f57ee619d72898d0e93d9a4254aaddf73941d6269298b4d49c0ac64a33802fe8f2
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:01bbc44314f24db4d67a2a7fb5ca3f7a5022790f5875895d448050eda5611a2f39de48e394c5a3df26208eb01f804d0a1d68eece6b6fa96d6db895e133e129094f78
++Ctrl.hexinfo = hexinfo:433e3ee77d00e4a9634efd677e2ff21b
++Output = f1255002293d5fbcf35ad0e532ae872171d11014616a2c52d7e5cb861b0251b9e505a77161c777bafc052b6525a6ecf34590605de72f13a1aff0a61a8a4a3364ebbe2f99224c13e043e497af8a26de749cd257e475b2f0e60e3b594901320a692a4af422f9636e4814b33f67d181a086265013b0d4efd9e1a94ea8a576afde66
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:01a33032a2bf6f8e9d6972dd339536c9e248ae9881844ff1bd04af48085be4ca1834f2a94ce1019dd9620d1e3a68203a5b291f40b5f8e3238a2a036312b89061cc60
++Ctrl.hexinfo = hexinfo:d3297ad6b9757d1f5a9d5b0e72176d74
++Output = 63565d1d3443620fba4218c97887ff40d6d68bf56b429c22018be5d91c318187ebe8a9399c5cc6c4a849288ab784d4340714ae3fdb426c4a83db9ce2ba8aea80d448e50ad543749b47bcaae519f7f00badd8d48296e81069104dcd293c605b08159ef2ef14c7833739d0414274136ae4db05ba4fa31b29c59de46d9be539525f
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:004b20a501776ea54cbdabffec2a664b7a93f8d67b17405a82bd9cbf3685a4659beb2deff1b6ecaa7ab187b6d4fd407f10db6992c65308410deb133be31a0de0c1c9
++Ctrl.hexinfo = hexinfo:fd5462cb37aa298e95f8e34bb49d85ca
++Output = cafcbc117317661bf15277c2881e05e345c1720b0c1c4040c33fe4a3ecf8032802642d29828a077ca91b6fac216b7a06517740c7d633c279dd2115eb7a34fd337376247219f53da32df57070f47c2e0816710080d6492e1c3e8cac818c3cfca2a3ce5cf1515f066b1815d2d2f69fa3111a9e81570963b90a536da0376c12265b
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:01fb44335b437771777f14d44e5b634c18c7f570b935228fd3073e3cbde299dfb9f4d64ad720d30e875e8c6bbe181027459c9d3f92a276a38e22faf25f208576a63f
++Ctrl.hexinfo = hexinfo:2359d18657243d61963ceca3fa93587d
++Output = 1544e54cd293e533959bdd893337f01ef0c7685a4d8d403d438b0223a7e18330c312a0f16bd819f4359fdd74ae85cc603d35e3d9cba896177452c8dee5214066fca420c3ab522a245af215beb7de52ebb0bdd15d0596b8b763cf7e25610a53efa726b899a1d9727b25ec673ee91ff2111f03cf761a7880d69625e784becfd4e0
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:0109afa3904193690d3f2c49e42d08c8c5cd2ea907a0d699c876e418e303b485374c8d6cf5a32af1491b3ea8a3503692b4a0fd78f9b4082e2a6e72345db4532d749f
++Ctrl.hexinfo = hexinfo:7c19631d3cd65915fa4789cf7b1c0979
++Output = fb60175568a66ef4202e110396663085fe2a9d6d2071e55d03c30ea499fee850c99c4e42a7227cca2eaf4d75e37dde205ae07260e84aeee6ef0819d98bd00d0ff5ba55994e7bf2a578baf2ee9aa862d94bf431fa14429010ebc30d7e602de726cdffacaeabc8541237fbc0c975abbf203c018c688ee354d07978654b90de9569
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:00632e165775f3c5b6e81d4042f809e904b8167687747638874b39ffce1993f46e8fc44e2a1c3df59563003bad3e25c85b61819e9addc0fdbe173dd4115c38f62ef6
++Ctrl.hexinfo = hexinfo:2bf0f18b7f21c4ec9c20b84c75f66b7c
++Output = c324fed01b75c37fc96703031403d5cc6857dc7ffa48192d9a10d5c69dd6274ecd0eb9a278f9e6b616c27bbf2e3e016635b311940390c52c61a4f4b3383ca6046961dbd2455ff6a982e8269864edd3cc1b1053da7daf9699c61b05f1acca7b79e68db655fd526fdc392bd36dcaf1c5b2fafb8975e318070d4bb948829ac41bb6
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:0096172bf47d06d544ae98471490cf9e52ee59ea7a2208b33b26c52d4952bb8f41b2211d3f9ff32e77ca8cc906ba8d246ff266ddf1df8f53824ccb15b8fb39724703
++Ctrl.hexinfo = hexinfo:cf3a74ba86af42f1ae85477ead645583
++Output = 995d1ab8557dfeafcb347f8182583fa0ac5e6cb3912393592590989f38a0214f6cf7d6fbe23917b0966c6a870876de2a2c13a45fa7aa1715be137ed332e1ffc204ce4dcce33ece6dec7f3da61fa049780040e44142cc8a1e5121cf56b386f65b7c261a192f05e5fefae4221a602bc51c41ef175dc45fb7eab8642421b4f7e3e7
++
++KDF = X963KDF
++Ctrl.digest = digest:SHA512
++Ctrl.hexsecret = hexsecret:0037cd001a0ad87f35ddf58ab355d6144ba2ed0749a7435dab548ba0bfbe723c047e2396b4eef99653412a92c8db74bb5c03063f2eb0525ae87356750ae3676faa86
++Ctrl.hexinfo = hexinfo:eb17da8851c41c7ac6710b1c49f324f8
++Output = 829a28b81f9e95b5f306604067499c07d5944ca034ed130d513951f7143e4e162bad8adb2833e53b8235c293cd2a809659ac7f7e392cba6a543660e5d95070c0c9e6a9cdc38123e22da61bb4cbb6ad6d1a58a069e934fc231bd9fe39a24afcbf322ccea385f0418f3b01c1edd6e7124593a1cefe3e48fcd95daaf72cfd973c59
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023094.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="023110.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23109">[ date ]</a>
+              <a href="thread.html#23109">[ thread ]</a>
+              <a href="subject.html#23109">[ subject ]</a>
+              <a href="author.html#23109">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

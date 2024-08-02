@@ -1,0 +1,426 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1491951714.421427.22764.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014066.html">
+   <LINK REL="Next"  HREF="014068.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1491951714.421427.22764.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Tue Apr 11 23:01:54 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014066.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="014068.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14067">[ date ]</a>
+              <a href="thread.html#14067">[ thread ]</a>
+              <a href="subject.html#14067">[ subject ]</a>
+              <a href="author.html#14067">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c79107961046be77ea4509991f97b8627d25ddc1 (commit)
+      from  829b2b854332bb3ccacc12c86e8fac1cfebb03bb (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c79107961046be77ea4509991f97b8627d25ddc1
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Apr 11 15:23:07 2017 +0100
+
+    Convert asynciotest for the new test framework
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3182">https://github.com/openssl/openssl/pull/3182</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/asynciotest.c | 217 +++++++++++++++++++++++++----------------------------
+ test/build.info    |   2 +-
+ 2 files changed, 103 insertions(+), 116 deletions(-)
+
+diff --git a/test/asynciotest.c b/test/asynciotest.c
+index f418bbe..f78b86f 100644
+--- a/test/asynciotest.c
++++ b/test/asynciotest.c
+@@ -16,10 +16,15 @@
+ #include &quot;../ssl/packet_locl.h&quot;
+ 
+ #include &quot;ssltestlib.h&quot;
++#include &quot;testutil.h&quot;
++#include &quot;test_main_custom.h&quot;
+ 
+ /* Should we fragment records or not? 0 = no, !0 = yes*/
+ static int fragment = 0;
+ 
++static char *cert = NULL;
++static char *privkey = NULL;
++
+ static int async_new(BIO *bi);
+ static int async_free(BIO *a);
+ static int async_read(BIO *b, char *out, int outl);
+@@ -139,18 +144,18 @@ static int async_write(BIO *bio, const char *in, int inl)
+             PACKET pkt;
+ 
+             if (!PACKET_buf_init(&amp;pkt, (const unsigned char *)in, inl))
+-                abort();
++                return -1;
+ 
+             while (PACKET_remaining(&amp;pkt) &gt; 0) {
+                 PACKET payload, wholebody;
+                 unsigned int contenttype, versionhi, versionlo, data;
+                 unsigned int msgtype = 0, negversion = 0;
+ 
+-                if (   !PACKET_get_1(&amp;pkt, &amp;contenttype)
+-                    || !PACKET_get_1(&amp;pkt, &amp;versionhi)
+-                    || !PACKET_get_1(&amp;pkt, &amp;versionlo)
+-                    || !PACKET_get_length_prefixed_2(&amp;pkt, &amp;payload))
+-                    abort();
++                if (!PACKET_get_1(&amp;pkt, &amp;contenttype)
++                        || !PACKET_get_1(&amp;pkt, &amp;versionhi)
++                        || !PACKET_get_1(&amp;pkt, &amp;versionlo)
++                        || !PACKET_get_length_prefixed_2(&amp;pkt, &amp;payload))
++                    return -1;
+ 
+                 /* Pretend we wrote out the record header */
+                 written += SSL3_RT_HEADER_LENGTH;
+@@ -158,13 +163,13 @@ static int async_write(BIO *bio, const char *in, int inl)
+                 wholebody = payload;
+                 if (contenttype == SSL3_RT_HANDSHAKE
+                         &amp;&amp; !PACKET_get_1(&amp;wholebody, &amp;msgtype))
+-                    abort();
++                    return -1;
+ 
+                 if (msgtype == SSL3_MT_SERVER_HELLO
+                         &amp;&amp; (!PACKET_forward(&amp;wholebody,
+                                             SSL3_HM_HEADER_LENGTH - 1)
+                             || !PACKET_get_net_2(&amp;wholebody, &amp;negversion)))
+-                    abort();
++                    return -1;
+ 
+                 while (PACKET_get_1(&amp;payload, &amp;data)) {
+                     /* Create a new one byte long record for each byte in the
+@@ -185,7 +190,7 @@ static int async_write(BIO *bio, const char *in, int inl)
+                     smallrec[DATAPOS] = data;
+                     ret = BIO_write(next, smallrec, MIN_RECORD_LEN);
+                     if (ret &lt;= 0)
+-                        abort();
++                        return -1;
+                     written++;
+                 }
+                 /*
+@@ -252,29 +257,19 @@ static int async_puts(BIO *bio, const char *str)
+ 
+ #define MAX_ATTEMPTS    100
+ 
+-int main(int argc, char *argv[])
++static int test_asyncio(int test)
+ {
+     SSL_CTX *serverctx = NULL, *clientctx = NULL;
+     SSL *serverssl = NULL, *clientssl = NULL;
+     BIO *s_to_c_fbio = NULL, *c_to_s_fbio = NULL;
+-    int test, err = 1, ret;
++    int testresult = 0, ret;
+     size_t i, j;
+     const char testdata[] = &quot;Test data&quot;;
+     char buf[sizeof(testdata)];
+ 
+-    CRYPTO_set_mem_debug(1);
+-    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
+-
+-    if (argc != 3) {
+-        printf(&quot;Invalid argument count\n&quot;);
+-        goto end;
+-    }
+-
+-    if (!create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
+-                             &amp;serverctx, &amp;clientctx, argv[1], argv[2])) {
+-        printf(&quot;Failed to create SSL_CTX pair\n&quot;);
++    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
++                             &amp;serverctx, &amp;clientctx, cert, privkey)))
+         goto end;
+-    }
+ 
+     /*
+      * We do 2 test runs. The first time around we just do a normal handshake
+@@ -282,116 +277,108 @@ int main(int argc, char *argv[])
+      * all records so that the content is only one byte length (up until the
+      * CCS)
+      */
+-    for (test = 1; test &lt; 3; test++) {
+-        if (test == 2)
+-            fragment = 1;
++    if (test == 1)
++        fragment = 1;
+ 
+ 
+-        s_to_c_fbio = BIO_new(bio_f_async_filter());
+-        c_to_s_fbio = BIO_new(bio_f_async_filter());
+-        if (s_to_c_fbio == NULL || c_to_s_fbio == NULL) {
+-            printf(&quot;Failed to create filter BIOs\n&quot;);
+-            BIO_free(s_to_c_fbio);
+-            BIO_free(c_to_s_fbio);
+-            goto end;
+-        }
++    s_to_c_fbio = BIO_new(bio_f_async_filter());
++    c_to_s_fbio = BIO_new(bio_f_async_filter());
++    if (!TEST_ptr(s_to_c_fbio)
++            || !TEST_ptr(c_to_s_fbio)) {
++        BIO_free(s_to_c_fbio);
++        BIO_free(c_to_s_fbio);
++        goto end;
++    }
+ 
+-        /* BIOs get freed on error */
+-        if (!create_ssl_objects(serverctx, clientctx, &amp;serverssl, &amp;clientssl,
+-                                s_to_c_fbio, c_to_s_fbio)) {
+-            printf(&quot;Test %d failed: Create SSL objects failed\n&quot;, test);
+-            goto end;
+-        }
++    /* BIOs get freed on error */
++    if (!TEST_true(create_ssl_objects(serverctx, clientctx, &amp;serverssl,
++                                      &amp;clientssl, s_to_c_fbio, c_to_s_fbio))
++            || !TEST_true(create_ssl_connection(serverssl, clientssl,
++                          SSL_ERROR_NONE)))
++        goto end;
+ 
+-        if (!create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)) {
+-            printf(&quot;Test %d failed: Create SSL connection failed\n&quot;, test);
+-            goto end;
+-        }
++    /*
++     * Send and receive some test data. Do the whole thing twice to ensure
++     * we hit at least one async event in both reading and writing
++     */
++    for (j = 0; j &lt; 2; j++) {
++        int len;
+ 
+         /*
+-         * Send and receive some test data. Do the whole thing twice to ensure
+-         * we hit at least one async event in both reading and writing
++         * Write some test data. It should never take more than 2 attempts
++         * (the first one might be a retryable fail).
+          */
+-        for (j = 0; j &lt; 2; j++) {
+-            int len;
+-
+-            /*
+-             * Write some test data. It should never take more than 2 attempts
+-             * (the first one might be a retryable fail).
+-             */
+-            for (ret = -1, i = 0, len = 0; len != sizeof(testdata) &amp;&amp; i &lt; 2;
+-                i++) {
+-                ret = SSL_write(clientssl, testdata + len,
+-                    sizeof(testdata) - len);
+-                if (ret &gt; 0) {
+-                    len += ret;
+-                } else {
+-                    int ssl_error = SSL_get_error(clientssl, ret);
+-
+-                    if (ssl_error == SSL_ERROR_SYSCALL ||
+-                        ssl_error == SSL_ERROR_SSL) {
+-                        printf(&quot;Test %d failed: Failed to write app data\n&quot;, test);
+-                        err = -1;
+-                        goto end;
+-                    }
+-                }
+-            }
+-            if (len != sizeof(testdata)) {
+-                err = -1;
+-                printf(&quot;Test %d failed: Failed to write all app data\n&quot;, test);
+-                goto end;
+-            }
+-            /*
+-             * Now read the test data. It may take more attemps here because
+-             * it could fail once for each byte read, including all overhead
+-             * bytes from the record header/padding etc.
+-             */
+-            for (ret = -1, i = 0, len = 0; len != sizeof(testdata) &amp;&amp;
+-                i &lt; MAX_ATTEMPTS; i++)
+-            {
+-                ret = SSL_read(serverssl, buf + len, sizeof(buf) - len);
+-                if (ret &gt; 0) {
+-                    len += ret;
+-                } else {
+-                    int ssl_error = SSL_get_error(serverssl, ret);
+-
+-                    if (ssl_error == SSL_ERROR_SYSCALL ||
+-                        ssl_error == SSL_ERROR_SSL) {
+-                        printf(&quot;Test %d failed: Failed to read app data\n&quot;, test);
+-                        err = -1;
+-                        goto end;
+-                    }
+-                }
+-            }
+-            if (len != sizeof(testdata)
+-                    || memcmp(buf, testdata, sizeof(testdata)) != 0) {
+-                err = -1;
+-                printf(&quot;Test %d failed: Unexpected app data received\n&quot;, test);
+-                goto end;
++        for (ret = -1, i = 0, len = 0; len != sizeof(testdata) &amp;&amp; i &lt; 2;
++            i++) {
++            ret = SSL_write(clientssl, testdata + len,
++                sizeof(testdata) - len);
++            if (ret &gt; 0) {
++                len += ret;
++            } else {
++                int ssl_error = SSL_get_error(clientssl, ret);
++
++                if (!TEST_false(ssl_error == SSL_ERROR_SYSCALL ||
++                                ssl_error == SSL_ERROR_SSL))
++                    goto end;
+             }
+         }
++        if (!TEST_size_t_eq(len, sizeof(testdata)))
++            goto end;
+ 
+-        /* Also frees the BIOs */
+-        SSL_free(clientssl);
+-        SSL_free(serverssl);
+-        clientssl = serverssl = NULL;
++        /*
++         * Now read the test data. It may take more attemps here because
++         * it could fail once for each byte read, including all overhead
++         * bytes from the record header/padding etc.
++         */
++        for (ret = -1, i = 0, len = 0; len != sizeof(testdata) &amp;&amp;
++                i &lt; MAX_ATTEMPTS; i++) {
++            ret = SSL_read(serverssl, buf + len, sizeof(buf) - len);
++            if (ret &gt; 0) {
++                len += ret;
++            } else {
++                int ssl_error = SSL_get_error(serverssl, ret);
++
++                if (!TEST_false(ssl_error == SSL_ERROR_SYSCALL ||
++                                ssl_error == SSL_ERROR_SSL))
++                    goto end;
++            }
++        }
++        if (!TEST_mem_eq(testdata, sizeof(testdata), buf, len))
++            goto end;
+     }
+ 
+-    printf(&quot;Test success\n&quot;);
++    /* Also frees the BIOs */
++    SSL_free(clientssl);
++    SSL_free(serverssl);
++    clientssl = serverssl = NULL;
+ 
+-    err = 0;
+- end:
+-    if (err)
+-        ERR_print_errors_fp(stderr);
++    testresult = 1;
+ 
++ end:
+     SSL_free(clientssl);
+     SSL_free(serverssl);
+     SSL_CTX_free(clientctx);
+     SSL_CTX_free(serverctx);
+ 
+-# ifndef OPENSSL_NO_CRYPTO_MDEBUG
+-    CRYPTO_mem_leaks_fp(stderr);
+-# endif
++    return testresult;
++}
++
++int test_main(int argc, char *argv[])
++{
++    int testresult = 0;
++
++    if (!TEST_int_eq(argc, 3))
++        goto end;
++
++    cert = argv[1];
++    privkey = argv[2];
++
++    ADD_ALL_TESTS(test_asyncio, 2);
++
++    testresult = run_tests(argv[0]);
++
++ end:
++    BIO_meth_free(methods_async);
+ 
+-    return err;
++    return testresult;
+ }
+diff --git a/test/build.info b/test/build.info
+index 0d82469..33d5199 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -264,7 +264,7 @@ IF[{- !$disabled{tests} -}]
+   INCLUDE[x509aux]=../include
+   DEPEND[x509aux]=../libcrypto
+ 
+-  SOURCE[asynciotest]=asynciotest.c ssltestlib.c
++  SOURCE[asynciotest]=asynciotest.c ssltestlib.c testutil.c test_main_custom.c
+   INCLUDE[asynciotest]=../include
+   DEPEND[asynciotest]=../libcrypto ../libssl
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014066.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="014068.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14067">[ date ]</a>
+              <a href="thread.html#14067">[ thread ]</a>
+              <a href="subject.html#14067">[ subject ]</a>
+              <a href="author.html#14067">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,240 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469875733.783501.31818.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009351.html">
+   <LINK REL="Next"  HREF="009372.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469875733.783501.31818.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Sat Jul 30 10:48:53 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009351.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009372.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9361">[ date ]</a>
+              <a href="thread.html#9361">[ thread ]</a>
+              <a href="subject.html#9361">[ subject ]</a>
+              <a href="author.html#9361">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  58c27c207ddf0f8bf20c18e1298831e7b7381b02 (commit)
+      from  0fae81501a80fae6e96942f8d766daf4c61defc7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 58c27c207ddf0f8bf20c18e1298831e7b7381b02
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Jul 25 10:36:57 2016 +0100
+
+    Fix crash as a result of MULTIBLOCK
+    
+    The MULTIBLOCK code uses a &quot;jumbo&quot; sized write buffer which it allocates
+    and then frees later. Pipelining however introduced multiple pipelines. It
+    keeps track of how many pipelines are initialised using numwpipes.
+    Unfortunately the MULTIBLOCK code was not updating this when in deallocated
+    its buffers, leading to a buffer being marked as initialised but set to
+    NULL.
+    
+    RT#4618
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/record/rec_layer_s3.c | 26 ++++++++++++--------------
+ ssl/record/record_locl.h  |  2 +-
+ ssl/record/ssl3_buffer.c  | 31 ++++++++++++++++---------------
+ 3 files changed, 29 insertions(+), 30 deletions(-)
+
+diff --git a/ssl/record/rec_layer_s3.c b/ssl/record/rec_layer_s3.c
+index b562913..2d0fca2 100644
+--- a/ssl/record/rec_layer_s3.c
++++ b/ssl/record/rec_layer_s3.c
+@@ -423,23 +423,21 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, int len)
+             else
+                 packlen *= 4;
+ 
+-            wb-&gt;buf = OPENSSL_malloc(packlen);
+-            if (wb-&gt;buf == NULL) {
++            if (!ssl3_setup_write_buffer(s, 1, packlen)) {
+                 SSLerr(SSL_F_SSL3_WRITE_BYTES, ERR_R_MALLOC_FAILURE);
+                 return -1;
+             }
+-            wb-&gt;len = packlen;
+         } else if (tot == len) { /* done? */
+-            OPENSSL_free(wb-&gt;buf); /* free jumbo buffer */
+-            wb-&gt;buf = NULL;
++            /* free jumbo buffer */
++            ssl3_release_write_buffer(s);
+             return tot;
+         }
+ 
+         n = (len - tot);
+         for (;;) {
+             if (n &lt; 4 * max_send_fragment) {
+-                OPENSSL_free(wb-&gt;buf); /* free jumbo buffer */
+-                wb-&gt;buf = NULL;
++                /* free jumbo buffer */
++                ssl3_release_write_buffer(s);
+                 break;
+             }
+ 
+@@ -471,8 +469,8 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, int len)
+                                           sizeof(mb_param), &amp;mb_param);
+ 
+             if (packlen &lt;= 0 || packlen &gt; (int)wb-&gt;len) { /* never happens */
+-                OPENSSL_free(wb-&gt;buf); /* free jumbo buffer */
+-                wb-&gt;buf = NULL;
++                /* free jumbo buffer */
++                ssl3_release_write_buffer(s);
+                 break;
+             }
+ 
+@@ -502,15 +500,15 @@ int ssl3_write_bytes(SSL *s, int type, const void *buf_, int len)
+             i = ssl3_write_pending(s, type, &amp;buf[tot], nw);
+             if (i &lt;= 0) {
+                 if (i &lt; 0 &amp;&amp; (!s-&gt;wbio || !BIO_should_retry(s-&gt;wbio))) {
+-                    OPENSSL_free(wb-&gt;buf);
+-                    wb-&gt;buf = NULL;
++                    /* free jumbo buffer */
++                    ssl3_release_write_buffer(s);
+                 }
+                 s-&gt;rlayer.wnum = tot;
+                 return i;
+             }
+             if (i == (int)n) {
+-                OPENSSL_free(wb-&gt;buf); /* free jumbo buffer */
+-                wb-&gt;buf = NULL;
++                /* free jumbo buffer */
++                ssl3_release_write_buffer(s);
+                 return tot + i;
+             }
+             n -= i;
+@@ -650,7 +648,7 @@ int do_ssl3_write(SSL *s, int type, const unsigned char *buf,
+     }
+ 
+     if (s-&gt;rlayer.numwpipes &lt; numpipes)
+-        if (!ssl3_setup_write_buffer(s, numpipes))
++        if (!ssl3_setup_write_buffer(s, numpipes, 0))
+             return -1;
+ 
+     if (totlen == 0 &amp;&amp; !create_empty_fragment)
+diff --git a/ssl/record/record_locl.h b/ssl/record/record_locl.h
+index ff1eb32..435e92a 100644
+--- a/ssl/record/record_locl.h
++++ b/ssl/record/record_locl.h
+@@ -69,7 +69,7 @@ void SSL3_BUFFER_clear(SSL3_BUFFER *b);
+ void SSL3_BUFFER_set_data(SSL3_BUFFER *b, const unsigned char *d, int n);
+ void SSL3_BUFFER_release(SSL3_BUFFER *b);
+ __owur int ssl3_setup_read_buffer(SSL *s);
+-__owur int ssl3_setup_write_buffer(SSL *s, unsigned int numwpipes);
++__owur int ssl3_setup_write_buffer(SSL *s, unsigned int numwpipes, size_t len);
+ int ssl3_release_read_buffer(SSL *s);
+ int ssl3_release_write_buffer(SSL *s);
+ 
+diff --git a/ssl/record/ssl3_buffer.c b/ssl/record/ssl3_buffer.c
+index 940b73e..9638002 100644
+--- a/ssl/record/ssl3_buffer.c
++++ b/ssl/record/ssl3_buffer.c
+@@ -74,33 +74,34 @@ int ssl3_setup_read_buffer(SSL *s)
+     return 0;
+ }
+ 
+-int ssl3_setup_write_buffer(SSL *s, unsigned int numwpipes)
++int ssl3_setup_write_buffer(SSL *s, unsigned int numwpipes, size_t len)
+ {
+     unsigned char *p;
+-    size_t len, align = 0, headerlen;
++    size_t align = 0, headerlen;
+     SSL3_BUFFER *wb;
+     unsigned int currpipe;
+ 
+     s-&gt;rlayer.numwpipes = numwpipes;
+ 
+-
+-    if (SSL_IS_DTLS(s))
+-        headerlen = DTLS1_RT_HEADER_LENGTH + 1;
+-    else
+-        headerlen = SSL3_RT_HEADER_LENGTH;
++    if (len == 0) {
++        if (SSL_IS_DTLS(s))
++            headerlen = DTLS1_RT_HEADER_LENGTH + 1;
++        else
++            headerlen = SSL3_RT_HEADER_LENGTH;
+ 
+ #if defined(SSL3_ALIGN_PAYLOAD) &amp;&amp; SSL3_ALIGN_PAYLOAD!=0
+-    align = (-SSL3_RT_HEADER_LENGTH) &amp; (SSL3_ALIGN_PAYLOAD - 1);
++        align = (-SSL3_RT_HEADER_LENGTH) &amp; (SSL3_ALIGN_PAYLOAD - 1);
+ #endif
+ 
+-    len = s-&gt;max_send_fragment
+-        + SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD + headerlen + align;
++        len = s-&gt;max_send_fragment
++            + SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD + headerlen + align;
+ #ifndef OPENSSL_NO_COMP
+-    if (ssl_allow_compression(s))
+-        len += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
++        if (ssl_allow_compression(s))
++            len += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
+ #endif
+-    if (!(s-&gt;options &amp; SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS))
+-        len += headerlen + align + SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD;
++        if (!(s-&gt;options &amp; SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS))
++            len += headerlen + align + SSL3_RT_SEND_MAX_ENCRYPTED_OVERHEAD;
++    }
+ 
+     wb = RECORD_LAYER_get_wbuf(&amp;s-&gt;rlayer);
+     for (currpipe = 0; currpipe &lt; numwpipes; currpipe++) {
+@@ -125,7 +126,7 @@ int ssl3_setup_buffers(SSL *s)
+ {
+     if (!ssl3_setup_read_buffer(s))
+         return 0;
+-    if (!ssl3_setup_write_buffer(s, 1))
++    if (!ssl3_setup_write_buffer(s, 1, 0))
+         return 0;
+     return 1;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009351.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009372.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9361">[ date ]</a>
+              <a href="thread.html#9361">[ thread ]</a>
+              <a href="subject.html#9361">[ subject ]</a>
+              <a href="author.html#9361">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

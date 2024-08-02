@@ -1,0 +1,295 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1430333431.489508.29064.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000981.html">
+   <LINK REL="Next"  HREF="000983.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1430333431.489508.29064.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Apr 29 18:50:31 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000981.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000983.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#982">[ date ]</a>
+              <a href="thread.html#982">[ thread ]</a>
+              <a href="subject.html#982">[ subject ]</a>
+              <a href="author.html#982">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  db4c08f0194d58c6192f0d8311bf3f20e251cf4f (commit)
+      from  2fa45e6ee722078bc55311c66bdba1ca2fc69c28 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit db4c08f0194d58c6192f0d8311bf3f20e251cf4f
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Wed Apr 29 14:50:00 2015 -0400
+
+    Rewrite parse_name
+    
+    Remove need for multiple arrays, parse the X509 name
+    one RDN at a time.  Thanks to Andy for careful review.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/apps.c | 166 +++++++++++++++++++++---------------------------------------
+ apps/apps.h |   2 +-
+ 2 files changed, 59 insertions(+), 109 deletions(-)
+
+diff --git a/apps/apps.c b/apps/apps.c
+index bec10a2..a93151c 100644
+--- a/apps/apps.c
++++ b/apps/apps.c
+@@ -1822,134 +1822,84 @@ int parse_yesno(const char *str, int def)
+ }
+ 
+ /*
+- * subject is expected to be in the format /type0=value0/type1=value1/type2=...
++ * name is expected to be in the format /type0=value0/type1=value1/type2=...
+  * where characters may be escaped by \
+  */
+-X509_NAME *parse_name(char *subject, long chtype, int multirdn)
++X509_NAME *parse_name(const char *cp, long chtype, int canmulti)
+ {
+-    size_t buflen = strlen(subject) + 1; /* to copy the types and values
+-                                          * into. due to escaping, the copy
+-                                          * can only become shorter */
+-    char *buf = OPENSSL_malloc(buflen);
+-    size_t max_ne = buflen / 2 + 1; /* maximum number of name elements */
+-    char **ne_types = OPENSSL_malloc(max_ne * sizeof(char *));
+-    char **ne_values = OPENSSL_malloc(max_ne * sizeof(char *));
+-    int *mval = OPENSSL_malloc(max_ne * sizeof(int));
++    int nextismulti = 0;
++    char *work;
++    X509_NAME *n;
+ 
+-    char *sp = subject, *bp = buf;
+-    int i, ne_num = 0;
+-
+-    X509_NAME *n = NULL;
+-    int nid;
++    if (*cp++ != '/')
++        return NULL;
+ 
+-    if (!buf || !ne_types || !ne_values || !mval) {
+-        BIO_printf(bio_err, &quot;malloc error\n&quot;);
+-        goto error;
+-    }
++    n = X509_NAME_new();
++    if (n == NULL)
++        return NULL;
++    work = strdup(cp);
++    if (work == NULL)
++        goto err;
+ 
+-    if (*subject != '/') {
+-        BIO_printf(bio_err, &quot;Subject does not start with '/'.\n&quot;);
+-        goto error;
+-    }
+-    sp++;                       /* skip leading / */
+-
+-    /* no multivalued RDN by default */
+-    mval[ne_num] = 0;
+-
+-    while (*sp) {
+-        /* collect type */
+-        ne_types[ne_num] = bp;
+-        while (*sp) {
+-            if (*sp == '\\') {  /* is there anything to escape in the
+-                                 * type...? */
+-                if (*++sp)
+-                    *bp++ = *sp++;
+-                else {
+-                    BIO_printf(bio_err,
+-                               &quot;escape character at end of string\n&quot;);
+-                    goto error;
+-                }
+-            } else if (*sp == '=') {
+-                sp++;
+-                *bp++ = '\0';
+-                break;
+-            } else
+-                *bp++ = *sp++;
+-        }
+-        if (!*sp) {
++    while (*cp) {
++        char *bp = work;
++        char *typestr = bp;
++        unsigned char *valstr;
++        int nid;
++        int ismulti = nextismulti;
++        nextismulti = 0;
++
++        /* Collect the type */
++        while (*cp &amp;&amp; *cp != '=')
++            *bp++ = *cp++;
++        if (*cp == '\0') {
+             BIO_printf(bio_err,
+-                       &quot;end of string encountered while processing type of subject name element #%d\n&quot;,
+-                       ne_num);
+-            goto error;
++                    &quot;%s: Hit end of string before finding the equals.\n&quot;,
++                    opt_getprog());
++            goto err;
+         }
+-        ne_values[ne_num] = bp;
+-        while (*sp) {
+-            if (*sp == '\\') {
+-                if (*++sp)
+-                    *bp++ = *sp++;
+-                else {
+-                    BIO_printf(bio_err,
+-                               &quot;escape character at end of string\n&quot;);
+-                    goto error;
+-                }
+-            } else if (*sp == '/') {
+-                sp++;
+-                /* no multivalued RDN by default */
+-                mval[ne_num + 1] = 0;
+-                break;
+-            } else if (*sp == '+' &amp;&amp; multirdn) {
+-                /*
+-                 * a not escaped + signals a mutlivalued RDN
+-                 */
+-                sp++;
+-                mval[ne_num + 1] = -1;
++        *bp++ = '\0';
++        ++cp;
++
++        /* Collect the value. */
++        valstr = (unsigned char *)bp;
++        for (; *cp &amp;&amp; *cp != '/'; *bp++ = *cp++) {
++            if (canmulti &amp;&amp; *cp == '+') {
++                nextismulti = 1;
+                 break;
+-            } else
+-                *bp++ = *sp++;
++            }
++            if (*cp == '\\' &amp;&amp; *++cp == '\0') {
++                BIO_printf(bio_err,
++                        &quot;%s: escape character at end of string\n&quot;,
++                        opt_getprog());
++                goto err;
++            }
+         }
+         *bp++ = '\0';
+-        ne_num++;
+-    }
+ 
+-    if (!(n = X509_NAME_new()))
+-        goto error;
+-
+-    for (i = 0; i &lt; ne_num; i++) {
+-        if ((nid = OBJ_txt2nid(ne_types[i])) == NID_undef) {
+-            BIO_printf(bio_err,
+-                       &quot;Subject Attribute %s has no known NID, skipped\n&quot;,
+-                       ne_types[i]);
+-            continue;
+-        }
++        /* If not at EOS (must be + or /), move forward. */
++        if (*cp)
++            ++cp;
+ 
+-        if (!*ne_values[i]) {
+-            BIO_printf(bio_err,
+-                       &quot;No value provided for Subject Attribute %s, skipped\n&quot;,
+-                       ne_types[i]);
++        /* Parse */
++        nid = OBJ_txt2nid(typestr);
++        if (nid == NID_undef) {
++            BIO_printf(bio_err, &quot;%s: Skipping unknown attribute \&quot;%s\&quot;\n&quot;,
++                      opt_getprog(), typestr);
+             continue;
+         }
+-
+-        if (!X509_NAME_add_entry_by_NID
+-            (n, nid, chtype, (unsigned char *)ne_values[i], -1, -1, mval[i]))
+-            goto error;
++        if (!X509_NAME_add_entry_by_NID(n, nid, chtype,
++                                        valstr, strlen((char *)valstr),
++                                        -1, ismulti ? -1 : 0))
++            goto err;
+     }
+ 
+-    OPENSSL_free(ne_values);
+-    OPENSSL_free(ne_types);
+-    OPENSSL_free(buf);
+-    OPENSSL_free(mval);
++    free(work);
+     return n;
+ 
+- error:
++ err:
+     X509_NAME_free(n);
+-    if (ne_values)
+-        OPENSSL_free(ne_values);
+-    if (ne_types)
+-        OPENSSL_free(ne_types);
+-    if (mval)
+-        OPENSSL_free(mval);
+-    if (buf)
+-        OPENSSL_free(buf);
++    free(work);
+     return NULL;
+ }
+ 
+diff --git a/apps/apps.h b/apps/apps.h
+index 1ba6485..5b24233 100644
+--- a/apps/apps.h
++++ b/apps/apps.h
+@@ -486,7 +486,7 @@ void free_index(CA_DB *db);
+ int index_name_cmp(const OPENSSL_CSTRING *a, const OPENSSL_CSTRING *b);
+ int parse_yesno(const char *str, int def);
+ 
+-X509_NAME *parse_name(char *str, long chtype, int multirdn);
++X509_NAME *parse_name(const char *str, long chtype, int multirdn);
+ int args_verify(char ***pargs, int *pargc,
+                 int *badarg, X509_VERIFY_PARAM **pm);
+ void policies_print(X509_STORE_CTX *ctx);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000981.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000983.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#982">[ date ]</a>
+              <a href="thread.html#982">[ thread ]</a>
+              <a href="subject.html#982">[ subject ]</a>
+              <a href="author.html#982">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

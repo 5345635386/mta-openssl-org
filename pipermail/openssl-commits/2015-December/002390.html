@@ -1,0 +1,219 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1449752014.422271.16679.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002369.html">
+   <LINK REL="Next"  HREF="002462.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1449752014.422271.16679.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update">matt at openssl.org
+       </A><BR>
+    <I>Thu Dec 10 12:53:34 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002369.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="002462.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2390">[ date ]</a>
+              <a href="thread.html#2390">[ thread ]</a>
+              <a href="subject.html#2390">[ subject ]</a>
+              <a href="author.html#2390">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_1-stable has been updated
+       via  f612bdb34252c3eae4808dd3e1360d0f0a3666bc (commit)
+       via  4a534243183498ee1a5b3fb19f4be8a0bf731ca7 (commit)
+      from  d724616f682cb374b613d7fbd57e4c2bf749469c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f612bdb34252c3eae4808dd3e1360d0f0a3666bc
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Wed Nov 4 11:20:50 2015 +0000
+
+    Ensure |rwstate| is set correctly on BIO_flush
+    
+    A BIO_flush call in the DTLS code was not correctly setting the |rwstate|
+    variable to SSL_WRITING. This means that SSL_get_error() will not return
+    SSL_ERROR_WANT_WRITE in the event of an IO retry.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (cherry picked from commit 67f60be8c9ae5ff3129fcd6238baf124385a41d8)
+
+commit 4a534243183498ee1a5b3fb19f4be8a0bf731ca7
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Nov 3 14:45:07 2015 +0000
+
+    Fix DTLS handshake fragment retries
+    
+    If using DTLS and NBIO then if a second or subsequent handshake message
+    fragment hits a retry, then the retry attempt uses the wrong fragment
+    offset value. This commit restores the fragment offset from the last
+    attempt.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (cherry picked from commit 2ad226e88bee97847496e542d63c67997d5beda6)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/d1_both.c | 70 +++++++++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 49 insertions(+), 21 deletions(-)
+
+diff --git a/ssl/d1_both.c b/ssl/d1_both.c
+index d453c07..aaa1867 100644
+--- a/ssl/d1_both.c
++++ b/ssl/d1_both.c
+@@ -291,8 +291,44 @@ int dtls1_do_write(SSL *s, int type)
+         blocksize = 0;
+ 
+     frag_off = 0;
++    s-&gt;rwstate = SSL_NOTHING;
++
+     /* s-&gt;init_num shouldn't ever be &lt; 0...but just in case */
+     while (s-&gt;init_num &gt; 0) {
++        if (type == SSL3_RT_HANDSHAKE &amp;&amp; s-&gt;init_off != 0) {
++            /* We must be writing a fragment other than the first one */
++
++            if (frag_off &gt; 0) {
++                /* This is the first attempt at writing out this fragment */
++
++                if (s-&gt;init_off &lt;= DTLS1_HM_HEADER_LENGTH) {
++                    /*
++                     * Each fragment that was already sent must at least have
++                     * contained the message header plus one other byte.
++                     * Therefore |init_off| must have progressed by at least
++                     * |DTLS1_HM_HEADER_LENGTH + 1| bytes. If not something went
++                     * wrong.
++                     */
++                    return -1;
++                }
++
++                /*
++                 * Adjust |init_off| and |init_num| to allow room for a new
++                 * message header for this fragment.
++                 */
++                s-&gt;init_off -= DTLS1_HM_HEADER_LENGTH;
++                s-&gt;init_num += DTLS1_HM_HEADER_LENGTH;
++            } else {
++                /*
++                 * We must have been called again after a retry so use the
++                 * fragment offset from our last attempt. We do not need
++                 * to adjust |init_off| and |init_num| as above, because
++                 * that should already have been done before the retry.
++                 */
++                frag_off = s-&gt;d1-&gt;w_msg_hdr.frag_off;
++            }
++        }
++
+         used_len = BIO_wpending(SSL_get_wbio(s)) + DTLS1_RT_HEADER_LENGTH
+             + mac_size + blocksize;
+         if (s-&gt;d1-&gt;mtu &gt; used_len)
+@@ -305,8 +341,10 @@ int dtls1_do_write(SSL *s, int type)
+              * grr.. we could get an error if MTU picked was wrong
+              */
+             ret = BIO_flush(SSL_get_wbio(s));
+-            if (ret &lt;= 0)
++            if (ret &lt;= 0) {
++                s-&gt;rwstate = SSL_WRITING;
+                 return ret;
++            }
+             used_len = DTLS1_RT_HEADER_LENGTH + mac_size + blocksize;
+             if (s-&gt;d1-&gt;mtu &gt; used_len + DTLS1_HM_HEADER_LENGTH) {
+                 curr_mtu = s-&gt;d1-&gt;mtu - used_len;
+@@ -332,25 +370,6 @@ int dtls1_do_write(SSL *s, int type)
+          * XDTLS: this function is too long.  split out the CCS part
+          */
+         if (type == SSL3_RT_HANDSHAKE) {
+-            if (s-&gt;init_off != 0) {
+-                OPENSSL_assert(s-&gt;init_off &gt; DTLS1_HM_HEADER_LENGTH);
+-                s-&gt;init_off -= DTLS1_HM_HEADER_LENGTH;
+-                s-&gt;init_num += DTLS1_HM_HEADER_LENGTH;
+-
+-                /*
+-                 * We just checked that s-&gt;init_num &gt; 0 so this cast should
+-                 * be safe
+-                 */
+-                if (((unsigned int)s-&gt;init_num) &gt; curr_mtu)
+-                    len = curr_mtu;
+-                else
+-                    len = s-&gt;init_num;
+-            }
+-
+-            /* Shouldn't ever happen */
+-            if (len &gt; INT_MAX)
+-                len = INT_MAX;
+-
+             if (len &lt; DTLS1_HM_HEADER_LENGTH) {
+                 /*
+                  * len is so small that we really can't do anything sensible
+@@ -438,7 +457,16 @@ int dtls1_do_write(SSL *s, int type)
+             }
+             s-&gt;init_off += ret;
+             s-&gt;init_num -= ret;
+-            frag_off += (ret -= DTLS1_HM_HEADER_LENGTH);
++            ret -= DTLS1_HM_HEADER_LENGTH;
++            frag_off += ret;
++
++            /*
++             * We save the fragment offset for the next fragment so we have it
++             * available in case of an IO retry. We don't know the length of the
++             * next fragment yet so just set that to 0 for now. It will be
++             * updated again later.
++             */
++            dtls1_fix_message_header(s, frag_off, 0);
+         }
+     }
+     return (0);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002369.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="002462.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2390">[ date ]</a>
+              <a href="thread.html#2390">[ thread ]</a>
+              <a href="subject.html#2390">[ subject ]</a>
+              <a href="author.html#2390">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

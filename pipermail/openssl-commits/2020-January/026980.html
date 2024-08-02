@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578519058.723809.9280.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026976.html">
+   <LINK REL="Next"  HREF="026981.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578519058.723809.9280.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Jan  8 21:30:58 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026976.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026981.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26980">[ date ]</a>
+              <a href="thread.html#26980">[ thread ]</a>
+              <a href="subject.html#26980">[ subject ]</a>
+              <a href="author.html#26980">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e0d8523e801b7a1fcdda698f9c28dd7a0617cd02 (commit)
+      from  a9e4e3c39eb361ddfb438edb27c754947009eed6 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e0d8523e801b7a1fcdda698f9c28dd7a0617cd02
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Jan 7 11:49:08 2020 +0100
+
+    EVP: If a key can't be exported to provider, fallback to legacy
+    
+    Currently, the operations that do try to export a legacy key to
+    providers will fail if the export failed.  It makes more sense to
+    simply use the legacy method instead, as a fallback for things not
+    being implemented (yet) in a provider.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10771">https://github.com/openssl/openssl/pull/10771</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/exchange.c | 16 +++++++---------
+ crypto/evp/m_sigver.c | 18 +++++++++++-------
+ crypto/evp/pmeth_fn.c | 14 ++++++--------
+ 3 files changed, 24 insertions(+), 24 deletions(-)
+
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index 189c1c0f45..3e7c00103c 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -208,10 +208,9 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+ 
+     if (ctx-&gt;pkey != NULL) {
+         provkey = evp_keymgmt_export_to_provider(ctx-&gt;pkey, ctx-&gt;keymgmt, 0);
+-        if (provkey == NULL) {
+-            EVPerr(0, EVP_R_INITIALIZATION_ERROR);
+-            goto err;
+-        }
++        /* If export failed, legacy may be able to pick it up */
++        if (provkey == NULL)
++            goto legacy;
+     }
+     ctx-&gt;op.kex.exchprovctx = exchange-&gt;newctx(ossl_provider_ctx(exchange-&gt;prov));
+     if (ctx-&gt;op.kex.exchprovctx == NULL) {
+@@ -227,7 +226,7 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+     return 0;
+ 
+  legacy:
+-    if (ctx == NULL || ctx-&gt;pmeth == NULL || ctx-&gt;pmeth-&gt;derive == NULL) {
++    if (ctx-&gt;pmeth == NULL || ctx-&gt;pmeth-&gt;derive == NULL) {
+         EVPerr(0, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+         return -2;
+     }
+@@ -261,10 +260,9 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+     }
+ 
+     provkey = evp_keymgmt_export_to_provider(peer, ctx-&gt;keymgmt, 0);
+-    if (provkey == NULL) {
+-        EVPerr(EVP_F_EVP_PKEY_DERIVE_SET_PEER, ERR_R_INTERNAL_ERROR);
+-        return 0;
+-    }
++    /* If export failed, legacy may be able to pick it up */
++    if (provkey == NULL)
++        goto legacy;
+     return ctx-&gt;op.kex.exchange-&gt;set_peer(ctx-&gt;op.kex.exchprovctx, provkey);
+ 
+  legacy:
+diff --git a/crypto/evp/m_sigver.c b/crypto/evp/m_sigver.c
+index 7a21f680b9..9d12e9b96a 100644
+--- a/crypto/evp/m_sigver.c
++++ b/crypto/evp/m_sigver.c
+@@ -104,6 +104,12 @@ static int do_sigver_init(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
+ 
+     locpctx-&gt;op.sig.signature = signature;
+ 
++    provkey =
++        evp_keymgmt_export_to_provider(locpctx-&gt;pkey, locpctx-&gt;keymgmt, 0);
++    /* If export failed, legacy may be able to pick it up */
++    if (provkey == NULL)
++        goto legacy;
++
+     locpctx-&gt;operation = ver ? EVP_PKEY_OP_VERIFYCTX
+                              : EVP_PKEY_OP_SIGNCTX;
+ 
+@@ -113,13 +119,6 @@ static int do_sigver_init(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
+         ERR_raise(ERR_LIB_EVP,  EVP_R_INITIALIZATION_ERROR);
+         goto err;
+     }
+-    provkey =
+-        evp_keymgmt_export_to_provider(locpctx-&gt;pkey, locpctx-&gt;keymgmt, 0);
+-    if (provkey == NULL) {
+-        ERR_raise(ERR_LIB_EVP, EVP_R_INITIALIZATION_ERROR);
+-        goto err;
+-    }
+-
+     if (type != NULL) {
+         ctx-&gt;reqdigest = type;
+     } else {
+@@ -156,6 +155,11 @@ static int do_sigver_init(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
+     return 0;
+ 
+  legacy:
++    if (ctx-&gt;pctx-&gt;pmeth == NULL) {
++        EVPerr(0, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++        return -2;
++    }
++
+     if (!(ctx-&gt;pctx-&gt;pmeth-&gt;flags &amp; EVP_PKEY_FLAG_SIGCTX_CUSTOM)) {
+ 
+         if (type == NULL) {
+diff --git a/crypto/evp/pmeth_fn.c b/crypto/evp/pmeth_fn.c
+index 638619051e..0ce4ff9522 100644
+--- a/crypto/evp/pmeth_fn.c
++++ b/crypto/evp/pmeth_fn.c
+@@ -367,10 +367,9 @@ static int evp_pkey_signature_init(EVP_PKEY_CTX *ctx, int operation)
+     if (ctx-&gt;pkey != NULL) {
+         provkey =
+             evp_keymgmt_export_to_provider(ctx-&gt;pkey, ctx-&gt;keymgmt, 0);
+-        if (provkey == NULL) {
+-            EVPerr(0, EVP_R_INITIALIZATION_ERROR);
+-            goto err;
+-        }
++        /* If export failed, legacy may be able to pick it up */
++        if (provkey == NULL)
++            goto legacy;
+     }
+     ctx-&gt;op.sig.sigprovctx = signature-&gt;newctx(ossl_provider_ctx(signature-&gt;prov));
+     if (ctx-&gt;op.sig.sigprovctx == NULL) {
+@@ -617,10 +616,9 @@ static int evp_pkey_asym_cipher_init(EVP_PKEY_CTX *ctx, int operation)
+ 
+     if (ctx-&gt;pkey != NULL) {
+         provkey = evp_keymgmt_export_to_provider(ctx-&gt;pkey, ctx-&gt;keymgmt, 0);
+-        if (provkey == NULL) {
+-            EVPerr(0, EVP_R_INITIALIZATION_ERROR);
+-            goto err;
+-        }
++        /* If export failed, legacy may be able to pick it up */
++        if (provkey == NULL)
++            goto legacy;
+     }
+     ctx-&gt;op.ciph.ciphprovctx = cipher-&gt;newctx(ossl_provider_ctx(cipher-&gt;prov));
+     if (ctx-&gt;op.ciph.ciphprovctx == NULL) {
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026976.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026981.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26980">[ date ]</a>
+              <a href="thread.html#26980">[ thread ]</a>
+              <a href="subject.html#26980">[ subject ]</a>
+              <a href="author.html#26980">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

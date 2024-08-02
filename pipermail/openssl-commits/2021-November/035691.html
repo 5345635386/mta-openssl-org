@@ -1,0 +1,3238 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1637290257.782056.890064.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035688.html">
+   <LINK REL="Next"  HREF="035695.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1637290257.782056.890064.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Fri Nov 19 02:50:57 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035688.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="035695.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35691">[ date ]</a>
+              <a href="thread.html#35691">[ thread ]</a>
+              <a href="subject.html#35691">[ subject ]</a>
+              <a href="author.html#35691">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f87b4c4ea67393c9269663ed40a7ea3463cc59d3 (commit)
+      from  e67edf60f2e9be6e5f5465b52d01aa26bf715280 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f87b4c4ea67393c9269663ed40a7ea3463cc59d3
+Author: Andrey Matyukov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">andrey.matyukov at intel.com</A>&gt;
+Date:   Tue Dec 8 22:53:39 2020 +0300
+
+    Dual 1536/2048-bit exponentiation optimization for Intel IceLake CPU
+    
+    It uses AVX512_IFMA + AVX512_VL (with 256-bit wide registers) ISA to
+    keep lower power license.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14908">https://github.com/openssl/openssl/pull/14908</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES.md                                         |   5 +
+ .../bn/asm/{rsaz-avx512.pl =&gt; rsaz-2k-avx512.pl}   | 310 ++++---
+ crypto/bn/asm/rsaz-3k-avx512.pl                    | 874 +++++++++++++++++++
+ crypto/bn/asm/rsaz-4k-avx512.pl                    | 930 +++++++++++++++++++++
+ crypto/bn/bn_exp.c                                 |  24 +-
+ crypto/bn/build.info                               |   6 +-
+ crypto/bn/rsaz_exp_x2.c                            | 410 +++++----
+ test/exptest.c                                     |   9 +-
+ 8 files changed, 2234 insertions(+), 334 deletions(-)
+ rename crypto/bn/asm/{rsaz-avx512.pl =&gt; rsaz-2k-avx512.pl} (70%)
+ create mode 100644 crypto/bn/asm/rsaz-3k-avx512.pl
+ create mode 100644 crypto/bn/asm/rsaz-4k-avx512.pl
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 940d450fdf..7724011022 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -65,6 +65,11 @@ OpenSSL 3.1
+ 
+    *Dmitry Belyavskiy*
+ 
++ * Parallel dual-prime 1536/2048-bit modular exponentiation for
++   AVX512_IFMA capable processors.
++
++   *Sergey Kirillov, Andrey Matyukov (Intel Corp)*
++
+ OpenSSL 3.0
+ -----------
+ 
+diff --git a/crypto/bn/asm/rsaz-avx512.pl b/crypto/bn/asm/rsaz-2k-avx512.pl
+similarity index 70%
+rename from crypto/bn/asm/rsaz-avx512.pl
+rename to crypto/bn/asm/rsaz-2k-avx512.pl
+index d031caa88e..aec5470387 100644
+--- a/crypto/bn/asm/rsaz-avx512.pl
++++ b/crypto/bn/asm/rsaz-2k-avx512.pl
+@@ -7,7 +7,8 @@
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ #
+ #
+-# Originally written by Ilya Albrekht, Sergey Kirillov and Andrey Matyukov
++# Originally written by Sergey Kirillov and Andrey Matyukov.
++# Special thanks to Ilya Albrekht for his valuable hints.
+ # Intel Corporation
+ #
+ # December 2020
+@@ -77,26 +78,29 @@ ___
+ ###############################################################################
+ # Almost Montgomery Multiplication (AMM) for 20-digit number in radix 2^52.
+ #
+-# AMM is defined as presented in the paper
+-# &quot;Efficient Software Implementations of Modular Exponentiation&quot; by Shay Gueron.
++# AMM is defined as presented in the paper [1].
+ #
+ # The input and output are presented in 2^52 radix domain, i.e.
+ #   |res|, |a|, |b|, |m| are arrays of 20 64-bit qwords with 12 high bits zeroed.
+ #   |k0| is a Montgomery coefficient, which is here k0 = -1/m mod 2^64
+-#        (note, the implementation counts only 52 bits from it).
+ #
+-# NB: the AMM implementation does not perform &quot;conditional&quot; subtraction step as
+-# specified in the original algorithm as according to the paper &quot;Enhanced Montgomery
+-# Multiplication&quot; by Shay Gueron (see Lemma 1), the result will be always &lt; 2*2^1024
+-# and can be used as a direct input to the next AMM iteration.
+-# This post-condition is true, provided the correct parameter |s| is choosen, i.e.
+-# s &gt;= n + 2 * k, which matches our case: 1040 &gt; 1024 + 2 * 1.
++# NB: the AMM implementation does not perform &quot;conditional&quot; subtraction step
++# specified in the original algorithm as according to the Lemma 1 from the paper
++# [2], the result will be always &lt; 2*m and can be used as a direct input to
++# the next AMM iteration.  This post-condition is true, provided the correct
++# parameter |s| (notion of the Lemma 1 from [2]) is choosen, i.e.  s &gt;= n + 2 * k,
++# which matches our case: 1040 &gt; 1024 + 2 * 1.
+ #
+-# void ossl_rsaz_amm52x20_x1_256(BN_ULONG *res,
+-#                           const BN_ULONG *a,
+-#                           const BN_ULONG *b,
+-#                           const BN_ULONG *m,
+-#                           BN_ULONG k0);
++# [1] Gueron, S. Efficient software implementations of modular exponentiation.
++#     DOI: 10.1007/s13389-012-0031-5
++# [2] Gueron, S. Enhanced Montgomery Multiplication.
++#     DOI: 10.1007/3-540-36400-5_5
++#
++# void ossl_rsaz_amm52x20_x1_ifma256(BN_ULONG *res,
++#                                    const BN_ULONG *a,
++#                                    const BN_ULONG *b,
++#                                    const BN_ULONG *m,
++#                                    BN_ULONG k0);
+ ###############################################################################
+ {
+ # input parameters (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;)
+@@ -112,16 +116,13 @@ my $b_ptr      = &quot;%r11&quot;;
+ my $iter = &quot;%ebx&quot;;
+ 
+ my $zero = &quot;%ymm0&quot;;
+-my ($R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0) = (&quot;%ymm1&quot;, map(&quot;%ymm$_&quot;,(16..19)));
+-my ($R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1) = (&quot;%ymm2&quot;, map(&quot;%ymm$_&quot;,(20..23)));
+-my $Bi = &quot;%ymm3&quot;;
+-my $Yi = &quot;%ymm4&quot;;
++my $Bi   = &quot;%ymm1&quot;;
++my $Yi   = &quot;%ymm2&quot;;
++my ($R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0) = (&quot;%ymm3&quot;,map(&quot;%ymm$_&quot;,(16..19)));
++my ($R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1) = (&quot;%ymm4&quot;,map(&quot;%ymm$_&quot;,(20..23)));
+ 
+ # Registers mapping for normalization.
+-# We can reuse Bi, Yi registers here.
+-my $TMP = $Bi;
+-my $mask52x4 = $Yi;
+-my ($T0,$T0h,$T1,$T1h,$T2) = map(&quot;%ymm$_&quot;, (24..28));
++my ($T0,$T0h,$T1,$T1h,$T2) = (&quot;$zero&quot;, &quot;$Bi&quot;, &quot;$Yi&quot;, map(&quot;%ymm$_&quot;, (25..26)));
+ 
+ sub amm52x20_x1() {
+ # _data_offset - offset in the |a| or |m| arrays pointing to the beginning
+@@ -190,16 +191,16 @@ $code.=&lt;&lt;___;
+ ___
+ }
+ 
+-# Normalization routine: handles carry bits in R0..R2 QWs and
+-# gets R0..R2 back to normalized 2^52 representation.
++# Normalization routine: handles carry bits and gets bignum qwords to normalized
++# 2^52 representation.
+ #
+ # Uses %r8-14,%e[bcd]x
+ sub amm52x20_x1_norm {
+ my ($_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2) = @_;
+ $code.=&lt;&lt;___;
+     # Put accumulator to low qword in R0
+-    vpbroadcastq    $_acc, $TMP
+-    vpblendd \$3, $TMP, $_R0, $_R0
++    vpbroadcastq    $_acc, $T0
++    vpblendd \$3, $T0, $_R0, $_R0
+ 
+     # Extract &quot;carries&quot; (12 high bits) from each QW of R0..R2
+     # Save them to LSB of QWs in T0..T2
+@@ -214,14 +215,14 @@ $code.=&lt;&lt;___;
+     valignq \$3, $T1,   $T1h, $T1h
+     valignq \$3, $T0h,  $T1,  $T1
+     valignq \$3, $T0,   $T0h, $T0h
+-    valignq \$3, $zero, $T0,  $T0
++    valignq \$3, .Lzeros(%rip), $T0,  $T0
+ 
+     # Drop &quot;carries&quot; from R0..R2 QWs
+-    vpandq    $mask52x4, $_R0,  $_R0
+-    vpandq    $mask52x4, $_R0h, $_R0h
+-    vpandq    $mask52x4, $_R1,  $_R1
+-    vpandq    $mask52x4, $_R1h, $_R1h
+-    vpandq    $mask52x4, $_R2,  $_R2
++    vpandq    .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq    .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq    .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq    .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq    .Lmask52x4(%rip), $_R2,  $_R2
+ 
+     # Sum R0..R2 with corresponding adjusted carries
+     vpaddq  $T0,  $_R0,  $_R0
+@@ -232,11 +233,11 @@ $code.=&lt;&lt;___;
+ 
+     # Now handle carry bits from this addition
+     # Get mask of QWs which 52-bit parts overflow...
+-    vpcmpuq   \$1, $_R0,  $mask52x4, %k1 # OP=lt
+-    vpcmpuq   \$1, $_R0h, $mask52x4, %k2
+-    vpcmpuq   \$1, $_R1,  $mask52x4, %k3
+-    vpcmpuq   \$1, $_R1h, $mask52x4, %k4
+-    vpcmpuq   \$1, $_R2,  $mask52x4, %k5
++    vpcmpuq   \$6, .Lmask52x4(%rip), $_R0,  %k1 # OP=nle (i.e. gt)
++    vpcmpuq   \$6, .Lmask52x4(%rip), $_R0h, %k2
++    vpcmpuq   \$6, .Lmask52x4(%rip), $_R1,  %k3
++    vpcmpuq   \$6, .Lmask52x4(%rip), $_R1h, %k4
++    vpcmpuq   \$6, .Lmask52x4(%rip), $_R2,  %k5
+     kmovb   %k1, %r14d                   # k1
+     kmovb   %k2, %r13d                   # k1h
+     kmovb   %k3, %r12d                   # k2
+@@ -244,11 +245,11 @@ $code.=&lt;&lt;___;
+     kmovb   %k5, %r10d                   # k3
+ 
+     # ...or saturated
+-    vpcmpuq   \$0, $_R0,  $mask52x4, %k1 # OP=eq
+-    vpcmpuq   \$0, $_R0h, $mask52x4, %k2
+-    vpcmpuq   \$0, $_R1,  $mask52x4, %k3
+-    vpcmpuq   \$0, $_R1h, $mask52x4, %k4
+-    vpcmpuq   \$0, $_R2,  $mask52x4, %k5
++    vpcmpuq   \$0, .Lmask52x4(%rip), $_R0,  %k1 # OP=eq
++    vpcmpuq   \$0, .Lmask52x4(%rip), $_R0h, %k2
++    vpcmpuq   \$0, .Lmask52x4(%rip), $_R1,  %k3
++    vpcmpuq   \$0, .Lmask52x4(%rip), $_R1h, %k4
++    vpcmpuq   \$0, .Lmask52x4(%rip), $_R2,  %k5
+     kmovb   %k1, %r9d                    # k4
+     kmovb   %k2, %r8d                    # k4h
+     kmovb   %k3, %ebx                    # k5
+@@ -288,27 +289,27 @@ $code.=&lt;&lt;___;
+     kmovb   %r10d, %k5
+ 
+     # Add carries according to the obtained mask
+-    vpsubq  $mask52x4, $_R0,  ${_R0}{%k1}
+-    vpsubq  $mask52x4, $_R0h, ${_R0h}{%k2}
+-    vpsubq  $mask52x4, $_R1,  ${_R1}{%k3}
+-    vpsubq  $mask52x4, $_R1h, ${_R1h}{%k4}
+-    vpsubq  $mask52x4, $_R2,  ${_R2}{%k5}
+-
+-    vpandq   $mask52x4, $_R0,  $_R0
+-    vpandq   $mask52x4, $_R0h, $_R0h
+-    vpandq   $mask52x4, $_R1,  $_R1
+-    vpandq   $mask52x4, $_R1h, $_R1h
+-    vpandq   $mask52x4, $_R2,  $_R2
++    vpsubq  .Lmask52x4(%rip), $_R0,  ${_R0}{%k1}
++    vpsubq  .Lmask52x4(%rip), $_R0h, ${_R0h}{%k2}
++    vpsubq  .Lmask52x4(%rip), $_R1,  ${_R1}{%k3}
++    vpsubq  .Lmask52x4(%rip), $_R1h, ${_R1h}{%k4}
++    vpsubq  .Lmask52x4(%rip), $_R2,  ${_R2}{%k5}
++
++    vpandq   .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq   .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq   .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq   .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq   .Lmask52x4(%rip), $_R2,  $_R2
+ ___
+ }
+ 
+ $code.=&lt;&lt;___;
+ .text
+ 
+-.globl  ossl_rsaz_amm52x20_x1_256
+-.type   ossl_rsaz_amm52x20_x1_256,\@function,5
++.globl  ossl_rsaz_amm52x20_x1_ifma256
++.type   ossl_rsaz_amm52x20_x1_ifma256,\@function,5
+ .align 32
+-ossl_rsaz_amm52x20_x1_256:
++ossl_rsaz_amm52x20_x1_ifma256:
+ .cfi_startproc
+     endbranch
+     push    %rbx
+@@ -323,7 +324,7 @@ ossl_rsaz_amm52x20_x1_256:
+ .cfi_push   %r14
+     push    %r15
+ .cfi_push   %r15
+-.Lrsaz_amm52x20_x1_256_body:
++.Lossl_rsaz_amm52x20_x1_ifma256_body:
+ 
+     # Zeroing accumulators
+     vpxord   $zero, $zero, $zero
+@@ -351,17 +352,15 @@ $code.=&lt;&lt;___;
+     lea    `4*8`($b_ptr), $b_ptr
+     dec    $iter
+     jne    .Lloop5
+-
+-    vmovdqa64   .Lmask52x4(%rip), $mask52x4
+ ___
+     &amp;amm52x20_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0);
+ $code.=&lt;&lt;___;
+ 
+-    vmovdqu64   $R0_0, ($res)
+-    vmovdqu64   $R0_0h, 32($res)
+-    vmovdqu64   $R1_0, 64($res)
+-    vmovdqu64   $R1_0h, 96($res)
+-    vmovdqu64   $R2_0, 128($res)
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
+ 
+     vzeroupper
+     mov  0(%rsp),%r15
+@@ -378,10 +377,10 @@ $code.=&lt;&lt;___;
+ .cfi_restore    %rbx
+     lea  48(%rsp),%rsp
+ .cfi_adjust_cfa_offset  -48
+-.Lrsaz_amm52x20_x1_256_epilogue:
++.Lossl_rsaz_amm52x20_x1_ifma256_epilogue:
+     ret
+ .cfi_endproc
+-.size   ossl_rsaz_amm52x20_x1_256, .-ossl_rsaz_amm52x20_x1_256
++.size   ossl_rsaz_amm52x20_x1_ifma256, .-ossl_rsaz_amm52x20_x1_ifma256
+ ___
+ 
+ $code.=&lt;&lt;___;
+@@ -397,25 +396,25 @@ ___
+ ###############################################################################
+ # Dual Almost Montgomery Multiplication for 20-digit number in radix 2^52
+ #
+-# See description of ossl_rsaz_amm52x20_x1_256() above for details about Almost
++# See description of ossl_rsaz_amm52x20_x1_ifma256() above for details about Almost
+ # Montgomery Multiplication algorithm and function input parameters description.
+ #
+ # This function does two AMMs for two independent inputs, hence dual.
+ #
+-# void ossl_rsaz_amm52x20_x2_256(BN_ULONG out[2][20],
+-#                           const BN_ULONG a[2][20],
+-#                           const BN_ULONG b[2][20],
+-#                           const BN_ULONG m[2][20],
+-#                           const BN_ULONG k0[2]);
++# void ossl_rsaz_amm52x20_x2_ifma256(BN_ULONG out[2][20],
++#                                    const BN_ULONG a[2][20],
++#                                    const BN_ULONG b[2][20],
++#                                    const BN_ULONG m[2][20],
++#                                    const BN_ULONG k0[2]);
+ ###############################################################################
+ 
+ $code.=&lt;&lt;___;
+ .text
+ 
+-.globl  ossl_rsaz_amm52x20_x2_256
+-.type   ossl_rsaz_amm52x20_x2_256,\@function,5
++.globl  ossl_rsaz_amm52x20_x2_ifma256
++.type   ossl_rsaz_amm52x20_x2_ifma256,\@function,5
+ .align 32
+-ossl_rsaz_amm52x20_x2_256:
++ossl_rsaz_amm52x20_x2_ifma256:
+ .cfi_startproc
+     endbranch
+     push    %rbx
+@@ -430,7 +429,7 @@ ossl_rsaz_amm52x20_x2_256:
+ .cfi_push   %r14
+     push    %r15
+ .cfi_push   %r15
+-.Lrsaz_amm52x20_x2_256_body:
++.Lossl_rsaz_amm52x20_x2_ifma256_body:
+ 
+     # Zeroing accumulators
+     vpxord   $zero, $zero, $zero
+@@ -463,24 +462,22 @@ $code.=&lt;&lt;___;
+     lea    8($b_ptr), $b_ptr
+     dec    $iter
+     jne    .Lloop20
+-
+-    vmovdqa64   .Lmask52x4(%rip), $mask52x4
+ ___
+     &amp;amm52x20_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0);
+     &amp;amm52x20_x1_norm($acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1);
+ $code.=&lt;&lt;___;
+ 
+-    vmovdqu64   $R0_0, ($res)
+-    vmovdqu64   $R0_0h, 32($res)
+-    vmovdqu64   $R1_0, 64($res)
+-    vmovdqu64   $R1_0h, 96($res)
+-    vmovdqu64   $R2_0, 128($res)
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
+ 
+-    vmovdqu64   $R0_1, 160($res)
+-    vmovdqu64   $R0_1h, 192($res)
+-    vmovdqu64   $R1_1, 224($res)
+-    vmovdqu64   $R1_1h, 256($res)
+-    vmovdqu64   $R2_1, 288($res)
++    vmovdqu64   $R0_1,  `5*32`($res)
++    vmovdqu64   $R0_1h, `6*32`($res)
++    vmovdqu64   $R1_1,  `7*32`($res)
++    vmovdqu64   $R1_1h, `8*32`($res)
++    vmovdqu64   $R2_1,  `9*32`($res)
+ 
+     vzeroupper
+     mov  0(%rsp),%r15
+@@ -497,10 +494,10 @@ $code.=&lt;&lt;___;
+ .cfi_restore    %rbx
+     lea  48(%rsp),%rsp
+ .cfi_adjust_cfa_offset  -48
+-.Lrsaz_amm52x20_x2_256_epilogue:
++.Lossl_rsaz_amm52x20_x2_ifma256_epilogue:
+     ret
+ .cfi_endproc
+-.size   ossl_rsaz_amm52x20_x2_256, .-ossl_rsaz_amm52x20_x2_256
++.size   ossl_rsaz_amm52x20_x2_ifma256, .-ossl_rsaz_amm52x20_x2_ifma256
+ ___
+ }
+ 
+@@ -508,77 +505,76 @@ ___
+ # Constant time extraction from the precomputed table of powers base^i, where
+ #    i = 0..2^EXP_WIN_SIZE-1
+ #
+-# The input |red_table| contains precomputations for two independent base values,
+-# so the |tbl_idx| indicates for which base shall we extract the value.
+-# |red_table_idx| is a power index.
++# The input |red_table| contains precomputations for two independent base values.
++# |red_table_idx1| and |red_table_idx2| are corresponding power indexes.
+ #
+-# Extracted value (output) is 20 digit number in 2^52 radix.
++# Extracted value (output) is 2 20 digit numbers in 2^52 radix.
+ #
+ # void ossl_extract_multiplier_2x20_win5(BN_ULONG *red_Y,
+ #                                        const BN_ULONG red_table[1 &lt;&lt; EXP_WIN_SIZE][2][20],
+-#                                        int red_table_idx,
+-#                                        int tbl_idx);           # 0 or 1
++#                                        int red_table_idx1, int red_table_idx2);
+ #
+ # EXP_WIN_SIZE = 5
+ ###############################################################################
+ {
+ # input parameters
+-my ($out,$red_tbl,$red_tbl_idx,$tbl_idx) = @_6_args_universal_ABI;
++my ($out,$red_tbl,$red_tbl_idx1,$red_tbl_idx2)=$win64 ? (&quot;%rcx&quot;,&quot;%rdx&quot;,&quot;%r8&quot;, &quot;%r9&quot;) :  # Win64 order
++                                                        (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;);  # Unix order
+ 
+-my ($t0,$t1,$t2,$t3,$t4) = map(&quot;%ymm$_&quot;, (0..4));
+-my $t4xmm = $t4;
+-$t4xmm =~ s/%y/%x/;
+-my ($tmp0,$tmp1,$tmp2,$tmp3,$tmp4) = map(&quot;%ymm$_&quot;, (16..20));
+-my ($cur_idx,$idx,$ones) = map(&quot;%ymm$_&quot;, (21..23));
++my ($t0,$t1,$t2,$t3,$t4,$t5) = map(&quot;%ymm$_&quot;, (0..5));
++my ($t6,$t7,$t8,$t9) = map(&quot;%ymm$_&quot;, (16..19));
++my ($tmp,$cur_idx,$idx1,$idx2,$ones) = map(&quot;%ymm$_&quot;, (20..24));
++
++my @t = ($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$t9);
++my $t0xmm = $t0;
++$t0xmm =~ s/%y/%x/;
+ 
+ $code.=&lt;&lt;___;
+ .text
+ 
+ .align 32
+ .globl  ossl_extract_multiplier_2x20_win5
+-.type   ossl_extract_multiplier_2x20_win5,\@function,4
++.type   ossl_extract_multiplier_2x20_win5,\@abi-omnipotent
+ ossl_extract_multiplier_2x20_win5:
+ .cfi_startproc
+     endbranch
+-    leaq    ($tbl_idx,$tbl_idx,4), %rax
+-    salq    \$5, %rax
+-    addq    %rax, $red_tbl
+-
+     vmovdqa64   .Lones(%rip), $ones         # broadcast ones
+-    vpbroadcastq    $red_tbl_idx, $idx
++    vpbroadcastq    $red_tbl_idx1, $idx1
++    vpbroadcastq    $red_tbl_idx2, $idx2
+     leaq   `(1&lt;&lt;5)*2*20*8`($red_tbl), %rax  # holds end of the tbl
+ 
+-    vpxor   $t4xmm, $t4xmm, $t4xmm
+-    vmovdqa64   $t4, $t3                    # zeroing t0..4, cur_idx
+-    vmovdqa64   $t4, $t2
+-    vmovdqa64   $t4, $t1
+-    vmovdqa64   $t4, $t0
+-    vmovdqa64   $t4, $cur_idx
++    # zeroing t0..n, cur_idx
++    vpxor   $t0xmm, $t0xmm, $t0xmm
++    vmovdqa64   $t0, $cur_idx
++___
++foreach (1..9) {
++    $code.=&quot;vmovdqa64   $t0, $t[$_] \n&quot;;
++}
++$code.=&lt;&lt;___;
+ 
+ .align 32
+ .Lloop:
+-    vpcmpq  \$0, $cur_idx, $idx, %k1        # mask of (idx == cur_idx)
+-    addq    \$320, $red_tbl                 # 320 = 2 * 20 digits * 8 bytes
+-    vpaddq  $ones, $cur_idx, $cur_idx       # increment cur_idx
+-    vmovdqu64  -320($red_tbl), $tmp0        # load data from red_tbl
+-    vmovdqu64  -288($red_tbl), $tmp1
+-    vmovdqu64  -256($red_tbl), $tmp2
+-    vmovdqu64  -224($red_tbl), $tmp3
+-    vmovdqu64  -192($red_tbl), $tmp4
+-    vpblendmq  $tmp0, $t0, ${t0}{%k1}       # extract data when mask is not zero
+-    vpblendmq  $tmp1, $t1, ${t1}{%k1}
+-    vpblendmq  $tmp2, $t2, ${t2}{%k1}
+-    vpblendmq  $tmp3, $t3, ${t3}{%k1}
+-    vpblendmq  $tmp4, $t4, ${t4}{%k1}
++    vpcmpq  \$0, $cur_idx, $idx1, %k1      # mask of (idx1 == cur_idx)
++    vpcmpq  \$0, $cur_idx, $idx2, %k2      # mask of (idx2 == cur_idx)
++___
++foreach (0..9) {
++    my $mask = $_&lt;5?&quot;%k1&quot;:&quot;%k2&quot;;
++$code.=&lt;&lt;___;
++    vmovdqu64  `${_}*32`($red_tbl), $tmp     # load data from red_tbl
++    vpblendmq  $tmp, $t[$_], ${t[$_]}{$mask} # extract data when mask is not zero
++___
++}
++$code.=&lt;&lt;___;
++    vpaddq  $ones, $cur_idx, $cur_idx      # increment cur_idx
++    addq    \$`2*20*8`, $red_tbl
+     cmpq    $red_tbl, %rax
+     jne .Lloop
+-
+-    vmovdqu64   $t0, ($out)                 # store t0..4
+-    vmovdqu64   $t1, 32($out)
+-    vmovdqu64   $t2, 64($out)
+-    vmovdqu64   $t3, 96($out)
+-    vmovdqu64   $t4, 128($out)
+-
++___
++# store t0..n
++foreach (0..9) {
++    $code.=&quot;vmovdqu64   $t[$_], `${_}*32`($out) \n&quot;;
++}
++$code.=&lt;&lt;___;
+     ret
+ .cfi_endproc
+ .size   ossl_extract_multiplier_2x20_win5, .-ossl_extract_multiplier_2x20_win5
+@@ -588,6 +584,8 @@ $code.=&lt;&lt;___;
+ .align 32
+ .Lones:
+     .quad   1,1,1,1
++.Lzeros:
++    .quad   0,0,0,0
+ ___
+ }
+ 
+@@ -597,7 +595,7 @@ $frame=&quot;%rdx&quot;;
+ $context=&quot;%r8&quot;;
+ $disp=&quot;%r9&quot;;
+ 
+-$code.=&lt;&lt;___
++$code.=&lt;&lt;___;
+ .extern     __imp_RtlVirtualUnwind
+ .type   rsaz_def_handler,\@abi-omnipotent
+ .align  16
+@@ -688,32 +686,24 @@ rsaz_def_handler:
+ 
+ .section    .pdata
+ .align  4
+-    .rva    .LSEH_begin_ossl_rsaz_amm52x20_x1_256
+-    .rva    .LSEH_end_ossl_rsaz_amm52x20_x1_256
+-    .rva    .LSEH_info_ossl_rsaz_amm52x20_x1_256
+-
+-    .rva    .LSEH_begin_ossl_rsaz_amm52x20_x2_256
+-    .rva    .LSEH_end_ossl_rsaz_amm52x20_x2_256
+-    .rva    .LSEH_info_ossl_rsaz_amm52x20_x2_256
++    .rva    .LSEH_begin_ossl_rsaz_amm52x20_x1_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x20_x1_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x20_x1_ifma256
+ 
+-    .rva    .LSEH_begin_ossl_extract_multiplier_2x20_win5
+-    .rva    .LSEH_end_ossl_extract_multiplier_2x20_win5
+-    .rva    .LSEH_info_ossl_extract_multiplier_2x20_win5
++    .rva    .LSEH_begin_ossl_rsaz_amm52x20_x2_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x20_x2_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x20_x2_ifma256
+ 
+ .section    .xdata
+ .align  8
+-.LSEH_info_ossl_rsaz_amm52x20_x1_256:
+-    .byte   9,0,0,0
+-    .rva    rsaz_def_handler
+-    .rva    .Lrsaz_amm52x20_x1_256_body,.Lrsaz_amm52x20_x1_256_epilogue
+-.LSEH_info_ossl_rsaz_amm52x20_x2_256:
++.LSEH_info_ossl_rsaz_amm52x20_x1_ifma256:
+     .byte   9,0,0,0
+     .rva    rsaz_def_handler
+-    .rva    .Lrsaz_amm52x20_x2_256_body,.Lrsaz_amm52x20_x2_256_epilogue
+-.LSEH_info_ossl_extract_multiplier_2x20_win5:
++    .rva    .Lossl_rsaz_amm52x20_x1_ifma256_body,.Lossl_rsaz_amm52x20_x1_ifma256_epilogue
++.LSEH_info_ossl_rsaz_amm52x20_x2_ifma256:
+     .byte   9,0,0,0
+     .rva    rsaz_def_handler
+-    .rva    .LSEH_begin_ossl_extract_multiplier_2x20_win5,.LSEH_begin_ossl_extract_multiplier_2x20_win5
++    .rva    .Lossl_rsaz_amm52x20_x2_ifma256_body,.Lossl_rsaz_amm52x20_x2_ifma256_epilogue
+ ___
+ }
+ }}} else {{{                # fallback for old assembler
+@@ -727,16 +717,16 @@ ossl_rsaz_avx512ifma_eligible:
+     ret
+ .size   ossl_rsaz_avx512ifma_eligible, .-ossl_rsaz_avx512ifma_eligible
+ 
+-.globl  ossl_rsaz_amm52x20_x1_256
+-.globl  ossl_rsaz_amm52x20_x2_256
++.globl  ossl_rsaz_amm52x20_x1_ifma256
++.globl  ossl_rsaz_amm52x20_x2_ifma256
+ .globl  ossl_extract_multiplier_2x20_win5
+-.type   ossl_rsaz_amm52x20_x1_256,\@abi-omnipotent
+-ossl_rsaz_amm52x20_x1_256:
+-ossl_rsaz_amm52x20_x2_256:
++.type   ossl_rsaz_amm52x20_x1_ifma256,\@abi-omnipotent
++ossl_rsaz_amm52x20_x1_ifma256:
++ossl_rsaz_amm52x20_x2_ifma256:
+ ossl_extract_multiplier_2x20_win5:
+     .byte   0x0f,0x0b    # ud2
+     ret
+-.size   ossl_rsaz_amm52x20_x1_256, .-ossl_rsaz_amm52x20_x1_256
++.size   ossl_rsaz_amm52x20_x1_ifma256, .-ossl_rsaz_amm52x20_x1_ifma256
+ ___
+ }}}
+ 
+diff --git a/crypto/bn/asm/rsaz-3k-avx512.pl b/crypto/bn/asm/rsaz-3k-avx512.pl
+new file mode 100644
+index 0000000000..e294afd294
+--- /dev/null
++++ b/crypto/bn/asm/rsaz-3k-avx512.pl
+@@ -0,0 +1,874 @@
++# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright (c) 2021, Intel Corporation. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++#
++#
++# Originally written by Sergey Kirillov and Andrey Matyukov
++# Intel Corporation
++#
++# March 2021
++#
++# Initial release.
++#
++# Implementation utilizes 256-bit (ymm) registers to avoid frequency scaling issues.
++#
++# IceLake-Client @ 1.3GHz
++# |---------+-----------------------+---------------+-------------|
++# |         | OpenSSL 3.0.0-alpha15 | this          | Unit        |
++# |---------+-----------------------+---------------+-------------|
++# | rsa3072 | 6 397 637             | 2 866 593     | cycles/sign |
++# |         | 203.2                 | 453.5 / +123% | sign/s      |
++# |---------+-----------------------+---------------+-------------|
++#
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$win64=0; $win64=1 if ($flavour =~ /[nm]asm|mingw64/ || $output =~ /\.asm$/);
++$avx512ifma=0;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}x86_64-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/x86_64-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate x86_64-xlate.pl&quot;;
++
++if (`$ENV{CC} -Wa,-v -c -o /dev/null -x assembler /dev/null 2&gt;&amp;1`
++        =~ /GNU assembler version ([2-9]\.[0-9]+)/) {
++    $avx512ifma = ($1&gt;=2.26);
++}
++
++if (!$avx512 &amp;&amp; $win64 &amp;&amp; ($flavour =~ /nasm/ || $ENV{ASM} =~ /nasm/) &amp;&amp;
++       `nasm -v 2&gt;&amp;1` =~ /NASM version ([2-9]\.[0-9]+)(?:\.([0-9]+))?/) {
++    $avx512ifma = ($1==2.11 &amp;&amp; $2&gt;=8) + ($1&gt;=2.12);
++}
++
++if (!$avx512 &amp;&amp; `$ENV{CC} -v 2&gt;&amp;1` =~ /((?:clang|LLVM) version|.*based on LLVM) ([0-9]+\.[0-9]+)/) {
++    $avx512ifma = ($2&gt;=7.0);
++}
++
++open OUT,&quot;| \&quot;$^X\&quot; \&quot;$xlate\&quot; $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++*STDOUT=*OUT;
++
++if ($avx512ifma&gt;0) {{{
+<A HREF="../../../mailman/listinfo/openssl-commits.html">+ at _6_args_universal_ABI</A> = (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;,&quot;%r9&quot;);
++
++###############################################################################
++# Almost Montgomery Multiplication (AMM) for 30-digit number in radix 2^52.
++#
++# AMM is defined as presented in the paper [1].
++#
++# The input and output are presented in 2^52 radix domain, i.e.
++#   |res|, |a|, |b|, |m| are arrays of 32 64-bit qwords with 12 high bits zeroed
++#
++#   NOTE: the function uses zero-padded data - 2 high QWs is a padding.
++#
++#   |k0| is a Montgomery coefficient, which is here k0 = -1/m mod 2^64
++#
++# NB: the AMM implementation does not perform &quot;conditional&quot; subtraction step
++# specified in the original algorithm as according to the Lemma 1 from the paper
++# [2], the result will be always &lt; 2*m and can be used as a direct input to
++# the next AMM iteration.  This post-condition is true, provided the correct
++# parameter |s| (notion of the Lemma 1 from [2]) is choosen, i.e.  s &gt;= n + 2 * k,
++# which matches our case: 1560 &gt; 1536 + 2 * 1.
++#
++# [1] Gueron, S. Efficient software implementations of modular exponentiation.
++#     DOI: 10.1007/s13389-012-0031-5
++# [2] Gueron, S. Enhanced Montgomery Multiplication.
++#     DOI: 10.1007/3-540-36400-5_5
++#
++# void ossl_rsaz_amm52x30_x1_ifma256(BN_ULONG *res,
++#                                    const BN_ULONG *a,
++#                                    const BN_ULONG *b,
++#                                    const BN_ULONG *m,
++#                                    BN_ULONG k0);
++###############################################################################
++{
++# input parameters (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;)
++my ($res,$a,$b,$m,$k0) = @_6_args_universal_ABI;
++
++my $mask52     = &quot;%rax&quot;;
++my $acc0_0     = &quot;%r9&quot;;
++my $acc0_0_low = &quot;%r9d&quot;;
++my $acc0_1     = &quot;%r15&quot;;
++my $acc0_1_low = &quot;%r15d&quot;;
++my $b_ptr      = &quot;%r11&quot;;
++
++my $iter = &quot;%ebx&quot;;
++
++my $zero = &quot;%ymm0&quot;;
++my $Bi   = &quot;%ymm1&quot;;
++my $Yi   = &quot;%ymm2&quot;;
++my ($R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h) = map(&quot;%ymm$_&quot;,(3..10));
++my ($R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h) = map(&quot;%ymm$_&quot;,(11..18));
++
++# Registers mapping for normalization
++my ($T0,$T0h,$T1,$T1h,$T2,$T2h,$T3,$T3h) = (&quot;$zero&quot;, &quot;$Bi&quot;, &quot;$Yi&quot;, map(&quot;%ymm$_&quot;, (19..23)));
++
++sub amm52x30_x1() {
++# _data_offset - offset in the |a| or |m| arrays pointing to the beginning
++#                of data for corresponding AMM operation;
++# _b_offset    - offset in the |b| array pointing to the next qword digit;
++my ($_data_offset,$_b_offset,$_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2,$_R2h,$_R3,$_R3h,$_k0) = @_;
++my $_R0_xmm = $_R0;
++$_R0_xmm =~ s/%y/%x/;
++$code.=&lt;&lt;___;
++    movq    $_b_offset($b_ptr), %r13             # b[i]
++
++    vpbroadcastq    %r13, $Bi                    # broadcast b[i]
++    movq    $_data_offset($a), %rdx
++    mulx    %r13, %r13, %r12                     # a[0]*b[i] = (t0,t2)
++    addq    %r13, $_acc                          # acc += t0
++    movq    %r12, %r10
++    adcq    \$0, %r10                            # t2 += CF
++
++    movq    $_k0, %r13
++    imulq   $_acc, %r13                          # acc * k0
++    andq    $mask52, %r13                        # yi = (acc * k0) &amp; mask52
++
++    vpbroadcastq    %r13, $Yi                    # broadcast y[i]
++    movq    $_data_offset($m), %rdx
++    mulx    %r13, %r13, %r12                     # yi * m[0] = (t0,t1)
++    addq    %r13, $_acc                          # acc += t0
++    adcq    %r12, %r10                           # t2 += (t1 + CF)
++
++    shrq    \$52, $_acc
++    salq    \$12, %r10
++    or      %r10, $_acc                          # acc = ((acc &gt;&gt; 52) | (t2 &lt;&lt; 12))
++
++    vpmadd52luq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($a), $Bi, $_R2
++    vpmadd52luq `$_data_offset+64*2+32`($a), $Bi, $_R2h
++    vpmadd52luq `$_data_offset+64*3`($a), $Bi, $_R3
++    vpmadd52luq `$_data_offset+64*3+32`($a), $Bi, $_R3h
++
++    vpmadd52luq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($m), $Yi, $_R2
++    vpmadd52luq `$_data_offset+64*2+32`($m), $Yi, $_R2h
++    vpmadd52luq `$_data_offset+64*3`($m), $Yi, $_R3
++    vpmadd52luq `$_data_offset+64*3+32`($m), $Yi, $_R3h
++
++    # Shift accumulators right by 1 qword, zero extending the highest one
++    valignq     \$1, $_R0, $_R0h, $_R0
++    valignq     \$1, $_R0h, $_R1, $_R0h
++    valignq     \$1, $_R1, $_R1h, $_R1
++    valignq     \$1, $_R1h, $_R2, $_R1h
++    valignq     \$1, $_R2, $_R2h, $_R2
++    valignq     \$1, $_R2h, $_R3, $_R2h
++    valignq     \$1, $_R3, $_R3h, $_R3
++    valignq     \$1, $_R3h, $zero, $_R3h
++
++    vmovq   $_R0_xmm, %r13
++    addq    %r13, $_acc    # acc += R0[0]
++
++    vpmadd52huq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($a), $Bi, $_R2
++    vpmadd52huq `$_data_offset+64*2+32`($a), $Bi, $_R2h
++    vpmadd52huq `$_data_offset+64*3`($a), $Bi, $_R3
++    vpmadd52huq `$_data_offset+64*3+32`($a), $Bi, $_R3h
++
++    vpmadd52huq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($m), $Yi, $_R2
++    vpmadd52huq `$_data_offset+64*2+32`($m), $Yi, $_R2h
++    vpmadd52huq `$_data_offset+64*3`($m), $Yi, $_R3
++    vpmadd52huq `$_data_offset+64*3+32`($m), $Yi, $_R3h
++___
++}
++
++# Normalization routine: handles carry bits and gets bignum qwords to normalized
++# 2^52 representation.
++#
++# Uses %r8-14,%e[abcd]x
++sub amm52x30_x1_norm {
++my ($_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2,$_R2h,$_R3,$_R3h) = @_;
++$code.=&lt;&lt;___;
++    # Put accumulator to low qword in R0
++    vpbroadcastq    $_acc, $T0
++    vpblendd \$3, $T0, $_R0, $_R0
++
++    # Extract &quot;carries&quot; (12 high bits) from each QW of the bignum
++    # Save them to LSB of QWs in T0..Tn
++    vpsrlq    \$52, $_R0,   $T0
++    vpsrlq    \$52, $_R0h,  $T0h
++    vpsrlq    \$52, $_R1,   $T1
++    vpsrlq    \$52, $_R1h,  $T1h
++    vpsrlq    \$52, $_R2,   $T2
++    vpsrlq    \$52, $_R2h,  $T2h
++    vpsrlq    \$52, $_R3,   $T3
++    vpsrlq    \$52, $_R3h,  $T3h
++
++    # &quot;Shift left&quot; T0..Tn by 1 QW
++    valignq \$3, $T3,  $T3h,  $T3h
++    valignq \$3, $T2h,  $T3,  $T3
++    valignq \$3, $T2,  $T2h,  $T2h
++    valignq \$3, $T1h,  $T2,  $T2
++    valignq \$3, $T1,   $T1h, $T1h
++    valignq \$3, $T0h,  $T1,  $T1
++    valignq \$3, $T0,   $T0h, $T0h
++    valignq \$3, .Lzeros(%rip), $T0,  $T0
++
++    # Drop &quot;carries&quot; from R0..Rn QWs
++    vpandq    .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq    .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq    .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq    .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq    .Lmask52x4(%rip), $_R2,  $_R2
++    vpandq    .Lmask52x4(%rip), $_R2h, $_R2h
++    vpandq    .Lmask52x4(%rip), $_R3,  $_R3
++    vpandq    .Lmask52x4(%rip), $_R3h, $_R3h
++
++    # Sum R0..Rn with corresponding adjusted carries
++    vpaddq  $T0,  $_R0,  $_R0
++    vpaddq  $T0h, $_R0h, $_R0h
++    vpaddq  $T1,  $_R1,  $_R1
++    vpaddq  $T1h, $_R1h, $_R1h
++    vpaddq  $T2,  $_R2,  $_R2
++    vpaddq  $T2h, $_R2h, $_R2h
++    vpaddq  $T3,  $_R3,  $_R3
++    vpaddq  $T3h, $_R3h, $_R3h
++
++    # Now handle carry bits from this addition
++    # Get mask of QWs whose 52-bit parts overflow
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R0},%k1    # OP=nle (i.e. gt)
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R0h},%k2
++    kmovb      %k1,%r14d
++    kmovb      %k2,%r13d
++    shl        \$4,%r13b
++    or         %r13b,%r14b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R1},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R1h},%k2
++    kmovb      %k1,%r13d
++    kmovb      %k2,%r12d
++    shl        \$4,%r12b
++    or         %r12b,%r13b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R2},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R2h},%k2
++    kmovb      %k1,%r12d
++    kmovb      %k2,%r11d
++    shl        \$4,%r11b
++    or         %r11b,%r12b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R3},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R3h},%k2
++    kmovb      %k1,%r11d
++    kmovb      %k2,%r10d
++    shl        \$4,%r10b
++    or         %r10b,%r11b
++
++    addb       %r14b,%r14b
++    adcb       %r13b,%r13b
++    adcb       %r12b,%r12b
++    adcb       %r11b,%r11b
++
++    # Get mask of QWs whose 52-bit parts saturated
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R0},%k1    # OP=eq
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R0h},%k2
++    kmovb      %k1,%r9d
++    kmovb      %k2,%r8d
++    shl        \$4,%r8b
++    or         %r8b,%r9b
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R1},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R1h},%k2
++    kmovb      %k1,%r8d
++    kmovb      %k2,%edx
++    shl        \$4,%dl
++    or         %dl,%r8b
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R2},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R2h},%k2
++    kmovb      %k1,%edx
++    kmovb      %k2,%ecx
++    shl        \$4,%cl
++    or         %cl,%dl
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R3},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R3h},%k2
++    kmovb      %k1,%ecx
++    kmovb      %k2,%ebx
++    shl        \$4,%bl
++    or         %bl,%cl
++
++    addb     %r9b,%r14b
++    adcb     %r8b,%r13b
++    adcb     %dl,%r12b
++    adcb     %cl,%r11b
++
++    xor      %r9b,%r14b
++    xor      %r8b,%r13b
++    xor      %dl,%r12b
++    xor      %cl,%r11b
++
++    kmovb    %r14d,%k1
++    shr      \$4,%r14b
++    kmovb    %r14d,%k2
++    kmovb    %r13d,%k3
++    shr      \$4,%r13b
++    kmovb    %r13d,%k4
++    kmovb    %r12d,%k5
++    shr      \$4,%r12b
++    kmovb    %r12d,%k6
++    kmovb    %r11d,%k7
++
++    vpsubq  .Lmask52x4(%rip), $_R0,  ${_R0}{%k1}
++    vpsubq  .Lmask52x4(%rip), $_R0h, ${_R0h}{%k2}
++    vpsubq  .Lmask52x4(%rip), $_R1,  ${_R1}{%k3}
++    vpsubq  .Lmask52x4(%rip), $_R1h, ${_R1h}{%k4}
++    vpsubq  .Lmask52x4(%rip), $_R2,  ${_R2}{%k5}
++    vpsubq  .Lmask52x4(%rip), $_R2h, ${_R2h}{%k6}
++    vpsubq  .Lmask52x4(%rip), $_R3,  ${_R3}{%k7}
++
++    vpandq  .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq  .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq  .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq  .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq  .Lmask52x4(%rip), $_R2,  $_R2
++    vpandq  .Lmask52x4(%rip), $_R2h, $_R2h
++    vpandq  .Lmask52x4(%rip), $_R3,  $_R3
++
++    shr    \$4,%r11b
++    kmovb   %r11d,%k1
++
++    vpsubq  .Lmask52x4(%rip), $_R3h, ${_R3h}{%k1}
++
++    vpandq  .Lmask52x4(%rip), $_R3h, $_R3h
++___
++}
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x30_x1_ifma256
++.type   ossl_rsaz_amm52x30_x1_ifma256,\@function,5
++.align 32
++ossl_rsaz_amm52x30_x1_ifma256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++___
++$code.=&lt;&lt;___ if ($win64);
++    lea     -168(%rsp),%rsp                 # 16*10 + (8 bytes to get correct 16-byte SIMD alignment)
++    vmovdqa64   %xmm6, `0*16`(%rsp)         # save non-volatile registers
++    vmovdqa64   %xmm7, `1*16`(%rsp)
++    vmovdqa64   %xmm8, `2*16`(%rsp)
++    vmovdqa64   %xmm9, `3*16`(%rsp)
++    vmovdqa64   %xmm10,`4*16`(%rsp)
++    vmovdqa64   %xmm11,`5*16`(%rsp)
++    vmovdqa64   %xmm12,`6*16`(%rsp)
++    vmovdqa64   %xmm13,`7*16`(%rsp)
++    vmovdqa64   %xmm14,`8*16`(%rsp)
++    vmovdqa64   %xmm15,`9*16`(%rsp)
++.Lossl_rsaz_amm52x30_x1_ifma256_body:
++___
++$code.=&lt;&lt;___;
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++    vmovdqa64   $zero, $R2_0h
++    vmovdqa64   $zero, $R3_0
++    vmovdqa64   $zero, $R3_0h
++
++    xorl    $acc0_0_low, $acc0_0_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    # Loop over 30 digits unrolled by 4
++    mov     \$7, $iter
++
++.align 32
++.Lloop7:
++___
++    foreach my $idx (0..3) {
++        &amp;amm52x30_x1(0,8*$idx,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$k0);
++    }
++$code.=&lt;&lt;___;
++    lea    `4*8`($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop7
++___
++    &amp;amm52x30_x1(0,8*0,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$k0);
++    &amp;amm52x30_x1(0,8*1,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$k0);
++
++    &amp;amm52x30_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
++    vmovdqu64   $R2_0h, `5*32`($res)
++    vmovdqu64   $R3_0,  `6*32`($res)
++    vmovdqu64   $R3_0h, `7*32`($res)
++
++    vzeroupper
++    lea     (%rsp),%rax
++.cfi_def_cfa_register   %rax
++___
++$code.=&lt;&lt;___ if ($win64);
++    vmovdqa64   `0*16`(%rax),%xmm6
++    vmovdqa64   `1*16`(%rax),%xmm7
++    vmovdqa64   `2*16`(%rax),%xmm8
++    vmovdqa64   `3*16`(%rax),%xmm9
++    vmovdqa64   `4*16`(%rax),%xmm10
++    vmovdqa64   `5*16`(%rax),%xmm11
++    vmovdqa64   `6*16`(%rax),%xmm12
++    vmovdqa64   `7*16`(%rax),%xmm13
++    vmovdqa64   `8*16`(%rax),%xmm14
++    vmovdqa64   `9*16`(%rax),%xmm15
++    lea  168(%rsp),%rax
++___
++$code.=&lt;&lt;___;
++    mov  0(%rax),%r15
++.cfi_restore    %r15
++    mov  8(%rax),%r14
++.cfi_restore    %r14
++    mov  16(%rax),%r13
++.cfi_restore    %r13
++    mov  24(%rax),%r12
++.cfi_restore    %r12
++    mov  32(%rax),%rbp
++.cfi_restore    %rbp
++    mov  40(%rax),%rbx
++.cfi_restore    %rbx
++    lea  48(%rax),%rsp       # restore rsp
++.cfi_def_cfa %rsp,8
++.Lossl_rsaz_amm52x30_x1_ifma256_epilogue:
++    ret
++.cfi_endproc
++.size   ossl_rsaz_amm52x30_x1_ifma256, .-ossl_rsaz_amm52x30_x1_ifma256
++___
++
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lmask52x4:
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++___
++
++###############################################################################
++# Dual Almost Montgomery Multiplication for 30-digit number in radix 2^52
++#
++# See description of ossl_rsaz_amm52x30_x1_ifma256() above for details about Almost
++# Montgomery Multiplication algorithm and function input parameters description.
++#
++# This function does two AMMs for two independent inputs, hence dual.
++#
++# NOTE: the function uses zero-padded data - 2 high QWs is a padding.
++#
++# void ossl_rsaz_amm52x30_x2_ifma256(BN_ULONG out[2][32],
++#                                    const BN_ULONG a[2][32],
++#                                    const BN_ULONG b[2][32],
++#                                    const BN_ULONG m[2][32],
++#                                    const BN_ULONG k0[2]);
++###############################################################################
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x30_x2_ifma256
++.type   ossl_rsaz_amm52x30_x2_ifma256,\@function,5
++.align 32
++ossl_rsaz_amm52x30_x2_ifma256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++___
++$code.=&lt;&lt;___ if ($win64);
++    lea     -168(%rsp),%rsp
++    vmovdqa64   %xmm6, `0*16`(%rsp)        # save non-volatile registers
++    vmovdqa64   %xmm7, `1*16`(%rsp)
++    vmovdqa64   %xmm8, `2*16`(%rsp)
++    vmovdqa64   %xmm9, `3*16`(%rsp)
++    vmovdqa64   %xmm10,`4*16`(%rsp)
++    vmovdqa64   %xmm11,`5*16`(%rsp)
++    vmovdqa64   %xmm12,`6*16`(%rsp)
++    vmovdqa64   %xmm13,`7*16`(%rsp)
++    vmovdqa64   %xmm14,`8*16`(%rsp)
++    vmovdqa64   %xmm15,`9*16`(%rsp)
++.Lossl_rsaz_amm52x30_x2_ifma256_body:
++___
++$code.=&lt;&lt;___;
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++    vmovdqa64   $zero, $R2_0h
++    vmovdqa64   $zero, $R3_0
++    vmovdqa64   $zero, $R3_0h
++
++    vmovdqa64   $zero, $R0_1
++    vmovdqa64   $zero, $R0_1h
++    vmovdqa64   $zero, $R1_1
++    vmovdqa64   $zero, $R1_1h
++    vmovdqa64   $zero, $R2_1
++    vmovdqa64   $zero, $R2_1h
++    vmovdqa64   $zero, $R3_1
++    vmovdqa64   $zero, $R3_1h
++
++
++    xorl    $acc0_0_low, $acc0_0_low
++    xorl    $acc0_1_low, $acc0_1_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    mov    \$30, $iter
++
++.align 32
++.Lloop30:
++___
++    &amp;amm52x30_x1(   0,   0,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,&quot;($k0)&quot;);
++    # 32*8 = offset of the next dimension in two-dimension array
++    &amp;amm52x30_x1(32*8,32*8,$acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h,&quot;8($k0)&quot;);
++$code.=&lt;&lt;___;
++    lea    8($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop30
++___
++    &amp;amm52x30_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h);
++    &amp;amm52x30_x1_norm($acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
++    vmovdqu64   $R2_0h, `5*32`($res)
++    vmovdqu64   $R3_0,  `6*32`($res)
++    vmovdqu64   $R3_0h, `7*32`($res)
++
++    vmovdqu64   $R0_1,  `8*32`($res)
++    vmovdqu64   $R0_1h, `9*32`($res)
++    vmovdqu64   $R1_1,  `10*32`($res)
++    vmovdqu64   $R1_1h, `11*32`($res)
++    vmovdqu64   $R2_1,  `12*32`($res)
++    vmovdqu64   $R2_1h, `13*32`($res)
++    vmovdqu64   $R3_1,  `14*32`($res)
++    vmovdqu64   $R3_1h, `15*32`($res)
++
++    vzeroupper
++    lea     (%rsp),%rax
++.cfi_def_cfa_register   %rax
++___
++$code.=&lt;&lt;___ if ($win64);
++    vmovdqa64   `0*16`(%rax),%xmm6
++    vmovdqa64   `1*16`(%rax),%xmm7
++    vmovdqa64   `2*16`(%rax),%xmm8
++    vmovdqa64   `3*16`(%rax),%xmm9
++    vmovdqa64   `4*16`(%rax),%xmm10
++    vmovdqa64   `5*16`(%rax),%xmm11
++    vmovdqa64   `6*16`(%rax),%xmm12
++    vmovdqa64   `7*16`(%rax),%xmm13
++    vmovdqa64   `8*16`(%rax),%xmm14
++    vmovdqa64   `9*16`(%rax),%xmm15
++    lea     168(%rsp),%rax
++___
++$code.=&lt;&lt;___;
++    mov  0(%rax),%r15
++.cfi_restore    %r15
++    mov  8(%rax),%r14
++.cfi_restore    %r14
++    mov  16(%rax),%r13
++.cfi_restore    %r13
++    mov  24(%rax),%r12
++.cfi_restore    %r12
++    mov  32(%rax),%rbp
++.cfi_restore    %rbp
++    mov  40(%rax),%rbx
++.cfi_restore    %rbx
++    lea  48(%rax),%rsp
++.cfi_def_cfa    %rsp,8
++.Lossl_rsaz_amm52x30_x2_ifma256_epilogue:
++    ret
++.cfi_endproc
++.size   ossl_rsaz_amm52x30_x2_ifma256, .-ossl_rsaz_amm52x30_x2_ifma256
++___
++}
++
++###############################################################################
++# Constant time extraction from the precomputed table of powers base^i, where
++#    i = 0..2^EXP_WIN_SIZE-1
++#
++# The input |red_table| contains precomputations for two independent base values.
++# |red_table_idx1| and |red_table_idx2| are corresponding power indexes.
++#
++# Extracted value (output) is 2 (30 + 2) digits numbers in 2^52 radix.
++# (2 high QW is zero padding)
++#
++# void ossl_extract_multiplier_2x30_win5(BN_ULONG *red_Y,
++#                                        const BN_ULONG red_table[1 &lt;&lt; EXP_WIN_SIZE][2][32],
++#                                        int red_table_idx1, int red_table_idx2);
++#
++# EXP_WIN_SIZE = 5
++###############################################################################
++{
++# input parameters
++my ($out,$red_tbl,$red_tbl_idx1,$red_tbl_idx2)=$win64 ? (&quot;%rcx&quot;,&quot;%rdx&quot;,&quot;%r8&quot;, &quot;%r9&quot;) :  # Win64 order
++                                                        (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;);  # Unix order
++
++my ($t0,$t1,$t2,$t3,$t4,$t5) = map(&quot;%ymm$_&quot;, (0..5));
++my ($t6,$t7,$t8,$t9,$t10,$t11,$t12,$t13,$t14,$t15) = map(&quot;%ymm$_&quot;, (16..25));
++my ($tmp,$cur_idx,$idx1,$idx2,$ones) = map(&quot;%ymm$_&quot;, (26..30));
++
++my @t = ($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$t9,$t10,$t11,$t12,$t13,$t14,$t15);
++my $t0xmm = $t0;
++$t0xmm =~ s/%y/%x/;
++
++$code.=&lt;&lt;___;
++.text
++
++.align 32
++.globl  ossl_extract_multiplier_2x30_win5
++.type   ossl_extract_multiplier_2x30_win5,\@abi-omnipotent
++ossl_extract_multiplier_2x30_win5:
++.cfi_startproc
++    endbranch
++    vmovdqa64   .Lones(%rip), $ones         # broadcast ones
++    vpbroadcastq    $red_tbl_idx1, $idx1
++    vpbroadcastq    $red_tbl_idx2, $idx2
++    leaq   `(1&lt;&lt;5)*2*32*8`($red_tbl), %rax  # holds end of the tbl
++
++    # zeroing t0..n, cur_idx
++    vpxor   $t0xmm, $t0xmm, $t0xmm
++    vmovdqa64   $t0, $cur_idx
++___
++foreach (1..15) {
++    $code.=&quot;vmovdqa64   $t0, $t[$_] \n&quot;;
++}
++$code.=&lt;&lt;___;
++
++.align 32
++.Lloop:
++    vpcmpq  \$0, $cur_idx, $idx1, %k1      # mask of (idx1 == cur_idx)
++    vpcmpq  \$0, $cur_idx, $idx2, %k2      # mask of (idx2 == cur_idx)
++___
++foreach (0..15) {
++    my $mask = $_&lt;8?&quot;%k1&quot;:&quot;%k2&quot;;
++$code.=&lt;&lt;___;
++    vmovdqu64  `${_}*32`($red_tbl), $tmp     # load data from red_tbl
++    vpblendmq  $tmp, $t[$_], ${t[$_]}{$mask} # extract data when mask is not zero
++___
++}
++$code.=&lt;&lt;___;
++    vpaddq  $ones, $cur_idx, $cur_idx      # increment cur_idx
++    addq    \$`2*32*8`, $red_tbl
++    cmpq    $red_tbl, %rax
++    jne .Lloop
++___
++# store t0..n
++foreach (0..15) {
++    $code.=&quot;vmovdqu64   $t[$_], `${_}*32`($out) \n&quot;;
++}
++$code.=&lt;&lt;___;
++
++    ret
++.cfi_endproc
++.size   ossl_extract_multiplier_2x30_win5, .-ossl_extract_multiplier_2x30_win5
++___
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lones:
++    .quad   1,1,1,1
++.Lzeros:
++    .quad   0,0,0,0
++___
++}
++
++if ($win64) {
++$rec=&quot;%rcx&quot;;
++$frame=&quot;%rdx&quot;;
++$context=&quot;%r8&quot;;
++$disp=&quot;%r9&quot;;
++
++$code.=&lt;&lt;___;
++.extern     __imp_RtlVirtualUnwind
++.type   rsaz_avx_handler,\@abi-omnipotent
++.align  16
++rsaz_avx_handler:
++    push    %rsi
++    push    %rdi
++    push    %rbx
++    push    %rbp
++    push    %r12
++    push    %r13
++    push    %r14
++    push    %r15
++    pushfq
++    sub     \$64,%rsp
++
++    mov     120($context),%rax # pull context-&gt;Rax
++    mov     248($context),%rbx # pull context-&gt;Rip
++
++    mov     8($disp),%rsi      # disp-&gt;ImageBase
++    mov     56($disp),%r11     # disp-&gt;HandlerData
++
++    mov     0(%r11),%r10d      # HandlerData[0]
++    lea     (%rsi,%r10),%r10   # prologue label
++    cmp     %r10,%rbx          # context-&gt;Rip&lt;.Lprologue
++    jb  .Lcommon_seh_tail
++
++    mov     4(%r11),%r10d      # HandlerData[1]
++    lea     (%rsi,%r10),%r10   # epilogue label
++    cmp     %r10,%rbx          # context-&gt;Rip&gt;=.Lepilogue
++    jae     .Lcommon_seh_tail
++
++    mov     152($context),%rax # pull context-&gt;Rsp
++
++    lea     (%rax),%rsi         # %xmm save area
++    lea     512($context),%rdi  # &amp; context.Xmm6
++    mov     \$20,%ecx           # 10*sizeof(%xmm0)/sizeof(%rax)
++    .long   0xa548f3fc          # cld; rep movsq
++
++    lea     `48+168`(%rax),%rax
++
++    mov     -8(%rax),%rbx
++    mov     -16(%rax),%rbp
++    mov     -24(%rax),%r12
++    mov     -32(%rax),%r13
++    mov     -40(%rax),%r14
++    mov     -48(%rax),%r15
++    mov     %rbx,144($context) # restore context-&gt;Rbx
++    mov     %rbp,160($context) # restore context-&gt;Rbp
++    mov     %r12,216($context) # restore context-&gt;R12
++    mov     %r13,224($context) # restore context-&gt;R13
++    mov     %r14,232($context) # restore context-&gt;R14
++    mov     %r15,240($context) # restore context-&gt;R14
++
++.Lcommon_seh_tail:
++    mov     8(%rax),%rdi
++    mov     16(%rax),%rsi
++    mov     %rax,152($context) # restore context-&gt;Rsp
++    mov     %rsi,168($context) # restore context-&gt;Rsi
++    mov     %rdi,176($context) # restore context-&gt;Rdi
++
++    mov     40($disp),%rdi     # disp-&gt;ContextRecord
++    mov     $context,%rsi      # context
++    mov     \$154,%ecx         # sizeof(CONTEXT)
++    .long   0xa548f3fc         # cld; rep movsq
++
++    mov     $disp,%rsi
++    xor     %rcx,%rcx          # arg1, UNW_FLAG_NHANDLER
++    mov     8(%rsi),%rdx       # arg2, disp-&gt;ImageBase
++    mov     0(%rsi),%r8        # arg3, disp-&gt;ControlPc
++    mov     16(%rsi),%r9       # arg4, disp-&gt;FunctionEntry
++    mov     40(%rsi),%r10      # disp-&gt;ContextRecord
++    lea     56(%rsi),%r11      # &amp;disp-&gt;HandlerData
++    lea     24(%rsi),%r12      # &amp;disp-&gt;EstablisherFrame
++    mov     %r10,32(%rsp)      # arg5
++    mov     %r11,40(%rsp)      # arg6
++    mov     %r12,48(%rsp)      # arg7
++    mov     %rcx,56(%rsp)      # arg8, (NULL)
++    call    *__imp_RtlVirtualUnwind(%rip)
++
++    mov     \$1,%eax           # ExceptionContinueSearch
++    add     \$64,%rsp
++    popfq
++    pop     %r15
++    pop     %r14
++    pop     %r13
++    pop     %r12
++    pop     %rbp
++    pop     %rbx
++    pop     %rdi
++    pop     %rsi
++    ret
++.size   rsaz_avx_handler,.-rsaz_avx_handler
++
++.section    .pdata
++.align  4
++    .rva    .LSEH_begin_ossl_rsaz_amm52x30_x1_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x30_x1_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x30_x1_ifma256
++
++    .rva    .LSEH_begin_ossl_rsaz_amm52x30_x2_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x30_x2_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x30_x2_ifma256
++
++.section    .xdata
++.align  8
++.LSEH_info_ossl_rsaz_amm52x30_x1_ifma256:
++    .byte   9,0,0,0
++    .rva    rsaz_avx_handler
++    .rva    .Lossl_rsaz_amm52x30_x1_ifma256_body,.Lossl_rsaz_amm52x30_x1_ifma256_epilogue
++.LSEH_info_ossl_rsaz_amm52x30_x2_ifma256:
++    .byte   9,0,0,0
++    .rva    rsaz_avx_handler
++    .rva    .Lossl_rsaz_amm52x30_x2_ifma256_body,.Lossl_rsaz_amm52x30_x2_ifma256_epilogue
++___
++}
++}}} else {{{                # fallback for old assembler
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x30_x1_ifma256
++.globl  ossl_rsaz_amm52x30_x2_ifma256
++.globl  ossl_extract_multiplier_2x30_win5
++.type   ossl_rsaz_amm52x30_x1_ifma256,\@abi-omnipotent
++ossl_rsaz_amm52x30_x1_ifma256:
++ossl_rsaz_amm52x30_x2_ifma256:
++ossl_extract_multiplier_2x30_win5:
++    .byte   0x0f,0x0b    # ud2
++    ret
++.size   ossl_rsaz_amm52x30_x1_ifma256, .-ossl_rsaz_amm52x30_x1_ifma256
++___
++}}}
++
++$code =~ s/\`([^\`]*)\`/eval $1/gem;
++print $code;
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/bn/asm/rsaz-4k-avx512.pl b/crypto/bn/asm/rsaz-4k-avx512.pl
+new file mode 100644
+index 0000000000..fb5bf10198
+--- /dev/null
++++ b/crypto/bn/asm/rsaz-4k-avx512.pl
+@@ -0,0 +1,930 @@
++# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright (c) 2021, Intel Corporation. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++#
++#
++# Originally written by Sergey Kirillov and Andrey Matyukov
++# Intel Corporation
++#
++# March 2021
++#
++# Initial release.
++#
++# Implementation utilizes 256-bit (ymm) registers to avoid frequency scaling issues.
++#
++# IceLake-Client @ 1.3GHz
++# |---------+-----------------------+---------------+-------------|
++# |         | OpenSSL 3.0.0-alpha15 | this          | Unit        |
++# |---------+-----------------------+---------------+-------------|
++# | rsa4096 | 14 301 4300           | 5 813 953     | cycles/sign |
++# |         | 90.9                  | 223.6 / +146% | sign/s      |
++# |---------+-----------------------+---------------+-------------|
++#
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$win64=0; $win64=1 if ($flavour =~ /[nm]asm|mingw64/ || $output =~ /\.asm$/);
++$avx512ifma=0;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}x86_64-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/x86_64-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate x86_64-xlate.pl&quot;;
++
++if (`$ENV{CC} -Wa,-v -c -o /dev/null -x assembler /dev/null 2&gt;&amp;1`
++        =~ /GNU assembler version ([2-9]\.[0-9]+)/) {
++    $avx512ifma = ($1&gt;=2.26);
++}
++
++if (!$avx512 &amp;&amp; $win64 &amp;&amp; ($flavour =~ /nasm/ || $ENV{ASM} =~ /nasm/) &amp;&amp;
++       `nasm -v 2&gt;&amp;1` =~ /NASM version ([2-9]\.[0-9]+)(?:\.([0-9]+))?/) {
++    $avx512ifma = ($1==2.11 &amp;&amp; $2&gt;=8) + ($1&gt;=2.12);
++}
++
++if (!$avx512 &amp;&amp; `$ENV{CC} -v 2&gt;&amp;1` =~ /((?:clang|LLVM) version|.*based on LLVM) ([0-9]+\.[0-9]+)/) {
++    $avx512ifma = ($2&gt;=7.0);
++}
++
++open OUT,&quot;| \&quot;$^X\&quot; \&quot;$xlate\&quot; $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++*STDOUT=*OUT;
++
++if ($avx512ifma&gt;0) {{{
+<A HREF="../../../mailman/listinfo/openssl-commits.html">+ at _6_args_universal_ABI</A> = (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;,&quot;%r9&quot;);
++
++###############################################################################
++# Almost Montgomery Multiplication (AMM) for 40-digit number in radix 2^52.
++#
++# AMM is defined as presented in the paper [1].
++#
++# The input and output are presented in 2^52 radix domain, i.e.
++#   |res|, |a|, |b|, |m| are arrays of 40 64-bit qwords with 12 high bits zeroed.
++#   |k0| is a Montgomery coefficient, which is here k0 = -1/m mod 2^64
++#
++# NB: the AMM implementation does not perform &quot;conditional&quot; subtraction step
++# specified in the original algorithm as according to the Lemma 1 from the paper
++# [2], the result will be always &lt; 2*m and can be used as a direct input to
++# the next AMM iteration.  This post-condition is true, provided the correct
++# parameter |s| (notion of the Lemma 1 from [2]) is choosen, i.e.  s &gt;= n + 2 * k,
++# which matches our case: 2080 &gt; 2048 + 2 * 1.
++#
++# [1] Gueron, S. Efficient software implementations of modular exponentiation.
++#     DOI: 10.1007/s13389-012-0031-5
++# [2] Gueron, S. Enhanced Montgomery Multiplication.
++#     DOI: 10.1007/3-540-36400-5_5
++#
++# void ossl_rsaz_amm52x40_x1_ifma256(BN_ULONG *res,
++#                                    const BN_ULONG *a,
++#                                    const BN_ULONG *b,
++#                                    const BN_ULONG *m,
++#                                    BN_ULONG k0);
++###############################################################################
++{
++# input parameters (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;)
++my ($res,$a,$b,$m,$k0) = @_6_args_universal_ABI;
++
++my $mask52     = &quot;%rax&quot;;
++my $acc0_0     = &quot;%r9&quot;;
++my $acc0_0_low = &quot;%r9d&quot;;
++my $acc0_1     = &quot;%r15&quot;;
++my $acc0_1_low = &quot;%r15d&quot;;
++my $b_ptr      = &quot;%r11&quot;;
++
++my $iter = &quot;%ebx&quot;;
++
++my $zero = &quot;%ymm0&quot;;
++my $Bi   = &quot;%ymm1&quot;;
++my $Yi   = &quot;%ymm2&quot;;
++my ($R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$R4_0,$R4_0h) = map(&quot;%ymm$_&quot;,(3..12));
++my ($R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h,$R4_1,$R4_1h) = map(&quot;%ymm$_&quot;,(13..22));
++
++# Registers mapping for normalization
++my ($T0,$T0h,$T1,$T1h,$T2,$T2h,$T3,$T3h,$T4,$T4h) = (&quot;$zero&quot;, &quot;$Bi&quot;, &quot;$Yi&quot;, map(&quot;%ymm$_&quot;, (23..29)));
++
++sub amm52x40_x1() {
++# _data_offset - offset in the |a| or |m| arrays pointing to the beginning
++#                of data for corresponding AMM operation;
++# _b_offset    - offset in the |b| array pointing to the next qword digit;
++my ($_data_offset,$_b_offset,$_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2,$_R2h,$_R3,$_R3h,$_R4,$_R4h,$_k0) = @_;
++my $_R0_xmm = $_R0;
++$_R0_xmm =~ s/%y/%x/;
++$code.=&lt;&lt;___;
++    movq    $_b_offset($b_ptr), %r13             # b[i]
++
++    vpbroadcastq    %r13, $Bi                    # broadcast b[i]
++    movq    $_data_offset($a), %rdx
++    mulx    %r13, %r13, %r12                     # a[0]*b[i] = (t0,t2)
++    addq    %r13, $_acc                          # acc += t0
++    movq    %r12, %r10
++    adcq    \$0, %r10                            # t2 += CF
++
++    movq    $_k0, %r13
++    imulq   $_acc, %r13                          # acc * k0
++    andq    $mask52, %r13                        # yi = (acc * k0) &amp; mask52
++
++    vpbroadcastq    %r13, $Yi                    # broadcast y[i]
++    movq    $_data_offset($m), %rdx
++    mulx    %r13, %r13, %r12                     # yi * m[0] = (t0,t1)
++    addq    %r13, $_acc                          # acc += t0
++    adcq    %r12, %r10                           # t2 += (t1 + CF)
++
++    shrq    \$52, $_acc
++    salq    \$12, %r10
++    or      %r10, $_acc                          # acc = ((acc &gt;&gt; 52) | (t2 &lt;&lt; 12))
++
++    vpmadd52luq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($a), $Bi, $_R2
++    vpmadd52luq `$_data_offset+64*2+32`($a), $Bi, $_R2h
++    vpmadd52luq `$_data_offset+64*3`($a), $Bi, $_R3
++    vpmadd52luq `$_data_offset+64*3+32`($a), $Bi, $_R3h
++    vpmadd52luq `$_data_offset+64*4`($a), $Bi, $_R4
++    vpmadd52luq `$_data_offset+64*4+32`($a), $Bi, $_R4h
++
++    vpmadd52luq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($m), $Yi, $_R2
++    vpmadd52luq `$_data_offset+64*2+32`($m), $Yi, $_R2h
++    vpmadd52luq `$_data_offset+64*3`($m), $Yi, $_R3
++    vpmadd52luq `$_data_offset+64*3+32`($m), $Yi, $_R3h
++    vpmadd52luq `$_data_offset+64*4`($m), $Yi, $_R4
++    vpmadd52luq `$_data_offset+64*4+32`($m), $Yi, $_R4h
++
++    # Shift accumulators right by 1 qword, zero extending the highest one
++    valignq     \$1, $_R0, $_R0h, $_R0
++    valignq     \$1, $_R0h, $_R1, $_R0h
++    valignq     \$1, $_R1, $_R1h, $_R1
++    valignq     \$1, $_R1h, $_R2, $_R1h
++    valignq     \$1, $_R2, $_R2h, $_R2
++    valignq     \$1, $_R2h, $_R3, $_R2h
++    valignq     \$1, $_R3, $_R3h, $_R3
++    valignq     \$1, $_R3h, $_R4, $_R3h
++    valignq     \$1, $_R4, $_R4h, $_R4
++    valignq     \$1, $_R4h, $zero, $_R4h
++
++    vmovq   $_R0_xmm, %r13
++    addq    %r13, $_acc    # acc += R0[0]
++
++    vpmadd52huq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($a), $Bi, $_R2
++    vpmadd52huq `$_data_offset+64*2+32`($a), $Bi, $_R2h
++    vpmadd52huq `$_data_offset+64*3`($a), $Bi, $_R3
++    vpmadd52huq `$_data_offset+64*3+32`($a), $Bi, $_R3h
++    vpmadd52huq `$_data_offset+64*4`($a), $Bi, $_R4
++    vpmadd52huq `$_data_offset+64*4+32`($a), $Bi, $_R4h
++
++    vpmadd52huq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($m), $Yi, $_R2
++    vpmadd52huq `$_data_offset+64*2+32`($m), $Yi, $_R2h
++    vpmadd52huq `$_data_offset+64*3`($m), $Yi, $_R3
++    vpmadd52huq `$_data_offset+64*3+32`($m), $Yi, $_R3h
++    vpmadd52huq `$_data_offset+64*4`($m), $Yi, $_R4
++    vpmadd52huq `$_data_offset+64*4+32`($m), $Yi, $_R4h
++___
++}
++
++# Normalization routine: handles carry bits and gets bignum qwords to normalized
++# 2^52 representation.
++#
++# Uses %r8-14,%e[abcd]x
++sub amm52x40_x1_norm {
++my ($_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2,$_R2h,$_R3,$_R3h,$_R4,$_R4h) = @_;
++$code.=&lt;&lt;___;
++    # Put accumulator to low qword in R0
++    vpbroadcastq    $_acc, $T0
++    vpblendd \$3, $T0, $_R0, $_R0
++
++    # Extract &quot;carries&quot; (12 high bits) from each QW of the bignum
++    # Save them to LSB of QWs in T0..Tn
++    vpsrlq    \$52, $_R0,   $T0
++    vpsrlq    \$52, $_R0h,  $T0h
++    vpsrlq    \$52, $_R1,   $T1
++    vpsrlq    \$52, $_R1h,  $T1h
++    vpsrlq    \$52, $_R2,   $T2
++    vpsrlq    \$52, $_R2h,  $T2h
++    vpsrlq    \$52, $_R3,   $T3
++    vpsrlq    \$52, $_R3h,  $T3h
++    vpsrlq    \$52, $_R4,   $T4
++    vpsrlq    \$52, $_R4h,  $T4h
++
++    # &quot;Shift left&quot; T0..Tn by 1 QW
++    valignq \$3, $T4,  $T4h,  $T4h
++    valignq \$3, $T3h,  $T4,  $T4
++    valignq \$3, $T3,  $T3h,  $T3h
++    valignq \$3, $T2h,  $T3,  $T3
++    valignq \$3, $T2,  $T2h,  $T2h
++    valignq \$3, $T1h,  $T2,  $T2
++    valignq \$3, $T1,   $T1h, $T1h
++    valignq \$3, $T0h,  $T1,  $T1
++    valignq \$3, $T0,   $T0h, $T0h
++    valignq \$3, .Lzeros(%rip), $T0,  $T0
++
++    # Drop &quot;carries&quot; from R0..Rn QWs
++    vpandq    .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq    .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq    .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq    .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq    .Lmask52x4(%rip), $_R2,  $_R2
++    vpandq    .Lmask52x4(%rip), $_R2h, $_R2h
++    vpandq    .Lmask52x4(%rip), $_R3,  $_R3
++    vpandq    .Lmask52x4(%rip), $_R3h, $_R3h
++    vpandq    .Lmask52x4(%rip), $_R4,  $_R4
++    vpandq    .Lmask52x4(%rip), $_R4h, $_R4h
++
++    # Sum R0..Rn with corresponding adjusted carries
++    vpaddq  $T0,  $_R0,  $_R0
++    vpaddq  $T0h, $_R0h, $_R0h
++    vpaddq  $T1,  $_R1,  $_R1
++    vpaddq  $T1h, $_R1h, $_R1h
++    vpaddq  $T2,  $_R2,  $_R2
++    vpaddq  $T2h, $_R2h, $_R2h
++    vpaddq  $T3,  $_R3,  $_R3
++    vpaddq  $T3h, $_R3h, $_R3h
++    vpaddq  $T4,  $_R4,  $_R4
++    vpaddq  $T4h, $_R4h, $_R4h
++
++    # Now handle carry bits from this addition
++    # Get mask of QWs whose 52-bit parts overflow
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R0},%k1    # OP=nle (i.e. gt)
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R0h},%k2
++    kmovb      %k1,%r14d
++    kmovb      %k2,%r13d
++    shl        \$4,%r13b
++    or         %r13b,%r14b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R1},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R1h},%k2
++    kmovb      %k1,%r13d
++    kmovb      %k2,%r12d
++    shl        \$4,%r12b
++    or         %r12b,%r13b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R2},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R2h},%k2
++    kmovb      %k1,%r12d
++    kmovb      %k2,%r11d
++    shl        \$4,%r11b
++    or         %r11b,%r12b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R3},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R3h},%k2
++    kmovb      %k1,%r11d
++    kmovb      %k2,%r10d
++    shl        \$4,%r10b
++    or         %r10b,%r11b
++
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R4},%k1
++    vpcmpuq    \$6,.Lmask52x4(%rip),${_R4h},%k2
++    kmovb      %k1,%r10d
++    kmovb      %k2,%r9d
++    shl        \$4,%r9b
++    or         %r9b,%r10b
++
++    addb       %r14b,%r14b
++    adcb       %r13b,%r13b
++    adcb       %r12b,%r12b
++    adcb       %r11b,%r11b
++    adcb       %r10b,%r10b
++
++    # Get mask of QWs whose 52-bit parts saturated
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R0},%k1    # OP=eq
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R0h},%k2
++    kmovb      %k1,%r9d
++    kmovb      %k2,%r8d
++    shl        \$4,%r8b
++    or         %r8b,%r9b
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R1},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R1h},%k2
++    kmovb      %k1,%r8d
++    kmovb      %k2,%edx
++    shl        \$4,%dl
++    or         %dl,%r8b
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R2},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R2h},%k2
++    kmovb      %k1,%edx
++    kmovb      %k2,%ecx
++    shl        \$4,%cl
++    or         %cl,%dl
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R3},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R3h},%k2
++    kmovb      %k1,%ecx
++    kmovb      %k2,%ebx
++    shl        \$4,%bl
++    or         %bl,%cl
++
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R4},%k1
++    vpcmpuq    \$0,.Lmask52x4(%rip),${_R4h},%k2
++    kmovb      %k1,%ebx
++    kmovb      %k2,%eax
++    shl        \$4,%al
++    or         %al,%bl
++
++    addb     %r9b,%r14b
++    adcb     %r8b,%r13b
++    adcb     %dl,%r12b
++    adcb     %cl,%r11b
++    adcb     %bl,%r10b
++
++    xor      %r9b,%r14b
++    xor      %r8b,%r13b
++    xor      %dl,%r12b
++    xor      %cl,%r11b
++    xor      %bl,%r10b
++
++    kmovb    %r14d,%k1
++    shr      \$4,%r14b
++    kmovb    %r14d,%k2
++    kmovb    %r13d,%k3
++    shr      \$4,%r13b
++    kmovb    %r13d,%k4
++    kmovb    %r12d,%k5
++    shr      \$4,%r12b
++    kmovb    %r12d,%k6
++    kmovb    %r11d,%k7
++
++    vpsubq  .Lmask52x4(%rip), $_R0,  ${_R0}{%k1}
++    vpsubq  .Lmask52x4(%rip), $_R0h, ${_R0h}{%k2}
++    vpsubq  .Lmask52x4(%rip), $_R1,  ${_R1}{%k3}
++    vpsubq  .Lmask52x4(%rip), $_R1h, ${_R1h}{%k4}
++    vpsubq  .Lmask52x4(%rip), $_R2,  ${_R2}{%k5}
++    vpsubq  .Lmask52x4(%rip), $_R2h, ${_R2h}{%k6}
++    vpsubq  .Lmask52x4(%rip), $_R3,  ${_R3}{%k7}
++
++    vpandq  .Lmask52x4(%rip), $_R0,  $_R0
++    vpandq  .Lmask52x4(%rip), $_R0h, $_R0h
++    vpandq  .Lmask52x4(%rip), $_R1,  $_R1
++    vpandq  .Lmask52x4(%rip), $_R1h, $_R1h
++    vpandq  .Lmask52x4(%rip), $_R2,  $_R2
++    vpandq  .Lmask52x4(%rip), $_R2h, $_R2h
++    vpandq  .Lmask52x4(%rip), $_R3,  $_R3
++
++    shr    \$4,%r11b
++    kmovb   %r11d,%k1
++    kmovb   %r10d,%k2
++    shr    \$4,%r10b
++    kmovb   %r10d,%k3
++
++    vpsubq  .Lmask52x4(%rip), $_R3h, ${_R3h}{%k1}
++    vpsubq  .Lmask52x4(%rip), $_R4,  ${_R4}{%k2}
++    vpsubq  .Lmask52x4(%rip), $_R4h, ${_R4h}{%k3}
++
++    vpandq  .Lmask52x4(%rip), $_R3h, $_R3h
++    vpandq  .Lmask52x4(%rip), $_R4,  $_R4
++    vpandq  .Lmask52x4(%rip), $_R4h, $_R4h
++___
++}
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x40_x1_ifma256
++.type   ossl_rsaz_amm52x40_x1_ifma256,\@function,5
++.align 32
++ossl_rsaz_amm52x40_x1_ifma256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++___
++$code.=&lt;&lt;___ if ($win64);
++    lea     -168(%rsp),%rsp                 # 16*10 + (8 bytes to get correct 16-byte SIMD alignment)
++    vmovdqa64   %xmm6, `0*16`(%rsp)         # save non-volatile registers
++    vmovdqa64   %xmm7, `1*16`(%rsp)
++    vmovdqa64   %xmm8, `2*16`(%rsp)
++    vmovdqa64   %xmm9, `3*16`(%rsp)
++    vmovdqa64   %xmm10,`4*16`(%rsp)
++    vmovdqa64   %xmm11,`5*16`(%rsp)
++    vmovdqa64   %xmm12,`6*16`(%rsp)
++    vmovdqa64   %xmm13,`7*16`(%rsp)
++    vmovdqa64   %xmm14,`8*16`(%rsp)
++    vmovdqa64   %xmm15,`9*16`(%rsp)
++.Lossl_rsaz_amm52x40_x1_ifma256_body:
++___
++$code.=&lt;&lt;___;
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++    vmovdqa64   $zero, $R2_0h
++    vmovdqa64   $zero, $R3_0
++    vmovdqa64   $zero, $R3_0h
++    vmovdqa64   $zero, $R4_0
++    vmovdqa64   $zero, $R4_0h
++
++    xorl    $acc0_0_low, $acc0_0_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    # Loop over 40 digits unrolled by 4
++    mov     \$10, $iter
++
++.align 32
++.Lloop10:
++___
++    foreach my $idx (0..3) {
++        &amp;amm52x40_x1(0,8*$idx,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$R4_0,$R4_0h,$k0);
++    }
++$code.=&lt;&lt;___;
++    lea    `4*8`($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop10
++___
++    &amp;amm52x40_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$R4_0,$R4_0h);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
++    vmovdqu64   $R2_0h, `5*32`($res)
++    vmovdqu64   $R3_0,  `6*32`($res)
++    vmovdqu64   $R3_0h, `7*32`($res)
++    vmovdqu64   $R4_0,  `8*32`($res)
++    vmovdqu64   $R4_0h, `9*32`($res)
++
++    vzeroupper
++    lea     (%rsp),%rax
++.cfi_def_cfa_register   %rax
++___
++$code.=&lt;&lt;___ if ($win64);
++    vmovdqa64   `0*16`(%rax),%xmm6
++    vmovdqa64   `1*16`(%rax),%xmm7
++    vmovdqa64   `2*16`(%rax),%xmm8
++    vmovdqa64   `3*16`(%rax),%xmm9
++    vmovdqa64   `4*16`(%rax),%xmm10
++    vmovdqa64   `5*16`(%rax),%xmm11
++    vmovdqa64   `6*16`(%rax),%xmm12
++    vmovdqa64   `7*16`(%rax),%xmm13
++    vmovdqa64   `8*16`(%rax),%xmm14
++    vmovdqa64   `9*16`(%rax),%xmm15
++    lea  168(%rsp),%rax
++___
++$code.=&lt;&lt;___;
++    mov  0(%rax),%r15
++.cfi_restore    %r15
++    mov  8(%rax),%r14
++.cfi_restore    %r14
++    mov  16(%rax),%r13
++.cfi_restore    %r13
++    mov  24(%rax),%r12
++.cfi_restore    %r12
++    mov  32(%rax),%rbp
++.cfi_restore    %rbp
++    mov  40(%rax),%rbx
++.cfi_restore    %rbx
++    lea  48(%rax),%rsp       # restore rsp
++.cfi_def_cfa %rsp,8
++.Lossl_rsaz_amm52x40_x1_ifma256_epilogue:
++
++    ret
++.cfi_endproc
++.size   ossl_rsaz_amm52x40_x1_ifma256, .-ossl_rsaz_amm52x40_x1_ifma256
++___
++
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lmask52x4:
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++___
++
++###############################################################################
++# Dual Almost Montgomery Multiplication for 40-digit number in radix 2^52
++#
++# See description of ossl_rsaz_amm52x40_x1_ifma256() above for details about Almost
++# Montgomery Multiplication algorithm and function input parameters description.
++#
++# This function does two AMMs for two independent inputs, hence dual.
++#
++# void ossl_rsaz_amm52x40_x2_ifma256(BN_ULONG out[2][40],
++#                                    const BN_ULONG a[2][40],
++#                                    const BN_ULONG b[2][40],
++#                                    const BN_ULONG m[2][40],
++#                                    const BN_ULONG k0[2]);
++###############################################################################
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x40_x2_ifma256
++.type   ossl_rsaz_amm52x40_x2_ifma256,\@function,5
++.align 32
++ossl_rsaz_amm52x40_x2_ifma256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++___
++$code.=&lt;&lt;___ if ($win64);
++    lea     -168(%rsp),%rsp
++    vmovdqa64   %xmm6, `0*16`(%rsp)        # save non-volatile registers
++    vmovdqa64   %xmm7, `1*16`(%rsp)
++    vmovdqa64   %xmm8, `2*16`(%rsp)
++    vmovdqa64   %xmm9, `3*16`(%rsp)
++    vmovdqa64   %xmm10,`4*16`(%rsp)
++    vmovdqa64   %xmm11,`5*16`(%rsp)
++    vmovdqa64   %xmm12,`6*16`(%rsp)
++    vmovdqa64   %xmm13,`7*16`(%rsp)
++    vmovdqa64   %xmm14,`8*16`(%rsp)
++    vmovdqa64   %xmm15,`9*16`(%rsp)
++.Lossl_rsaz_amm52x40_x2_ifma256_body:
++___
++$code.=&lt;&lt;___;
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++    vmovdqa64   $zero, $R2_0h
++    vmovdqa64   $zero, $R3_0
++    vmovdqa64   $zero, $R3_0h
++    vmovdqa64   $zero, $R4_0
++    vmovdqa64   $zero, $R4_0h
++
++    vmovdqa64   $zero, $R0_1
++    vmovdqa64   $zero, $R0_1h
++    vmovdqa64   $zero, $R1_1
++    vmovdqa64   $zero, $R1_1h
++    vmovdqa64   $zero, $R2_1
++    vmovdqa64   $zero, $R2_1h
++    vmovdqa64   $zero, $R3_1
++    vmovdqa64   $zero, $R3_1h
++    vmovdqa64   $zero, $R4_1
++    vmovdqa64   $zero, $R4_1h
++
++
++    xorl    $acc0_0_low, $acc0_0_low
++    xorl    $acc0_1_low, $acc0_1_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    mov    \$40, $iter
++
++.align 32
++.Lloop40:
++___
++    &amp;amm52x40_x1(   0,   0,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$R4_0,$R4_0h,&quot;($k0)&quot;);
++    # 40*8 = offset of the next dimension in two-dimension array
++    &amp;amm52x40_x1(40*8,40*8,$acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h,$R4_1,$R4_1h,&quot;8($k0)&quot;);
++$code.=&lt;&lt;___;
++    lea    8($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop40
++___
++    &amp;amm52x40_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$R2_0h,$R3_0,$R3_0h,$R4_0,$R4_0h);
++    &amp;amm52x40_x1_norm($acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,$R2_1h,$R3_1,$R3_1h,$R4_1,$R4_1h);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0,  `0*32`($res)
++    vmovdqu64   $R0_0h, `1*32`($res)
++    vmovdqu64   $R1_0,  `2*32`($res)
++    vmovdqu64   $R1_0h, `3*32`($res)
++    vmovdqu64   $R2_0,  `4*32`($res)
++    vmovdqu64   $R2_0h, `5*32`($res)
++    vmovdqu64   $R3_0,  `6*32`($res)
++    vmovdqu64   $R3_0h, `7*32`($res)
++    vmovdqu64   $R4_0,  `8*32`($res)
++    vmovdqu64   $R4_0h, `9*32`($res)
++
++    vmovdqu64   $R0_1,  `10*32`($res)
++    vmovdqu64   $R0_1h, `11*32`($res)
++    vmovdqu64   $R1_1,  `12*32`($res)
++    vmovdqu64   $R1_1h, `13*32`($res)
++    vmovdqu64   $R2_1,  `14*32`($res)
++    vmovdqu64   $R2_1h, `15*32`($res)
++    vmovdqu64   $R3_1,  `16*32`($res)
++    vmovdqu64   $R3_1h, `17*32`($res)
++    vmovdqu64   $R4_1,  `18*32`($res)
++    vmovdqu64   $R4_1h, `19*32`($res)
++
++    vzeroupper
++    lea     (%rsp),%rax
++.cfi_def_cfa_register   %rax
++___
++$code.=&lt;&lt;___ if ($win64);
++    vmovdqa64   `0*16`(%rax),%xmm6
++    vmovdqa64   `1*16`(%rax),%xmm7
++    vmovdqa64   `2*16`(%rax),%xmm8
++    vmovdqa64   `3*16`(%rax),%xmm9
++    vmovdqa64   `4*16`(%rax),%xmm10
++    vmovdqa64   `5*16`(%rax),%xmm11
++    vmovdqa64   `6*16`(%rax),%xmm12
++    vmovdqa64   `7*16`(%rax),%xmm13
++    vmovdqa64   `8*16`(%rax),%xmm14
++    vmovdqa64   `9*16`(%rax),%xmm15
++    lea     168(%rsp),%rax
++___
++$code.=&lt;&lt;___;
++    mov  0(%rax),%r15
++.cfi_restore    %r15
++    mov  8(%rax),%r14
++.cfi_restore    %r14
++    mov  16(%rax),%r13
++.cfi_restore    %r13
++    mov  24(%rax),%r12
++.cfi_restore    %r12
++    mov  32(%rax),%rbp
++.cfi_restore    %rbp
++    mov  40(%rax),%rbx
++.cfi_restore    %rbx
++    lea  48(%rax),%rsp
++.cfi_def_cfa    %rsp,8
++.Lossl_rsaz_amm52x40_x2_ifma256_epilogue:
++    ret
++.cfi_endproc
++.size   ossl_rsaz_amm52x40_x2_ifma256, .-ossl_rsaz_amm52x40_x2_ifma256
++___
++}
++
++###############################################################################
++# Constant time extraction from the precomputed table of powers base^i, where
++#    i = 0..2^EXP_WIN_SIZE-1
++#
++# The input |red_table| contains precomputations for two independent base values.
++# |red_table_idx1| and |red_table_idx2| are corresponding power indexes.
++#
++# Extracted value (output) is 2 40 digits numbers in 2^52 radix.
++#
++# void ossl_extract_multiplier_2x40_win5(BN_ULONG *red_Y,
++#                                        const BN_ULONG red_table[1 &lt;&lt; EXP_WIN_SIZE][2][40],
++#                                        int red_table_idx1, int red_table_idx2);
++#
++# EXP_WIN_SIZE = 5
++###############################################################################
++{
++# input parameters
++my ($out,$red_tbl,$red_tbl_idx1,$red_tbl_idx2)=$win64 ? (&quot;%rcx&quot;,&quot;%rdx&quot;,&quot;%r8&quot;, &quot;%r9&quot;) :  # Win64 order
++                                                        (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;);  # Unix order
++
++my ($t0,$t1,$t2,$t3,$t4,$t5) = map(&quot;%ymm$_&quot;, (0..5));
++my ($t6,$t7,$t8,$t9) = map(&quot;%ymm$_&quot;, (16..19));
++my ($tmp,$cur_idx,$idx1,$idx2,$ones) = map(&quot;%ymm$_&quot;, (20..24));
++
++my @t = ($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$t9);
++my $t0xmm = $t0;
++$t0xmm =~ s/%y/%x/;
++
++sub get_table_value_consttime() {
++my ($_idx,$_offset) = @_;
++$code.=&lt;&lt;___;
++    vpxorq   $cur_idx, $cur_idx, $cur_idx
++.align 32
++.Lloop_$_offset:
++    vpcmpq  \$0, $cur_idx, $_idx, %k1      # mask of (idx == cur_idx)
++___
++foreach (0..9) {
++$code.=&lt;&lt;___;
++    vmovdqu64  `$_offset+${_}*32`($red_tbl), $tmp   # load data from red_tbl
++    vpblendmq  $tmp, $t[$_], ${t[$_]}{%k1}          # extract data when mask is not zero
++___
++}
++$code.=&lt;&lt;___;
++    vpaddq  $ones, $cur_idx, $cur_idx # increment cur_idx
++    addq    \$`2*40*8`, $red_tbl
++    cmpq    $red_tbl, %rax
++    jne .Lloop_$_offset
++___
++}
++
++$code.=&lt;&lt;___;
++.text
++
++.align 32
++.globl  ossl_extract_multiplier_2x40_win5
++.type   ossl_extract_multiplier_2x40_win5,\@abi-omnipotent
++ossl_extract_multiplier_2x40_win5:
++.cfi_startproc
++    endbranch
++    vmovdqa64   .Lones(%rip), $ones         # broadcast ones
++    vpbroadcastq    $red_tbl_idx1, $idx1
++    vpbroadcastq    $red_tbl_idx2, $idx2
++    leaq   `(1&lt;&lt;5)*2*40*8`($red_tbl), %rax  # holds end of the tbl
++
++    # backup red_tbl address
++    movq    $red_tbl, %r10
++
++    # zeroing t0..n, cur_idx
++    vpxor   $t0xmm, $t0xmm, $t0xmm
++___
++foreach (1..9) {
++    $code.=&quot;vmovdqa64   $t0, $t[$_] \n&quot;;
++}
++
++&amp;get_table_value_consttime($idx1, 0);
++foreach (0..9) {
++    $code.=&quot;vmovdqu64   $t[$_], `(0+$_)*32`($out) \n&quot;;
++}
++$code.=&quot;movq    %r10, $red_tbl \n&quot;;
++&amp;get_table_value_consttime($idx2, 40*8);
++foreach (0..9) {
++    $code.=&quot;vmovdqu64   $t[$_], `(10+$_)*32`($out) \n&quot;;
++}
++$code.=&lt;&lt;___;
++
++    ret
++.cfi_endproc
++.size   ossl_extract_multiplier_2x40_win5, .-ossl_extract_multiplier_2x40_win5
++___
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lones:
++    .quad   1,1,1,1
++.Lzeros:
++    .quad   0,0,0,0
++___
++}
++
++if ($win64) {
++$rec=&quot;%rcx&quot;;
++$frame=&quot;%rdx&quot;;
++$context=&quot;%r8&quot;;
++$disp=&quot;%r9&quot;;
++
++$code.=&lt;&lt;___;
++.extern     __imp_RtlVirtualUnwind
++.type   rsaz_avx_handler,\@abi-omnipotent
++.align  16
++rsaz_avx_handler:
++    push    %rsi
++    push    %rdi
++    push    %rbx
++    push    %rbp
++    push    %r12
++    push    %r13
++    push    %r14
++    push    %r15
++    pushfq
++    sub     \$64,%rsp
++
++    mov     120($context),%rax # pull context-&gt;Rax
++    mov     248($context),%rbx # pull context-&gt;Rip
++
++    mov     8($disp),%rsi      # disp-&gt;ImageBase
++    mov     56($disp),%r11     # disp-&gt;HandlerData
++
++    mov     0(%r11),%r10d      # HandlerData[0]
++    lea     (%rsi,%r10),%r10   # prologue label
++    cmp     %r10,%rbx          # context-&gt;Rip&lt;.Lprologue
++    jb  .Lcommon_seh_tail
++
++    mov     4(%r11),%r10d      # HandlerData[1]
++    lea     (%rsi,%r10),%r10   # epilogue label
++    cmp     %r10,%rbx          # context-&gt;Rip&gt;=.Lepilogue
++    jae     .Lcommon_seh_tail
++
++    mov     152($context),%rax # pull context-&gt;Rsp
++
++    lea     (%rax),%rsi         # %xmm save area
++    lea     512($context),%rdi  # &amp; context.Xmm6
++    mov     \$20,%ecx           # 10*sizeof(%xmm0)/sizeof(%rax)
++    .long   0xa548f3fc          # cld; rep movsq
++
++    lea     `48+168`(%rax),%rax
++
++    mov     -8(%rax),%rbx
++    mov     -16(%rax),%rbp
++    mov     -24(%rax),%r12
++    mov     -32(%rax),%r13
++    mov     -40(%rax),%r14
++    mov     -48(%rax),%r15
++    mov     %rbx,144($context) # restore context-&gt;Rbx
++    mov     %rbp,160($context) # restore context-&gt;Rbp
++    mov     %r12,216($context) # restore context-&gt;R12
++    mov     %r13,224($context) # restore context-&gt;R13
++    mov     %r14,232($context) # restore context-&gt;R14
++    mov     %r15,240($context) # restore context-&gt;R14
++
++.Lcommon_seh_tail:
++    mov     8(%rax),%rdi
++    mov     16(%rax),%rsi
++    mov     %rax,152($context) # restore context-&gt;Rsp
++    mov     %rsi,168($context) # restore context-&gt;Rsi
++    mov     %rdi,176($context) # restore context-&gt;Rdi
++
++    mov     40($disp),%rdi     # disp-&gt;ContextRecord
++    mov     $context,%rsi      # context
++    mov     \$154,%ecx         # sizeof(CONTEXT)
++    .long   0xa548f3fc         # cld; rep movsq
++
++    mov     $disp,%rsi
++    xor     %rcx,%rcx          # arg1, UNW_FLAG_NHANDLER
++    mov     8(%rsi),%rdx       # arg2, disp-&gt;ImageBase
++    mov     0(%rsi),%r8        # arg3, disp-&gt;ControlPc
++    mov     16(%rsi),%r9       # arg4, disp-&gt;FunctionEntry
++    mov     40(%rsi),%r10      # disp-&gt;ContextRecord
++    lea     56(%rsi),%r11      # &amp;disp-&gt;HandlerData
++    lea     24(%rsi),%r12      # &amp;disp-&gt;EstablisherFrame
++    mov     %r10,32(%rsp)      # arg5
++    mov     %r11,40(%rsp)      # arg6
++    mov     %r12,48(%rsp)      # arg7
++    mov     %rcx,56(%rsp)      # arg8, (NULL)
++    call    *__imp_RtlVirtualUnwind(%rip)
++
++    mov     \$1,%eax           # ExceptionContinueSearch
++    add     \$64,%rsp
++    popfq
++    pop     %r15
++    pop     %r14
++    pop     %r13
++    pop     %r12
++    pop     %rbp
++    pop     %rbx
++    pop     %rdi
++    pop     %rsi
++    ret
++.size   rsaz_avx_handler,.-rsaz_avx_handler
++
++.section    .pdata
++.align  4
++    .rva    .LSEH_begin_ossl_rsaz_amm52x40_x1_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x40_x1_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x40_x1_ifma256
++
++    .rva    .LSEH_begin_ossl_rsaz_amm52x40_x2_ifma256
++    .rva    .LSEH_end_ossl_rsaz_amm52x40_x2_ifma256
++    .rva    .LSEH_info_ossl_rsaz_amm52x40_x2_ifma256
++
++.section    .xdata
++.align  8
++.LSEH_info_ossl_rsaz_amm52x40_x1_ifma256:
++    .byte   9,0,0,0
++    .rva    rsaz_avx_handler
++    .rva    .Lossl_rsaz_amm52x40_x1_ifma256_body,.Lossl_rsaz_amm52x40_x1_ifma256_epilogue
++.LSEH_info_ossl_rsaz_amm52x40_x2_ifma256:
++    .byte   9,0,0,0
++    .rva    rsaz_avx_handler
++    .rva    .Lossl_rsaz_amm52x40_x2_ifma256_body,.Lossl_rsaz_amm52x40_x2_ifma256_epilogue
++___
++}
++}}} else {{{                # fallback for old assembler
++$code.=&lt;&lt;___;
++.text
++
++.globl  ossl_rsaz_amm52x40_x1_ifma256
++.globl  ossl_rsaz_amm52x40_x2_ifma256
++.globl  ossl_extract_multiplier_2x40_win5
++.type   ossl_rsaz_amm52x40_x1_ifma256,\@abi-omnipotent
++ossl_rsaz_amm52x40_x1_ifma256:
++ossl_rsaz_amm52x40_x2_ifma256:
++ossl_extract_multiplier_2x40_win5:
++    .byte   0x0f,0x0b    # ud2
++    ret
++.size   ossl_rsaz_amm52x40_x1_ifma256, .-ossl_rsaz_amm52x40_x1_ifma256
++___
++}}}
++
++$code =~ s/\`([^\`]*)\`/eval $1/gem;
++print $code;
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/bn/bn_exp.c b/crypto/bn/bn_exp.c
+index 5329cd12a9..bb20e1683e 100644
+--- a/crypto/bn/bn_exp.c
++++ b/crypto/bn/bn_exp.c
+@@ -1410,12 +1410,20 @@ int BN_mod_exp_mont_consttime_x2(BIGNUM *rr1, const BIGNUM *a1, const BIGNUM *p1
+     BN_MONT_CTX *mont2 = NULL;
+ 
+     if (ossl_rsaz_avx512ifma_eligible() &amp;&amp;
+-        ((a1-&gt;top == 16) &amp;&amp; (p1-&gt;top == 16) &amp;&amp; (BN_num_bits(m1) == 1024) &amp;&amp;
+-         (a2-&gt;top == 16) &amp;&amp; (p2-&gt;top == 16) &amp;&amp; (BN_num_bits(m2) == 1024))) {
+-
+-        if (bn_wexpand(rr1, 16) == NULL)
++        (((a1-&gt;top == 16) &amp;&amp; (p1-&gt;top == 16) &amp;&amp; (BN_num_bits(m1) == 1024) &amp;&amp;
++          (a2-&gt;top == 16) &amp;&amp; (p2-&gt;top == 16) &amp;&amp; (BN_num_bits(m2) == 1024)) ||
++         ((a1-&gt;top == 24) &amp;&amp; (p1-&gt;top == 24) &amp;&amp; (BN_num_bits(m1) == 1536) &amp;&amp;
++          (a2-&gt;top == 24) &amp;&amp; (p2-&gt;top == 24) &amp;&amp; (BN_num_bits(m2) == 1536)) ||
++         ((a1-&gt;top == 32) &amp;&amp; (p1-&gt;top == 32) &amp;&amp; (BN_num_bits(m1) == 2048) &amp;&amp;
++          (a2-&gt;top == 32) &amp;&amp; (p2-&gt;top == 32) &amp;&amp; (BN_num_bits(m2) == 2048)))) {
++
++        int topn = a1-&gt;top;
++        /* Modulus bits of |m1| and |m2| are equal */
++        int mod_bits = BN_num_bits(m1);
++
++        if (bn_wexpand(rr1, topn) == NULL)
+             goto err;
+-        if (bn_wexpand(rr2, 16) == NULL)
++        if (bn_wexpand(rr2, topn) == NULL)
+             goto err;
+ 
+         /*  Ensure that montgomery contexts are initialized */
+@@ -1440,14 +1448,14 @@ int BN_mod_exp_mont_consttime_x2(BIGNUM *rr1, const BIGNUM *a1, const BIGNUM *p1
+                                           mont1-&gt;RR.d, mont1-&gt;n0[0],
+                                           rr2-&gt;d, a2-&gt;d, p2-&gt;d, m2-&gt;d,
+                                           mont2-&gt;RR.d, mont2-&gt;n0[0],
+-                                          1024 /* factor bit size */);
++                                          mod_bits);
+ 
+-        rr1-&gt;top = 16;
++        rr1-&gt;top = topn;
+         rr1-&gt;neg = 0;
+         bn_correct_top(rr1);
+         bn_check_top(rr1);
+ 
+-        rr2-&gt;top = 16;
++        rr2-&gt;top = topn;
+         rr2-&gt;neg = 0;
+         bn_correct_top(rr2);
+         bn_check_top(rr2);
+diff --git a/crypto/bn/build.info b/crypto/bn/build.info
+index 9330274aef..b0fcb7ab97 100644
+--- a/crypto/bn/build.info
++++ b/crypto/bn/build.info
+@@ -24,7 +24,7 @@ IF[{- !$disabled{asm} -}]
+ 
+   $BNASM_x86_64=\
+           x86_64-mont.s x86_64-mont5.s x86_64-gf2m.s rsaz_exp.c rsaz-x86_64.s \
+-          rsaz-avx2.s rsaz_exp_x2.c rsaz-avx512.s
++          rsaz-avx2.s rsaz_exp_x2.c rsaz-2k-avx512.s rsaz-3k-avx512.s rsaz-4k-avx512.s
+   IF[{- $config{target} !~ /^VC/ -}]
+     $BNASM_x86_64=asm/x86_64-gcc.c $BNASM_x86_64
+   ELSE
+@@ -160,7 +160,9 @@ GENERATE[x86_64-mont5.s]=asm/x86_64-mont5.pl
+ GENERATE[x86_64-gf2m.s]=asm/x86_64-gf2m.pl
+ GENERATE[rsaz-x86_64.s]=asm/rsaz-x86_64.pl
+ GENERATE[rsaz-avx2.s]=asm/rsaz-avx2.pl
+-GENERATE[rsaz-avx512.s]=asm/rsaz-avx512.pl
++GENERATE[rsaz-2k-avx512.s]=asm/rsaz-2k-avx512.pl
++GENERATE[rsaz-3k-avx512.s]=asm/rsaz-3k-avx512.pl
++GENERATE[rsaz-4k-avx512.s]=asm/rsaz-4k-avx512.pl
+ 
+ GENERATE[bn-ia64.s]=asm/ia64.S
+ GENERATE[ia64-mont.s]=asm/ia64-mont.pl
+diff --git a/crypto/bn/rsaz_exp_x2.c b/crypto/bn/rsaz_exp_x2.c
+index b7d11180f8..93f104f68e 100644
+--- a/crypto/bn/rsaz_exp_x2.c
++++ b/crypto/bn/rsaz_exp_x2.c
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright 2020-2021 The OpenSSL Project Authors. All Rights Reserved.
+- * Copyright (c) 2020, Intel Corporation. All Rights Reserved.
++ * Copyright (c) 2020-2021, Intel Corporation. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -8,7 +8,8 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  *
+  *
+- * Originally written by Ilya Albrekht, Sergey Kirillov and Andrey Matyukov
++ * Originally written by Sergey Kirillov and Andrey Matyukov.
++ * Special thanks to Ilya Albrekht for his valuable hints.
+  * Intel Corporation
+  *
+  */
+@@ -41,8 +42,12 @@ NON_EMPTY_TRANSLATION_UNIT
+ # define BITS2WORD8_SIZE(x)  (((x) + 7) &gt;&gt; 3)
+ # define BITS2WORD64_SIZE(x) (((x) + 63) &gt;&gt; 6)
+ 
+-static ossl_inline uint64_t get_digit52(const uint8_t *in, int in_len);
+-static ossl_inline void put_digit52(uint8_t *out, int out_len, uint64_t digit);
++/* Number of registers required to hold |digits_num| amount of qword digits */
++# define NUMBER_OF_REGISTERS(digits_num, register_size)            \
++    (((digits_num) * 64 + (register_size) - 1) / (register_size))
++
++static ossl_inline uint64_t get_digit(const uint8_t *in, int in_len);
++static ossl_inline void put_digit(uint8_t *out, int out_len, uint64_t digit);
+ static void to_words52(BN_ULONG *out, int out_len, const BN_ULONG *in,
+                        int in_bitsize);
+ static void from_words52(BN_ULONG *bn_out, int out_bitsize, const BN_ULONG *in);
+@@ -54,37 +59,52 @@ static ossl_inline int number_of_digits(int bitsize, int digit_size)
+     return (bitsize + digit_size - 1) / digit_size;
+ }
+ 
+-typedef void (*AMM52)(BN_ULONG *res, const BN_ULONG *base,
+-                      const BN_ULONG *exp, const BN_ULONG *m, BN_ULONG k0);
+-typedef void (*EXP52_x2)(BN_ULONG *res, const BN_ULONG *base,
+-                         const BN_ULONG *exp[2], const BN_ULONG *m,
+-                         const BN_ULONG *rr, const BN_ULONG k0[2]);
+-
+ /*
+  * For details of the methods declared below please refer to
+  *    crypto/bn/asm/rsaz-avx512.pl
+  *
+- * Naming notes:
++ * Naming conventions:
+  *  amm = Almost Montgomery Multiplication
+  *  ams = Almost Montgomery Squaring
+- *  52x20 - data represented as array of 20 digits in 52-bit radix
++ *  52xZZ - data represented as array of ZZ digits in 52-bit radix
+  *  _x1_/_x2_ - 1 or 2 independent inputs/outputs
+- *  _256 suffix - uses 256-bit (AVX512VL) registers
++ *  _ifma256 - uses 256-bit wide IFMA ISA (AVX512_IFMA256)
+  */
+ 
+-/*AMM = Almost Montgomery Multiplication. */
+-void ossl_rsaz_amm52x20_x1_256(BN_ULONG *res, const BN_ULONG *base,
+-                               const BN_ULONG *exp, const BN_ULONG *m,
+-                               BN_ULONG k0);
+-static void RSAZ_exp52x20_x2_256(BN_ULONG *res, const BN_ULONG *base,
+-                                 const BN_ULONG *exp[2], const BN_ULONG *m,
+-                                 const BN_ULONG *rr, const BN_ULONG k0[2]);
+-void ossl_rsaz_amm52x20_x2_256(BN_ULONG *out, const BN_ULONG *a,
+-                               const BN_ULONG *b, const BN_ULONG *m,
+-                               const BN_ULONG k0[2]);
++void ossl_rsaz_amm52x20_x1_ifma256(BN_ULONG *res, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   BN_ULONG k0);
++void ossl_rsaz_amm52x20_x2_ifma256(BN_ULONG *out, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   const BN_ULONG k0[2]);
+ void ossl_extract_multiplier_2x20_win5(BN_ULONG *red_Y,
+                                        const BN_ULONG *red_table,
+-                                       int red_table_idx, int tbl_idx);
++                                       int red_table_idx1, int red_table_idx2);
++
++void ossl_rsaz_amm52x30_x1_ifma256(BN_ULONG *res, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   BN_ULONG k0);
++void ossl_rsaz_amm52x30_x2_ifma256(BN_ULONG *out, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   const BN_ULONG k0[2]);
++void ossl_extract_multiplier_2x30_win5(BN_ULONG *red_Y,
++                                       const BN_ULONG *red_table,
++                                       int red_table_idx1, int red_table_idx2);
++
++void ossl_rsaz_amm52x40_x1_ifma256(BN_ULONG *res, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   BN_ULONG k0);
++void ossl_rsaz_amm52x40_x2_ifma256(BN_ULONG *out, const BN_ULONG *a,
++                                   const BN_ULONG *b, const BN_ULONG *m,
++                                   const BN_ULONG k0[2]);
++void ossl_extract_multiplier_2x40_win5(BN_ULONG *red_Y,
++                                       const BN_ULONG *red_table,
++                                       int red_table_idx1, int red_table_idx2);
++
++static int RSAZ_mod_exp_x2_ifma256(BN_ULONG *res, const BN_ULONG *base,
++                                   const BN_ULONG *exp[2], const BN_ULONG *m,
++                                   const BN_ULONG *rr, const BN_ULONG k0[2],
++                                   int modulus_bitsize);
+ 
+ /*
+  * Dual Montgomery modular exponentiation using prime moduli of the
+@@ -97,7 +117,10 @@ void ossl_extract_multiplier_2x20_win5(BN_ULONG *red_Y,
+  *
+  * Each moduli shall be |factor_size| bit size.
+  *
+- * NOTE: currently only 2x1024 case is supported.
++ * Supported cases:
++ *   - 2x1024
++ *   - 2x1536
++ *   - 2x2048
+  *
+  *  [out] res|i|      - result of modular exponentiation: array of qword values
+  *                      in regular (2^64) radix. Size of array shall be enough
+@@ -126,6 +149,8 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
+                                 BN_ULONG k0_2,
+                                 int factor_size)
+ {
++    typedef void (*AMM)(BN_ULONG *res, const BN_ULONG *a,
++                        const BN_ULONG *b, const BN_ULONG *m, BN_ULONG k0);
+     int ret = 0;
+ 
+     /*
+@@ -134,52 +159,60 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
+      */
+     int exp_digits = number_of_digits(factor_size + 2, DIGIT_SIZE);
+     int coeff_pow = 4 * (DIGIT_SIZE * exp_digits - factor_size);
++
++    /*  Number of YMM registers required to store exponent's digits */
++    int ymm_regs_num = NUMBER_OF_REGISTERS(exp_digits, 256 /* ymm bit size */);
++    /* Capacity of the register set (in qwords) to store exponent */
++    int regs_capacity = ymm_regs_num * 4;
++
+     BN_ULONG *base1_red, *m1_red, *rr1_red;
+     BN_ULONG *base2_red, *m2_red, *rr2_red;
+     BN_ULONG *coeff_red;
+     BN_ULONG *storage = NULL;
+     BN_ULONG *storage_aligned = NULL;
+-    BN_ULONG storage_len_bytes = 7 * exp_digits * sizeof(BN_ULONG);
+-
+-    /* AMM = Almost Montgomery Multiplication */
+-    AMM52 amm = NULL;
+-    /* Dual (2-exps in parallel) exponentiation */
+-    EXP52_x2 exp_x2 = NULL;
++    int storage_len_bytes = 7 * regs_capacity * sizeof(BN_ULONG)
++                           + 64 /* alignment */;
+ 
+     const BN_ULONG *exp[2] = {0};
+     BN_ULONG k0[2] = {0};
++    /* AMM = Almost Montgomery Multiplication */
++    AMM amm = NULL;
+ 
+-    /* Only 1024-bit factor size is supported now */
+     switch (factor_size) {
+     case 1024:
+-        amm = ossl_rsaz_amm52x20_x1_256;
+-        exp_x2 = RSAZ_exp52x20_x2_256;
++        amm = ossl_rsaz_amm52x20_x1_ifma256;
++        break;
++    case 1536:
++        amm = ossl_rsaz_amm52x30_x1_ifma256;
++        break;
++    case 2048:
++        amm = ossl_rsaz_amm52x40_x1_ifma256;
+         break;
+     default:
+         goto err;
+     }
+ 
+-    storage = (BN_ULONG *)OPENSSL_malloc(storage_len_bytes + 64);
++    storage = (BN_ULONG *)OPENSSL_malloc(storage_len_bytes);
+     if (storage == NULL)
+         goto err;
+     storage_aligned = (BN_ULONG *)ALIGN_OF(storage, 64);
+ 
+     /* Memory layout for red(undant) representations */
+     base1_red = storage_aligned;
+-    base2_red = storage_aligned + 1 * exp_digits;
+-    m1_red    = storage_aligned + 2 * exp_digits;
+-    m2_red    = storage_aligned + 3 * exp_digits;
+-    rr1_red   = storage_aligned + 4 * exp_digits;
+-    rr2_red   = storage_aligned + 5 * exp_digits;
+-    coeff_red = storage_aligned + 6 * exp_digits;
++    base2_red = storage_aligned + 1 * regs_capacity;
++    m1_red    = storage_aligned + 2 * regs_capacity;
++    m2_red    = storage_aligned + 3 * regs_capacity;
++    rr1_red   = storage_aligned + 4 * regs_capacity;
++    rr2_red   = storage_aligned + 5 * regs_capacity;
++    coeff_red = storage_aligned + 6 * regs_capacity;
+ 
+     /* Convert base_i, m_i, rr_i, from regular to 52-bit radix */
+-    to_words52(base1_red, exp_digits, base1, factor_size);
+-    to_words52(base2_red, exp_digits, base2, factor_size);
+-    to_words52(m1_red, exp_digits, m1, factor_size);
+-    to_words52(m2_red, exp_digits, m2, factor_size);
+-    to_words52(rr1_red, exp_digits, rr1, factor_size);
+-    to_words52(rr2_red, exp_digits, rr2, factor_size);
++    to_words52(base1_red, regs_capacity, base1, factor_size);
++    to_words52(base2_red, regs_capacity, base2, factor_size);
++    to_words52(m1_red,    regs_capacity, m1,    factor_size);
++    to_words52(m2_red,    regs_capacity, m2,    factor_size);
++    to_words52(rr1_red,   regs_capacity, rr1,   factor_size);
++    to_words52(rr2_red,   regs_capacity, rr2,   factor_size);
+ 
+     /*
+      * Compute target domain Montgomery converters RR' for each modulus
+@@ -192,10 +225,10 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
+      * where
+      *  k = 4 * (52 * digits52 - modlen)
+      *  R  = 2^(64 * ceil(modlen/64)) mod m
+-     *  RR = R^2 mod M
++     *  RR = R^2 mod m
+      *  R' = 2^(52 * ceil(modlen/52)) mod m
+      *
+-     *  modlen = 1024: k = 64, RR = 2^2048 mod m, RR' = 2^2080 mod m
++     *  EX/ modlen = 1024: k = 64, RR = 2^2048 mod m, RR' = 2^2080 mod m
+      */
+     memset(coeff_red, 0, exp_digits * sizeof(BN_ULONG));
+     /* (1) in reduced domain representation */
+@@ -213,13 +246,16 @@ int ossl_rsaz_mod_exp_avx512_x2(BN_ULONG *res1,
+     k0[0] = k0_1;
+     k0[1] = k0_2;
+ 
+-    exp_x2(rr1_red, base1_red, exp, m1_red, rr1_red, k0);
++    /* Dual (2-exps in parallel) exponentiation */
++    ret = RSAZ_mod_exp_x2_ifma256(rr1_red, base1_red, exp, m1_red, rr1_red,
++                                  k0, factor_size);
++    if (!ret)
++        goto err;
+ 
+     /* Convert rr_i back to regular radix */
+     from_words52(res1, factor_size, rr1_red);
+     from_words52(res2, factor_size, rr2_red);
+ 
+-    ret = 1;
+ err:
+     if (storage != NULL) {
+         OPENSSL_cleanse(storage, storage_len_bytes);
+@@ -229,98 +265,156 @@ err:
+ }
+ 
+ /*
+- * Dual 1024-bit w-ary modular exponentiation using prime moduli of the same
+- * bit size using Almost Montgomery Multiplication, optimized with AVX512_IFMA
+- * ISA.
++ * Dual {1024,1536,2048}-bit w-ary modular exponentiation using prime moduli of
++ * the same bit size using Almost Montgomery Multiplication, optimized with
++ * AVX512_IFMA256 ISA.
+  *
+  * The parameter w (window size) = 5.
+  *
+- *  [out] res      - result of modular exponentiation: 2x20 qword
++ *  [out] res      - result of modular exponentiation: 2x{20,30,40} qword
+  *                   values in 2^52 radix.
+- *  [in]  base     - base (2x20 qword values in 2^52 radix)
+- *  [in]  exp      - array of 2 pointers to 16 qword values in 2^64 radix.
++ *  [in]  base     - base (2x{20,30,40} qword values in 2^52 radix)
++ *  [in]  exp      - array of 2 pointers to {16,24,32} qword values in 2^64 radix.
+  *                   Exponent is not converted to redundant representation.
+- *  [in]  m        - moduli (2x20 qword values in 2^52 radix)
+- *  [in]  rr       - Montgomery parameter for 2 moduli: RR = 2^2080 mod m.
+- *                   (2x20 qword values in 2^52 radix)
++ *  [in]  m        - moduli (2x{20,30,40} qword values in 2^52 radix)
++ *  [in]  rr       - Montgomery parameter for 2 moduli:
++ *                     RR(1024) = 2^2080 mod m.
++ *                     RR(1536) = 2^3120 mod m.
++ *                     RR(2048) = 2^4160 mod m.
++ *                   (2x{20,30,40} qword values in 2^52 radix)
+  *  [in]  k0       - Montgomery parameter for 2 moduli: k0 = -1/m mod 2^64
+  *
+  * \return (void).
+  */
+-static void RSAZ_exp52x20_x2_256(BN_ULONG *out,          /* [2][20] */
+-                                 const BN_ULONG *base,   /* [2][20] */
+-                                 const BN_ULONG *exp[2], /* 2x16    */
+-                                 const BN_ULONG *m,      /* [2][20] */
+-                                 const BN_ULONG *rr,     /* [2][20] */
+-                                 const BN_ULONG k0[2])
++int RSAZ_mod_exp_x2_ifma256(BN_ULONG *out,
++                            const BN_ULONG *base,
++                            const BN_ULONG *exp[2],
++                            const BN_ULONG *m,
++                            const BN_ULONG *rr,
++                            const BN_ULONG k0[2],
++                            int modulus_bitsize)
+ {
+-# define BITSIZE_MODULUS (1024)
+-# define EXP_WIN_SIZE (5)
+-# define EXP_WIN_MASK ((1U &lt;&lt; EXP_WIN_SIZE) - 1)
+-/*
+- * Number of digits (64-bit words) in redundant representation to handle
+- * modulus bits
+- */
+-# define RED_DIGITS (20)
+-# define EXP_DIGITS (16)
+-# define DAMM ossl_rsaz_amm52x20_x2_256
++    typedef void (*DAMM)(BN_ULONG *res, const BN_ULONG *a,
++                         const BN_ULONG *b, const BN_ULONG *m,
++                         const BN_ULONG k0[2]);
++    typedef void (*DEXTRACT)(BN_ULONG *res, const BN_ULONG *red_table,
++                             int red_table_idx, int tbl_idx);
++
++    int ret = 0;
++    int idx;
++
++    /* Exponent window size */
++    int exp_win_size = 5;
++    int exp_win_mask = (1U &lt;&lt; exp_win_size) - 1;
++
++    /*
++    * Number of digits (64-bit words) in redundant representation to handle
++    * modulus bits
++    */
++    int red_digits = 0;
++    int exp_digits = 0;
++
++    BN_ULONG *storage = NULL;
++    BN_ULONG *storage_aligned = NULL;
++    int storage_len_bytes = 0;
++
++    /* Red(undant) result Y and multiplier X */
++    BN_ULONG *red_Y = NULL;     /* [2][red_digits] */
++    BN_ULONG *red_X = NULL;     /* [2][red_digits] */
++    /* Pre-computed table of base powers */
++    BN_ULONG *red_table = NULL; /* [1U &lt;&lt; exp_win_size][2][red_digits] */
++    /* Expanded exponent */
++    BN_ULONG *expz = NULL;      /* [2][exp_digits + 1] */
++
++    /* Dual AMM */
++    DAMM damm = NULL;
++    /* Extractor from red_table */
++    DEXTRACT extract = NULL;
++
+ /*
+  * Squaring is done using multiplication now. That can be a subject of
+  * optimization in future.
+  */
+-# define DAMS(r,a,m,k0) \
+-              ossl_rsaz_amm52x20_x2_256((r),(a),(a),(m),(k0))
+-
+-    /* Allocate stack for red(undant) result Y and multiplier X */
+-    ALIGN64 BN_ULONG red_Y[2][RED_DIGITS];
+-    ALIGN64 BN_ULONG red_X[2][RED_DIGITS];
++# define DAMS(r,a,m,k0) damm((r),(a),(a),(m),(k0))
+ 
+-    /* Allocate expanded exponent */
+-    ALIGN64 BN_ULONG expz[2][EXP_DIGITS + 1];
++    switch (modulus_bitsize) {
++    case 1024:
++        red_digits = 20;
++        exp_digits = 16;
++        damm = ossl_rsaz_amm52x20_x2_ifma256;
++        extract = ossl_extract_multiplier_2x20_win5;
++        break;
++    case 1536:
++        /* Extended with 2 digits padding to avoid mask ops in high YMM register */
++        red_digits = 30 + 2;
++        exp_digits = 24;
++        damm = ossl_rsaz_amm52x30_x2_ifma256;
++        extract = ossl_extract_multiplier_2x30_win5;
++        break;
++    case 2048:
++        red_digits = 40;
++        exp_digits = 32;
++        damm = ossl_rsaz_amm52x40_x2_ifma256;
++        extract = ossl_extract_multiplier_2x40_win5;
++        break;
++    default:
++        goto err;
++    }
+ 
+-    /* Pre-computed table of base powers */
+-    ALIGN64 BN_ULONG red_table[1U &lt;&lt; EXP_WIN_SIZE][2][RED_DIGITS];
++    storage_len_bytes = (2 * red_digits                         /* red_Y     */
++                       + 2 * red_digits                         /* red_X     */
++                       + 2 * red_digits * (1U &lt;&lt; exp_win_size)  /* red_table */
++                       + 2 * (exp_digits + 1))                  /* expz      */
++                       * sizeof(BN_ULONG)
++                       + 64;                                    /* alignment */
+ 
+-    int idx;
++    storage = (BN_ULONG *)OPENSSL_zalloc(storage_len_bytes);
++    if (storage == NULL)
++        goto err;
++    storage_aligned = (BN_ULONG *)ALIGN_OF(storage, 64);
+ 
+-    memset(red_Y, 0, sizeof(red_Y));
+-    memset(red_table, 0, sizeof(red_table));
+-    memset(red_X, 0, sizeof(red_X));
++    red_Y     = storage_aligned;
++    red_X     = red_Y + 2 * red_digits;
++    red_table = red_X + 2 * red_digits;
++    expz      = red_table + 2 * red_digits * (1U &lt;&lt; exp_win_size);
+ 
+     /*
+      * Compute table of powers base^i, i = 0, ..., (2^EXP_WIN_SIZE) - 1
+      *   table[0] = mont(x^0) = mont(1)
+      *   table[1] = mont(x^1) = mont(x)
+      */
+-    red_X[0][0] = 1;
+-    red_X[1][0] = 1;
+-    DAMM(red_table[0][0], (const BN_ULONG*)red_X, rr, m, k0);
+-    DAMM(red_table[1][0], base,  rr, m, k0);
+-
+-    for (idx = 1; idx &lt; (int)((1U &lt;&lt; EXP_WIN_SIZE) / 2); idx++) {
+-        DAMS(red_table[2 * idx + 0][0], red_table[1 * idx][0], m, k0);
+-        DAMM(red_table[2 * idx + 1][0], red_table[2 * idx][0], red_table[1][0], m, k0);
++    red_X[0 * red_digits] = 1;
++    red_X[1 * red_digits] = 1;
++    damm(&amp;red_table[0 * 2 * red_digits], (const BN_ULONG*)red_X, rr, m, k0);
++    damm(&amp;red_table[1 * 2 * red_digits], base,  rr, m, k0);
++
++    for (idx = 1; idx &lt; (int)((1U &lt;&lt; exp_win_size) / 2); idx++) {
++        DAMS(&amp;red_table[(2 * idx + 0) * 2 * red_digits],
++             &amp;red_table[(1 * idx)     * 2 * red_digits], m, k0);
++        damm(&amp;red_table[(2 * idx + 1) * 2 * red_digits],
++             &amp;red_table[(2 * idx)     * 2 * red_digits],
++             &amp;red_table[1 * 2 * red_digits], m, k0);
+     }
+ 
+     /* Copy and expand exponents */
+-    memcpy(expz[0], exp[0], EXP_DIGITS * sizeof(BN_ULONG));
+-    expz[0][EXP_DIGITS] = 0;
+-    memcpy(expz[1], exp[1], EXP_DIGITS * sizeof(BN_ULONG));
+-    expz[1][EXP_DIGITS] = 0;
++    memcpy(&amp;expz[0 * (exp_digits + 1)], exp[0], exp_digits * sizeof(BN_ULONG));
++    expz[1 * (exp_digits + 1) - 1] = 0;
++    memcpy(&amp;expz[1 * (exp_digits + 1)], exp[1], exp_digits * sizeof(BN_ULONG));
++    expz[2 * (exp_digits + 1) - 1] = 0;
+ 
+     /* Exponentiation */
+     {
+-        int rem = BITSIZE_MODULUS % EXP_WIN_SIZE;
+-        int delta = rem ? rem : EXP_WIN_SIZE;
+-        BN_ULONG table_idx_mask = EXP_WIN_MASK;
++        int rem = modulus_bitsize % exp_win_size;
++        int delta = rem ? rem : exp_win_size;
++        BN_ULONG table_idx_mask = exp_win_mask;
+ 
+-        int exp_bit_no = BITSIZE_MODULUS - delta;
++        int exp_bit_no = modulus_bitsize - delta;
+         int exp_chunk_no = exp_bit_no / 64;
+         int exp_chunk_shift = exp_bit_no % 64;
+ 
+         /* Process 1-st exp window - just init result */
+-        BN_ULONG red_table_idx_0 = expz[0][exp_chunk_no];
+-        BN_ULONG red_table_idx_1 = expz[1][exp_chunk_no];
++        BN_ULONG red_table_idx_0 = expz[exp_chunk_no + 0 * (exp_digits + 1)];
++        BN_ULONG red_table_idx_1 = expz[exp_chunk_no + 1 * (exp_digits + 1)];
+         /*
+          * The function operates with fixed moduli sizes divisible by 64,
+          * thus table index here is always in supported range [0, EXP_WIN_SIZE).
+@@ -328,13 +422,10 @@ static void RSAZ_exp52x20_x2_256(BN_ULONG *out,          /* [2][20] */
+         red_table_idx_0 &gt;&gt;= exp_chunk_shift;
+         red_table_idx_1 &gt;&gt;= exp_chunk_shift;
+ 
+-        ossl_extract_multiplier_2x20_win5(red_Y[0], (const BN_ULONG*)red_table,
+-                                          (int)red_table_idx_0, 0);
+-        ossl_extract_multiplier_2x20_win5(red_Y[1], (const BN_ULONG*)red_table,
+-                                          (int)red_table_idx_1, 1);
++        extract(&amp;red_Y[0 * red_digits], (const BN_ULONG*)red_table, (int)red_table_idx_0, (int)red_table_idx_1);
+ 
+         /* Process other exp windows */
+-        for (exp_bit_no -= EXP_WIN_SIZE; exp_bit_no &gt;= 0; exp_bit_no -= EXP_WIN_SIZE) {
++        for (exp_bit_no -= exp_win_size; exp_bit_no &gt;= 0; exp_bit_no -= exp_win_size) {
+             /* Extract pre-computed multiplier from the table */
+             {
+                 BN_ULONG T;
+@@ -342,43 +433,37 @@ static void RSAZ_exp52x20_x2_256(BN_ULONG *out,          /* [2][20] */
+                 exp_chunk_no = exp_bit_no / 64;
+                 exp_chunk_shift = exp_bit_no % 64;
+                 {
+-                    red_table_idx_0 = expz[0][exp_chunk_no];
+-                    T = expz[0][exp_chunk_no + 1];
++                    red_table_idx_0 = expz[exp_chunk_no + 0 * (exp_digits + 1)];
++                    T = expz[exp_chunk_no + 1 + 0 * (exp_digits + 1)];
+ 
+                     red_table_idx_0 &gt;&gt;= exp_chunk_shift;
+                     /*
+                      * Get additional bits from then next quadword
+                      * when 64-bit boundaries are crossed.
+                      */
+-                    if (exp_chunk_shift &gt; 64 - EXP_WIN_SIZE) {
++                    if (exp_chunk_shift &gt; 64 - exp_win_size) {
+                         T &lt;&lt;= (64 - exp_chunk_shift);
+                         red_table_idx_0 ^= T;
+                     }
+                     red_table_idx_0 &amp;= table_idx_mask;
+-
+-                    ossl_extract_multiplier_2x20_win5(red_X[0],
+-                                                      (const BN_ULONG*)red_table,
+-                                                      (int)red_table_idx_0, 0);
+                 }
+                 {
+-                    red_table_idx_1 = expz[1][exp_chunk_no];
+-                    T = expz[1][exp_chunk_no + 1];
++                    red_table_idx_1 = expz[exp_chunk_no + 1 * (exp_digits + 1)];
++                    T = expz[exp_chunk_no + 1 + 1 * (exp_digits + 1)];
+ 
+                     red_table_idx_1 &gt;&gt;= exp_chunk_shift;
+                     /*
+                      * Get additional bits from then next quadword
+                      * when 64-bit boundaries are crossed.
+                      */
+-                    if (exp_chunk_shift &gt; 64 - EXP_WIN_SIZE) {
++                    if (exp_chunk_shift &gt; 64 - exp_win_size) {
+                         T &lt;&lt;= (64 - exp_chunk_shift);
+                         red_table_idx_1 ^= T;
+                     }
+                     red_table_idx_1 &amp;= table_idx_mask;
+-
+-                    ossl_extract_multiplier_2x20_win5(red_X[1],
+-                                                      (const BN_ULONG*)red_table,
+-                                                      (int)red_table_idx_1, 1);
+                 }
++
++                extract(&amp;red_X[0 * red_digits], (const BN_ULONG*)red_table, (int)red_table_idx_0, (int)red_table_idx_1);
+             }
+ 
+             /* Series of squaring */
+@@ -388,43 +473,46 @@ static void RSAZ_exp52x20_x2_256(BN_ULONG *out,          /* [2][20] */
+             DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
+             DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
+ 
+-            DAMM((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
++            damm((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
+         }
+     }
+ 
+     /*
+      *
+      * NB: After the last AMM of exponentiation in Montgomery domain, the result
+-     * may be 1025-bit, but the conversion out of Montgomery domain performs an
+-     * AMM(x,1) which guarantees that the final result is less than |m|, so no
+-     * conditional subtraction is needed here. See &quot;Efficient Software
+-     * Implementations of Modular Exponentiation&quot; (by Shay Gueron) paper for details.
++     * may be (modulus_bitsize + 1), but the conversion out of Montgomery domain
++     * performs an AMM(x,1) which guarantees that the final result is less than
++     * |m|, so no conditional subtraction is needed here. See [1] for details.
++     *
++     * [1] Gueron, S. Efficient software implementations of modular exponentiation.
++     *     DOI: 10.1007/s13389-012-0031-5
+      */
+ 
+     /* Convert result back in regular 2^52 domain */
+-    memset(red_X, 0, sizeof(red_X));
+-    red_X[0][0] = 1;
+-    red_X[1][0] = 1;
+-    DAMM(out, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
+-
+-    /* Clear exponents */
+-    OPENSSL_cleanse(expz, sizeof(expz));
+-    OPENSSL_cleanse(red_Y, sizeof(red_Y));
+-
+-# undef DAMS
+-# undef DAMM
+-# undef EXP_DIGITS
+-# undef RED_DIGITS
+-# undef EXP_WIN_MASK
+-# undef EXP_WIN_SIZE
+-# undef BITSIZE_MODULUS
++    memset(red_X, 0, 2 * red_digits * sizeof(BN_ULONG));
++    red_X[0 * red_digits] = 1;
++    red_X[1 * red_digits] = 1;
++    damm(out, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
++
++    ret = 1;
++
++err:
++    if (storage != NULL) {
++        /* Clear whole storage */
++        OPENSSL_cleanse(storage, storage_len_bytes);
++        OPENSSL_free(storage);
++    }
++
++#undef DAMS
++    return ret;
+ }
+ 
+-static ossl_inline uint64_t get_digit52(const uint8_t *in, int in_len)
++static ossl_inline uint64_t get_digit(const uint8_t *in, int in_len)
+ {
+     uint64_t digit = 0;
+ 
+     assert(in != NULL);
++    assert(in_len &lt;= 8);
+ 
+     for (; in_len &gt; 0; in_len--) {
+         digit &lt;&lt;= 8;
+@@ -458,17 +546,17 @@ static void to_words52(BN_ULONG *out, int out_len,
+     }
+ 
+     if (in_bitsize &gt; DIGIT_SIZE) {
+-        uint64_t digit = get_digit52(in_str, 7);
++        uint64_t digit = get_digit(in_str, 7);
+ 
+         out[0] = digit &amp; DIGIT_MASK;
+         in_str += 6;
+         in_bitsize -= DIGIT_SIZE;
+-        digit = get_digit52(in_str, BITS2WORD8_SIZE(in_bitsize));
++        digit = get_digit(in_str, BITS2WORD8_SIZE(in_bitsize));
+         out[1] = digit &gt;&gt; 4;
+         out += 2;
+         out_len -= 2;
+     } else if (in_bitsize &gt; 0) {
+-        out[0] = get_digit52(in_str, BITS2WORD8_SIZE(in_bitsize));
++        out[0] = get_digit(in_str, BITS2WORD8_SIZE(in_bitsize));
+         out++;
+         out_len--;
+     }
+@@ -480,12 +568,13 @@ static void to_words52(BN_ULONG *out, int out_len,
+     }
+ }
+ 
+-static ossl_inline void put_digit52(uint8_t *pStr, int strLen, uint64_t digit)
++static ossl_inline void put_digit(uint8_t *out, int out_len, uint64_t digit)
+ {
+-    assert(pStr != NULL);
++    assert(out != NULL);
++    assert(out_len &lt;= 8);
+ 
+-    for (; strLen &gt; 0; strLen--) {
+-        *pStr++ = (uint8_t)(digit &amp; 0xFF);
++    for (; out_len &gt; 0; out_len--) {
++        *out++ = (uint8_t)(digit &amp; 0xFF);
+         digit &gt;&gt;= 8;
+     }
+ }
+@@ -508,7 +597,8 @@ static void from_words52(BN_ULONG *out, int out_bitsize, const BN_ULONG *in)
+     {
+         uint8_t *out_str = (uint8_t *)out;
+ 
+-        for (; out_bitsize &gt;= (2 * DIGIT_SIZE); out_bitsize -= (2 * DIGIT_SIZE), in += 2) {
++        for (; out_bitsize &gt;= (2 * DIGIT_SIZE);
++               out_bitsize -= (2 * DIGIT_SIZE), in += 2) {
+             (*(uint64_t *)out_str) = in[0];
+             out_str += 6;
+             (*(uint64_t *)out_str) ^= in[1] &lt;&lt; 4;
+@@ -516,13 +606,13 @@ static void from_words52(BN_ULONG *out, int out_bitsize, const BN_ULONG *in)
+         }
+ 
+         if (out_bitsize &gt; DIGIT_SIZE) {
+-            put_digit52(out_str, 7, in[0]);
++            put_digit(out_str, 7, in[0]);
+             out_str += 6;
+             out_bitsize -= DIGIT_SIZE;
+-            put_digit52(out_str, BITS2WORD8_SIZE(out_bitsize),
++            put_digit(out_str, BITS2WORD8_SIZE(out_bitsize),
+                         (in[1] &lt;&lt; 4 | in[0] &gt;&gt; 48));
+         } else if (out_bitsize) {
+-            put_digit52(out_str, BITS2WORD8_SIZE(out_bitsize), in[0]);
++            put_digit(out_str, BITS2WORD8_SIZE(out_bitsize), in[0]);
+         }
+     }
+ }
+diff --git a/test/exptest.c b/test/exptest.c
+index 84d972afe3..675984c8cb 100644
+--- a/test/exptest.c
++++ b/test/exptest.c
+@@ -223,11 +223,12 @@ static int test_mod_exp_x2(int idx)
+     BIGNUM *m2 = NULL;
+     int factor_size = 0;
+ 
+-    /*
+-     * Currently only 1024-bit factor size is supported.
+-     */
+     if (idx &lt;= 100)
+         factor_size = 1024;
++    else if (idx &lt;= 200)
++        factor_size = 1536;
++    else if (idx &lt;= 300)
++        factor_size = 2048;
+ 
+     if (!TEST_ptr(ctx = BN_CTX_new()))
+         goto err;
+@@ -303,6 +304,6 @@ int setup_tests(void)
+ {
+     ADD_TEST(test_mod_exp_zero);
+     ADD_ALL_TESTS(test_mod_exp, 200);
+-    ADD_ALL_TESTS(test_mod_exp_x2, 100);
++    ADD_ALL_TESTS(test_mod_exp_x2, 300);
+     return 1;
+ }
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035688.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="035695.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35691">[ date ]</a>
+              <a href="thread.html#35691">[ thread ]</a>
+              <a href="subject.html#35691">[ subject ]</a>
+              <a href="author.html#35691">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

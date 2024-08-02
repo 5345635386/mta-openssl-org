@@ -1,0 +1,358 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607648165.527274.7010.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032596.html">
+   <LINK REL="Next"  HREF="032599.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607648165.527274.7010.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Fri Dec 11 00:56:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032596.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032599.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32598">[ date ]</a>
+              <a href="thread.html#32598">[ thread ]</a>
+              <a href="subject.html#32598">[ subject ]</a>
+              <a href="author.html#32598">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f0591559f6f4697768f516da11ba5557842191b0 (commit)
+      from  1a683b80dc9ad4dcbf206a0617364a9d614a9883 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f0591559f6f4697768f516da11ba5557842191b0
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Fri Nov 20 19:14:14 2020 +1000
+
+    Add validate method to ECX keymanager
+    
+    Fixes #11619
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13459">https://github.com/openssl/openssl/pull/13459</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/implementations/keymgmt/ecx_kmgmt.c | 77 ++++++++++++++++++++++
+ test/evp_pkey_provided_test.c                 | 95 +++++++++++++++++++++------
+ 2 files changed, 152 insertions(+), 20 deletions(-)
+
+diff --git a/providers/implementations/keymgmt/ecx_kmgmt.c b/providers/implementations/keymgmt/ecx_kmgmt.c
+index 3dccbaf880..076e59eafe 100644
+--- a/providers/implementations/keymgmt/ecx_kmgmt.c
++++ b/providers/implementations/keymgmt/ecx_kmgmt.c
+@@ -60,6 +60,10 @@ static OSSL_FUNC_keymgmt_settable_params_fn ed25519_settable_params;
+ static OSSL_FUNC_keymgmt_settable_params_fn ed448_settable_params;
+ static OSSL_FUNC_keymgmt_has_fn ecx_has;
+ static OSSL_FUNC_keymgmt_match_fn ecx_match;
++static OSSL_FUNC_keymgmt_validate_fn x25519_validate;
++static OSSL_FUNC_keymgmt_validate_fn x448_validate;
++static OSSL_FUNC_keymgmt_validate_fn ed25519_validate;
++static OSSL_FUNC_keymgmt_validate_fn ed448_validate;
+ static OSSL_FUNC_keymgmt_import_fn ecx_import;
+ static OSSL_FUNC_keymgmt_import_types_fn ecx_imexport_types;
+ static OSSL_FUNC_keymgmt_export_fn ecx_export;
+@@ -670,6 +674,78 @@ void *ecx_load(const void *reference, size_t reference_sz)
+     return NULL;
+ }
+ 
++static int ecx_key_pairwise_check(const ECX_KEY *ecx, int type)
++{
++    uint8_t pub[64];
++
++    switch (type) {
++    case ECX_KEY_TYPE_X25519:
++        X25519_public_from_private(pub, ecx-&gt;privkey);
++        break;
++    case ECX_KEY_TYPE_X448:
++        X448_public_from_private(pub, ecx-&gt;privkey);
++        break;
++    case ECX_KEY_TYPE_ED25519:
++        if (!ED25519_public_from_private(ecx-&gt;libctx, pub, ecx-&gt;privkey,
++                                         ecx-&gt;propq))
++            return 0;
++        break;
++    case ECX_KEY_TYPE_ED448:
++        if (!ED448_public_from_private(ecx-&gt;libctx, pub, ecx-&gt;privkey,
++                                       ecx-&gt;propq))
++            return 0;
++        break;
++    default:
++        return 0;
++    }
++    return CRYPTO_memcmp(ecx-&gt;pubkey, pub, ecx-&gt;keylen) == 0;
++}
++
++static int ecx_validate(const void *keydata, int selection, int type, size_t keylen)
++{
++    const ECX_KEY *ecx = keydata;
++    int ok = 0;
++
++    if (!ossl_prov_is_running())
++        return 0;
++
++    assert(keylen == ecx-&gt;keylen);
++
++    if ((selection &amp; ECX_POSSIBLE_SELECTIONS) != 0)
++        ok = 1;
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0)
++        ok = ok &amp;&amp; ecx-&gt;haspubkey;
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0)
++        ok = ok &amp;&amp; ecx-&gt;privkey != NULL;
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_KEYPAIR) == OSSL_KEYMGMT_SELECT_KEYPAIR)
++        ok = ok &amp;&amp; ecx_key_pairwise_check(ecx, type);
++
++    return ok;
++}
++
++static int x25519_validate(const void *keydata, int selection)
++{
++    return ecx_validate(keydata, selection, ECX_KEY_TYPE_X25519, X25519_KEYLEN);
++}
++
++static int x448_validate(const void *keydata, int selection)
++{
++    return ecx_validate(keydata, selection, ECX_KEY_TYPE_X448, X448_KEYLEN);
++}
++
++static int ed25519_validate(const void *keydata, int selection)
++{
++    return ecx_validate(keydata, selection, ECX_KEY_TYPE_ED25519, ED25519_KEYLEN);
++}
++
++static int ed448_validate(const void *keydata, int selection)
++{
++    return ecx_validate(keydata, selection, ECX_KEY_TYPE_ED448, ED448_KEYLEN);
++}
++
+ #define MAKE_KEYMGMT_FUNCTIONS(alg) \
+     const OSSL_DISPATCH ossl_##alg##_keymgmt_functions[] = { \
+         { OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))alg##_new_key }, \
+@@ -680,6 +756,7 @@ void *ecx_load(const void *reference, size_t reference_sz)
+         { OSSL_FUNC_KEYMGMT_SETTABLE_PARAMS, (void (*) (void))alg##_settable_params }, \
+         { OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))ecx_has }, \
+         { OSSL_FUNC_KEYMGMT_MATCH, (void (*)(void))ecx_match }, \
++        { OSSL_FUNC_KEYMGMT_VALIDATE, (void (*)(void))alg##_validate }, \
+         { OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))ecx_import }, \
+         { OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))ecx_imexport_types }, \
+         { OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))ecx_export }, \
+diff --git a/test/evp_pkey_provided_test.c b/test/evp_pkey_provided_test.c
+index a5604b4fdf..a983d3b533 100644
+--- a/test/evp_pkey_provided_test.c
++++ b/test/evp_pkey_provided_test.c
+@@ -22,6 +22,11 @@
+ 
+ static char *datadir = NULL;
+ 
++/*
++ * Do not change the order of the following defines unless you also
++ * update the for loop bounds used inside test_print_key_using_encoder() and
++ * test_print_key_using_encoder_public().
++ */
+ #define PRIV_TEXT    0
+ #define PRIV_PEM     1
+ #define PRIV_DER     2
+@@ -266,11 +271,25 @@ static int test_print_key_using_encoder(const char *alg, const EVP_PKEY *pk)
+     int i;
+     int ret = 1;
+ 
+-    for (i = 0; i &lt; 6; i++)
++    for (i = PRIV_TEXT; i &lt;= PUB_DER; i++)
++        ret = ret &amp;&amp; test_print_key_type_using_encoder(alg, i, pk);
++
++    return ret;
++}
++
++#ifndef OPENSSL_NO_EC
++static int test_print_key_using_encoder_public(const char *alg,
++                                               const EVP_PKEY *pk)
++{
++    int i;
++    int ret = 1;
++
++    for (i = PUB_TEXT; i &lt;= PUB_DER; i++)
+         ret = ret &amp;&amp; test_print_key_type_using_encoder(alg, i, pk);
+ 
+     return ret;
+ }
++#endif
+ 
+ /* Array indexes used in test_fromdata_rsa */
+ #define N       0
+@@ -709,15 +728,23 @@ err:
+ # define ED25519_IDX     2
+ # define ED448_IDX       3
+ 
++/*
++ * tst uses indexes 0 ... (3 * 4 - 1)
++ * For the 4 ECX key types (X25519_IDX..ED448_IDX)
++ * 0..3  = public + private key.
++ * 4..7  = private key (This will generate the public key from the private key)
++ * 8..11 = public key
++ */
+ static int test_fromdata_ecx(int tst)
+ {
+     int ret = 0;
+-    EVP_PKEY_CTX *ctx = NULL;
++    EVP_PKEY_CTX *ctx = NULL, *ctx2 = NULL;
+     EVP_PKEY *pk = NULL, *copy_pk = NULL;
+     const char *alg = NULL;
+     size_t len;
+     unsigned char out_pub[ED448_KEYLEN];
+     unsigned char out_priv[ED448_KEYLEN];
++    OSSL_PARAM params[3] = { OSSL_PARAM_END, OSSL_PARAM_END, OSSL_PARAM_END };
+ 
+     /* ED448_KEYLEN &gt; X448_KEYLEN &gt; X25519_KEYLEN == ED25519_KEYLEN */
+     static unsigned char key_numbers[4][2][ED448_KEYLEN] = {
+@@ -836,8 +863,9 @@ static int test_fromdata_ecx(int tst)
+     };
+     OSSL_PARAM *fromdata_params = NULL;
+     int bits = 0, security_bits = 0, size = 0;
++    OSSL_PARAM *orig_fromdata_params = NULL;
+ 
+-    switch (tst) {
++    switch (tst &amp; 3) {
+     case X25519_IDX:
+         fromdata_params = x25519_fromdata_params;
+         bits = X25519_BITS;
+@@ -877,6 +905,17 @@ static int test_fromdata_ecx(int tst)
+     if (!TEST_ptr(ctx))
+         goto err;
+ 
++    orig_fromdata_params = fromdata_params;
++    if (tst &gt; 7) {
++        /* public key only */
++        fromdata_params++;
++    } else if (tst &gt; 3) {
++        /* private key only */
++        params[0] = fromdata_params[0];
++        params[1] = fromdata_params[2];
++        fromdata_params = params;
++    }
++
+     if (!TEST_true(EVP_PKEY_key_fromdata_init(ctx))
+         || !TEST_true(EVP_PKEY_fromdata(ctx, &amp;pk, fromdata_params))
+         || !TEST_int_eq(EVP_PKEY_bits(pk), bits)
+@@ -884,32 +923,48 @@ static int test_fromdata_ecx(int tst)
+         || !TEST_int_eq(EVP_PKEY_size(pk), size))
+         goto err;
+ 
++    if (!TEST_ptr(ctx2 = EVP_PKEY_CTX_new_from_pkey(NULL, pk, NULL)))
++        goto err;
++    if (tst &lt;= 7) {
++        if (!TEST_true(EVP_PKEY_check(ctx2)))
++            goto err;
++        if (!TEST_true(EVP_PKEY_get_octet_string_param(
++                           pk, orig_fromdata_params[PRIV_KEY].key,
++                           out_priv, sizeof(out_priv), &amp;len))
++            || !TEST_mem_eq(out_priv, len,
++                            orig_fromdata_params[PRIV_KEY].data,
++                            orig_fromdata_params[PRIV_KEY].data_size)
++            || !TEST_true(EVP_PKEY_get_octet_string_param(
++                              pk, orig_fromdata_params[PUB_KEY].key,
++                              out_pub, sizeof(out_pub), &amp;len))
++            || !TEST_mem_eq(out_pub, len,
++                            orig_fromdata_params[PUB_KEY].data,
++                            orig_fromdata_params[PUB_KEY].data_size))
++            goto err;
++    } else {
++        /* The private key check should fail if there is only a public key */
++        if (!TEST_true(EVP_PKEY_public_check(ctx2))
++            || !TEST_false(EVP_PKEY_private_check(ctx2))
++            || !TEST_false(EVP_PKEY_check(ctx2)))
++            goto err;
++    }
++
+     if (!TEST_ptr(copy_pk = EVP_PKEY_new())
+            /* This should succeed because there are no parameters to copy */
+         || !TEST_true(EVP_PKEY_copy_parameters(copy_pk, pk)))
+         goto err;
+ 
+-    if (!TEST_true(EVP_PKEY_get_octet_string_param(
+-                       pk, fromdata_params[PRIV_KEY].key,
+-                       out_priv, sizeof(out_priv), &amp;len))
+-        || !TEST_mem_eq(out_priv, len,
+-                        fromdata_params[PRIV_KEY].data,
+-                        fromdata_params[PRIV_KEY].data_size)
+-        || !TEST_true(EVP_PKEY_get_octet_string_param(
+-                          pk, fromdata_params[PUB_KEY].key,
+-                          out_pub, sizeof(out_pub), &amp;len))
+-        || !TEST_mem_eq(out_pub, len,
+-                        fromdata_params[PUB_KEY].data,
+-                        fromdata_params[PUB_KEY].data_size))
+-        goto err;
+-
+-    ret = test_print_key_using_pem(alg, pk)
+-          &amp;&amp; test_print_key_using_encoder(alg, pk);
++    if (tst &gt; 7)
++        ret = test_print_key_using_encoder_public(alg, pk);
++    else
++        ret = test_print_key_using_pem(alg, pk)
++              &amp;&amp; test_print_key_using_encoder(alg, pk);
+ 
+ err:
+     EVP_PKEY_free(pk);
+     EVP_PKEY_free(copy_pk);
+     EVP_PKEY_CTX_free(ctx);
++    EVP_PKEY_CTX_free(ctx2);
+ 
+     return ret;
+ }
+@@ -1286,7 +1341,7 @@ int setup_tests(void)
+     ADD_TEST(test_fromdata_dsa_fips186_4);
+ #endif
+ #ifndef OPENSSL_NO_EC
+-    ADD_ALL_TESTS(test_fromdata_ecx, 4);
++    ADD_ALL_TESTS(test_fromdata_ecx, 4 * 3);
+     ADD_TEST(test_fromdata_ec);
+ #endif
+     return 1;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032596.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032599.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32598">[ date ]</a>
+              <a href="thread.html#32598">[ thread ]</a>
+              <a href="subject.html#32598">[ subject ]</a>
+              <a href="author.html#32598">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

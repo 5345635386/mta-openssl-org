@@ -1,0 +1,685 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441619284.422442.13171.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001770.html">
+   <LINK REL="Next"  HREF="001772.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441619284.422442.13171.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon Sep  7 09:48:04 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001770.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001772.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1771">[ date ]</a>
+              <a href="thread.html#1771">[ thread ]</a>
+              <a href="subject.html#1771">[ subject ]</a>
+              <a href="author.html#1771">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  50932c4af2fdd1da01203e9fabe176f9c106882b (commit)
+      from  0e2d091103ed5846c72a5c9e8b10e25ead4bf152 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 50932c4af2fdd1da01203e9fabe176f9c106882b
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Aug 4 17:36:02 2015 +0100
+
+    PACKETise ServerHello processing
+    
+    Process ServerHello messages using the PACKET API
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/d1_srtp.c  |  24 +++++-------
+ ssl/s3_clnt.c  | 116 +++++++++++++++++++++++++++++++++++++++++++--------------
+ ssl/ssl_locl.h |   8 ++--
+ ssl/t1_lib.c   |  99 ++++++++++++++++++++++--------------------------
+ ssl/t1_reneg.c |  25 ++++++-------
+ 5 files changed, 157 insertions(+), 115 deletions(-)
+
+diff --git a/ssl/d1_srtp.c b/ssl/d1_srtp.c
+index 4384eda..87dbcc6 100644
+--- a/ssl/d1_srtp.c
++++ b/ssl/d1_srtp.c
+@@ -358,33 +358,27 @@ int ssl_add_serverhello_use_srtp_ext(SSL *s, unsigned char *p, int *len,
+     return 0;
+ }
+ 
+-int ssl_parse_serverhello_use_srtp_ext(SSL *s, unsigned char *d, int len,
+-                                       int *al)
++int ssl_parse_serverhello_use_srtp_ext(SSL *s, PACKET *pkt, int *al)
+ {
+-    unsigned id;
++    unsigned int id, ct, mki;
+     int i;
+-    int ct;
+ 
+     STACK_OF(SRTP_PROTECTION_PROFILE) *clnt;
+     SRTP_PROTECTION_PROFILE *prof;
+ 
+-    if (len != 5) {
+-        SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_USE_SRTP_EXT,
+-               SSL_R_BAD_SRTP_PROTECTION_PROFILE_LIST);
+-        *al = SSL_AD_DECODE_ERROR;
+-        return 1;
+-    }
+-
+-    n2s(d, ct);
+-    if (ct != 2) {
++    if (!PACKET_get_net_2(pkt, &amp;ct)
++            || ct != 2
++            || !PACKET_get_net_2(pkt, &amp;id)
++            || !PACKET_get_1(pkt, &amp;mki)
++            || PACKET_remaining(pkt) != 0) {
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_USE_SRTP_EXT,
+                SSL_R_BAD_SRTP_PROTECTION_PROFILE_LIST);
+         *al = SSL_AD_DECODE_ERROR;
+         return 1;
+     }
+ 
+-    n2s(d, id);
+-    if (*d) {                   /* Must be no MKI, since we never offer one */
++    if (mki != 0) {
++        /* Must be no MKI, since we never offer one */
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_USE_SRTP_EXT,
+                SSL_R_BAD_SRTP_MKI_VALUE);
+         *al = SSL_AD_ILLEGAL_PARAMETER;
+diff --git a/ssl/s3_clnt.c b/ssl/s3_clnt.c
+index ba35fb9..b27cba2 100644
+--- a/ssl/s3_clnt.c
++++ b/ssl/s3_clnt.c
+@@ -930,9 +930,10 @@ int ssl3_get_server_hello(SSL *s)
+ {
+     STACK_OF(SSL_CIPHER) *sk;
+     const SSL_CIPHER *c;
+-    unsigned char *p, *d;
++    PACKET pkt;
++    unsigned char *session_id, *cipherchars;
+     int i, al = SSL_AD_INTERNAL_ERROR, ok;
+-    unsigned int j;
++    unsigned int j, ciphercharlen;
+     long n;
+ #ifndef OPENSSL_NO_COMP
+     SSL_COMP *comp;
+@@ -971,10 +972,20 @@ int ssl3_get_server_hello(SSL *s)
+         goto f_err;
+     }
+ 
+-    d = p = (unsigned char *)s-&gt;init_msg;
++    if (!PACKET_buf_init(&amp;pkt, s-&gt;init_msg, n)) {
++        al = SSL_AD_INTERNAL_ERROR;
++        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, ERR_R_INTERNAL_ERROR);
++        goto f_err;
++    }
+ 
+     if (s-&gt;method-&gt;version == TLS_ANY_VERSION) {
+-        int sversion = (p[0] &lt;&lt; 8) | p[1];
++        unsigned int sversion;
++
++        if (!PACKET_get_net_2(&amp;pkt, &amp;sversion)) {
++            al = SSL_AD_DECODE_ERROR;
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++            goto f_err;
++        }
+ 
+ #if TLS_MAX_VERSION != TLS1_2_VERSION
+ #error Code needs updating for new TLS version
+@@ -1012,8 +1023,16 @@ int ssl3_get_server_hello(SSL *s)
+         }
+     } else if (s-&gt;method-&gt;version == DTLS_ANY_VERSION) {
+         /* Work out correct protocol version to use */
+-        int hversion = (p[0] &lt;&lt; 8) | p[1];
+-        int options = s-&gt;options;
++        unsigned int hversion;
++        int options;
++
++        if (!PACKET_get_net_2(&amp;pkt, &amp;hversion)) {
++            al = SSL_AD_DECODE_ERROR;
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++            goto f_err;
++        }
++
++        options = s-&gt;options;
+         if (hversion == DTLS1_2_VERSION &amp;&amp; !(options &amp; SSL_OP_NO_DTLSv1_2))
+             s-&gt;method = DTLSv1_2_client_method();
+         else if (tls1_suiteb(s)) {
+@@ -1031,30 +1050,43 @@ int ssl3_get_server_hello(SSL *s)
+             goto f_err;
+         }
+         s-&gt;session-&gt;ssl_version = s-&gt;version = s-&gt;method-&gt;version;
+-    } else if ((p[0] != (s-&gt;version &gt;&gt; 8)) || (p[1] != (s-&gt;version &amp; 0xff))) {
+-        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_WRONG_SSL_VERSION);
+-        s-&gt;version = (s-&gt;version &amp; 0xff00) | p[1];
+-        al = SSL_AD_PROTOCOL_VERSION;
+-        goto f_err;
++    } else {
++        unsigned char *vers;
++
++        if (!PACKET_get_bytes(&amp;pkt, &amp;vers, 2)) {
++            al = SSL_AD_DECODE_ERROR;
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++            goto f_err;
++        }
++        if ((vers[0] != (s-&gt;version &gt;&gt; 8))
++                || (vers[1] != (s-&gt;version &amp; 0xff))) {
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_WRONG_SSL_VERSION);
++            s-&gt;version = (s-&gt;version &amp; 0xff00) | vers[1];
++            al = SSL_AD_PROTOCOL_VERSION;
++            goto f_err;
++        }
+     }
+-    p += 2;
+ 
+     /* load the server hello data */
+     /* load the server random */
+-    memcpy(s-&gt;s3-&gt;server_random, p, SSL3_RANDOM_SIZE);
+-    p += SSL3_RANDOM_SIZE;
++    if (!PACKET_copy_bytes(&amp;pkt, s-&gt;s3-&gt;server_random, SSL3_RANDOM_SIZE)) {
++        al = SSL_AD_DECODE_ERROR;
++        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++        goto f_err;
++    }
+ 
+     s-&gt;hit = 0;
+ 
+-    /* get the session-id */
+-    j = *(p++);
+-
+-    if ((j &gt; sizeof s-&gt;session-&gt;session_id) || (j &gt; SSL3_SESSION_ID_SIZE)) {
++    /* get the session-id length */
++    if (!PACKET_get_1(&amp;pkt, &amp;j)
++            || (j &gt; sizeof s-&gt;session-&gt;session_id)
++            || (j &gt; SSL3_SESSION_ID_SIZE)) {
+         al = SSL_AD_ILLEGAL_PARAMETER;
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_SSL3_SESSION_ID_TOO_LONG);
+         goto f_err;
+     }
+ 
++    ciphercharlen = ssl_put_cipher_by_char(s, NULL, NULL);
+     /*
+      * Check if we can resume the session based on external pre-shared secret.
+      * EAP-FAST (RFC 4851) supports two types of session resumption.
+@@ -1070,22 +1102,42 @@ int ssl3_get_server_hello(SSL *s)
+     if (s-&gt;version &gt;= TLS1_VERSION &amp;&amp; s-&gt;tls_session_secret_cb &amp;&amp;
+         s-&gt;session-&gt;tlsext_tick) {
+         SSL_CIPHER *pref_cipher = NULL;
++        size_t bookm;
++        if (!PACKET_get_bookmark(&amp;pkt, &amp;bookm)
++                || !PACKET_forward(&amp;pkt, j)
++                || !PACKET_get_bytes(&amp;pkt, &amp;cipherchars, ciphercharlen)) {
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++            al = SSL_AD_DECODE_ERROR;
++            goto f_err;
++        }
+         s-&gt;session-&gt;master_key_length = sizeof(s-&gt;session-&gt;master_key);
+         if (s-&gt;tls_session_secret_cb(s, s-&gt;session-&gt;master_key,
+                                      &amp;s-&gt;session-&gt;master_key_length,
+                                      NULL, &amp;pref_cipher,
+                                      s-&gt;tls_session_secret_cb_arg)) {
+             s-&gt;session-&gt;cipher = pref_cipher ?
+-                pref_cipher : ssl_get_cipher_by_char(s, p + j);
++                pref_cipher : ssl_get_cipher_by_char(s, cipherchars);
+         } else {
+             SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, ERR_R_INTERNAL_ERROR);
+             al = SSL_AD_INTERNAL_ERROR;
+             goto f_err;
+         }
++        if (!PACKET_goto_bookmark(&amp;pkt, bookm)) {
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, ERR_R_INTERNAL_ERROR);
++            al = SSL_AD_INTERNAL_ERROR;
++            goto f_err;
++        }
++    }
++
++    /* Get the session id */
++    if (!PACKET_get_bytes(&amp;pkt, &amp;session_id, j)) {
++        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++        al = SSL_AD_DECODE_ERROR;
++        goto f_err;
+     }
+ 
+     if (j != 0 &amp;&amp; j == s-&gt;session-&gt;session_id_length
+-        &amp;&amp; memcmp(p, s-&gt;session-&gt;session_id, j) == 0) {
++        &amp;&amp; memcmp(session_id, s-&gt;session-&gt;session_id, j) == 0) {
+         if (s-&gt;sid_ctx_length != s-&gt;session-&gt;sid_ctx_length
+             || memcmp(s-&gt;session-&gt;sid_ctx, s-&gt;sid_ctx, s-&gt;sid_ctx_length)) {
+             /* actually a client application bug */
+@@ -1109,10 +1161,15 @@ int ssl3_get_server_hello(SSL *s)
+             }
+         }
+         s-&gt;session-&gt;session_id_length = j;
+-        memcpy(s-&gt;session-&gt;session_id, p, j); /* j could be 0 */
++        memcpy(s-&gt;session-&gt;session_id, session_id, j); /* j could be 0 */
+     }
+-    p += j;
+-    c = ssl_get_cipher_by_char(s, p);
++
++    if (!PACKET_get_bytes(&amp;pkt, &amp;cipherchars, ciphercharlen)) {
++        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++        al = SSL_AD_DECODE_ERROR;
++        goto f_err;
++    }
++    c = ssl_get_cipher_by_char(s, cipherchars);
+     if (c == NULL) {
+         /* unknown cipher */
+         al = SSL_AD_ILLEGAL_PARAMETER;
+@@ -1133,7 +1190,6 @@ int ssl3_get_server_hello(SSL *s)
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_WRONG_CIPHER_RETURNED);
+         goto f_err;
+     }
+-    p += ssl_put_cipher_by_char(s, NULL, NULL);
+ 
+     sk = ssl_get_ciphers_by_id(s);
+     i = sk_SSL_CIPHER_find(sk, c);
+@@ -1166,8 +1222,13 @@ int ssl3_get_server_hello(SSL *s)
+         goto f_err;
+     /* lets get the compression algorithm */
+     /* COMPRESSION */
++    if (!PACKET_get_1(&amp;pkt, &amp;j)) {
++        SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_LENGTH_MISMATCH);
++        al = SSL_AD_DECODE_ERROR;
++        goto f_err;
++    }
+ #ifdef OPENSSL_NO_COMP
+-    if (*(p++) != 0) {
++    if (j != 0) {
+         al = SSL_AD_ILLEGAL_PARAMETER;
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO,
+                SSL_R_UNSUPPORTED_COMPRESSION_ALGORITHM);
+@@ -1182,7 +1243,6 @@ int ssl3_get_server_hello(SSL *s)
+         goto f_err;
+     }
+ #else
+-    j = *(p++);
+     if (s-&gt;hit &amp;&amp; j != s-&gt;session-&gt;compress_meth) {
+         al = SSL_AD_ILLEGAL_PARAMETER;
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO,
+@@ -1209,12 +1269,12 @@ int ssl3_get_server_hello(SSL *s)
+ #endif
+ 
+     /* TLS extensions */
+-    if (!ssl_parse_serverhello_tlsext(s, &amp;p, d, n)) {
++    if (!ssl_parse_serverhello_tlsext(s, &amp;pkt)) {
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_PARSE_TLSEXT);
+         goto err;
+     }
+ 
+-    if (p != (d + n)) {
++    if (PACKET_remaining(&amp;pkt) != 0) {
+         /* wrong packet length */
+         al = SSL_AD_DECODE_ERROR;
+         SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, SSL_R_BAD_PACKET_LENGTH);
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 79926ff..2539a4e 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -2088,8 +2088,7 @@ __owur unsigned char *ssl_add_serverhello_tlsext(SSL *s, unsigned char *buf,
+ __owur int ssl_parse_clienthello_tlsext(SSL *s, PACKET *pkt);
+ __owur int tls1_set_server_sigalgs(SSL *s);
+ __owur int ssl_check_clienthello_tlsext_late(SSL *s);
+-__owur int ssl_parse_serverhello_tlsext(SSL *s, unsigned char **data,
+-                                 unsigned char *d, int n);
++__owur int ssl_parse_serverhello_tlsext(SSL *s, PACKET *pkt);
+ __owur int ssl_prepare_clienthello_tlsext(SSL *s);
+ __owur int ssl_prepare_serverhello_tlsext(SSL *s);
+ 
+@@ -2126,7 +2125,7 @@ __owur EVP_MD_CTX *ssl_replace_hash(EVP_MD_CTX **hash, const EVP_MD *md);
+ void ssl_clear_hash_ctx(EVP_MD_CTX **hash);
+ __owur int ssl_add_serverhello_renegotiate_ext(SSL *s, unsigned char *p, int *len,
+                                         int maxlen);
+-__owur int ssl_parse_serverhello_renegotiate_ext(SSL *s, unsigned char *d, int len,
++__owur int ssl_parse_serverhello_renegotiate_ext(SSL *s, PACKET *pkt,
+                                           int *al);
+ __owur int ssl_add_clienthello_renegotiate_ext(SSL *s, unsigned char *p, int *len,
+                                         int maxlen);
+@@ -2147,8 +2146,7 @@ __owur int ssl_add_clienthello_use_srtp_ext(SSL *s, unsigned char *p, int *len,
+ __owur int ssl_parse_clienthello_use_srtp_ext(SSL *s, PACKET *pkt, int *al);
+ __owur int ssl_add_serverhello_use_srtp_ext(SSL *s, unsigned char *p, int *len,
+                                      int maxlen);
+-__owur int ssl_parse_serverhello_use_srtp_ext(SSL *s, unsigned char *d, int len,
+-                                       int *al);
++__owur int ssl_parse_serverhello_use_srtp_ext(SSL *s, PACKET *pkt, int *al);
+ 
+ __owur int ssl_handshake_hash(SSL *s, unsigned char *out, int outlen);
+ 
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index f004288..95b4fb6 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -2344,28 +2344,23 @@ int ssl_parse_clienthello_tlsext(SSL *s, PACKET *pkt)
+  * elements of zero length are allowed and the set of elements must exactly
+  * fill the length of the block.
+  */
+-static char ssl_next_proto_validate(unsigned char *d, unsigned len)
++static char ssl_next_proto_validate(PACKET *pkt)
+ {
+-    unsigned int off = 0;
++    unsigned int len;
+ 
+-    while (off &lt; len) {
+-        if (d[off] == 0)
++    while (PACKET_remaining(pkt)) {
++        if (!PACKET_get_1(pkt, &amp;len)
++                || !PACKET_forward(pkt, len))
+             return 0;
+-        off += d[off];
+-        off++;
+     }
+ 
+-    return off == len;
++    return 1;
+ }
+ #endif
+ 
+-static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+-                                       unsigned char *d, int n, int *al)
++static int ssl_scan_serverhello_tlsext(SSL *s, PACKET *pkt, int *al)
+ {
+-    unsigned short length;
+-    unsigned short type;
+-    unsigned short size;
+-    unsigned char *data = *p;
++    unsigned int length, type, size;
+     int tlsext_servername = 0;
+     int renegotiate_seen = 0;
+ 
+@@ -2385,27 +2380,27 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+     s-&gt;s3-&gt;flags &amp;= ~TLS1_FLAGS_ENCRYPT_THEN_MAC;
+ #endif
+ 
+-    if (data &gt;= (d + n - 2))
++    if (!PACKET_get_net_2(pkt, &amp;length))
+         goto ri_check;
+ 
+-    n2s(data, length);
+-    if (data + length != d + n) {
++    if (PACKET_remaining(pkt) != length) {
+         *al = SSL_AD_DECODE_ERROR;
+         return 0;
+     }
+ 
+-    while (data &lt;= (d + n - 4)) {
+-        n2s(data, type);
+-        n2s(data, size);
++    while (PACKET_get_net_2(pkt, &amp;type) &amp;&amp; PACKET_get_net_2(pkt, &amp;size)) {
++        unsigned char *data;
++        PACKET spkt;
+ 
+-        if (data + size &gt; (d + n))
++        if (!PACKET_get_sub_packet(pkt, &amp;spkt, size)
++                ||  !PACKET_peek_bytes(&amp;spkt, &amp;data, size))
+             goto ri_check;
+ 
+         if (s-&gt;tlsext_debug_cb)
+             s-&gt;tlsext_debug_cb(s, 1, type, data, size, s-&gt;tlsext_debug_arg);
+ 
+         if (type == TLSEXT_TYPE_renegotiate) {
+-            if (!ssl_parse_serverhello_renegotiate_ext(s, data, size, al))
++            if (!ssl_parse_serverhello_renegotiate_ext(s, &amp;spkt, al))
+                 return 0;
+             renegotiate_seen = 1;
+         } else if (s-&gt;version == SSL3_VERSION) {
+@@ -2418,10 +2413,9 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+         }
+ #ifndef OPENSSL_NO_EC
+         else if (type == TLSEXT_TYPE_ec_point_formats) {
+-            unsigned char *sdata = data;
+-            int ecpointformatlist_length = *(sdata++);
+-
+-            if (ecpointformatlist_length != size - 1) {
++            unsigned int ecpointformatlist_length;
++            if (!PACKET_get_1(&amp;spkt, &amp;ecpointformatlist_length)
++                    || ecpointformatlist_length != size - 1) {
+                 *al = TLS1_AD_DECODE_ERROR;
+                 return 0;
+             }
+@@ -2435,8 +2429,13 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+                 }
+                 s-&gt;session-&gt;tlsext_ecpointformatlist_length =
+                     ecpointformatlist_length;
+-                memcpy(s-&gt;session-&gt;tlsext_ecpointformatlist, sdata,
+-                       ecpointformatlist_length);
++                if (!PACKET_copy_bytes(&amp;spkt,
++                                       s-&gt;session-&gt;tlsext_ecpointformatlist,
++                                       ecpointformatlist_length)) {
++                    *al = TLS1_AD_DECODE_ERROR;
++                    return 0;
++                }
++
+             }
+         }
+ #endif                         /* OPENSSL_NO_EC */
+@@ -2472,14 +2471,13 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+                  s-&gt;s3-&gt;tmp.finish_md_len == 0) {
+             unsigned char *selected;
+             unsigned char selected_len;
+-
+             /* We must have requested it. */
+             if (s-&gt;ctx-&gt;next_proto_select_cb == NULL) {
+                 *al = TLS1_AD_UNSUPPORTED_EXTENSION;
+                 return 0;
+             }
+             /* The data must be valid */
+-            if (!ssl_next_proto_validate(data, size)) {
++            if (!ssl_next_proto_validate(&amp;spkt)) {
+                 *al = TLS1_AD_DECODE_ERROR;
+                 return 0;
+             }
+@@ -2504,31 +2502,21 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+ 
+         else if (type == TLSEXT_TYPE_application_layer_protocol_negotiation) {
+             unsigned len;
+-
+             /* We must have requested it. */
+             if (s-&gt;alpn_client_proto_list == NULL) {
+                 *al = TLS1_AD_UNSUPPORTED_EXTENSION;
+                 return 0;
+             }
+-            if (size &lt; 4) {
+-                *al = TLS1_AD_DECODE_ERROR;
+-                return 0;
+-            }
+             /*-
+              * The extension data consists of:
+              *   uint16 list_length
+              *   uint8 proto_length;
+              *   uint8 proto[proto_length];
+              */
+-            len = data[0];
+-            len &lt;&lt;= 8;
+-            len |= data[1];
+-            if (len != (unsigned)size - 2) {
+-                *al = TLS1_AD_DECODE_ERROR;
+-                return 0;
+-            }
+-            len = data[2];
+-            if (len != (unsigned)size - 3) {
++            if (!PACKET_get_net_2(&amp;spkt, &amp;len)
++                    || PACKET_remaining(&amp;spkt) != len
++                    || !PACKET_get_1(&amp;spkt, &amp;len)
++                    || PACKET_remaining(&amp;spkt) != len) {
+                 *al = TLS1_AD_DECODE_ERROR;
+                 return 0;
+             }
+@@ -2538,12 +2526,20 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+                 *al = TLS1_AD_INTERNAL_ERROR;
+                 return 0;
+             }
+-            memcpy(s-&gt;s3-&gt;alpn_selected, data + 3, len);
++            if (!PACKET_copy_bytes(&amp;spkt, s-&gt;s3-&gt;alpn_selected, len)) {
++                *al = TLS1_AD_DECODE_ERROR;
++                return 0;
++            }
+             s-&gt;s3-&gt;alpn_selected_len = len;
+         }
+ #ifndef OPENSSL_NO_HEARTBEATS
+         else if (type == TLSEXT_TYPE_heartbeat) {
+-            switch (data[0]) {
++            unsigned int hbtype;
++            if (!PACKET_get_1(&amp;spkt, &amp;hbtype)) {
++                *al = SSL_AD_DECODE_ERROR;
++                return 0;
++            }
++            switch (hbtype) {
+             case 0x01:         /* Server allows us to send HB requests */
+                 s-&gt;tlsext_heartbeat |= SSL_TLSEXT_HB_ENABLED;
+                 break;
+@@ -2559,7 +2555,7 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+ #endif
+ #ifndef OPENSSL_NO_SRTP
+         else if (SSL_IS_DTLS(s) &amp;&amp; type == TLSEXT_TYPE_use_srtp) {
+-            if (ssl_parse_serverhello_use_srtp_ext(s, data, size, al))
++            if (ssl_parse_serverhello_use_srtp_ext(s, &amp;spkt, al))
+                 return 0;
+         }
+ #endif
+@@ -2581,11 +2577,9 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+          */
+         else if (custom_ext_parse(s, 0, type, data, size, al) &lt;= 0)
+             return 0;
+-
+-        data += size;
+     }
+ 
+-    if (data != d + n) {
++    if (PACKET_remaining(pkt) != 0) {
+         *al = SSL_AD_DECODE_ERROR;
+         return 0;
+     }
+@@ -2605,8 +2599,6 @@ static int ssl_scan_serverhello_tlsext(SSL *s, unsigned char **p,
+         }
+     }
+ 
+-    *p = data;
+-
+  ri_check:
+ 
+     /*
+@@ -2887,13 +2879,12 @@ int ssl_check_serverhello_tlsext(SSL *s)
+     }
+ }
+ 
+-int ssl_parse_serverhello_tlsext(SSL *s, unsigned char **p, unsigned char *d,
+-                                 int n)
++int ssl_parse_serverhello_tlsext(SSL *s, PACKET *pkt)
+ {
+     int al = -1;
+     if (s-&gt;version &lt; SSL3_VERSION)
+         return 1;
+-    if (ssl_scan_serverhello_tlsext(s, p, d, n, &amp;al) &lt;= 0) {
++    if (ssl_scan_serverhello_tlsext(s, pkt, &amp;al) &lt;= 0) {
+         ssl3_send_alert(s, SSL3_AL_FATAL, al);
+         return 0;
+     }
+diff --git a/ssl/t1_reneg.c b/ssl/t1_reneg.c
+index 22a71fe..3fb6a96 100644
+--- a/ssl/t1_reneg.c
++++ b/ssl/t1_reneg.c
+@@ -220,29 +220,27 @@ int ssl_add_serverhello_renegotiate_ext(SSL *s, unsigned char *p, int *len,
+ /*
+  * Parse the server's renegotiation binding and abort if it's not right
+  */
+-int ssl_parse_serverhello_renegotiate_ext(SSL *s, unsigned char *d, int len,
+-                                          int *al)
++int ssl_parse_serverhello_renegotiate_ext(SSL *s, PACKET *pkt, int *al)
+ {
+-    int expected_len = s-&gt;s3-&gt;previous_client_finished_len
++    unsigned int expected_len = s-&gt;s3-&gt;previous_client_finished_len
+         + s-&gt;s3-&gt;previous_server_finished_len;
+-    int ilen;
++    unsigned int ilen;
++    unsigned char *data;
+ 
+     /* Check for logic errors */
+     OPENSSL_assert(!expected_len || s-&gt;s3-&gt;previous_client_finished_len);
+     OPENSSL_assert(!expected_len || s-&gt;s3-&gt;previous_server_finished_len);
+ 
+     /* Parse the length byte */
+-    if (len &lt; 1) {
++    if (!PACKET_get_1(pkt, &amp;ilen)) {
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_RENEGOTIATE_EXT,
+                SSL_R_RENEGOTIATION_ENCODING_ERR);
+         *al = SSL_AD_ILLEGAL_PARAMETER;
+         return 0;
+     }
+-    ilen = *d;
+-    d++;
+ 
+     /* Consistency check */
+-    if (ilen + 1 != len) {
++    if (PACKET_remaining(pkt) != ilen) {
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_RENEGOTIATE_EXT,
+                SSL_R_RENEGOTIATION_ENCODING_ERR);
+         *al = SSL_AD_ILLEGAL_PARAMETER;
+@@ -257,17 +255,18 @@ int ssl_parse_serverhello_renegotiate_ext(SSL *s, unsigned char *d, int len,
+         return 0;
+     }
+ 
+-    if (memcmp(d, s-&gt;s3-&gt;previous_client_finished,
+-               s-&gt;s3-&gt;previous_client_finished_len)) {
++    if (!PACKET_get_bytes(pkt, &amp;data, s-&gt;s3-&gt;previous_client_finished_len)
++            || memcmp(data, s-&gt;s3-&gt;previous_client_finished,
++               s-&gt;s3-&gt;previous_client_finished_len) != 0) {
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_RENEGOTIATE_EXT,
+                SSL_R_RENEGOTIATION_MISMATCH);
+         *al = SSL_AD_HANDSHAKE_FAILURE;
+         return 0;
+     }
+-    d += s-&gt;s3-&gt;previous_client_finished_len;
+ 
+-    if (memcmp(d, s-&gt;s3-&gt;previous_server_finished,
+-               s-&gt;s3-&gt;previous_server_finished_len)) {
++    if (!PACKET_get_bytes(pkt, &amp;data, s-&gt;s3-&gt;previous_server_finished_len)
++            || memcmp(data, s-&gt;s3-&gt;previous_server_finished,
++               s-&gt;s3-&gt;previous_server_finished_len) != 0) {
+         SSLerr(SSL_F_SSL_PARSE_SERVERHELLO_RENEGOTIATE_EXT,
+                SSL_R_RENEGOTIATION_MISMATCH);
+         *al = SSL_AD_ILLEGAL_PARAMETER;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001770.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001772.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1771">[ date ]</a>
+              <a href="thread.html#1771">[ thread ]</a>
+              <a href="subject.html#1771">[ subject ]</a>
+              <a href="author.html#1771">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

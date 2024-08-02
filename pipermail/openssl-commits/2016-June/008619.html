@@ -1,0 +1,220 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1467015020.059847.841.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008600.html">
+   <LINK REL="Next"  HREF="008620.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1467015020.059847.841.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Mon Jun 27 08:10:20 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008600.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="008620.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8619">[ date ]</a>
+              <a href="thread.html#8619">[ thread ]</a>
+              <a href="subject.html#8619">[ subject ]</a>
+              <a href="author.html#8619">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5fc77684f1bfa87d0cf9f7a84de92550fa854a84 (commit)
+       via  c3a73daf0acc1272905db954b92a23146aad82f0 (commit)
+      from  dca5eeb4d06262b5e48f21af5e5d4dd672a8c5af (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5fc77684f1bfa87d0cf9f7a84de92550fa854a84
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jun 20 11:11:25 2016 +0200
+
+    evp/evp_enc.c: refine partial buffer overlap detection.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+commit c3a73daf0acc1272905db954b92a23146aad82f0
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Jun 17 13:55:01 2016 +0200
+
+    evp/evp_enc.c: check for partially[!] overlapping buffers
+    in EVP_EncryptUpdate and EVP_DecryptUpdate. It is argued that in
+    general case it's impossible to provide guarantee that partially[!]
+    overlapping buffers can be tolerated.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_enc.c           | 57 ++++++++++++++++++++++++++++++++++++++++--
+ doc/crypto/EVP_EncryptInit.pod |  4 ++-
+ 2 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index acb6b8b..e43a5d2 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include &lt;stdio.h&gt;
++#include &lt;assert.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/err.h&gt;
+@@ -252,12 +253,53 @@ int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+     return EVP_CipherInit_ex(ctx, cipher, impl, key, iv, 0);
+ }
+ 
++/*
++ * According to the letter of standard difference between pointers
++ * is specified to be valid only within same object. This makes
++ * it formally challenging to determine if input and output buffers
++ * are not partially overlapping with standard pointer arithmetic.
++ */
++#ifdef PTRDIFF_T
++# undef PTRDIFF_T
++#endif
++#if defined(OPENSSL_SYS_VMS) &amp;&amp; __INITIAL_POINTER_SIZE==64
++/*
++ * Then we have VMS that distinguishes itself by adhering to
++ * sizeof(size_t)==4 even in 64-bit builds, which means that
++ * difference between two pointers might be truncated to 32 bits.
++ * In the context one can even wonder how comparison for
++ * equality is implemented. To be on the safe side we adhere to
++ * PTRDIFF_T even for comparison for equality.
++ */
++# define PTRDIFF_T uint64_t
++#else
++# define PTRDIFF_T size_t
++#endif
++
++static int is_partially_overlapping(const void *ptr1, const void *ptr2,
++                                    int len)
++{
++    PTRDIFF_T diff = (PTRDIFF_T)ptr1-(PTRDIFF_T)ptr2;
++    /*
++     * Check for partially overlapping buffers. [Binary logical
++     * operations are used instead of boolean to minimize number
++     * of conditional branches.]
++     */
++    int condition = (len &gt; 0) &amp; (diff != 0) &amp; ((diff &lt; (PTRDIFF_T)len) |
++                                               (diff &gt; (0 - (PTRDIFF_T)len)));
++    assert(!condition);
++    return condition;
++}
++
+ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+                       const unsigned char *in, int inl)
+ {
+     int i, j, bl;
+ 
+     if (ctx-&gt;cipher-&gt;flags &amp; EVP_CIPH_FLAG_CUSTOM_CIPHER) {
++        if (is_partially_overlapping(out, in, inl))
++            return 0;
++
+         i = ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl);
+         if (i &lt; 0)
+             return 0;
+@@ -270,6 +312,8 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+         *outl = 0;
+         return inl == 0;
+     }
++    if (is_partially_overlapping(out, in, inl))
++        return 0;
+ 
+     if (ctx-&gt;buf_len == 0 &amp;&amp; (inl &amp; (ctx-&gt;block_mask)) == 0) {
+         if (ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl)) {
+@@ -292,10 +336,12 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+         } else {
+             j = bl - i;
+             memcpy(&amp;(ctx-&gt;buf[i]), in, j);
+-            if (!ctx-&gt;cipher-&gt;do_cipher(ctx, out, ctx-&gt;buf, bl))
+-                return 0;
+             inl -= j;
+             in += j;
++            if (is_partially_overlapping(out, in, bl))
++                return 0;
++            if (!ctx-&gt;cipher-&gt;do_cipher(ctx, out, ctx-&gt;buf, bl))
++                return 0;
+             out += bl;
+             *outl = bl;
+         }
+@@ -371,6 +417,9 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+     unsigned int b;
+ 
+     if (ctx-&gt;cipher-&gt;flags &amp; EVP_CIPH_FLAG_CUSTOM_CIPHER) {
++        if (is_partially_overlapping(out, in, inl))
++            return 0;
++
+         fix_len = ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl);
+         if (fix_len &lt; 0) {
+             *outl = 0;
+@@ -392,6 +441,10 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+     OPENSSL_assert(b &lt;= sizeof ctx-&gt;final);
+ 
+     if (ctx-&gt;final_used) {
++        /* see comment about PTRDIFF_T comparison above */
++        if (((PTRDIFF_T)out == (PTRDIFF_T)in)
++            || is_partially_overlapping(out, in, b))
++            return 0;
+         memcpy(out, ctx-&gt;final, b);
+         out += b;
+         fix_len = 1;
+diff --git a/doc/crypto/EVP_EncryptInit.pod b/doc/crypto/EVP_EncryptInit.pod
+index 7b53302..8732f36 100644
+--- a/doc/crypto/EVP_EncryptInit.pod
++++ b/doc/crypto/EVP_EncryptInit.pod
+@@ -137,7 +137,9 @@ multiple times to encrypt successive blocks of data. The amount
+ of data written depends on the block alignment of the encrypted data:
+ as a result the amount of data written may be anything from zero bytes
+ to (inl + cipher_block_size - 1) so B&lt;out&gt; should contain sufficient
+-room. The actual number of bytes written is placed in B&lt;outl&gt;.
++room. The actual number of bytes written is placed in B&lt;outl&gt;. It also
++checks if B&lt;in&gt; and B&lt;out&gt; are partially overlapping, and if they are
++0 is returned to indicate failure.
+ 
+ If padding is enabled (the default) then EVP_EncryptFinal_ex() encrypts
+ the &quot;final&quot; data, that is any data that remains in a partial block.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008600.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="008620.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8619">[ date ]</a>
+              <a href="thread.html#8619">[ thread ]</a>
+              <a href="subject.html#8619">[ subject ]</a>
+              <a href="author.html#8619">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

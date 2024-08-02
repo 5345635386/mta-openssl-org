@@ -1,0 +1,304 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1590261132.750391.19036.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028887.html">
+   <LINK REL="Next"  HREF="028896.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1590261132.750391.19036.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sat May 23 19:12:12 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028887.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028896.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28888">[ date ]</a>
+              <a href="thread.html#28888">[ thread ]</a>
+              <a href="subject.html#28888">[ subject ]</a>
+              <a href="author.html#28888">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5e5bc836fbc5b1c0af428864f5286bbb225f7baf (commit)
+      from  aa2cb51da03bc8fc40d785042b35fe0c253846bf (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5e5bc836fbc5b1c0af428864f5286bbb225f7baf
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri May 22 15:41:28 2020 +0200
+
+    Re-introduce legacy EVP_PKEY types for provided keys
+    
+    EVP_PKEYs with provider side internal keys got the key type
+    EVP_PKEY_NONE.  This turned out to be too disruptive, so we try
+    instead to find a matching EVP_PKEY_ASN1_METHOD and use whatever
+    EVP_PKEY type it uses.
+    
+    To make internal coding easier, we introduce a few internal macros to
+    distinguish what can be expected from a EVP_PKEY:
+    
+    - evp_pkey_is_blank(), to detect an unassigned EVP_PKEY.
+    - evp_pkey_is_typed(), to detect that an EVP_PKEY has been assigned a
+      type, which may be an old style type number or a EVP_KEYMGMT method.
+    - evp_pkey_is_assigned(), to detect that an EVP_PKEY has been assigned
+      an key value.
+    - evp_pkey_is_legacy(), to detect that the internal EVP_PKEY key is a
+      legacy one, i.e. will be handled via an EVP_PKEY_ASN1_METHOD and an
+      EVP_PKEY_METHOD.
+    - evp_pkey_is_provided(), to detect that the internal EVP_PKEY key is
+      a provider side one, i.e. will be handdled via an EVP_KEYMGMT and
+      other provider methods.
+    
+    This also introduces EVP_PKEY_KEYMGMT, to indicate that this EVP_PKEY
+    contains a provider side key for which there are no known
+    EVP_PKEY_ASN1_METHODs or EVP_PKEY_METHODs, i.e. these can only be
+    handled via EVP_KEYMGMT and other provider methods.
+    
+    Fixes #11823
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11913">https://github.com/openssl/openssl/pull/11913</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/p_lib.c     | 61 +++++++++++++++++++++++++-------------------------
+ crypto/evp/pmeth_lib.c |  6 ++---
+ include/crypto/evp.h   | 20 +++++++++++++++--
+ include/openssl/evp.h  |  2 ++
+ 4 files changed, 53 insertions(+), 36 deletions(-)
+
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 9eb9f4937b..d05f0f2cba 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -119,7 +119,7 @@ int EVP_PKEY_copy_parameters(EVP_PKEY *to, const EVP_PKEY *from)
+      * If |to| is a legacy key and |from| isn't, we must downgrade |from|.
+      * If that fails, this function fails.
+      */
+-    if (to-&gt;type != EVP_PKEY_NONE &amp;&amp; from-&gt;keymgmt != NULL)
++    if (evp_pkey_is_legacy(to) &amp;&amp; evp_pkey_is_provided(from))
+         if (!evp_pkey_downgrade((EVP_PKEY *)from))
+             return 0;
+ 
+@@ -135,15 +135,15 @@ int EVP_PKEY_copy_parameters(EVP_PKEY *to, const EVP_PKEY *from)
+      * like evp_keymgmt_util_copy() and evp_pkey_export_to_provider() called
+      * further down help us find out if they are the same or not.
+      */
+-    if (to-&gt;type == EVP_PKEY_NONE &amp;&amp; to-&gt;keymgmt == NULL) {
+-        if (from-&gt;type != EVP_PKEY_NONE) {
++    if (evp_pkey_is_blank(to)) {
++        if (evp_pkey_is_legacy(from)) {
+             if (EVP_PKEY_set_type(to, from-&gt;type) == 0)
+                 return 0;
+         } else {
+             if (EVP_PKEY_set_type_by_keymgmt(to, from-&gt;keymgmt) == 0)
+                 return 0;
+         }
+-    } else if (to-&gt;type != EVP_PKEY_NONE) {
++    } else if (evp_pkey_is_legacy(to)) {
+         if (to-&gt;type != from-&gt;type) {
+             EVPerr(EVP_F_EVP_PKEY_COPY_PARAMETERS, EVP_R_DIFFERENT_KEY_TYPES);
+             goto err;
+@@ -1357,19 +1357,17 @@ static int pkey_set_type(EVP_PKEY *pkey, ENGINE *e, int type, const char *str,
+         pkey-&gt;engine = e;
+ 
+         /*
+-         * The EVP_PKEY_ASN1_METHOD |pkey_id| serves different purposes,
+-         * depending on if we're setting this key to contain a legacy or
+-         * a provider side &quot;origin&quot; key.  For a legacy key, we assign it
+-         * to the |type| field, but for a provider side key, we assign it
+-         * to the |save_type| field, because |type| is supposed to be set
+-         * to EVP_PKEY_NONE in that case.
++         * The EVP_PKEY_ASN1_METHOD |pkey_id| retains its legacy key purpose
++         * for any key type that has a legacy implementation, regardless of
++         * if the internal key is a legacy or a provider side one.  When
++         * there is no legacy implementation for the key, the type becomes
++         * EVP_PKEY_KEYMGMT, which indicates that one should be cautious
++         * with functions that expect legacy internal keys.
+          */
+-        if (ameth != NULL) {
+-            if (keymgmt != NULL)
+-                pkey-&gt;save_type = ameth-&gt;pkey_id;
+-            else if (pkey-&gt;ameth != NULL)
+-                pkey-&gt;type = ameth-&gt;pkey_id;
+-        }
++        if (ameth != NULL)
++            pkey-&gt;type = ameth-&gt;pkey_id;
++        else
++            pkey-&gt;type = EVP_PKEY_KEYMGMT;
+ #endif
+     }
+     return 1;
+@@ -1453,7 +1451,6 @@ void evp_pkey_free_legacy(EVP_PKEY *x)
+     ENGINE_finish(x-&gt;pmeth_engine);
+     x-&gt;pmeth_engine = NULL;
+ # endif
+-    x-&gt;type = EVP_PKEY_NONE;
+ }
+ #endif  /* FIPS_MODULE */
+ 
+@@ -1472,6 +1469,7 @@ static void evp_pkey_free_it(EVP_PKEY *x)
+         x-&gt;keymgmt = NULL;
+         x-&gt;keydata = NULL;
+     }
++    x-&gt;type = EVP_PKEY_NONE;
+ }
+ 
+ void EVP_PKEY_free(EVP_PKEY *x)
+@@ -1661,32 +1659,33 @@ int evp_pkey_downgrade(EVP_PKEY *pk)
+ {
+     EVP_KEYMGMT *keymgmt = pk-&gt;keymgmt;
+     void *keydata = pk-&gt;keydata;
+-    int type = pk-&gt;save_type;
++    int type = pk-&gt;type;
+     const char *keytype = NULL;
+ 
+     /* If this isn't a provider side key, we're done */
+     if (keymgmt == NULL)
+         return 1;
+ 
+-    /* Get the key type name for error reporting */
+-    if (type != EVP_PKEY_NONE)
+-        keytype = OBJ_nid2sn(type);
+-    else
+-        keytype =
+-            evp_first_name(EVP_KEYMGMT_provider(keymgmt), keymgmt-&gt;name_id);
++    keytype = evp_first_name(EVP_KEYMGMT_provider(keymgmt), keymgmt-&gt;name_id);
+ 
+     /*
+-     * |save_type| was set when any of the EVP_PKEY_set_type functions
+-     * was called.  It was set to EVP_PKEY_NONE if the key type wasn't
+-     * recognised to be any of the legacy key types, and the downgrade
+-     * isn't possible.
++     * If the type is EVP_PKEY_NONE, then we have a problem somewhere else
++     * in our code.  If it's not one of the well known EVP_PKEY_xxx values,
++     * it should at least be EVP_PKEY_KEYMGMT at this point.
++     * TODO(3.0) remove this check when we're confident that the rest of the
++     * code treats this correctly.
+      */
+-    if (type == EVP_PKEY_NONE) {
+-        ERR_raise_data(ERR_LIB_EVP, EVP_R_UNKNOWN_KEY_TYPE,
+-                       &quot;key type = %s, can't downgrade&quot;, keytype);
++    if (!ossl_assert(type != EVP_PKEY_NONE)) {
++        ERR_raise_data(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR,
++                       &quot;keymgmt key type = %s but legacy type = EVP_PKEY_NONE&quot;,
++                       keytype);
+         return 0;
+     }
+ 
++    /* Prefer the legacy key type name for error reporting */
++    if (type != EVP_PKEY_KEYMGMT)
++        keytype = OBJ_nid2sn(type);
++
+     /*
+      * To be able to downgrade, we steal the provider side &quot;origin&quot; keymgmt
+      * and keydata.  We've already grabbed the pointers, so all we need to
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index eca5178129..e4327b3a94 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -155,10 +155,10 @@ static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
+         goto common;
+ 
+     /*
+-     * If the key doesn't contain anything legacy, then it must be provided,
+-     * so we extract the necessary information and use that.
++     * If the internal key is provided, we extract the keytype from its
++     * keymgmt and skip over the legacy code.
+      */
+-    if (pkey != NULL &amp;&amp; pkey-&gt;type == EVP_PKEY_NONE) {
++    if (pkey != NULL &amp;&amp; evp_pkey_is_provided(pkey)) {
+         /* If we have an engine, something went wrong somewhere... */
+         if (!ossl_assert(e == NULL))
+             return NULL;
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index ee4b6221e6..d1756cf183 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -518,9 +518,25 @@ const EVP_CIPHER *EVP_##cname##_ecb(void) { return &amp;cname##_ecb; }
+  *     (type != EVP_PKEY_NONE &amp;&amp; pkey.ptr != NULL)      ## legacy (libcrypto only)
+  *     || (keymgmt != NULL &amp;&amp; keydata != NULL)          ## provider side
+  *
+- * The easiest way to detect a legacy key is:           type != EVP_PKEY_NONE
+- * The easiest way to detect a provider side key is:    keymgmt != NULL
++ * The easiest way to detect a legacy key is:
++ *
++ *     keymgmt == NULL &amp;&amp; type != EVP_PKEY_NONE
++ *
++ * The easiest way to detect a provider side key is:
++ *
++ *     keymgmt != NULL
+  */
++#define evp_pkey_is_blank(pk)                                   \
++    ((pk)-&gt;type == EVP_PKEY_NONE &amp;&amp; (pk)-&gt;keymgmt == NULL)
++#define evp_pkey_is_typed(pk)                                   \
++    ((pk)-&gt;type != EVP_PKEY_NONE || (pk)-&gt;keymgmt != NULL)
++#define evp_pkey_is_assigned(pk)                                \
++    ((pk)-&gt;pkey.ptr != NULL || (pk)-&gt;keydata != NULL)
++#define evp_pkey_is_legacy(pk)                                  \
++    ((pk)-&gt;type != EVP_PKEY_NONE &amp;&amp; (pk)-&gt;keymgmt == NULL)
++#define evp_pkey_is_provided(pk)                                \
++    ((pk)-&gt;keymgmt != NULL)
++
+ struct evp_pkey_st {
+     /* == Legacy attributes == */
+     int type;
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index ea305c2cf0..0d5ce07f31 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -72,6 +72,8 @@
+ # define EVP_PKEY_ED25519 NID_ED25519
+ # define EVP_PKEY_X448 NID_X448
+ # define EVP_PKEY_ED448 NID_ED448
++/* Special indicator that the object is uniquely provider side */
++# define EVP_PKEY_KEYMGMT -1
+ 
+ #ifdef  __cplusplus
+ extern &quot;C&quot; {
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028887.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028896.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28888">[ date ]</a>
+              <a href="thread.html#28888">[ thread ]</a>
+              <a href="subject.html#28888">[ subject ]</a>
+              <a href="author.html#28888">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

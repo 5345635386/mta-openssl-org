@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1586263142.396717.23745.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028175.html">
+   <LINK REL="Next"  HREF="028183.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>nicola.tuveri at ibm.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1586263142.396717.23745.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">nicola.tuveri at ibm.com
+       </A><BR>
+    <I>Tue Apr  7 12:39:02 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028175.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028183.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28180">[ date ]</a>
+              <a href="thread.html#28180">[ thread ]</a>
+              <a href="subject.html#28180">[ subject ]</a>
+              <a href="author.html#28180">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c61ced5ec50fc68707c7cea79f7df1d170f03f13 (commit)
+      from  1eb9b54af7e00fa12196411964ce742ea8677766 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c61ced5ec50fc68707c7cea79f7df1d170f03f13
+Author: Billy Brumley &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bbrumley at gmail.com</A>&gt;
+Date:   Wed Apr 1 21:15:58 2020 +0300
+
+    [crypto/ec] blind coordinates in ec_wNAF_mul for robustness
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nicola.tuveri at ibm.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11439">https://github.com/openssl/openssl/pull/11439</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_mult.c  | 14 ++++++++++++++
+ crypto/ec/ecp_smpl.c | 42 ++++++++++++++++++++++--------------------
+ 2 files changed, 36 insertions(+), 20 deletions(-)
+
+diff --git a/crypto/ec/ec_mult.c b/crypto/ec/ec_mult.c
+index 2d3fc50acf..c66276efce 100644
+--- a/crypto/ec/ec_mult.c
++++ b/crypto/ec/ec_mult.c
+@@ -746,6 +746,20 @@ int ec_wNAF_mul(const EC_GROUP *group, EC_POINT *r, const BIGNUM *scalar,
+                     if (r_is_at_infinity) {
+                         if (!EC_POINT_copy(r, val_sub[i][digit &gt;&gt; 1]))
+                             goto err;
++
++                        /*-
++                         * Apply coordinate blinding for EC_POINT.
++                         *
++                         * The underlying EC_METHOD can optionally implement this function:
++                         * ec_point_blind_coordinates() returns 0 in case of errors or 1 on
++                         * success or if coordinate blinding is not implemented for this
++                         * group.
++                         */
++                        if (!ec_point_blind_coordinates(group, r, ctx)) {
++                            ECerr(EC_F_EC_WNAF_MUL, EC_R_POINT_COORDINATES_BLIND_FAILURE);
++                            goto err;
++                        }
++
+                         r_is_at_infinity = 0;
+                     } else {
+                         if (!EC_POINT_add
+diff --git a/crypto/ec/ecp_smpl.c b/crypto/ec/ecp_smpl.c
+index 9eaa887f21..0c25816c72 100644
+--- a/crypto/ec/ecp_smpl.c
++++ b/crypto/ec/ecp_smpl.c
+@@ -1442,36 +1442,38 @@ int ec_GFp_simple_blind_coordinates(const EC_GROUP *group, EC_POINT *p,
+     temp = BN_CTX_get(ctx);
+     if (temp == NULL) {
+         ECerr(EC_F_EC_GFP_SIMPLE_BLIND_COORDINATES, ERR_R_MALLOC_FAILURE);
+-        goto err;
++        goto end;
+     }
+ 
+-    /* make sure lambda is not zero */
++    /*-
++     * Make sure lambda is not zero.
++     * If the RNG fails, we cannot blind but nevertheless want
++     * code to continue smoothly and not clobber the error stack.
++     */
+     do {
+-        if (!BN_priv_rand_range_ex(lambda, group-&gt;field, ctx)) {
+-            ECerr(EC_F_EC_GFP_SIMPLE_BLIND_COORDINATES, ERR_R_BN_LIB);
+-            goto err;
++        ERR_set_mark();
++        ret = BN_priv_rand_range_ex(lambda, group-&gt;field, ctx);
++        ERR_pop_to_mark();
++        if (ret == 0) {
++            ret = 1;
++            goto end;
+         }
+     } while (BN_is_zero(lambda));
+ 
+     /* if field_encode defined convert between representations */
+-    if (group-&gt;meth-&gt;field_encode != NULL
+-        &amp;&amp; !group-&gt;meth-&gt;field_encode(group, lambda, lambda, ctx))
+-        goto err;
+-    if (!group-&gt;meth-&gt;field_mul(group, p-&gt;Z, p-&gt;Z, lambda, ctx))
+-        goto err;
+-    if (!group-&gt;meth-&gt;field_sqr(group, temp, lambda, ctx))
+-        goto err;
+-    if (!group-&gt;meth-&gt;field_mul(group, p-&gt;X, p-&gt;X, temp, ctx))
+-        goto err;
+-    if (!group-&gt;meth-&gt;field_mul(group, temp, temp, lambda, ctx))
+-        goto err;
+-    if (!group-&gt;meth-&gt;field_mul(group, p-&gt;Y, p-&gt;Y, temp, ctx))
+-        goto err;
+-    p-&gt;Z_is_one = 0;
++    if ((group-&gt;meth-&gt;field_encode != NULL
++         &amp;&amp; !group-&gt;meth-&gt;field_encode(group, lambda, lambda, ctx))
++        || !group-&gt;meth-&gt;field_mul(group, p-&gt;Z, p-&gt;Z, lambda, ctx)
++        || !group-&gt;meth-&gt;field_sqr(group, temp, lambda, ctx)
++        || !group-&gt;meth-&gt;field_mul(group, p-&gt;X, p-&gt;X, temp, ctx)
++        || !group-&gt;meth-&gt;field_mul(group, temp, temp, lambda, ctx)
++        || !group-&gt;meth-&gt;field_mul(group, p-&gt;Y, p-&gt;Y, temp, ctx))
++        goto end;
+ 
++    p-&gt;Z_is_one = 0;
+     ret = 1;
+ 
+- err:
++ end:
+     BN_CTX_end(ctx);
+     return ret;
+ }
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028175.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028183.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28180">[ date ]</a>
+              <a href="thread.html#28180">[ thread ]</a>
+              <a href="subject.html#28180">[ subject ]</a>
+              <a href="author.html#28180">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

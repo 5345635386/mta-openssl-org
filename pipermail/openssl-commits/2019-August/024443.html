@@ -1,0 +1,767 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1565777593.335913.12190.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024441.html">
+   <LINK REL="Next"  HREF="024455.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1565777593.335913.12190.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">matt at openssl.org
+       </A><BR>
+    <I>Wed Aug 14 10:13:13 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024441.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="024455.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24443">[ date ]</a>
+              <a href="thread.html#24443">[ thread ]</a>
+              <a href="subject.html#24443">[ subject ]</a>
+              <a href="author.html#24443">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  57a3af94a7ccff2efa99c26b2e842f520e4a731c (commit)
+       via  604ba26560ca71bf8a1c127da96727b5b2b077e1 (commit)
+      from  cd5e2b0a689a7b22bd470e70ed0b8c84305d6d03 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 57a3af94a7ccff2efa99c26b2e842f520e4a731c
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jul 23 17:10:05 2019 +0100
+
+    Extend tests of SSL_check_chain()
+    
+    Actually supply a chain and then test:
+    1) A successful check of both the ee and chain certs
+    2) A failure to check the ee cert
+    3) A failure to check a chain cert
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9443">https://github.com/openssl/openssl/pull/9443</A>)
+
+commit 604ba26560ca71bf8a1c127da96727b5b2b077e1
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jul 23 15:14:29 2019 +0100
+
+    Fix SSL_check_chain()
+    
+    The function SSL_check_chain() can be used by applications to check that
+    a cert and chain is compatible with the negotiated parameters. This could
+    be useful (for example) from the certificate callback. Unfortunately this
+    function was applying TLSv1.2 sig algs rules and did not work correctly if
+    TLSv1.3 was negotiated.
+    
+    We refactor tls_choose_sigalg to split it up and create a new function
+    find_sig_alg which can (optionally) take a certificate and key as
+    parameters and find an appropriate sig alg if one exists. If the cert and
+    key are not supplied then we try to find a cert and key from the ones we
+    have available that matches the shared sig algs.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9443">https://github.com/openssl/openssl/pull/9443</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/t1_lib.c                  | 203 +++++++++++++++++++++++++++++-------------
+ test/ct_test.c                |  23 +----
+ test/recipes/90-test_sslapi.t |   5 +-
+ test/sslapitest.c             |  98 ++++++++++++++++----
+ test/testutil.h               |   3 +
+ test/testutil/driver.c        |  18 ++++
+ 6 files changed, 246 insertions(+), 104 deletions(-)
+
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 7997bc7e84..e5e77023cc 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -21,6 +21,8 @@
+ #include &quot;ssl_locl.h&quot;
+ #include &lt;openssl/ct.h&gt;
+ 
++static const SIGALG_LOOKUP *find_sig_alg(SSL *s, X509 *x, EVP_PKEY *pkey);
++
+ SSL3_ENC_METHOD const TLSv1_enc_data = {
+     tls1_enc,
+     tls1_mac,
+@@ -2072,16 +2074,34 @@ int tls1_set_sigalgs(CERT *c, const int *psig_nids, size_t salglen, int client)
+ 
+ static int tls1_check_sig_alg(SSL *s, X509 *x, int default_nid)
+ {
+-    int sig_nid;
++    int sig_nid, use_pc_sigalgs = 0;
+     size_t i;
++    const SIGALG_LOOKUP *sigalg;
++    size_t sigalgslen;
+     if (default_nid == -1)
+         return 1;
+     sig_nid = X509_get_signature_nid(x);
+     if (default_nid)
+         return sig_nid == default_nid ? 1 : 0;
+-    for (i = 0; i &lt; s-&gt;shared_sigalgslen; i++)
+-        if (sig_nid == s-&gt;shared_sigalgs[i]-&gt;sigandhash)
++
++    if (SSL_IS_TLS13(s) &amp;&amp; s-&gt;s3-&gt;tmp.peer_cert_sigalgs != NULL) {
++        /*
++         * If we're in TLSv1.3 then we only get here if we're checking the
++         * chain. If the peer has specified peer_cert_sigalgs then we use them
++         * otherwise we default to normal sigalgs.
++         */
++        sigalgslen = s-&gt;s3-&gt;tmp.peer_cert_sigalgslen;
++        use_pc_sigalgs = 1;
++    } else {
++        sigalgslen = s-&gt;shared_sigalgslen;
++    }
++    for (i = 0; i &lt; sigalgslen; i++) {
++        sigalg = use_pc_sigalgs
++                 ? tls1_lookup_sigalg(s-&gt;s3-&gt;tmp.peer_cert_sigalgs[i])
++                 : s-&gt;shared_sigalgs[i];
++        if (sig_nid == sigalg-&gt;sigandhash)
+             return 1;
++    }
+     return 0;
+ }
+ 
+@@ -2238,7 +2258,14 @@ int tls1_check_chain(SSL *s, X509 *x, EVP_PKEY *pk, STACK_OF(X509) *chain,
+             }
+         }
+         /* Check signature algorithm of each cert in chain */
+-        if (!tls1_check_sig_alg(s, x, default_nid)) {
++        if (SSL_IS_TLS13(s)) {
++            /*
++             * We only get here if the application has called SSL_check_chain(),
++             * so check_flags is always set.
++             */
++            if (find_sig_alg(s, x, pk) != NULL)
++                rv |= CERT_PKEY_EE_SIGNATURE;
++        } else if (!tls1_check_sig_alg(s, x, default_nid)) {
+             if (!check_flags)
+                 goto end;
+         } else
+@@ -2526,43 +2553,36 @@ static int tls12_get_cert_sigalg_idx(const SSL *s, const SIGALG_LOOKUP *lu)
+ }
+ 
+ /*
+- * Returns true if |s| has a usable certificate configured for use
+- * with signature scheme |sig|.
+- * &quot;Usable&quot; includes a check for presence as well as applying
+- * the signature_algorithm_cert restrictions sent by the peer (if any).
+- * Returns false if no usable certificate is found.
++ * Checks the given cert against signature_algorithm_cert restrictions sent by
++ * the peer (if any) as well as whether the hash from the sigalg is usable with
++ * the key.
++ * Returns true if the cert is usable and false otherwise.
+  */
+-static int has_usable_cert(SSL *s, const SIGALG_LOOKUP *sig, int idx)
++static int check_cert_usable(SSL *s, const SIGALG_LOOKUP *sig, X509 *x,
++                             EVP_PKEY *pkey)
+ {
+     const SIGALG_LOOKUP *lu;
+     int mdnid, pknid, default_mdnid;
+     int mandatory_md = 0;
+     size_t i;
+ 
+-    /* TLS 1.2 callers can override lu-&gt;sig_idx, but not TLS 1.3 callers. */
+-    if (idx == -1)
+-        idx = sig-&gt;sig_idx;
+-    if (!ssl_has_cert(s, idx))
+-        return 0;
+     /* If the EVP_PKEY reports a mandatory digest, allow nothing else. */
+     ERR_set_mark();
+-    switch (EVP_PKEY_get_default_digest_nid(s-&gt;cert-&gt;pkeys[idx].privatekey,
+-                                            &amp;default_mdnid)) {
++    switch (EVP_PKEY_get_default_digest_nid(pkey, &amp;default_mdnid)) {
+     case 2:
+         mandatory_md = 1;
+         break;
+     case 1:
+-        break;
+     default: /* If it didn't report a mandatory NID, for whatever reasons,
+               * just clear the error and allow all hashes to be used. */
+-        ERR_pop_to_mark();
++        break;
+     }
++    ERR_pop_to_mark();
+     if (s-&gt;s3-&gt;tmp.peer_cert_sigalgs != NULL) {
+         for (i = 0; i &lt; s-&gt;s3-&gt;tmp.peer_cert_sigalgslen; i++) {
+             lu = tls1_lookup_sigalg(s-&gt;s3-&gt;tmp.peer_cert_sigalgs[i]);
+             if (lu == NULL
+-                || !X509_get_signature_info(s-&gt;cert-&gt;pkeys[idx].x509, &amp;mdnid,
+-                                            &amp;pknid, NULL, NULL)
++                || !X509_get_signature_info(x, &amp;mdnid, &amp;pknid, NULL, NULL)
+                 || (mandatory_md &amp;&amp; mdnid != default_mdnid))
+                 continue;
+             /*
+@@ -2579,6 +2599,103 @@ static int has_usable_cert(SSL *s, const SIGALG_LOOKUP *sig, int idx)
+     return !mandatory_md || sig-&gt;hash == default_mdnid;
+ }
+ 
++/*
++ * Returns true if |s| has a usable certificate configured for use
++ * with signature scheme |sig|.
++ * &quot;Usable&quot; includes a check for presence as well as applying
++ * the signature_algorithm_cert restrictions sent by the peer (if any).
++ * Returns false if no usable certificate is found.
++ */
++static int has_usable_cert(SSL *s, const SIGALG_LOOKUP *sig, int idx)
++{
++    /* TLS 1.2 callers can override sig-&gt;sig_idx, but not TLS 1.3 callers. */
++    if (idx == -1)
++        idx = sig-&gt;sig_idx;
++    if (!ssl_has_cert(s, idx))
++        return 0;
++
++    return check_cert_usable(s, sig, s-&gt;cert-&gt;pkeys[idx].x509,
++                             s-&gt;cert-&gt;pkeys[idx].privatekey);
++}
++
++/*
++ * Returns true if the supplied cert |x| and key |pkey| is usable with the
++ * specified signature scheme |sig|, or false otherwise.
++ */
++static int is_cert_usable(SSL *s, const SIGALG_LOOKUP *sig, X509 *x,
++                          EVP_PKEY *pkey)
++{
++    size_t idx;
++
++    if (ssl_cert_lookup_by_pkey(pkey, &amp;idx) == NULL)
++        return 0;
++
++    /* Check the key is consistent with the sig alg */
++    if ((int)idx != sig-&gt;sig_idx)
++        return 0;
++
++    return check_cert_usable(s, sig, x, pkey);
++}
++
++/*
++ * Find a signature scheme that works with the supplied certificate |x| and key
++ * |pkey|. |x| and |pkey| may be NULL in which case we additionally look at our
++ * available certs/keys to find one that works.
++ */
++static const SIGALG_LOOKUP *find_sig_alg(SSL *s, X509 *x, EVP_PKEY *pkey)
++{
++    const SIGALG_LOOKUP *lu = NULL;
++    size_t i;
++#ifndef OPENSSL_NO_EC
++    int curve = -1;
++#endif
++    EVP_PKEY *tmppkey;
++
++    /* Look for a shared sigalgs matching possible certificates */
++    for (i = 0; i &lt; s-&gt;shared_sigalgslen; i++) {
++        lu = s-&gt;shared_sigalgs[i];
++
++        /* Skip SHA1, SHA224, DSA and RSA if not PSS */
++        if (lu-&gt;hash == NID_sha1
++            || lu-&gt;hash == NID_sha224
++            || lu-&gt;sig == EVP_PKEY_DSA
++            || lu-&gt;sig == EVP_PKEY_RSA)
++            continue;
++        /* Check that we have a cert, and signature_algorithms_cert */
++        if (!tls1_lookup_md(lu, NULL))
++            continue;
++        if ((pkey == NULL &amp;&amp; !has_usable_cert(s, lu, -1))
++                || (pkey != NULL &amp;&amp; !is_cert_usable(s, lu, x, pkey)))
++            continue;
++
++        tmppkey = (pkey != NULL) ? pkey
++                                 : s-&gt;cert-&gt;pkeys[lu-&gt;sig_idx].privatekey;
++
++        if (lu-&gt;sig == EVP_PKEY_EC) {
++#ifndef OPENSSL_NO_EC
++            if (curve == -1) {
++                EC_KEY *ec = EVP_PKEY_get0_EC_KEY(tmppkey);
++                curve = EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
++            }
++            if (lu-&gt;curve != NID_undef &amp;&amp; curve != lu-&gt;curve)
++                continue;
++#else
++            continue;
++#endif
++        } else if (lu-&gt;sig == EVP_PKEY_RSA_PSS) {
++            /* validate that key is large enough for the signature algorithm */
++            if (!rsa_pss_check_min_key_size(EVP_PKEY_get0(tmppkey), lu))
++                continue;
++        }
++        break;
++    }
++
++    if (i == s-&gt;shared_sigalgslen)
++        return NULL;
++
++    return lu;
++}
++
+ /*
+  * Choose an appropriate signature algorithm based on available certificates
+  * Sets chosen certificate and signature algorithm.
+@@ -2599,48 +2716,8 @@ int tls_choose_sigalg(SSL *s, int fatalerrs)
+     s-&gt;s3-&gt;tmp.sigalg = NULL;
+ 
+     if (SSL_IS_TLS13(s)) {
+-        size_t i;
+-#ifndef OPENSSL_NO_EC
+-        int curve = -1;
+-#endif
+-
+-        /* Look for a certificate matching shared sigalgs */
+-        for (i = 0; i &lt; s-&gt;shared_sigalgslen; i++) {
+-            lu = s-&gt;shared_sigalgs[i];
+-            sig_idx = -1;
+-
+-            /* Skip SHA1, SHA224, DSA and RSA if not PSS */
+-            if (lu-&gt;hash == NID_sha1
+-                || lu-&gt;hash == NID_sha224
+-                || lu-&gt;sig == EVP_PKEY_DSA
+-                || lu-&gt;sig == EVP_PKEY_RSA)
+-                continue;
+-            /* Check that we have a cert, and signature_algorithms_cert */
+-            if (!tls1_lookup_md(lu, NULL) || !has_usable_cert(s, lu, -1))
+-                continue;
+-            if (lu-&gt;sig == EVP_PKEY_EC) {
+-#ifndef OPENSSL_NO_EC
+-                if (curve == -1) {
+-                    EC_KEY *ec = EVP_PKEY_get0_EC_KEY(s-&gt;cert-&gt;pkeys[SSL_PKEY_ECC].privatekey);
+-
+-                    curve = EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
+-                }
+-                if (lu-&gt;curve != NID_undef &amp;&amp; curve != lu-&gt;curve)
+-                    continue;
+-#else
+-                continue;
+-#endif
+-            } else if (lu-&gt;sig == EVP_PKEY_RSA_PSS) {
+-                /* validate that key is large enough for the signature algorithm */
+-                EVP_PKEY *pkey;
+-
+-                pkey = s-&gt;cert-&gt;pkeys[lu-&gt;sig_idx].privatekey;
+-                if (!rsa_pss_check_min_key_size(EVP_PKEY_get0(pkey), lu))
+-                    continue;
+-            }
+-            break;
+-        }
+-        if (i == s-&gt;shared_sigalgslen) {
++        lu = find_sig_alg(s, NULL, NULL);
++        if (lu == NULL) {
+             if (!fatalerrs)
+                 return 1;
+             SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, SSL_F_TLS_CHOOSE_SIGALG,
+diff --git a/test/ct_test.c b/test/ct_test.c
+index f881d5f6a9..78d11ca98c 100644
+--- a/test/ct_test.c
++++ b/test/ct_test.c
+@@ -87,29 +87,10 @@ static void tear_down(CT_TEST_FIXTURE *fixture)
+     OPENSSL_free(fixture);
+ }
+ 
+-static char *mk_file_path(const char *dir, const char *file)
+-{
+-# ifndef OPENSSL_SYS_VMS
+-    const char *sep = &quot;/&quot;;
+-# else
+-    const char *sep = &quot;&quot;;
+-# endif
+-    size_t len = strlen(dir) + strlen(sep) + strlen(file) + 1;
+-    char *full_file = OPENSSL_zalloc(len);
+-
+-    if (full_file != NULL) {
+-        OPENSSL_strlcpy(full_file, dir, len);
+-        OPENSSL_strlcat(full_file, sep, len);
+-        OPENSSL_strlcat(full_file, file, len);
+-    }
+-
+-    return full_file;
+-}
+-
+ static X509 *load_pem_cert(const char *dir, const char *file)
+ {
+     X509 *cert = NULL;
+-    char *file_path = mk_file_path(dir, file);
++    char *file_path = test_mk_file_path(dir, file);
+ 
+     if (file_path != NULL) {
+         BIO *cert_io = BIO_new_file(file_path, &quot;r&quot;);
+@@ -127,7 +108,7 @@ static int read_text_file(const char *dir, const char *file,
+                           char *buffer, int buffer_length)
+ {
+     int len = -1;
+-    char *file_path = mk_file_path(dir, file);
++    char *file_path = test_mk_file_path(dir, file);
+ 
+     if (file_path != NULL) {
+         BIO *file_io = BIO_new_file(file_path, &quot;r&quot;);
+diff --git a/test/recipes/90-test_sslapi.t b/test/recipes/90-test_sslapi.t
+index 633df47736..4dd70bf18d 100644
+--- a/test/recipes/90-test_sslapi.t
++++ b/test/recipes/90-test_sslapi.t
+@@ -8,7 +8,7 @@
+ 
+ 
+ use OpenSSL::Test::Utils;
+-use OpenSSL::Test qw/:DEFAULT srctop_file/;
++use OpenSSL::Test qw/:DEFAULT srctop_file srctop_dir/;
+ use File::Temp qw(tempfile);
+ 
+ setup(&quot;test_sslapi&quot;);
+@@ -20,8 +20,7 @@ plan tests =&gt; 1;
+ 
+ (undef, my $tmpfilename) = tempfile();
+ 
+-ok(run(test([&quot;sslapitest&quot;, srctop_file(&quot;apps&quot;, &quot;server.pem&quot;),
+-             srctop_file(&quot;apps&quot;, &quot;server.pem&quot;),
++ok(run(test([&quot;sslapitest&quot;, srctop_dir(&quot;test&quot;, &quot;certs&quot;),
+              srctop_file(&quot;test&quot;, &quot;recipes&quot;, &quot;90-test_sslapi_data&quot;,
+                          &quot;passwd.txt&quot;), $tmpfilename])),
+              &quot;running sslapitest&quot;);
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index 8c6e16c2fc..c29bb64f6f 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -42,6 +42,7 @@ static int find_session_cb_cnt = 0;
+ static SSL_SESSION *create_a_psk(SSL *ssl);
+ #endif
+ 
++static char *certsdir = NULL;
+ static char *cert = NULL;
+ static char *privkey = NULL;
+ static char *srpvfile = NULL;
+@@ -5664,7 +5665,10 @@ static int cert_cb(SSL *s, void *arg)
+     SSL_CTX *ctx = (SSL_CTX *)arg;
+     BIO *in = NULL;
+     EVP_PKEY *pkey = NULL;
+-    X509 *x509 = NULL;
++    X509 *x509 = NULL, *rootx = NULL;
++    STACK_OF(X509) *chain = NULL;
++    char *rootfile = NULL, *ecdsacert = NULL, *ecdsakey = NULL;
++    int ret = 0;
+ 
+     if (cert_cb_cnt == 0) {
+         /* Suspend the handshake */
+@@ -5687,38 +5691,58 @@ static int cert_cb(SSL *s, void *arg)
+         return 1;
+     } else if (cert_cb_cnt == 3) {
+         int rv;
++
++        rootfile = test_mk_file_path(certsdir, &quot;rootcert.pem&quot;);
++        ecdsacert = test_mk_file_path(certsdir, &quot;server-ecdsa-cert.pem&quot;);
++        ecdsakey = test_mk_file_path(certsdir, &quot;server-ecdsa-key.pem&quot;);
++        if (!TEST_ptr(rootfile) || !TEST_ptr(ecdsacert) || !TEST_ptr(ecdsakey))
++            goto out;
++        chain = sk_X509_new_null();
++        if (!TEST_ptr(chain))
++            goto out;
+         if (!TEST_ptr(in = BIO_new(BIO_s_file()))
+-                || !TEST_int_ge(BIO_read_filename(in, cert), 0)
++                || !TEST_int_ge(BIO_read_filename(in, rootfile), 0)
++                || !TEST_ptr(rootx = PEM_read_bio_X509(in, NULL, NULL, NULL))
++                || !TEST_true(sk_X509_push(chain, rootx)))
++            goto out;
++        rootx = NULL;
++        BIO_free(in);
++        if (!TEST_ptr(in = BIO_new(BIO_s_file()))
++                || !TEST_int_ge(BIO_read_filename(in, ecdsacert), 0)
+                 || !TEST_ptr(x509 = PEM_read_bio_X509(in, NULL, NULL, NULL)))
+             goto out;
+         BIO_free(in);
+         if (!TEST_ptr(in = BIO_new(BIO_s_file()))
+-                || !TEST_int_ge(BIO_read_filename(in, privkey), 0)
++                || !TEST_int_ge(BIO_read_filename(in, ecdsakey), 0)
+                 || !TEST_ptr(pkey = PEM_read_bio_PrivateKey(in, NULL, NULL, NULL)))
+             goto out;
+-        rv = SSL_check_chain(s, x509, pkey, NULL);
++        rv = SSL_check_chain(s, x509, pkey, chain);
+         /*
+          * If the cert doesn't show as valid here (e.g., because we don't
+          * have any shared sigalgs), then we will not set it, and there will
+          * be no certificate at all on the SSL or SSL_CTX.  This, in turn,
+          * will cause tls_choose_sigalgs() to fail the connection.
+          */
+-        if ((rv &amp; CERT_PKEY_VALID)) {
++        if ((rv &amp; (CERT_PKEY_VALID | CERT_PKEY_CA_SIGNATURE))
++                == (CERT_PKEY_VALID | CERT_PKEY_CA_SIGNATURE)) {
+             if (!SSL_use_cert_and_key(s, x509, pkey, NULL, 1))
+                 goto out;
+         }
+-        BIO_free(in);
+-        EVP_PKEY_free(pkey);
+-        X509_free(x509);
+-        return 1;
++
++        ret = 1;
+     }
+ 
+     /* Abort the handshake */
+  out:
++    OPENSSL_free(ecdsacert);
++    OPENSSL_free(ecdsakey);
++    OPENSSL_free(rootfile);
+     BIO_free(in);
+     EVP_PKEY_free(pkey);
+     X509_free(x509);
+-    return 0;
++    X509_free(rootx);
++    sk_X509_pop_free(chain, X509_free);
++    return ret;
+ }
+ 
+ /*
+@@ -5726,6 +5750,10 @@ static int cert_cb(SSL *s, void *arg)
+  * Test 0: Callback fails
+  * Test 1: Success - no SSL_set_SSL_CTX() in the callback
+  * Test 2: Success - SSL_set_SSL_CTX() in the callback
++ * Test 3: Success - Call SSL_check_chain from the callback
++ * Test 4: Failure - SSL_check_chain fails from callback due to bad cert in the
++ *                   chain
++ * Test 5: Failure - SSL_check_chain fails from callback due to bad ee cert
+  */
+ static int test_cert_cb_int(int prot, int tst)
+ {
+@@ -5733,6 +5761,12 @@ static int test_cert_cb_int(int prot, int tst)
+     SSL *clientssl = NULL, *serverssl = NULL;
+     int testresult = 0, ret;
+ 
++#ifdef OPENSSL_NO_EC
++    /* We use an EC cert in these tests, so we skip in a no-ec build */
++    if (tst &gt;= 3)
++        return 1;
++#endif
++
+     if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(),
+                                        TLS_client_method(),
+                                        TLS1_VERSION,
+@@ -5742,10 +5776,11 @@ static int test_cert_cb_int(int prot, int tst)
+ 
+     if (tst == 0)
+         cert_cb_cnt = -1;
+-    else if (tst == 3)
++    else if (tst &gt;= 3)
+         cert_cb_cnt = 3;
+     else
+         cert_cb_cnt = 0;
++
+     if (tst == 2)
+         snictx = SSL_CTX_new(TLS_server_method());
+     SSL_CTX_set_cert_cb(sctx, cert_cb, snictx);
+@@ -5754,8 +5789,26 @@ static int test_cert_cb_int(int prot, int tst)
+                                       NULL, NULL)))
+         goto end;
+ 
++    if (tst == 4) {
++        /*
++         * We cause SSL_check_chain() to fail by specifying sig_algs that
++         * the chain doesn't meet (the root uses an RSA cert)
++         */
++        if (!TEST_true(SSL_set1_sigalgs_list(clientssl,
++                                             &quot;ecdsa_secp256r1_sha256&quot;)))
++            goto end;
++    } else if (tst == 5) {
++        /*
++         * We cause SSL_check_chain() to fail by specifying sig_algs that
++         * the ee cert doesn't meet (the ee uses an ECDSA cert)
++         */
++        if (!TEST_true(SSL_set1_sigalgs_list(clientssl,
++                           &quot;rsa_pss_rsae_sha256:rsa_pkcs1_sha256&quot;)))
++            goto end;
++    }
++
+     ret = create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE);
+-    if (!TEST_true(tst == 0 ? !ret : ret)
++    if (!TEST_true(tst == 0 || tst == 4 || tst == 5 ? !ret : ret)
+             || (tst &gt; 0
+                 &amp;&amp; !TEST_int_eq((cert_cb_cnt - 2) * (cert_cb_cnt - 3), 0))) {
+         goto end;
+@@ -6018,10 +6071,9 @@ static int test_ca_names(int tst)
+ 
+ int setup_tests(void)
+ {
+-    if (!TEST_ptr(cert = test_get_argument(0))
+-            || !TEST_ptr(privkey = test_get_argument(1))
+-            || !TEST_ptr(srpvfile = test_get_argument(2))
+-            || !TEST_ptr(tmpfilename = test_get_argument(3)))
++    if (!TEST_ptr(certsdir = test_get_argument(0))
++            || !TEST_ptr(srpvfile = test_get_argument(1))
++            || !TEST_ptr(tmpfilename = test_get_argument(2)))
+         return 0;
+ 
+     if (getenv(&quot;OPENSSL_TEST_GETCOUNTS&quot;) != NULL) {
+@@ -6040,6 +6092,16 @@ int setup_tests(void)
+ #endif
+     }
+ 
++    cert = test_mk_file_path(certsdir, &quot;servercert.pem&quot;);
++    if (cert == NULL)
++        return 0;
++
++    privkey = test_mk_file_path(certsdir, &quot;serverkey.pem&quot;);
++    if (privkey == NULL) {
++        OPENSSL_free(cert);
++        return 0;
++    }
++
+     ADD_TEST(test_large_message_tls);
+     ADD_TEST(test_large_message_tls_read_ahead);
+ #ifndef OPENSSL_NO_DTLS
+@@ -6120,7 +6182,7 @@ int setup_tests(void)
+     ADD_ALL_TESTS(test_ssl_get_shared_ciphers, OSSL_NELEM(shared_ciphers_data));
+     ADD_ALL_TESTS(test_ticket_callbacks, 12);
+     ADD_ALL_TESTS(test_shutdown, 7);
+-    ADD_ALL_TESTS(test_cert_cb, 4);
++    ADD_ALL_TESTS(test_cert_cb, 6);
+     ADD_ALL_TESTS(test_client_cert_cb, 2);
+     ADD_ALL_TESTS(test_ca_names, 3);
+     return 1;
+@@ -6128,6 +6190,8 @@ int setup_tests(void)
+ 
+ void cleanup_tests(void)
+ {
++    OPENSSL_free(cert);
++    OPENSSL_free(privkey);
+     bio_s_mempacket_test_free();
+     bio_s_always_retry_free();
+ }
+diff --git a/test/testutil.h b/test/testutil.h
+index db0c74ef88..0e9e3d5c9e 100644
+--- a/test/testutil.h
++++ b/test/testutil.h
+@@ -462,4 +462,7 @@ char *glue_strings(const char *list[], size_t *out_len);
+ uint32_t test_random(void);
+ void test_random_seed(uint32_t sd);
+ 
++/* Create a file path from a directory and a filename */
++char *test_mk_file_path(const char *dir, const char *file);
++
+ #endif                          /* HEADER_TESTUTIL_H */
+diff --git a/test/testutil/driver.c b/test/testutil/driver.c
+index 48f94aea1e..89a3a0ba43 100644
+--- a/test/testutil/driver.c
++++ b/test/testutil/driver.c
+@@ -297,3 +297,21 @@ char *glue_strings(const char *list[], size_t *out_len)
+     return ret;
+ }
+ 
++char *test_mk_file_path(const char *dir, const char *file)
++{
++# ifndef OPENSSL_SYS_VMS
++    const char *sep = &quot;/&quot;;
++# else
++    const char *sep = &quot;&quot;;
++# endif
++    size_t len = strlen(dir) + strlen(sep) + strlen(file) + 1;
++    char *full_file = OPENSSL_zalloc(len);
++
++    if (full_file != NULL) {
++        OPENSSL_strlcpy(full_file, dir, len);
++        OPENSSL_strlcat(full_file, sep, len);
++        OPENSSL_strlcat(full_file, file, len);
++    }
++
++    return full_file;
++}
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024441.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="024455.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24443">[ date ]</a>
+              <a href="thread.html#24443">[ thread ]</a>
+              <a href="subject.html#24443">[ subject ]</a>
+              <a href="author.html#24443">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

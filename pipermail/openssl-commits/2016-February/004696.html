@@ -1,0 +1,203 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1456764133.646022.4183.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004694.html">
+   <LINK REL="Next"  HREF="004706.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1456764133.646022.4183.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon Feb 29 16:42:13 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004694.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="004706.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4696">[ date ]</a>
+              <a href="thread.html#4696">[ thread ]</a>
+              <a href="subject.html#4696">[ subject ]</a>
+              <a href="author.html#4696">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  99ba9fd02fd481eb971023a3a0a251a37eb87e4c (commit)
+      from  15e58273da866e47832ee46ef3023beeefb870a9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 99ba9fd02fd481eb971023a3a0a251a37eb87e4c
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Feb 22 10:27:18 2016 +0000
+
+    Fix BN_hex2bn/BN_dec2bn NULL ptr/heap corruption
+    
+    In the BN_hex2bn function the number of hex digits is calculated using
+    an int value |i|. Later |bn_expand| is called with a value of |i * 4|.
+    For large values of |i| this can result in |bn_expand| not allocating any
+    memory because |i * 4| is negative. This leaves ret-&gt;d as NULL leading
+    to a subsequent NULL ptr deref. For very large values of |i|, the
+    calculation |i * 4| could be a positive value smaller than |i|. In this
+    case memory is allocated to ret-&gt;d, but it is insufficiently sized
+    leading to heap corruption. A similar issue exists in BN_dec2bn.
+    
+    This could have security consequences if BN_hex2bn/BN_dec2bn is ever
+    called by user applications with very large untrusted hex/dec data. This is
+    anticipated to be a rare occurrence.
+    
+    All OpenSSL internal usage of this function uses data that is not expected
+    to be untrusted, e.g. config file data or application command line
+    arguments. If user developed applications generate config file data based
+    on untrusted data then it is possible that this could also lead to security
+    consequences. This is also anticipated to be a rare.
+    
+    Issue reported by Guido Vranken.
+    
+    CVE-2016-0797
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/bn_lcl.h               | 11 +++++++++++
+ crypto/bn/bn_print.c             | 17 +++++++++++++----
+ crypto/include/internal/bn_int.h |  3 +--
+ 3 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/crypto/bn/bn_lcl.h b/crypto/bn/bn_lcl.h
+index 4af8bfb..412740d 100644
+--- a/crypto/bn/bn_lcl.h
++++ b/crypto/bn/bn_lcl.h
+@@ -774,6 +774,17 @@ int bn_probable_prime_dh(BIGNUM *rnd, int bits,
+ int bn_probable_prime_dh_retry(BIGNUM *rnd, int bits, BN_CTX *ctx);
+ int bn_probable_prime_dh_coprime(BIGNUM *rnd, int bits, BN_CTX *ctx);
+ 
++static ossl_inline BIGNUM *bn_expand(BIGNUM *a, int bits)
++{
++    if (bits &gt; (INT_MAX - BN_BITS2 + 1))
++        return NULL;
++
++    if(((bits+BN_BITS2-1)/BN_BITS2) &lt;= (a)-&gt;dmax)
++        return a;
++
++    return bn_expand2((a),(bits+BN_BITS2-1)/BN_BITS2);
++}
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/crypto/bn/bn_print.c b/crypto/bn/bn_print.c
+index b73ed0a..0c3b214 100644
+--- a/crypto/bn/bn_print.c
++++ b/crypto/bn/bn_print.c
+@@ -57,6 +57,7 @@
+ 
+ #include &lt;stdio.h&gt;
+ #include &lt;ctype.h&gt;
++#include &lt;limits.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/buffer.h&gt;
+ #include &quot;bn_lcl.h&quot;
+@@ -183,7 +184,11 @@ int BN_hex2bn(BIGNUM **bn, const char *a)
+         a++;
+     }
+ 
+-    for (i = 0; isxdigit((unsigned char)a[i]); i++) ;
++    for (i = 0; i &lt;= (INT_MAX/4) &amp;&amp; isxdigit((unsigned char)a[i]); i++)
++        continue;
++
++    if (i &gt; INT_MAX/4)
++        goto err;
+ 
+     num = i + neg;
+     if (bn == NULL)
+@@ -198,7 +203,7 @@ int BN_hex2bn(BIGNUM **bn, const char *a)
+         BN_zero(ret);
+     }
+ 
+-    /* i is the number of hex digests; */
++    /* i is the number of hex digits */
+     if (bn_expand(ret, i * 4) == NULL)
+         goto err;
+ 
+@@ -254,7 +259,11 @@ int BN_dec2bn(BIGNUM **bn, const char *a)
+         a++;
+     }
+ 
+-    for (i = 0; isdigit((unsigned char)a[i]); i++) ;
++    for (i = 0; i &lt;= (INT_MAX/4) &amp;&amp; isdigit((unsigned char)a[i]); i++)
++        continue;
++
++    if (i &gt; INT_MAX/4)
++        goto err;
+ 
+     num = i + neg;
+     if (bn == NULL)
+@@ -272,7 +281,7 @@ int BN_dec2bn(BIGNUM **bn, const char *a)
+         BN_zero(ret);
+     }
+ 
+-    /* i is the number of digests, a bit of an over expand; */
++    /* i is the number of digits, a bit of an over expand */
+     if (bn_expand(ret, i * 4) == NULL)
+         goto err;
+ 
+diff --git a/crypto/include/internal/bn_int.h b/crypto/include/internal/bn_int.h
+index a7c0fd4..8ea5193 100644
+--- a/crypto/include/internal/bn_int.h
++++ b/crypto/include/internal/bn_int.h
+@@ -56,13 +56,12 @@
+ # define HEADER_BN_INT_H
+ 
+ # include &lt;openssl/bn.h&gt;
++# include &lt;limits.h&gt;
+ 
+ #ifdef  __cplusplus
+ extern &quot;C&quot; {
+ #endif
+ 
+-# define bn_expand(a,bits) ((((((bits+BN_BITS2-1))/BN_BITS2)) &lt;= (a)-&gt;dmax)?\
+-        (a):bn_expand2((a),(bits+BN_BITS2-1)/BN_BITS2))
+ BIGNUM *bn_wexpand(BIGNUM *a, int words);
+ BIGNUM *bn_expand2(BIGNUM *a, int words);
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004694.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="004706.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4696">[ date ]</a>
+              <a href="thread.html#4696">[ thread ]</a>
+              <a href="subject.html#4696">[ subject ]</a>
+              <a href="author.html#4696">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

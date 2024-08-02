@@ -1,0 +1,471 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [tools]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Btools%5D%20%20master%20update&In-Reply-To=%3C1497429126.845052.19510.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014996.html">
+   <LINK REL="Next"  HREF="015008.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [tools]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Btools%5D%20%20master%20update&In-Reply-To=%3C1497429126.845052.19510.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [tools]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Jun 14 08:32:06 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014996.html">[openssl-commits] Build completed: openssl master.10973
+</A></li>
+        <LI>Next message: <A HREF="015008.html">[openssl-commits] [tools]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15004">[ date ]</a>
+              <a href="thread.html#15004">[ thread ]</a>
+              <a href="subject.html#15004">[ subject ]</a>
+              <a href="author.html#15004">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  851081ea0b61dfbc4f5b8cfffe5ea97ee388a715 (commit)
+       via  5297816332bda684feabba0441269ca0d5c37165 (commit)
+      from  604dd16ed723ee1ce23762f2f06b0fd73065a92b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 851081ea0b61dfbc4f5b8cfffe5ea97ee388a715
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">richard at levitte.org</A>&gt;
+Date:   Wed Jun 14 10:27:57 2017 +0200
+
+    OpenSSL-Query: Implement late evaluation further in the REST client
+    
+    In the base class, take note of all implementions, not just the first
+    that initiated successfully.  Instead, use all impllementations in the
+    methods, and return the value from the first successful one.
+    
+    For the REST implementations, this means moving the check of server
+    errors to the implementation methods instead of doing so when building
+    the object.
+
+commit 5297816332bda684feabba0441269ca0d5c37165
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">richard at levitte.org</A>&gt;
+Date:   Wed Jun 14 10:27:05 2017 +0200
+
+    QueryApp: standardise entirely on Carp in the lib
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ OpenSSL-Query/lib/OpenSSL/Query.pm            | 57 +++++++++++++++++++++------
+ OpenSSL-Query/lib/OpenSSL/Query/ClaREST.pm    | 21 +++++-----
+ OpenSSL-Query/lib/OpenSSL/Query/PersonREST.pm | 24 ++++++-----
+ QueryApp/lib/OpenSSL/Query/PersonDB.pm        |  1 +
+ QueryApp/lib/OpenSSL/Query/Role/Bureau.pm     |  4 +-
+ 5 files changed, 74 insertions(+), 33 deletions(-)
+
+diff --git a/OpenSSL-Query/lib/OpenSSL/Query.pm b/OpenSSL-Query/lib/OpenSSL/Query.pm
+index 94b0cab..3d884bc 100644
+--- a/OpenSSL-Query/lib/OpenSSL/Query.pm
++++ b/OpenSSL-Query/lib/OpenSSL/Query.pm
+@@ -49,15 +49,15 @@ sub _new_type {
+   my @packages =
+     map { (sort keys %{$register_impl{$type}-&gt;{$_}}) }
+     sort keys %{$register_impl{$type}};
+-  my $obj = undef;
++  my @objs = ();
+   while (@packages) {
+-    $obj = (shift @packages)-&gt;new(@args);
+-    last if $obj;
++    my $obj = (shift @packages)-&gt;new(@args);
++    push @objs, $obj if $obj;
+   }
+ 
+-  croak &quot;No implementation for $type queries&quot; unless $obj;
++  croak &quot;No implementation for $type queries&quot; unless @objs;
+ 
+-  return $obj;
++  return @objs;
+ }
+ 
+ sub new {
+@@ -68,44 +68,77 @@ sub new {
+   bless $self, $class;
+ 
+   foreach (('person', 'cla')) {
+-    $self-&gt;{$_} = $self-&gt;_new_type($_, @args);
++    $self-&gt;{$_} = [ $self-&gt;_new_type($_, @args) ];
+   }
+ 
+   return $self;
+ }
+ 
++sub _perform {
++  my $self = shift;
++  my $sub = shift;
++  my $opts = shift;
++
++  croak &quot;\$opts MUST be a HASHref&quot; unless ref($opts) eq &quot;HASH&quot;;
++
++  my @errors = ();
++  foreach (@{$self-&gt;{person}}) {
++    my @result = eval { $sub-&gt;($_, $opts, @_) };
++    return @result unless $@;
++    push @errors, $@;
++  }
++
++  croak join(&quot;\n&quot;, @errors);
++}
++
+ # Person methods
+ sub find_person {
+   my $self = shift;
+ 
+-  return wantarray
+-    ? ($self-&gt;{person}-&gt;find_person(@_)) : $self-&gt;{person}-&gt;find_person(@_);
++  $self-&gt;_perform(sub { my $obj = shift;
++			my $opts = shift;
++			return $opts-&gt;{wantarray}
++			  ? ($obj-&gt;find_person(@_))
++			  : $obj-&gt;find_person(@_); },
++		  { wantarray =&gt; wantarray }, @_);
+ }
+ 
+ sub find_person_tag {
+   my $self = shift;
+ 
+-  $self-&gt;{person}-&gt;find_person_tag(@_);
++  $self-&gt;_perform(sub { my $obj = shift;
++			my $opts = shift;
++			$obj-&gt;find_person_tag(@_) },
++		  { wantarray =&gt; wantarray }, @_);
+ }
+ 
+ sub is_member_of {
+   my $self = shift;
+ 
+-  $self-&gt;{person}-&gt;is_member_of(@_);
++  $self-&gt;_perform(sub { my $obj = shift;
++			my $opts = shift;
++			$obj-&gt;is_member_of(@_) },
++		  { wantarray =&gt; wantarray }, @_);
+ }
+ 
+ # Group methods
+ sub members_of {
+   my $self = shift;
+ 
+-  $self-&gt;{person}-&gt;members_of(@_);
++  $self-&gt;_perform(sub { my $obj = shift;
++			my $opts = shift;
++			$obj-&gt;members_of(@_) },
++		  { wantarray =&gt; wantarray }, @_);
+ }
+ 
+ # Cla methods
+ sub has_cla {
+   my $self = shift;
+ 
+-  $self-&gt;{cla}-&gt;has_cla(@_);
++  $self-&gt;_perform(sub { my $obj = shift;
++			my $opts = shift;
++			$obj-&gt;has_cla(@_) },
++		  { wantarray =&gt; wantarray }, @_);
+ }
+ 
+ 1;
+diff --git a/OpenSSL-Query/lib/OpenSSL/Query/ClaREST.pm b/OpenSSL-Query/lib/OpenSSL/Query/ClaREST.pm
+index e643f24..a92ef8c 100644
+--- a/OpenSSL-Query/lib/OpenSSL/Query/ClaREST.pm
++++ b/OpenSSL-Query/lib/OpenSSL/Query/ClaREST.pm
+@@ -22,18 +22,18 @@ has base_url =&gt; ( is =&gt; 'ro', default =&gt; '<A HREF="https://api.openssl.org">https://api.openssl.org</A>' );
+ has _clahandler =&gt; ( is =&gt; 'ro', builder =&gt; 1 );
+ 
+ sub _build__clahandler {
+-  return LWP::UserAgent-&gt;new();
++  return LWP::UserAgent-&gt;new( keep_alive =&gt; 1 );
+ }
+ 
+-# Validation
+-sub BUILD {
+-  my $self = shift;
+-
+-  # print STDERR Dumper(@_);
+-  my $ua = $self-&gt;_clahandler;
+-  my $resp = $ua-&gt;get($self-&gt;base_url);
+-  croak &quot;Server error: &quot;, $resp-&gt;message if $resp-&gt;is_server_error;
+-}
++## Validation
++#sub BUILD {
++#  my $self = shift;
++#
++#  # print STDERR Dumper(@_);
++#  my $ua = $self-&gt;_clahandler;
++#  my $resp = $ua-&gt;get($self-&gt;base_url);
++#  croak &quot;Server error: &quot;, $resp-&gt;message if $resp-&gt;is_server_error;
++#}
+ 
+ sub has_cla {
+   my $self = shift;
+@@ -42,6 +42,7 @@ sub has_cla {
+   my $ua = $self-&gt;_clahandler;
+   my $json = $ua-&gt;get($self-&gt;base_url . '/0/HasCLA/'
+ 		      . uri_encode($id, {encode_reserved =&gt; 1}));
++  croak &quot;Server error: &quot;, $json-&gt;message if $json-&gt;is_server_error;
+   return $json-&gt;code == 200;
+ }
+ 
+diff --git a/OpenSSL-Query/lib/OpenSSL/Query/PersonREST.pm b/OpenSSL-Query/lib/OpenSSL/Query/PersonREST.pm
+index 729fb4e..082c877 100644
+--- a/OpenSSL-Query/lib/OpenSSL/Query/PersonREST.pm
++++ b/OpenSSL-Query/lib/OpenSSL/Query/PersonREST.pm
+@@ -22,18 +22,18 @@ has base_url =&gt; ( is =&gt; 'ro', default =&gt; '<A HREF="https://api.openssl.org">https://api.openssl.org</A>' );
+ has _personhandler =&gt; ( is =&gt; 'lazy', builder =&gt; 1 );
+ 
+ sub _build__personhandler {
+-  return LWP::UserAgent-&gt;new();
++  return LWP::UserAgent-&gt;new( keep_alive =&gt; 1 );
+ }
+ 
+-# Validation
+-sub BUILD {
+-  my $self = shift;
+-
+-  # print STDERR Dumper(@_);
+-  my $ua = $self-&gt;_personhandler;
+-  my $resp = $ua-&gt;get($self-&gt;base_url);
+-  croak &quot;Server error: &quot;, $resp-&gt;message if $resp-&gt;is_server_error;
+-}
++## Validation
++#sub BUILD {
++#  my $self = shift;
++#
++#  # print STDERR Dumper(@_);
++#  my $ua = $self-&gt;_personhandler;
++#  my $resp = $ua-&gt;get($self-&gt;base_url);
++#  croak &quot;Server error: &quot;, $resp-&gt;message if $resp-&gt;is_server_error;
++#}
+ 
+ sub find_person {
+   my $self = shift;
+@@ -42,6 +42,7 @@ sub find_person {
+   my $ua = $self-&gt;_personhandler;
+   my $json = $ua-&gt;get($self-&gt;base_url . '/0/Person/'
+ 			  . uri_encode($id, {encode_reserved =&gt; 1}));
++  croak &quot;Server error: &quot;, $json-&gt;message if $json-&gt;is_server_error;
+   return () unless $json-&gt;code == 200;
+ 
+   my $decoded = decode_json $json-&gt;decoded_content;
+@@ -60,6 +61,7 @@ sub find_person_tag {
+ 		      . uri_encode($id, {encode_reserved =&gt; 1})
+ 		      . '/ValueOfTag/'
+ 		      . uri_encode ($tag, {encode_reserved =&gt; 1}));
++  croak &quot;Server error: &quot;, $json-&gt;message if $json-&gt;is_server_error;
+   return undef unless $json-&gt;code == 200;
+ 
+   my $decoded = decode_json $json-&gt;decoded_content;
+@@ -78,6 +80,7 @@ sub is_member_of {
+ 		      . uri_encode($id, {encode_reserved =&gt; 1})
+ 		      . '/IsMemberOf/'
+ 		      . uri_encode ($group, {encode_reserved =&gt; 1}));
++  croak &quot;Server error: &quot;, $json-&gt;message if $json-&gt;is_server_error;
+   return 0 unless $json-&gt;code == 200;
+ 
+   my $decoded = decode_json $json-&gt;decoded_content;
+@@ -95,6 +98,7 @@ sub members_of {
+ 		      . '/0/Group/'
+ 		      . uri_encode($group, {encode_reserved =&gt; 1})
+ 		      . '/Members');
++  croak &quot;Server error: &quot;, $json-&gt;message if $json-&gt;is_server_error;
+   return () unless $json-&gt;code == 200;
+ 
+   my $decoded = decode_json $json-&gt;decoded_content;
+diff --git a/QueryApp/lib/OpenSSL/Query/PersonDB.pm b/QueryApp/lib/OpenSSL/Query/PersonDB.pm
+index 7c6e677..4d9ede3 100644
+--- a/QueryApp/lib/OpenSSL/Query/PersonDB.pm
++++ b/QueryApp/lib/OpenSSL/Query/PersonDB.pm
+@@ -10,6 +10,7 @@
+ use strict;
+ 
+ package OpenSSL::Query::PersonDB;
++
+ use Carp;
+ use Moo;
+ use OpenSSL::Query qw(-register-person OpenSSL::Query::PersonDB -priority 0);
+diff --git a/QueryApp/lib/OpenSSL/Query/Role/Bureau.pm b/QueryApp/lib/OpenSSL/Query/Role/Bureau.pm
+index a574556..f4771b5 100644
+--- a/QueryApp/lib/OpenSSL/Query/Role/Bureau.pm
++++ b/QueryApp/lib/OpenSSL/Query/Role/Bureau.pm
+@@ -8,9 +8,11 @@
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ 
+ use strict;
++use warnings;
+ 
+ package OpenSSL::Query::Role::Bureau;
+ 
++use Carp;
+ use File::Spec::Functions;
+ use Moo::Role;
+ 
+@@ -28,7 +30,7 @@ sub _find_file {
+   foreach (@paths) {
+     return $_ if -r $_;
+   }
+-  die &quot;$filename not found in any of &quot;, join(&quot;, &quot;, @paths), &quot;\n&quot;;
++  croak &quot;$filename not found in any of &quot;, join(&quot;, &quot;, @paths), &quot;\n&quot;;
+ }
+ 
+ 1;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014996.html">[openssl-commits] Build completed: openssl master.10973
+</A></li>
+	<LI>Next message: <A HREF="015008.html">[openssl-commits] [tools]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15004">[ date ]</a>
+              <a href="thread.html#15004">[ thread ]</a>
+              <a href="subject.html#15004">[ subject ]</a>
+              <a href="author.html#15004">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

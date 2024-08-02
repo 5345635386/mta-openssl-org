@@ -1,0 +1,297 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1551461427.836132.4590.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022138.html">
+   <LINK REL="Next"  HREF="022173.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>bernd.edlinger at hotmail.de</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1551461427.836132.4590.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">bernd.edlinger at hotmail.de
+       </A><BR>
+    <I>Fri Mar  1 17:30:27 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022138.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="022173.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22149">[ date ]</a>
+              <a href="thread.html#22149">[ thread ]</a>
+              <a href="subject.html#22149">[ subject ]</a>
+              <a href="author.html#22149">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  c352bd07ed2ff872876534c950a6968d75ef121e (commit)
+      from  de4fb434c7f5fe7359dd9f57185bb98845d8e6f1 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c352bd07ed2ff872876534c950a6968d75ef121e
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Fri Feb 15 00:03:50 2019 +0100
+
+    Fix seeding from random device w/o getrandom syscall
+    
+    Use select to wait for /dev/random in readable state,
+    but do not actually read anything from /dev/random,
+    use /dev/urandom first.
+    
+    Use linux define __NR_getrandom instead of the
+    glibc define SYS_getrandom, in case the kernel headers
+    are more current than the glibc headers.
+    
+    Fixes #8215
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8251">https://github.com/openssl/openssl/pull/8251</A>)
+    
+    (cherry picked from commit 38023b87f037f4b832c236dfce2a76272be08763)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/rand_unix.c | 29 ++++++++++++++++++++++++++---
+ e_os.h                  |  9 +++------
+ 2 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index 9cbc9ad..4710dbb 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -19,7 +19,7 @@
+ #include &lt;stdio.h&gt;
+ #include &quot;internal/dso.h&quot;
+ #if defined(__linux)
+-# include &lt;sys/syscall.h&gt;
++# include &lt;asm/unistd.h&gt;
+ #endif
+ #if defined(__FreeBSD__)
+ # include &lt;sys/types.h&gt;
+@@ -324,8 +324,8 @@ static ssize_t syscall_random(void *buf, size_t buflen)
+ #  endif
+ 
+     /* Linux supports this since version 3.17 */
+-#  if defined(__linux) &amp;&amp; defined(SYS_getrandom)
+-    return syscall(SYS_getrandom, buf, buflen, 0);
++#  if defined(__linux) &amp;&amp; defined(__NR_getrandom)
++    return syscall(__NR_getrandom, buf, buflen, 0);
+ #  elif (defined(__FreeBSD__) || defined(__NetBSD__)) &amp;&amp; defined(KERN_ARND)
+     return sysctl_random(buf, buflen);
+ #  else
+@@ -510,6 +510,29 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
+     {
+         size_t i;
++#ifdef DEVRANDOM_WAIT
++        static int wait_done = 0;
++
++        /*
++         * On some implementations reading from /dev/urandom is possible
++         * before it is initialized. Therefore we wait for /dev/random
++         * to be readable to make sure /dev/urandom is initialized.
++         */
++        if (!wait_done &amp;&amp; bytes_needed &gt; 0) {
++             int f = open(DEVRANDOM_WAIT, O_RDONLY);
++
++             if (f &gt;= 0) {
++                 fd_set fds;
++
++                 FD_ZERO(&amp;fds);
++                 FD_SET(f, &amp;fds);
++                 while (select(f+1, &amp;fds, NULL, NULL, NULL) &lt; 0
++                        &amp;&amp; errno == EINTR);
++                 close(f);
++             }
++             wait_done = 1;
++        }
++#endif
+ 
+         for (i = 0; bytes_needed &gt; 0 &amp;&amp; i &lt; OSSL_NELEM(random_device_paths); i++) {
+             ssize_t bytes = 0;
+diff --git a/e_os.h b/e_os.h
+index 8e6efa9..556688f 100644
+--- a/e_os.h
++++ b/e_os.h
+@@ -27,11 +27,8 @@
+  * set this to a comma-separated list of 'random' device files to try out. By
+  * default, we will try to read at least one of these files
+  */
+-#  if defined(__s390__)
+-#   define DEVRANDOM &quot;/dev/prandom&quot;,&quot;/dev/urandom&quot;,&quot;/dev/hwrng&quot;,&quot;/dev/random&quot;
+-#  else
+-#   define DEVRANDOM &quot;/dev/urandom&quot;,&quot;/dev/random&quot;,&quot;/dev/srandom&quot;
+-#  endif
++#  define DEVRANDOM &quot;/dev/urandom&quot;, &quot;/dev/random&quot;, &quot;/dev/hwrng&quot;, &quot;/dev/srandom&quot;
++#  define DEVRANDOM_WAIT &quot;/dev/random&quot;
+ # endif
+ # if !defined(OPENSSL_NO_EGD) &amp;&amp; !defined(DEVRANDOM_EGD)
+ /*
+@@ -39,7 +36,7 @@
+  * sockets will be tried in the order listed in case accessing the device
+  * files listed in DEVRANDOM did not return enough randomness.
+  */
+-#  define DEVRANDOM_EGD &quot;/var/run/egd-pool&quot;,&quot;/dev/egd-pool&quot;,&quot;/etc/egd-pool&quot;,&quot;/etc/entropy&quot;
++#  define DEVRANDOM_EGD &quot;/var/run/egd-pool&quot;, &quot;/dev/egd-pool&quot;, &quot;/etc/egd-pool&quot;, &quot;/etc/entropy&quot;
+ # endif
+ 
+ # if defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022138.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="022173.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22149">[ date ]</a>
+              <a href="thread.html#22149">[ thread ]</a>
+              <a href="subject.html#22149">[ subject ]</a>
+              <a href="author.html#22149">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,445 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1475327624.288336.29378.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011262.html">
+   <LINK REL="Next"  HREF="010910.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1475327624.288336.29378.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update">steve at openssl.org
+       </A><BR>
+    <I>Sat Oct  1 13:13:44 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011262.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="010910.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10907">[ date ]</a>
+              <a href="thread.html#10907">[ thread ]</a>
+              <a href="subject.html#10907">[ subject ]</a>
+              <a href="author.html#10907">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_0-stable has been updated
+       via  3f39423aac144bf10f04f8d7b069e72bac9fff98 (commit)
+       via  25a127bde9ec5022125158bba82e86b02afa76b1 (commit)
+      from  6b02b586c35359e338cfa151341e49aeb01590d0 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3f39423aac144bf10f04f8d7b069e72bac9fff98
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Thu Sep 29 19:24:26 2016 +0100
+
+    SRP code tidy.
+    
+    Tidy up srp_Calc_k and SRP_Calc_u by making them a special case of
+    srp_Calc_xy which performs SHA1(PAD(x) | PAD(y)).
+    
+    This addresses an OCAP Audit issue.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (cherry picked from commit 8f332ac962b377a52016927e6db7a15367cb839c)
+
+commit 25a127bde9ec5022125158bba82e86b02afa76b1
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Thu Sep 29 23:22:46 2016 +0100
+
+    Add SRP test vectors from RFC5054
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (cherry picked from commit 198d805900b183943a1ced0f5a230d55c8493a04)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/srp/srp_lib.c |  86 ++++++-----------------------
+ test/srptest.c       | 150 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 167 insertions(+), 69 deletions(-)
+
+diff --git a/crypto/srp/srp_lib.c b/crypto/srp/srp_lib.c
+index ddd86b7..e79352c 100644
+--- a/crypto/srp/srp_lib.c
++++ b/crypto/srp/srp_lib.c
+@@ -14,92 +14,40 @@
+ # include &lt;openssl/evp.h&gt;
+ # include &quot;internal/bn_srp.h&quot;
+ 
+-static BIGNUM *srp_Calc_k(const BIGNUM *N, const BIGNUM *g)
+-{
+-    /* k = SHA1(N | PAD(g)) -- tls-srp draft 8 */
++/* calculate = SHA1(PAD(x) || PAD(y)) */
+ 
++static BIGNUM *srp_Calc_xy(const BIGNUM *x, const BIGNUM *y, const BIGNUM *N)
++{
+     unsigned char digest[SHA_DIGEST_LENGTH];
+     unsigned char *tmp = NULL;
+-    EVP_MD_CTX *ctxt = NULL;
+-    int longg;
+-    int longN = BN_num_bytes(N);
++    int numN = BN_num_bytes(N);
+     BIGNUM *res = NULL;
+-
+-    if (BN_ucmp(g, N) &gt;= 0)
++    if (x != N &amp;&amp; BN_ucmp(x, N) &gt;= 0)
+         return NULL;
+-
+-    ctxt = EVP_MD_CTX_new();
+-    if (ctxt == NULL)
++    if (y != N &amp;&amp; BN_ucmp(y, N) &gt;= 0)
+         return NULL;
+-    if ((tmp = OPENSSL_malloc(longN)) == NULL)
+-        goto err;
+-    BN_bn2bin(N, tmp);
+-
+-    if (!EVP_DigestInit_ex(ctxt, EVP_sha1(), NULL)
+-        || !EVP_DigestUpdate(ctxt, tmp, longN))
++    if ((tmp = OPENSSL_malloc(numN * 2)) == NULL)
+         goto err;
+-
+-    memset(tmp, 0, longN);
+-    longg = BN_bn2bin(g, tmp);
+-    /* use the zeros behind to pad on left */
+-    if (!EVP_DigestUpdate(ctxt, tmp + longg, longN - longg)
+-        || !EVP_DigestUpdate(ctxt, tmp, longg))
+-        goto err;
+-
+-    if (!EVP_DigestFinal_ex(ctxt, digest, NULL))
++    if (BN_bn2binpad(x, tmp, numN) &lt; 0
++        || BN_bn2binpad(y, tmp + numN, numN) &lt; 0
++        || !EVP_Digest(tmp, numN * 2, digest, NULL, EVP_sha1(), NULL))
+         goto err;
+     res = BN_bin2bn(digest, sizeof(digest), NULL);
+  err:
+     OPENSSL_free(tmp);
+-    EVP_MD_CTX_free(ctxt);
+     return res;
+ }
+ 
++static BIGNUM *srp_Calc_k(const BIGNUM *N, const BIGNUM *g)
++{
++    /* k = SHA1(N | PAD(g)) -- tls-srp draft 8 */
++    return srp_Calc_xy(N, g, N);
++}
++
+ BIGNUM *SRP_Calc_u(const BIGNUM *A, const BIGNUM *B, const BIGNUM *N)
+ {
+     /* k = SHA1(PAD(A) || PAD(B) ) -- tls-srp draft 8 */
+-
+-    BIGNUM *u = NULL;
+-    unsigned char cu[SHA_DIGEST_LENGTH];
+-    unsigned char *cAB = NULL;
+-    EVP_MD_CTX *ctxt = NULL;
+-    int longN;
+-    if ((A == NULL) || (B == NULL) || (N == NULL))
+-        return NULL;
+-
+-    if (BN_ucmp(A, N) &gt;= 0 || BN_ucmp(B, N) &gt;= 0)
+-        return NULL;
+-
+-    longN = BN_num_bytes(N);
+-
+-    ctxt = EVP_MD_CTX_new();
+-    if (ctxt == NULL)
+-        return NULL;
+-    if ((cAB = OPENSSL_malloc(2 * longN)) == NULL)
+-        goto err;
+-
+-    memset(cAB, 0, longN);
+-
+-    if (!EVP_DigestInit_ex(ctxt, EVP_sha1(), NULL)
+-        || !EVP_DigestUpdate(ctxt, cAB + BN_bn2bin(A, cAB + longN), longN)
+-        || !EVP_DigestUpdate(ctxt, cAB + BN_bn2bin(B, cAB + longN), longN))
+-        goto err;
+-
+-    if (!EVP_DigestFinal_ex(ctxt, cu, NULL))
+-        goto err;
+-
+-    if ((u = BN_bin2bn(cu, sizeof(cu), NULL)) == NULL)
+-        goto err;
+-    if (BN_is_zero(u)) {
+-        BN_free(u);
+-        u = NULL;
+-    }
+-
+- err:
+-    OPENSSL_free(cAB);
+-    EVP_MD_CTX_free(ctxt);
+-
+-    return u;
++    return srp_Calc_xy(A, B, N);
+ }
+ 
+ BIGNUM *SRP_Calc_server_key(const BIGNUM *A, const BIGNUM *v, const BIGNUM *u,
+diff --git a/test/srptest.c b/test/srptest.c
+index 8d0aaa3..73b3881 100644
+--- a/test/srptest.c
++++ b/test/srptest.c
+@@ -130,6 +130,150 @@ static int run_srp(const char *username, const char *client_pass,
+     return ret;
+ }
+ 
++static int check_bn(const char *name, const BIGNUM *bn, const char *hexbn)
++{
++    BIGNUM *tmp = NULL;
++    int rv;
++    if (BN_hex2bn(&amp;tmp, hexbn) == 0)
++        return 0;
++    rv = BN_cmp(bn, tmp);
++    if (rv == 0) {
++        printf(&quot;%s = &quot;, name);
++        BN_print_fp(stdout, bn);
++        printf(&quot;\n&quot;);
++        BN_free(tmp);
++        return 1;
++    }
++    printf(&quot;Unexpected %s value\n&quot;, name);
++    printf(&quot;Expecting: &quot;);
++    BN_print_fp(stdout, tmp);
++    printf(&quot;\nReceived: &quot;);
++    BN_print_fp(stdout, bn);
++    printf(&quot;\n&quot;);
++    BN_free(tmp);
++    return 0;
++}
++
++/* SRP test vectors from RFC5054 */
++static int run_srp_kat(void)
++{
++    int ret = 0;
++    BIGNUM *s = NULL;
++    BIGNUM *v = NULL;
++    BIGNUM *a = NULL;
++    BIGNUM *b = NULL;
++    BIGNUM *u = NULL;
++    BIGNUM *x = NULL;
++    BIGNUM *Apub = NULL;
++    BIGNUM *Bpub = NULL;
++    BIGNUM *Kclient = NULL;
++    BIGNUM *Kserver = NULL;
++    /* use builtin 1024-bit params */
++    const SRP_gN *GN = SRP_get_default_gN(&quot;1024&quot;);
++
++    if (GN == NULL) {
++        fprintf(stderr, &quot;Failed to get SRP parameters\n&quot;);
++        goto err;
++    }
++    BN_hex2bn(&amp;s, &quot;BEB25379D1A8581EB5A727673A2441EE&quot;);
++    /* Set up server's password entry */
++    if (!SRP_create_verifier_BN(&quot;alice&quot;, &quot;password123&quot;, &amp;s, &amp;v, GN-&gt;N,
++                                GN-&gt;g)) {
++        fprintf(stderr, &quot;Failed to create SRP verifier\n&quot;);
++        goto err;
++    }
++
++    if (!check_bn(&quot;v&quot;, v,
++                 &quot;7E273DE8696FFC4F4E337D05B4B375BEB0DDE1569E8FA00A9886D812&quot;
++                 &quot;9BADA1F1822223CA1A605B530E379BA4729FDC59F105B4787E5186F5&quot;
++                 &quot;C671085A1447B52A48CF1970B4FB6F8400BBF4CEBFBB168152E08AB5&quot;
++                 &quot;EA53D15C1AFF87B2B9DA6E04E058AD51CC72BFC9033B564E26480D78&quot;
++                 &quot;E955A5E29E7AB245DB2BE315E2099AFB&quot;))
++        goto err;
++
++    /* Server random */
++    BN_hex2bn(&amp;b, &quot;E487CB59D31AC550471E81F00F6928E01DDA08E974A004F49E61F5D1&quot;
++                  &quot;05284D20&quot;);
++
++    /* Server's first message */
++    Bpub = SRP_Calc_B(b, GN-&gt;N, GN-&gt;g, v);
++
++    if (!SRP_Verify_B_mod_N(Bpub, GN-&gt;N)) {
++        fprintf(stderr, &quot;Invalid B\n&quot;);
++        goto err;
++    }
++
++    if (!check_bn(&quot;B&quot;, Bpub,
++                  &quot;BD0C61512C692C0CB6D041FA01BB152D4916A1E77AF46AE105393011&quot;
++                  &quot;BAF38964DC46A0670DD125B95A981652236F99D9B681CBF87837EC99&quot;
++                  &quot;6C6DA04453728610D0C6DDB58B318885D7D82C7F8DEB75CE7BD4FBAA&quot;
++                  &quot;37089E6F9C6059F388838E7A00030B331EB76840910440B1B27AAEAE&quot;
++                  &quot;EB4012B7D7665238A8E3FB004B117B58&quot;))
++        goto err;
++
++    /* Client random */
++    BN_hex2bn(&amp;a, &quot;60975527035CF2AD1989806F0407210BC81EDC04E2762A56AFD529DD&quot;
++                  &quot;DA2D4393&quot;);
++
++    /* Client's response */
++    Apub = SRP_Calc_A(a, GN-&gt;N, GN-&gt;g);
++
++    if (!SRP_Verify_A_mod_N(Apub, GN-&gt;N)) {
++        fprintf(stderr, &quot;Invalid A\n&quot;);
++        return -1;
++    }
++
++    if (!check_bn(&quot;A&quot;, Apub,
++                  &quot;61D5E490F6F1B79547B0704C436F523DD0E560F0C64115BB72557EC4&quot;
++                  &quot;4352E8903211C04692272D8B2D1A5358A2CF1B6E0BFCF99F921530EC&quot;
++                  &quot;8E39356179EAE45E42BA92AEACED825171E1E8B9AF6D9C03E1327F44&quot;
++                  &quot;BE087EF06530E69F66615261EEF54073CA11CF5858F0EDFDFE15EFEA&quot;
++                  &quot;B349EF5D76988A3672FAC47B0769447B&quot;))
++        goto err;
++
++    /* Both sides calculate u */
++    u = SRP_Calc_u(Apub, Bpub, GN-&gt;N);
++
++    if (!check_bn(&quot;u&quot;, u, &quot;CE38B9593487DA98554ED47D70A7AE5F462EF019&quot;))
++        goto err;
++
++    /* Client's key */
++    x = SRP_Calc_x(s, &quot;alice&quot;, &quot;password123&quot;);
++    Kclient = SRP_Calc_client_key(GN-&gt;N, Bpub, GN-&gt;g, x, a, u);
++    if (!check_bn(&quot;Client's key&quot;, Kclient,
++                  &quot;B0DC82BABCF30674AE450C0287745E7990A3381F63B387AAF271A10D&quot;
++                  &quot;233861E359B48220F7C4693C9AE12B0A6F67809F0876E2D013800D6C&quot;
++                  &quot;41BB59B6D5979B5C00A172B4A2A5903A0BDCAF8A709585EB2AFAFA8F&quot;
++                  &quot;3499B200210DCC1F10EB33943CD67FC88A2F39A4BE5BEC4EC0A3212D&quot;
++                  &quot;C346D7E474B29EDE8A469FFECA686E5A&quot;))
++        goto err;
++    /* Server's key */
++    Kserver = SRP_Calc_server_key(Apub, v, u, b, GN-&gt;N);
++    if (!check_bn(&quot;Server's key&quot;, Kserver,
++                  &quot;B0DC82BABCF30674AE450C0287745E7990A3381F63B387AAF271A10D&quot;
++                  &quot;233861E359B48220F7C4693C9AE12B0A6F67809F0876E2D013800D6C&quot;
++                  &quot;41BB59B6D5979B5C00A172B4A2A5903A0BDCAF8A709585EB2AFAFA8F&quot;
++                  &quot;3499B200210DCC1F10EB33943CD67FC88A2F39A4BE5BEC4EC0A3212D&quot;
++                  &quot;C346D7E474B29EDE8A469FFECA686E5A&quot;))
++        goto err;
++
++    ret = 1;
++
++    err:
++    BN_clear_free(Kclient);
++    BN_clear_free(Kserver);
++    BN_clear_free(x);
++    BN_free(u);
++    BN_free(Apub);
++    BN_clear_free(a);
++    BN_free(Bpub);
++    BN_clear_free(b);
++    BN_free(s);
++    BN_clear_free(v);
++
++    return ret;
++}
++
+ int main(int argc, char **argv)
+ {
+     BIO *bio_err;
+@@ -151,6 +295,12 @@ int main(int argc, char **argv)
+         return 1;
+     }
+ 
++    /* KAT from RFC5054: should pass */
++    if (run_srp_kat() != 1) {
++        fprintf(stderr, &quot;SRP KAT failed\n&quot;);
++        return 1;
++    }
++
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
+     if (CRYPTO_mem_leaks(bio_err) &lt;= 0)
+         return 1;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011262.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="010910.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10907">[ date ]</a>
+              <a href="thread.html#10907">[ thread ]</a>
+              <a href="subject.html#10907">[ subject ]</a>
+              <a href="author.html#10907">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,442 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1614169541.073609.26145.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033242.html">
+   <LINK REL="Next"  HREF="033244.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1614169541.073609.26145.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Feb 24 12:25:41 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033242.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033244.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33243">[ date ]</a>
+              <a href="thread.html#33243">[ thread ]</a>
+              <a href="subject.html#33243">[ subject ]</a>
+              <a href="author.html#33243">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  81c15ed00bbe5cb4b864ad9b1fab12a26fa91201 (commit)
+       via  de4a88a979193e1f28c65c1f902828dd91d10ba5 (commit)
+      from  b0001d0cf2539b9309712e3e04f407dcbb04352c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 81c15ed00bbe5cb4b864ad9b1fab12a26fa91201
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Feb 16 10:10:26 2021 +0000
+
+    Test errors from a provider can still be accessed after unload
+    
+    Providers can create errors that may refer to const strings within the
+    provider module itself. If the provider gets unloaded we need to be sure
+    that we can still access the errors in the error stack.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14213">https://github.com/openssl/openssl/pull/14213</A>)
+
+commit de4a88a979193e1f28c65c1f902828dd91d10ba5
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Feb 15 16:59:43 2021 +0000
+
+    Duplicate the file and func error strings
+    
+    Errors raised from a provider that is subsequently unloaded from memory
+    may have references to strings representing the file and function that
+    are no longer present because the provider is no longer in memory. This
+    can cause crashes. To avoid this we duplicate the file and func strings.
+    
+    Fixes #13623
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14213">https://github.com/openssl/openssl/pull/14213</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/err/err.c         |  2 +-
+ crypto/err/err_local.h   | 21 ++++++++++++--
+ include/openssl/err.h.in |  4 +--
+ test/build.info          |  6 ++--
+ test/p_test.c            | 73 ++++++++++++++++++++++++++++++++++++++++++++----
+ test/provider_test.c     | 64 +++++++++++++++++++++++++++++++++---------
+ 6 files changed, 143 insertions(+), 27 deletions(-)
+
+diff --git a/crypto/err/err.c b/crypto/err/err.c
+index fe91ca7b5d..e5f9866813 100644
+--- a/crypto/err/err.c
++++ b/crypto/err/err.c
+@@ -190,7 +190,7 @@ static void ERR_STATE_free(ERR_STATE *s)
+     if (s == NULL)
+         return;
+     for (i = 0; i &lt; ERR_NUM_ERRORS; i++) {
+-        err_clear_data(s, i, 1);
++        err_clear(s, i, 1);
+     }
+     OPENSSL_free(s);
+ }
+diff --git a/crypto/err/err_local.h b/crypto/err/err_local.h
+index 03e05b7a1c..abb6996e13 100644
+--- a/crypto/err/err_local.h
++++ b/crypto/err/err_local.h
+@@ -48,9 +48,21 @@ static ossl_inline void err_set_debug(ERR_STATE *es, size_t i,
+                                       const char *file, int line,
+                                       const char *fn)
+ {
+-    es-&gt;err_file[i] = file;
++    /*
++     * We dup the file and fn strings because they may be provider owned. If the
++     * provider gets unloaded, they may not be valid anymore.
++     */
++    OPENSSL_free(es-&gt;err_file[i]);
++    if (file == NULL || file[0] == '\0')
++        es-&gt;err_file[i] = NULL;
++    else
++        es-&gt;err_file[i] = OPENSSL_strdup(file);
+     es-&gt;err_line[i] = line;
+-    es-&gt;err_func[i] = fn;
++    OPENSSL_free(es-&gt;err_func[i]);
++    if (fn == NULL || fn[0] == '\0')
++        es-&gt;err_func[i] = NULL;
++    else
++        es-&gt;err_func[i] = OPENSSL_strdup(fn);
+ }
+ 
+ static ossl_inline void err_set_data(ERR_STATE *es, size_t i,
+@@ -67,8 +79,11 @@ static ossl_inline void err_clear(ERR_STATE *es, size_t i, int deall)
+     es-&gt;err_marks[i] = 0;
+     es-&gt;err_flags[i] = 0;
+     es-&gt;err_buffer[i] = 0;
+-    es-&gt;err_file[i] = NULL;
+     es-&gt;err_line[i] = -1;
++    OPENSSL_free(es-&gt;err_file[i]);
++    es-&gt;err_file[i] = NULL;
++    OPENSSL_free(es-&gt;err_func[i]);
++    es-&gt;err_func[i] = NULL;
+ }
+ 
+ ERR_STATE *err_get_state_int(void);
+diff --git a/include/openssl/err.h.in b/include/openssl/err.h.in
+index c012f65d08..f7d5c174a1 100644
+--- a/include/openssl/err.h.in
++++ b/include/openssl/err.h.in
+@@ -62,9 +62,9 @@ struct err_state_st {
+     char *err_data[ERR_NUM_ERRORS];
+     size_t err_data_size[ERR_NUM_ERRORS];
+     int err_data_flags[ERR_NUM_ERRORS];
+-    const char *err_file[ERR_NUM_ERRORS];
++    char *err_file[ERR_NUM_ERRORS];
+     int err_line[ERR_NUM_ERRORS];
+-    const char *err_func[ERR_NUM_ERRORS];
++    char *err_func[ERR_NUM_ERRORS];
+     int top, bottom;
+ };
+ # endif
+diff --git a/test/build.info b/test/build.info
+index 5bf35dcb10..3b0fa12d20 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -762,17 +762,17 @@ IF[{- !$disabled{tests} -}]
+   PROGRAMS{noinst}=provider_internal_test
+   DEFINE[provider_internal_test]=PROVIDER_INIT_FUNCTION_NAME=p_test_init
+   SOURCE[provider_internal_test]=provider_internal_test.c p_test.c
+-  INCLUDE[provider_internal_test]=../include ../apps/include
++  INCLUDE[provider_internal_test]=../include ../apps/include ..
+   DEPEND[provider_internal_test]=../libcrypto.a libtestutil.a
+   PROGRAMS{noinst}=provider_test
+   DEFINE[provider_test]=PROVIDER_INIT_FUNCTION_NAME=p_test_init
+   SOURCE[provider_test]=provider_test.c p_test.c
+-  INCLUDE[provider_test]=../include ../apps/include
++  INCLUDE[provider_test]=../include ../apps/include ..
+   DEPEND[provider_test]=../libcrypto.a libtestutil.a
+   IF[{- !$disabled{module} -}]
+     MODULES{noinst}=p_test
+     SOURCE[p_test]=p_test.c
+-    INCLUDE[p_test]=../include
++    INCLUDE[p_test]=../include ..
+     IF[{- defined $target{shared_defflag} -}]
+       SOURCE[p_test]=p_test.ld
+       GENERATE[p_test.ld]=../util/providers.num
+diff --git a/test/p_test.c b/test/p_test.c
+index dfd62ebd83..57597086aa 100644
+--- a/test/p_test.c
++++ b/test/p_test.c
+@@ -26,11 +26,22 @@
+ # define OSSL_provider_init PROVIDER_INIT_FUNCTION_NAME
+ #endif
+ 
++#include &quot;e_os.h&quot;
+ #include &lt;openssl/core.h&gt;
+ #include &lt;openssl/core_dispatch.h&gt;
++#include &lt;openssl/err.h&gt;
++
++typedef struct p_test_ctx {
++    char *thisfile;
++    char *thisfunc;
++    const OSSL_CORE_HANDLE *handle;
++} P_TEST_CTX;
+ 
+ static OSSL_FUNC_core_gettable_params_fn *c_gettable_params = NULL;
+ static OSSL_FUNC_core_get_params_fn *c_get_params = NULL;
++static OSSL_FUNC_core_new_error_fn *c_new_error;
++static OSSL_FUNC_core_set_error_debug_fn *c_set_error_debug;
++static OSSL_FUNC_core_vset_error_fn *c_vset_error;
+ 
+ /* Tell the core what params we provide and what type they are */
+ static const OSSL_PARAM p_param_types[] = {
+@@ -42,15 +53,17 @@ static const OSSL_PARAM p_param_types[] = {
+ static OSSL_FUNC_provider_gettable_params_fn p_gettable_params;
+ static OSSL_FUNC_provider_get_params_fn p_get_params;
+ static OSSL_FUNC_provider_get_reason_strings_fn p_get_reason_strings;
++static OSSL_FUNC_provider_teardown_fn p_teardown;
+ 
+ static const OSSL_PARAM *p_gettable_params(void *_)
+ {
+     return p_param_types;
+ }
+ 
+-static int p_get_params(void *vhand, OSSL_PARAM params[])
++static int p_get_params(void *provctx, OSSL_PARAM params[])
+ {
+-    const OSSL_CORE_HANDLE *hand = vhand;
++    P_TEST_CTX *ctx = (P_TEST_CTX *)provctx;
++    const OSSL_CORE_HANDLE *hand = ctx-&gt;handle;
+     OSSL_PARAM *p = params;
+     int ok = 1;
+ 
+@@ -101,6 +114,14 @@ static int p_get_params(void *vhand, OSSL_PARAM params[])
+     return ok;
+ }
+ 
++static void p_set_error(int lib, int reason, const char *file, int line,
++                        const char *func)
++{
++    c_new_error(NULL);
++    c_set_error_debug(NULL, file, line, func);
++    c_vset_error(NULL, ERR_PACK(lib, 0, reason), NULL, NULL);
++}
++
+ static const OSSL_ITEM *p_get_reason_strings(void *_)
+ {
+     static const OSSL_ITEM reason_strings[] = {
+@@ -116,6 +137,7 @@ static const OSSL_DISPATCH p_test_table[] = {
+     { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))p_get_params },
+     { OSSL_FUNC_PROVIDER_GET_REASON_STRINGS,
+         (void (*)(void))p_get_reason_strings},
++    { OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))p_teardown },
+     { 0, NULL }
+ };
+ 
+@@ -124,6 +146,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+                        const OSSL_DISPATCH **out,
+                        void **provctx)
+ {
++    P_TEST_CTX *ctx;
++
+     for (; in-&gt;function_id != 0; in++) {
+         switch (in-&gt;function_id) {
+         case OSSL_FUNC_CORE_GETTABLE_PARAMS:
+@@ -132,15 +156,54 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+         case OSSL_FUNC_CORE_GET_PARAMS:
+             c_get_params = OSSL_FUNC_core_get_params(in);
+             break;
++        case OSSL_FUNC_CORE_NEW_ERROR:
++            c_new_error = OSSL_FUNC_core_new_error(in);
++            break;
++        case OSSL_FUNC_CORE_SET_ERROR_DEBUG:
++            c_set_error_debug = OSSL_FUNC_core_set_error_debug(in);
++            break;
++        case OSSL_FUNC_CORE_VSET_ERROR:
++            c_vset_error = OSSL_FUNC_core_vset_error(in);
++            break;
+         default:
+             /* Just ignore anything we don't understand */
+             break;
+         }
+     }
+ 
+-    /* Because we use this in get_params, we need to pass it back */
+-    *provctx = (void *)handle;
+-
++    /*
++     * We want to test that libcrypto doesn't use the file and func pointers
++     * that we provide to it via c_set_error_debug beyond the time that they
++     * are valid for. Therefore we dynamically allocate these strings now and
++     * free them again when the provider is torn down. If anything tries to
++     * use those strings after that point there will be a use-after-free and
++     * asan will complain (and hence the tests will fail).
++     * This file isn't linked against libcrypto, so we use malloc and strdup
++     * instead of OPENSSL_malloc and OPENSSL_strdup
++     */
++    ctx = malloc(sizeof(*ctx));
++    if (ctx == NULL)
++        return 0;
++    ctx-&gt;thisfile = strdup(OPENSSL_FILE);
++    ctx-&gt;thisfunc = strdup(OPENSSL_FUNC);
++    ctx-&gt;handle = handle;
++
++    /*
++     * Set a spurious error to check error handling works correctly. This will
++     * be ignored
++     */
++    p_set_error(ERR_LIB_PROV, 1, ctx-&gt;thisfile, OPENSSL_LINE, ctx-&gt;thisfunc);
++
++    *provctx = (void *)ctx;
+     *out = p_test_table;
+     return 1;
+ }
++
++static void p_teardown(void *provctx)
++{
++    P_TEST_CTX *ctx = (P_TEST_CTX *)provctx;
++
++    free(ctx-&gt;thisfile);
++    free(ctx-&gt;thisfunc);
++    free(ctx);
++}
+diff --git a/test/provider_test.c b/test/provider_test.c
+index acb9f2000e..7406bb4318 100644
+--- a/test/provider_test.c
++++ b/test/provider_test.c
+@@ -19,41 +19,79 @@ static OSSL_PARAM greeting_request[] = {
+     { NULL, 0, NULL, 0, 0 }
+ };
+ 
+-static int test_provider(const char *name)
++static int test_provider(OSSL_LIB_CTX **libctx, const char *name)
+ {
+     OSSL_PROVIDER *prov = NULL;
+     const char *greeting = NULL;
+     char expected_greeting[256];
++    int ok = 0;
++    long err;
+ 
+     BIO_snprintf(expected_greeting, sizeof(expected_greeting),
+                  &quot;Hello OpenSSL %.20s, greetings from %s!&quot;,
+                  OPENSSL_VERSION_STR, name);
+ 
+-    return
+-        TEST_ptr(prov = OSSL_PROVIDER_load(NULL, name))
+-        &amp;&amp; TEST_true(OSSL_PROVIDER_get_params(prov, greeting_request))
+-        &amp;&amp; TEST_ptr(greeting = greeting_request[0].data)
+-        &amp;&amp; TEST_size_t_gt(greeting_request[0].data_size, 0)
+-        &amp;&amp; TEST_str_eq(greeting, expected_greeting)
+-        &amp;&amp; TEST_true(OSSL_PROVIDER_unload(prov));
++    if (!TEST_ptr(prov = OSSL_PROVIDER_load(*libctx, name))
++            || !TEST_true(OSSL_PROVIDER_get_params(prov, greeting_request))
++            || !TEST_ptr(greeting = greeting_request[0].data)
++            || !TEST_size_t_gt(greeting_request[0].data_size, 0)
++            || !TEST_str_eq(greeting, expected_greeting)
++            || !TEST_true(OSSL_PROVIDER_unload(prov)))
++        goto err;
++
++    prov = NULL;
++
++    /*
++     * We must free the libctx to force the provider to really be unloaded from
++     * memory
++     */
++    OSSL_LIB_CTX_free(*libctx);
++    *libctx = NULL;
++
++    /* Make sure we got the error we were expecting */
++    err = ERR_peek_last_error();
++    if (!TEST_int_gt(err, 0)
++            || !TEST_int_eq(ERR_GET_REASON(err), 1))
++        goto err;
++
++    /* We print out all the data to make sure it can still be accessed */
++    ERR_print_errors_fp(stderr);
++    ok = 1;
++ err:
++    OSSL_PROVIDER_unload(prov);
++    OSSL_LIB_CTX_free(*libctx);
++    *libctx = NULL;
++    return ok;
+ }
+ 
+ static int test_builtin_provider(void)
+ {
++    OSSL_LIB_CTX *libctx = OSSL_LIB_CTX_new();
+     const char *name = &quot;p_test_builtin&quot;;
++    int ok;
+ 
+-    return
+-        TEST_true(OSSL_PROVIDER_add_builtin(NULL, name,
+-                                            PROVIDER_INIT_FUNCTION_NAME))
+-        &amp;&amp; test_provider(name);
++    ok =
++        TEST_ptr(libctx)
++        &amp;&amp; TEST_true(OSSL_PROVIDER_add_builtin(libctx, name,
++                                               PROVIDER_INIT_FUNCTION_NAME))
++        &amp;&amp; test_provider(&amp;libctx, name);
++
++    OSSL_LIB_CTX_free(libctx);
++
++    return ok;
+ }
+ 
+ #ifndef NO_PROVIDER_MODULE
+ static int test_loaded_provider(void)
+ {
++    OSSL_LIB_CTX *libctx = OSSL_LIB_CTX_new();
+     const char *name = &quot;p_test&quot;;
+ 
+-    return test_provider(name);
++    if (!TEST_ptr(libctx))
++        return 0;
++
++    /* test_provider will free libctx as part of the test */
++    return test_provider(&amp;libctx, name);
+ }
+ #endif
+ 
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033242.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033244.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33243">[ date ]</a>
+              <a href="thread.html#33243">[ thread ]</a>
+              <a href="subject.html#33243">[ subject ]</a>
+              <a href="author.html#33243">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

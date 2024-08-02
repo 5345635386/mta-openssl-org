@@ -1,0 +1,383 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457486261.925997.14084.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005183.html">
+   <LINK REL="Next"  HREF="005187.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457486261.925997.14084.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Mar  9 01:17:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005183.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005187.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5185">[ date ]</a>
+              <a href="thread.html#5185">[ thread ]</a>
+              <a href="subject.html#5185">[ subject ]</a>
+              <a href="author.html#5185">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  bfd53c32cd840ed381ba557c4de8f21e3615655c (commit)
+       via  f58cee8fb47da29ec44e3429e8cf630afd046b79 (commit)
+       via  8eed7e873bb54ab46b15e6efa3aff416e02f4d7f (commit)
+      from  29eed3ddb856ab1804f65d53a673078c7f5ac38d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit bfd53c32cd840ed381ba557c4de8f21e3615655c
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Wed Mar 9 00:03:50 2016 +0000
+
+    Ensure CRYPTO_mem_leaks is the last thing we do
+    
+    CRYPTO_mem_leaks de-inits the library, so we must not do anything
+    interesting after we've used it!
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit f58cee8fb47da29ec44e3429e8cf630afd046b79
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Mar 8 20:59:50 2016 +0000
+
+    Fix memory leak in ssltest
+    
+    The new Rand usage of Thread API exposed a bug in ssltest. ssltest &quot;cheats&quot;
+    and uses internal headers to directly call functions that normally you
+    wouldn't be able to do. This means that auto-init doesn't happen, and
+    therefore auto-deinit doesn't happen either, meaning that the new rand locks
+    don't get cleaned up properly.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit 8eed7e873bb54ab46b15e6efa3aff416e02f4d7f
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Mar 8 11:40:05 2016 +0000
+
+    Convert rand code to new threading API
+    
+    Replace the CRYPTO_LOCK_RAND and CRYPTO_LOCK_RAND2 locks with new thread
+    API style locks.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/md_rand.c    | 79 ++++++++++++++++++++++++++++--------------------
+ include/openssl/crypto.h |  2 --
+ test/exptest.c           |  6 ++--
+ test/ssltest.c           |  6 ++++
+ 4 files changed, 56 insertions(+), 37 deletions(-)
+
+diff --git a/crypto/rand/md_rand.c b/crypto/rand/md_rand.c
+index fa36918..e9574b0 100644
+--- a/crypto/rand/md_rand.c
++++ b/crypto/rand/md_rand.c
+@@ -125,6 +125,7 @@
+ #include &lt;openssl/rand.h&gt;
+ #include &lt;openssl/async.h&gt;
+ #include &quot;rand_lcl.h&quot;
++#include &quot;internal/threads.h&quot;
+ 
+ #include &lt;openssl/err.h&gt;
+ 
+@@ -147,12 +148,15 @@ static long md_count[2] = { 0, 0 };
+ static double entropy = 0;
+ static int initialized = 0;
+ 
+-static unsigned int crypto_lock_rand = 0; /* may be set only when a thread
+-                                           * holds CRYPTO_LOCK_RAND (to
+-                                           * prevent double locking) */
+-/* access to lockin_thread is synchronized by CRYPTO_LOCK_RAND2 */
++static CRYPTO_RWLOCK *rand_lock = NULL;
++static CRYPTO_RWLOCK *rand_tmp_lock = NULL;
++static CRYPTO_ONCE rand_lock_init = CRYPTO_ONCE_STATIC_INIT;
++
++/* May be set only when a thread holds rand_lock (to prevent double locking) */
++static unsigned int crypto_lock_rand = 0;
++/* access to locking_threadid is synchronized by rand_tmp_lock */
+ /* valid iff crypto_lock_rand is set */
+-static CRYPTO_THREADID locking_threadid;
++static CRYPTO_THREAD_ID locking_threadid;
+ 
+ #ifdef PREDICT
+ int rand_predictable = 0;
+@@ -183,6 +187,12 @@ static RAND_METHOD rand_meth = {
+     rand_status
+ };
+ 
++static void do_rand_lock_init(void)
++{
++    rand_lock = CRYPTO_THREAD_lock_new();
++    rand_tmp_lock = CRYPTO_THREAD_lock_new();
++}
++
+ RAND_METHOD *RAND_OpenSSL(void)
+ {
+     return (&amp;rand_meth);
+@@ -198,6 +208,8 @@ static void rand_cleanup(void)
+     md_count[1] = 0;
+     entropy = 0;
+     initialized = 0;
++    CRYPTO_THREAD_lock_free(rand_lock);
++    CRYPTO_THREAD_lock_free(rand_tmp_lock);
+ }
+ 
+ static int rand_add(const void *buf, int num, double add)
+@@ -231,18 +243,19 @@ static int rand_add(const void *buf, int num, double add)
+     if (m == NULL)
+         goto err;
+ 
++    CRYPTO_THREAD_run_once(&amp;rand_lock_init, do_rand_lock_init);
++
+     /* check if we already have the lock */
+     if (crypto_lock_rand) {
+-        CRYPTO_THREADID cur;
+-        CRYPTO_THREADID_current(&amp;cur);
+-        CRYPTO_r_lock(CRYPTO_LOCK_RAND2);
+-        do_not_lock = !CRYPTO_THREADID_cmp(&amp;locking_threadid, &amp;cur);
+-        CRYPTO_r_unlock(CRYPTO_LOCK_RAND2);
++        CRYPTO_THREAD_ID cur = CRYPTO_THREAD_get_current_id();
++        CRYPTO_THREAD_read_lock(rand_tmp_lock);
++        do_not_lock = CRYPTO_THREAD_compare_id(locking_threadid, cur);
++        CRYPTO_THREAD_unlock(rand_tmp_lock);
+     } else
+         do_not_lock = 0;
+ 
+     if (!do_not_lock)
+-        CRYPTO_w_lock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_write_lock(rand_lock);
+     st_idx = state_index;
+ 
+     /*
+@@ -274,7 +287,7 @@ static int rand_add(const void *buf, int num, double add)
+     md_count[1] += (num / MD_DIGEST_LENGTH) + (num % MD_DIGEST_LENGTH &gt; 0);
+ 
+     if (!do_not_lock)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_unlock(rand_lock);
+ 
+     for (i = 0; i &lt; num; i += MD_DIGEST_LENGTH) {
+         j = (num - i);
+@@ -328,7 +341,7 @@ static int rand_add(const void *buf, int num, double add)
+     }
+ 
+     if (!do_not_lock)
+-        CRYPTO_w_lock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_write_lock(rand_lock);
+     /*
+      * Don't just copy back local_md into md -- this could mean that other
+      * thread's seeding remains without effect (except for the incremented
+@@ -341,7 +354,7 @@ static int rand_add(const void *buf, int num, double add)
+     if (entropy &lt; ENTROPY_NEEDED) /* stop counting when we have enough */
+         entropy += add;
+     if (!do_not_lock)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_unlock(rand_lock);
+ 
+     rv = 1;
+  err:
+@@ -428,7 +441,8 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+      * global 'md'.
+      */
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_RAND);
++    CRYPTO_THREAD_run_once(&amp;rand_lock_init, do_rand_lock_init);
++    CRYPTO_THREAD_write_lock(rand_lock);
+     /*
+      * We could end up in an async engine while holding this lock so ensure
+      * we don't pause and cause a deadlock
+@@ -436,9 +450,9 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     ASYNC_block_pause();
+ 
+     /* prevent rand_bytes() from trying to obtain the lock again */
+-    CRYPTO_w_lock(CRYPTO_LOCK_RAND2);
+-    CRYPTO_THREADID_current(&amp;locking_threadid);
+-    CRYPTO_w_unlock(CRYPTO_LOCK_RAND2);
++    CRYPTO_THREAD_write_lock(rand_tmp_lock);
++    locking_threadid = CRYPTO_THREAD_get_current_id();
++    CRYPTO_THREAD_unlock(rand_tmp_lock);
+     crypto_lock_rand = 1;
+ 
+     if (!initialized) {
+@@ -513,7 +527,7 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     /* before unlocking, we must clear 'crypto_lock_rand' */
+     crypto_lock_rand = 0;
+     ASYNC_unblock_pause();
+-    CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++    CRYPTO_THREAD_unlock(rand_lock);
+ 
+     while (num &gt; 0) {
+         /* num_ceil -= MD_DIGEST_LENGTH/2 */
+@@ -566,17 +580,17 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+         || !MD_Update(m, (unsigned char *)&amp;(md_c[0]), sizeof(md_c))
+         || !MD_Update(m, local_md, MD_DIGEST_LENGTH))
+         goto err;
+-    CRYPTO_w_lock(CRYPTO_LOCK_RAND);
++    CRYPTO_THREAD_write_lock(rand_lock);
+     /*
+      * Prevent deadlocks if we end up in an async engine
+      */
+     ASYNC_block_pause();
+     if (!MD_Update(m, md, MD_DIGEST_LENGTH) || !MD_Final(m, md)) {
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_unlock(rand_lock);
+         goto err;
+     }
+     ASYNC_unblock_pause();
+-    CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++    CRYPTO_THREAD_unlock(rand_lock);
+ 
+     EVP_MD_CTX_free(m);
+     if (ok)
+@@ -617,24 +631,25 @@ static int rand_pseudo_bytes(unsigned char *buf, int num)
+ 
+ static int rand_status(void)
+ {
+-    CRYPTO_THREADID cur;
++    CRYPTO_THREAD_ID cur;
+     int ret;
+     int do_not_lock;
+ 
+-    CRYPTO_THREADID_current(&amp;cur);
++    CRYPTO_THREAD_run_once(&amp;rand_lock_init, do_rand_lock_init);
++    cur = CRYPTO_THREAD_get_current_id();
+     /*
+      * check if we already have the lock (could happen if a RAND_poll()
+      * implementation calls RAND_status())
+      */
+     if (crypto_lock_rand) {
+-        CRYPTO_r_lock(CRYPTO_LOCK_RAND2);
+-        do_not_lock = !CRYPTO_THREADID_cmp(&amp;locking_threadid, &amp;cur);
+-        CRYPTO_r_unlock(CRYPTO_LOCK_RAND2);
++        CRYPTO_THREAD_read_lock(rand_tmp_lock);
++        do_not_lock = CRYPTO_THREAD_compare_id(locking_threadid, cur);
++        CRYPTO_THREAD_unlock(rand_tmp_lock);
+     } else
+         do_not_lock = 0;
+ 
+     if (!do_not_lock) {
+-        CRYPTO_w_lock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_write_lock(rand_lock);
+         /*
+          * Prevent deadlocks in case we end up in an async engine
+          */
+@@ -643,9 +658,9 @@ static int rand_status(void)
+         /*
+          * prevent rand_bytes() from trying to obtain the lock again
+          */
+-        CRYPTO_w_lock(CRYPTO_LOCK_RAND2);
+-        CRYPTO_THREADID_cpy(&amp;locking_threadid, &amp;cur);
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RAND2);
++        CRYPTO_THREAD_write_lock(rand_tmp_lock);
++        locking_threadid = cur;
++        CRYPTO_THREAD_unlock(rand_tmp_lock);
+         crypto_lock_rand = 1;
+     }
+ 
+@@ -661,7 +676,7 @@ static int rand_status(void)
+         crypto_lock_rand = 0;
+ 
+         ASYNC_unblock_pause();
+-        CRYPTO_w_unlock(CRYPTO_LOCK_RAND);
++        CRYPTO_THREAD_unlock(rand_lock);
+     }
+ 
+     return ret;
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index d010bfa..8cca13e 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -166,8 +166,6 @@ extern &quot;C&quot; {
+  */
+ 
+ # define CRYPTO_LOCK_X509_STORE          11
+-# define CRYPTO_LOCK_RAND                18
+-# define CRYPTO_LOCK_RAND2               19
+ # define CRYPTO_LOCK_DYNLOCK             29
+ # define CRYPTO_LOCK_ENGINE              30
+ # define CRYPTO_LOCK_ECDSA               32
+diff --git a/test/exptest.c b/test/exptest.c
+index 84d76be..bc023ef 100644
+--- a/test/exptest.c
++++ b/test/exptest.c
+@@ -297,6 +297,9 @@ int main(int argc, char *argv[])
+     BN_free(m);
+     BN_CTX_free(ctx);
+ 
++    if (test_exp_mod_zero() != 0)
++        goto err;
++
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
+     if (CRYPTO_mem_leaks(out) &lt;= 0)
+         goto err;
+@@ -304,9 +307,6 @@ int main(int argc, char *argv[])
+     BIO_free(out);
+     printf(&quot;\n&quot;);
+ 
+-    if (test_exp_mod_zero() != 0)
+-        goto err;
+-
+     printf(&quot;done\n&quot;);
+ 
+     EXIT(0);
+diff --git a/test/ssltest.c b/test/ssltest.c
+index 94aeebe..8d9b2c8 100644
+--- a/test/ssltest.c
++++ b/test/ssltest.c
+@@ -3617,6 +3617,12 @@ static int do_test_cipherlist(void)
+     int i = 0;
+     const SSL_METHOD *meth;
+     const SSL_CIPHER *ci, *tci = NULL;
++
++    /*
++     * This is required because ssltest &quot;cheats&quot; and uses internal headers to
++     * call functions, thus avoiding auto-init
++     */
++    OPENSSL_init_crypto(0, NULL);
+ #endif
+ 
+ #ifndef OPENSSL_NO_SSL3
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005183.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005187.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5185">[ date ]</a>
+              <a href="thread.html#5185">[ thread ]</a>
+              <a href="subject.html#5185">[ subject ]</a>
+              <a href="author.html#5185">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

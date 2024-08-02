@@ -1,0 +1,678 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583531377.347795.11689.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027820.html">
+   <LINK REL="Next"  HREF="027826.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583531377.347795.11689.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Fri Mar  6 21:49:37 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027820.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027826.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27823">[ date ]</a>
+              <a href="thread.html#27823">[ thread ]</a>
+              <a href="subject.html#27823">[ subject ]</a>
+              <a href="author.html#27823">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  55f02cb6849f0366dd8b787dbe8e74b56c15bfd1 (commit)
+      from  f529fc7d53bf4228fae61cb1efe73d97fe3eb35f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 55f02cb6849f0366dd8b787dbe8e74b56c15bfd1
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Sat Mar 7 07:47:58 2020 +1000
+
+    Change DH_get_nid() to set the value of q if it is not already set
+    
+    Fixes #11108.
+    
+    It only sets q if a valid named group is found.
+    The function signature was recently changed to pass a non const DH pointer
+    in order to allow the nid to be cached internally. As an extension of this
+    the value of q can now also be set as q is always known for named groups.
+    The length field is also set if q is set.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11114">https://github.com/openssl/openssl/pull/11114</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/dh/dh_group_params.c                 | 142 +++++++++++++++-------------
+ crypto/dh/dh_key.c                          |   3 +-
+ crypto/dh/dh_lib.c                          |  15 ++-
+ crypto/ffc/ffc_key_generate.c               |  11 ++-
+ crypto/rsa/rsa_lib.c                        |  16 +++-
+ crypto/rsa/rsa_local.h                      |   2 -
+ crypto/rsa/rsa_sp800_56b_gen.c              |   3 +-
+ doc/man3/DH_get0_pqg.pod                    |  39 ++++----
+ doc/man3/DH_new_by_nid.pod                  |  15 ++-
+ include/crypto/{async.h =&gt; security_bits.h} |   9 +-
+ test/dhtest.c                               |  71 ++++++++++++++
+ 11 files changed, 220 insertions(+), 106 deletions(-)
+ copy include/crypto/{async.h =&gt; security_bits.h} (60%)
+
+diff --git a/crypto/dh/dh_group_params.c b/crypto/dh/dh_group_params.c
+index d2dd258248..d672ae3034 100644
+--- a/crypto/dh/dh_group_params.c
++++ b/crypto/dh/dh_group_params.c
+@@ -22,6 +22,33 @@
+ #include &lt;openssl/objects.h&gt;
+ #include &quot;crypto/bn_dh.h&quot;
+ #include &quot;crypto/dh.h&quot;
++#include &quot;crypto/security_bits.h&quot;
++
++
++#define FFDHE(sz) { NID_ffdhe##sz, sz, &amp;_bignum_ffdhe##sz##_p }
++#define MODP(sz)  { NID_modp_##sz, sz, &amp;_bignum_modp_##sz##_p }
++
++typedef struct safe_prime_group_st {
++    int nid;
++    int32_t nbits;
++    const BIGNUM *p;
++} SP_GROUP;
++
++static const SP_GROUP sp_groups[] = {
++    FFDHE(2048),
++    FFDHE(3072),
++    FFDHE(4096),
++    FFDHE(6144),
++    FFDHE(8192),
++#ifndef FIPS_MODE
++    MODP(1536),
++#endif
++    MODP(2048),
++    MODP(3072),
++    MODP(4096),
++    MODP(6144),
++    MODP(8192),
++};
+ 
+ #ifndef FIPS_MODE
+ static DH *dh_new_by_nid_with_ctx(OPENSSL_CTX *libctx, int nid);
+@@ -54,40 +81,24 @@ static DH *dh_param_init(OPENSSL_CTX *libctx, int nid, const BIGNUM *p,
+ 
+ static DH *dh_new_by_nid_with_ctx(OPENSSL_CTX *libctx, int nid)
+ {
+-    /*
+-     * The last parameter specified in these fields is
+-     * 2 * max_target_security_strength.
+-     * See SP800-56Ar3 Table(s) 25 &amp; 26.
+-     */
+-    switch (nid) {
+-    case NID_ffdhe2048:
+-        return dh_param_init(libctx, nid, &amp;_bignum_ffdhe2048_p, 225);
+-    case NID_ffdhe3072:
+-        return dh_param_init(libctx, nid, &amp;_bignum_ffdhe3072_p, 275);
+-    case NID_ffdhe4096:
+-        return dh_param_init(libctx, nid, &amp;_bignum_ffdhe4096_p, 325);
+-    case NID_ffdhe6144:
+-        return dh_param_init(libctx, nid, &amp;_bignum_ffdhe6144_p, 375);
+-    case NID_ffdhe8192:
+-        return dh_param_init(libctx, nid, &amp;_bignum_ffdhe8192_p, 400);
+-#ifndef FIPS_MODE
+-    case NID_modp_1536:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_1536_p, 190);
+-#endif
+-    case NID_modp_2048:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_2048_p, 225);
+-    case NID_modp_3072:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_3072_p, 275);
+-    case NID_modp_4096:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_4096_p, 325);
+-    case NID_modp_6144:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_6144_p, 375);
+-    case NID_modp_8192:
+-        return dh_param_init(libctx, nid, &amp;_bignum_modp_8192_p, 400);
+-    default:
+-        DHerr(0, DH_R_INVALID_PARAMETER_NID);
+-        return NULL;
++    int i;
++
++    for (i = 0; i &lt; (int)OSSL_NELEM(sp_groups); ++i) {
++        if (sp_groups[i].nid == nid) {
++            int max_target_security_strength =
++                ifc_ffc_compute_security_bits(sp_groups[i].nbits);
++
++            /*
++             * The last parameter specified here is
++             * 2 * max_target_security_strength.
++             * See SP800-56Ar3 Table(s) 25 &amp; 26.
++             */
++            return dh_param_init(libctx, nid, sp_groups[i].p,
++                                 2 * max_target_security_strength);
++        }
+     }
++    DHerr(0, DH_R_INVALID_PARAMETER_NID);
++    return NULL;
+ }
+ 
+ DH *DH_new_by_nid(int nid)
+@@ -98,49 +109,44 @@ DH *DH_new_by_nid(int nid)
+ 
+ int DH_get_nid(DH *dh)
+ {
+-    int nid = dh-&gt;params.nid;
++    BIGNUM *q = NULL;
++    int i, nid;
++
++    if (dh == NULL)
++        return NID_undef;
+ 
++    nid = dh-&gt;params.nid;
++    /* Just return if it is already cached */
+     if (nid != NID_undef)
+         return nid;
+ 
+     if (BN_get_word(dh-&gt;params.g) != 2)
+         return NID_undef;
+-    if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_ffdhe2048_p))
+-        nid = NID_ffdhe2048;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_ffdhe3072_p))
+-        nid = NID_ffdhe3072;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_ffdhe4096_p))
+-        nid = NID_ffdhe4096;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_ffdhe6144_p))
+-        nid = NID_ffdhe6144;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_ffdhe8192_p))
+-        nid = NID_ffdhe8192;
+-#ifndef FIPS_MODE
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_1536_p))
+-        nid = NID_modp_1536;
+-#endif
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_2048_p))
+-        nid = NID_modp_2048;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_3072_p))
+-        nid = NID_modp_3072;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_4096_p))
+-        nid = NID_modp_4096;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_6144_p))
+-        nid = NID_modp_6144;
+-    else if (!BN_cmp(dh-&gt;params.p, &amp;_bignum_modp_8192_p))
+-        nid = NID_modp_8192;
+-    else
+-        return NID_undef;
+ 
+-    /* Verify q is correct if it exists - reset the nid if it is not correct */
+-    if (dh-&gt;params.q != NULL) {
+-        BIGNUM *q = BN_dup(dh-&gt;params.p);
++    for (i = 0; i &lt; (int)OSSL_NELEM(sp_groups); ++i) {
++        /* If a matching p is found then we will break out of the loop */
++        if (!BN_cmp(dh-&gt;params.p, sp_groups[i].p)) {
++            /* Set q = (p - 1) / 2 (p is known to be odd so just shift right ) */
++            q = BN_dup(dh-&gt;params.p);
+ 
+-        /* Check q = p * 2 + 1 we already know q is odd, so just shift right */
+-        if (q == NULL || !BN_rshift1(q, q) || (BN_cmp(dh-&gt;params.q, q) != 0))
+-            nid = NID_undef;
+-        BN_free(q);
++            if (q == NULL || !BN_rshift1(q, q))
++                break; /* returns nid = NID_undef on failure */
++
++            /* Verify q is correct if it exists */
++            if (dh-&gt;params.q != NULL) {
++                if (BN_cmp(dh-&gt;params.q, q) != 0)
++                    break;  /* returns nid = NID_undef if q does not match */
++            } else {
++                /* assign the calculated q */
++                dh-&gt;params.q = q;
++                q = NULL; /* set to NULL so it is not freed */
++            }
++            dh-&gt;params.nid = sp_groups[i].nid; /* cache the nid */
++            dh-&gt;length = 2 * ifc_ffc_compute_security_bits(sp_groups[i].nbits);
++            dh-&gt;dirty_cnt++;
++            break;
++        }
+     }
+-    dh-&gt;params.nid = nid; /* cache the nid */
++    BN_free(q);
+     return nid;
+ }
+diff --git a/crypto/dh/dh_key.c b/crypto/dh/dh_key.c
+index 5748be810f..ab2e25ea87 100644
+--- a/crypto/dh/dh_key.c
++++ b/crypto/dh/dh_key.c
+@@ -251,8 +251,7 @@ static int generate_key(DH *dh)
+              * (where s = max security strength supported).
+              * N = dh-&gt;length (N = maximum bit length of private key)
+              */
+-            if (dh-&gt;length == 0
+-                || dh-&gt;params.q == NULL
++            if (dh-&gt;params.q == NULL
+                 || dh-&gt;length &gt; BN_num_bits(dh-&gt;params.q))
+                 goto err;
+             if (!ffc_generate_private_key(ctx, &amp;dh-&gt;params, dh-&gt;length,
+diff --git a/crypto/dh/dh_lib.c b/crypto/dh/dh_lib.c
+index d7fe850f58..29152dca4d 100644
+--- a/crypto/dh/dh_lib.c
++++ b/crypto/dh/dh_lib.c
+@@ -211,11 +211,16 @@ int DH_set0_pqg(DH *dh, BIGNUM *p, BIGNUM *q, BIGNUM *g)
+ 
+     ffc_params_set0_pqg(&amp;dh-&gt;params, p, q, g);
+     dh-&gt;params.nid = NID_undef;
+-    DH_get_nid(dh); /* Check if this is a named group and cache it */
+-
+-    if (q != NULL)
+-        dh-&gt;length = BN_num_bits(q);
+-
++    /*
++     * Check if this is a named group. If it finds a named group then the
++     * 'q' and 'length' value are either already set or are set by the
++     * call.
++     */
++    if (DH_get_nid(dh) == NID_undef) {
++        /* If its not a named group then set the 'length' if q is not NULL */
++        if (q != NULL)
++            dh-&gt;length = BN_num_bits(q);
++    }
+     dh-&gt;dirty_cnt++;
+     return 1;
+ }
+diff --git a/crypto/ffc/ffc_key_generate.c b/crypto/ffc/ffc_key_generate.c
+index b8c85480c1..078e8d39a1 100644
+--- a/crypto/ffc/ffc_key_generate.c
++++ b/crypto/ffc/ffc_key_generate.c
+@@ -36,13 +36,19 @@ int ffc_generate_private_key(BN_CTX *ctx, const FFC_PARAMS *params,
+ int ffc_generate_private_key_fips(BN_CTX *ctx, const FFC_PARAMS *params,
+                                   int N, int s, BIGNUM *priv)
+ {
+-    int ret = 0;
++    int ret = 0, qbits = BN_num_bits(params-&gt;q);
+     BIGNUM *m, *two_powN = NULL;
+ 
+     /* Step (2) : check range of N */
+-    if (N &lt; 2 * s || N &gt; BN_num_bits(params-&gt;q))
++    if (N &lt; 2 * s || N &gt; qbits)
+         return 0;
+ 
++    /* Deal with the edge case where the value of N is not set */
++    if (N == 0) {
++        N = qbits;
++        s = N / 2;
++    }
++
+     two_powN = BN_new();
+     /* 2^N */
+     if (two_powN == NULL || !BN_lshift(two_powN, BN_value_one(), N))
+@@ -50,6 +56,7 @@ int ffc_generate_private_key_fips(BN_CTX *ctx, const FFC_PARAMS *params,
+ 
+     /* Step (5) : M = min(2 ^ N, q) */
+     m = (BN_cmp(two_powN, params-&gt;q) &gt; 0) ? params-&gt;q : two_powN;
++
+     do {
+         /* Steps (3, 4 &amp; 7) :  c + 1 = 1 + random[0..2^N - 1] */
+         if (!BN_priv_rand_range_ex(priv, two_powN, ctx)
+diff --git a/crypto/rsa/rsa_lib.c b/crypto/rsa/rsa_lib.c
+index 08ce8b4ef8..ada5388bb2 100644
+--- a/crypto/rsa/rsa_lib.c
++++ b/crypto/rsa/rsa_lib.c
+@@ -23,6 +23,7 @@
+ #include &quot;crypto/bn.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;crypto/rsa.h&quot;
++#include &quot;crypto/security_bits.h&quot;
+ #include &quot;rsa_local.h&quot;
+ 
+ static RSA *rsa_new_intern(ENGINE *engine, OPENSSL_CTX *libctx);
+@@ -281,11 +282,20 @@ static uint32_t ilog_e(uint64_t v)
+  * NIST SP 800-56B rev 2 Appendix D: Maximum Security Strength Estimates for IFC
+  * Modulus Lengths.
+  *
++ * Note that this formula is also referred to in SP800-56A rev3 Appendix D:
++ * for FFC safe prime groups for modp and ffdhe.
++ * After Table 25 and Table 26 it refers to
++ * &quot;The maximum security strength estimates were calculated using the formula in
++ * Section 7.5 of the FIPS 140 IG and rounded to the nearest multiple of eight
++ * bits&quot;.
++ *
++ * The formula is:
++ *
+  * E = \frac{1.923 \sqrt[3]{nBits \cdot log_e(2)}
+  *           \cdot(log_e(nBits \cdot log_e(2))^{2/3} - 4.69}{log_e(2)}
+  * The two cube roots are merged together here.
+  */
+-uint16_t rsa_compute_security_bits(int n)
++uint16_t ifc_ffc_compute_security_bits(int n)
+ {
+     uint64_t x;
+     uint32_t lx;
+@@ -322,6 +332,8 @@ uint16_t rsa_compute_security_bits(int n)
+     return (y + 4) &amp; ~7;
+ }
+ 
++
++
+ int RSA_security_bits(const RSA *rsa)
+ {
+     int bits = BN_num_bits(rsa-&gt;n);
+@@ -335,7 +347,7 @@ int RSA_security_bits(const RSA *rsa)
+             return 0;
+     }
+ #endif
+-    return rsa_compute_security_bits(bits);
++    return ifc_ffc_compute_security_bits(bits);
+ }
+ 
+ int RSA_set0_key(RSA *r, BIGNUM *n, BIGNUM *e, BIGNUM *d)
+diff --git a/crypto/rsa/rsa_local.h b/crypto/rsa/rsa_local.h
+index 11d7635c35..ac8856207e 100644
+--- a/crypto/rsa/rsa_local.h
++++ b/crypto/rsa/rsa_local.h
+@@ -137,8 +137,6 @@ RSA_PRIME_INFO *rsa_multip_info_new(void);
+ int rsa_multip_calc_product(RSA *rsa);
+ int rsa_multip_cap(int bits);
+ 
+-uint16_t rsa_compute_security_bits(int n);
+-
+ int rsa_sp800_56b_validate_strength(int nbits, int strength);
+ int rsa_check_pminusq_diff(BIGNUM *diff, const BIGNUM *p, const BIGNUM *q,
+                            int nbits);
+diff --git a/crypto/rsa/rsa_sp800_56b_gen.c b/crypto/rsa/rsa_sp800_56b_gen.c
+index 1f8d01d477..a60a428b14 100644
+--- a/crypto/rsa/rsa_sp800_56b_gen.c
++++ b/crypto/rsa/rsa_sp800_56b_gen.c
+@@ -11,6 +11,7 @@
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/bn.h&gt;
+ #include &quot;crypto/bn.h&quot;
++#include &quot;crypto/security_bits.h&quot;
+ #include &quot;rsa_local.h&quot;
+ 
+ #define RSA_FIPS1864_MIN_KEYGEN_KEYSIZE 2048
+@@ -144,7 +145,7 @@ err:
+  */
+ int rsa_sp800_56b_validate_strength(int nbits, int strength)
+ {
+-    int s = (int)rsa_compute_security_bits(nbits);
++    int s = (int)ifc_ffc_compute_security_bits(nbits);
+ 
+     if (s &lt; RSA_FIPS1864_MIN_KEYGEN_STRENGTH
+             || s &gt; RSA_FIPS1864_MAX_KEYGEN_STRENGTH) {
+diff --git a/doc/man3/DH_get0_pqg.pod b/doc/man3/DH_get0_pqg.pod
+index ab49a325f8..3806dab357 100644
+--- a/doc/man3/DH_get0_pqg.pod
++++ b/doc/man3/DH_get0_pqg.pod
+@@ -37,31 +37,38 @@ L&lt;openssl_user_macros(7)&gt;:
+ 
+ =head1 DESCRIPTION
+ 
+-A DH object contains the parameters B&lt;p&gt;, B&lt;q&gt; and B&lt;g&gt;. Note that the B&lt;q&gt;
+-parameter is optional. It also contains a public key (B&lt;pub_key&gt;) and
+-(optionally) a private key (B&lt;priv_key&gt;).
++A DH object contains the parameters I&lt;p&gt;, I&lt;q&gt; and I&lt;g&gt;. Note that the I&lt;q&gt;
++parameter is optional. It also contains a public key (I&lt;pub_key&gt;) and
++(optionally) a private key (I&lt;priv_key&gt;).
+ 
+-The B&lt;p&gt;, B&lt;q&gt; and B&lt;g&gt; parameters can be obtained by calling DH_get0_pqg().
+-If the parameters have not yet been set then B&lt;*p&gt;, B&lt;*q&gt; and B&lt;*g&gt; will be set
++The I&lt;p&gt;, I&lt;q&gt; and I&lt;g&gt; parameters can be obtained by calling DH_get0_pqg().
++If the parameters have not yet been set then I&lt;*p&gt;, I&lt;*q&gt; and I&lt;*g&gt; will be set
+ to NULL. Otherwise they are set to pointers to their respective values. These
+ point directly to the internal representations of the values and therefore
+ should not be freed directly.
+-Any of the out parameters B&lt;p&gt;, B&lt;q&gt;, and B&lt;g&gt; can be NULL, in which case no
++Any of the out parameters I&lt;p&gt;, I&lt;q&gt;, and I&lt;g&gt; can be NULL, in which case no
+ value will be returned for that parameter.
+ 
+-The B&lt;p&gt;, B&lt;q&gt; and B&lt;g&gt; values can be set by calling DH_set0_pqg() and passing
+-the new values for B&lt;p&gt;, B&lt;q&gt; and B&lt;g&gt; as parameters to the function. Calling
++The I&lt;p&gt;, I&lt;q&gt; and I&lt;g&gt; values can be set by calling DH_set0_pqg() and passing
++the new values for I&lt;p&gt;, I&lt;q&gt; and I&lt;g&gt; as parameters to the function. Calling
+ this function transfers the memory management of the values to the DH object,
+ and therefore the values that have been passed in should not be freed directly
+-after this function has been called. The B&lt;q&gt; parameter may be NULL.
++after this function has been called. The I&lt;q&gt; parameter may be NULL.
++DH_set0_pqg() also checks if the parameters associated with I&lt;p&gt; and I&lt;g&gt; and
++optionally I&lt;q&gt; are associated with known safe prime groups. If it is a safe
++prime group then the value of I&lt;q&gt; will be set to q = (p - 1) / 2 if I&lt;q&gt; is NULL.
++For safe prime groups the optional length parameter I&lt;length&gt; is set to twice
++the value of the maximum_target_security_strength(BN_num_bits(I&lt;p&gt;)) as listed in
++SP800-56Ar3 Table(s) 25 &amp; 26. If it is not a safe prime group then the optional
++length parameter will be set if I&lt;q&gt; is not NULL to BN_num_bits(I&lt;q&gt;).
+ 
+ To get the public and private key values use the DH_get0_key() function. A
+-pointer to the public key will be stored in B&lt;*pub_key&gt;, and a pointer to the
+-private key will be stored in B&lt;*priv_key&gt;. Either may be NULL if they have not
++pointer to the public key will be stored in I&lt;*pub_key&gt;, and a pointer to the
++private key will be stored in I&lt;*priv_key&gt;. Either may be NULL if they have not
+ been set yet, although if the private key has been set then the public key must
+ be. The values point to the internal representation of the public key and
+ private key values. This memory should not be freed directly.
+-Any of the out parameters B&lt;pub_key&gt; and B&lt;priv_key&gt; can be NULL, in which case
++Any of the out parameters I&lt;pub_key&gt; and I&lt;priv_key&gt; can be NULL, in which case
+ no value will be returned for that parameter.
+ 
+ The public and private key values can be set using DH_set0_key(). Either
+@@ -70,14 +77,14 @@ untouched. As with DH_set0_pqg() this function transfers the memory management
+ of the key values to the DH object, and therefore they should not be freed
+ directly after this function has been called.
+ 
+-Any of the values B&lt;p&gt;, B&lt;q&gt;, B&lt;g&gt;, B&lt;priv_key&gt;, and B&lt;pub_key&gt; can also be
++Any of the values I&lt;p&gt;, I&lt;q&gt;, I&lt;g&gt;, I&lt;priv_key&gt;, and I&lt;pub_key&gt; can also be
+ retrieved separately by the corresponding function DH_get0_p(), DH_get0_q(),
+ DH_get0_g(), DH_get0_priv_key(), and DH_get0_pub_key(), respectively.
+ 
+-DH_set_flags() sets the flags in the B&lt;flags&gt; parameter on the DH object.
++DH_set_flags() sets the flags in the I&lt;flags&gt; parameter on the DH object.
+ Multiple flags can be passed in one go (bitwise ORed together). Any flags that
+ are already set are left set. DH_test_flags() tests to see whether the flags
+-passed in the B&lt;flags&gt; parameter are currently set in the DH object. Multiple
++passed in the I&lt;flags&gt; parameter are currently set in the DH object. Multiple
+ flags can be tested in one go. All flags that are currently set are returned, or
+ zero if none of the flags are set. DH_clear_flags() clears the specified flags
+ within the DH object.
+@@ -87,7 +94,7 @@ object, or NULL if no such ENGINE has been set. This function is deprecated.
+ 
+ The DH_get_length() and DH_set_length() functions get and set the optional
+ length parameter associated with this DH object. If the length is nonzero then
+-it is used, otherwise it is ignored. The B&lt;length&gt; parameter indicates the
++it is used, otherwise it is ignored. The I&lt;length&gt; parameter indicates the
+ length of the secret exponent (private key) in bits. These functions are
+ deprecated.
+ 
+diff --git a/doc/man3/DH_new_by_nid.pod b/doc/man3/DH_new_by_nid.pod
+index 3456b9d57e..a333ecb6d2 100644
+--- a/doc/man3/DH_new_by_nid.pod
++++ b/doc/man3/DH_new_by_nid.pod
+@@ -24,15 +24,22 @@ B&lt;NID_modp_1536&gt;, B&lt;NID_modp_2048&gt;, B&lt;NID_modp_3072&gt;,
+ B&lt;NID_modp_4096&gt;, B&lt;NID_modp_6144&gt; or B&lt;NID_modp_8192&gt;.
+ 
+ DH_get_nid() determines if the parameters contained in B&lt;dh&gt; match
+-any named set. It returns the NID corresponding to the matching parameters or
+-B&lt;NID_undef&gt; if there is no match. This function is deprecated.
++any named safe prime group. It returns the NID corresponding to the matching
++parameters or B&lt;NID_undef&gt; if there is no match.
++Internally it caches the nid, so that any subsequent calls can fetch the
++cached value.
++If a matching p and g are not found and the value of parameter q is not set,
++then it is set to q = (p - 1) / 2.
++If parameter q is already set then it must also match the expected q otherwise
++no match will be found.
++This function is deprecated.
+ 
+ =head1 RETURN VALUES
+ 
+ DH_new_by_nid() returns a set of DH parameters or B&lt;NULL&gt; if an error occurred.
+ 
+-DH_get_nid() returns the NID of the matching set of parameters or
+-B&lt;NID_undef&gt; if there is no match.
++DH_get_nid() returns the NID of the matching set of parameters for p and g
++and optionally q, otherwise it returns B&lt;NID_undef&gt; if there is no match.
+ 
+ =head1 HISTORY
+ 
+diff --git a/include/crypto/async.h b/include/crypto/security_bits.h
+similarity index 60%
+copy from include/crypto/async.h
+copy to include/crypto/security_bits.h
+index e9a89da314..c62d89bcb8 100644
+--- a/include/crypto/async.h
++++ b/include/crypto/security_bits.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2019-2020 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -7,8 +7,9 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-#include &lt;openssl/async.h&gt;
++#ifndef OSSL_SECURITY_BITS_H
++# define OSSL_SECURITY_BITS_H
+ 
+-int async_init(void);
+-void async_deinit(void);
++uint16_t ifc_ffc_compute_security_bits(int n);
+ 
++#endif
+diff --git a/test/dhtest.c b/test/dhtest.c
+index b3e2e2fdcb..ebc4599907 100644
+--- a/test/dhtest.c
++++ b/test/dhtest.c
+@@ -700,6 +700,7 @@ static int dh_test_prime_groups(int index)
+     int ok = 0;
+     DH *dh = NULL;
+     const BIGNUM *p, *q, *g;
++    long len;
+ 
+     if (!TEST_ptr(dh = DH_new_by_nid(prime_groups[index])))
+         goto err;
+@@ -709,11 +710,80 @@ static int dh_test_prime_groups(int index)
+ 
+     if (!TEST_int_eq(DH_get_nid(dh), prime_groups[index]))
+         goto err;
++
++    len = DH_get_length(dh);
++    if (!TEST_true(len &gt; 0)
++        || !TEST_true(len &lt;= BN_num_bits(q)))
++        goto err;
++
+     ok = 1;
+ err:
+     DH_free(dh);
+     return ok;
+ }
++
++static int dh_get_nid(void)
++{
++    int ok = 0;
++    const BIGNUM *p, *q, *g;
++    BIGNUM *pcpy = NULL, *gcpy = NULL, *qcpy = NULL;
++    DH *dh1 = DH_new_by_nid(NID_ffdhe2048);
++    DH *dh2 = DH_new();
++
++    if (!TEST_ptr(dh1)
++        || !TEST_ptr(dh2))
++        goto err;
++
++    /* Set new DH parameters manually using a existing named group's p &amp; g */
++    DH_get0_pqg(dh1, &amp;p, &amp;q, &amp;g);
++    if (!TEST_ptr(p)
++        || !TEST_ptr(q)
++        || !TEST_ptr(g)
++        || !TEST_ptr(pcpy = BN_dup(p))
++        || !TEST_ptr(gcpy = BN_dup(g)))
++        goto err;
++
++    if (!TEST_true(DH_set0_pqg(dh2, pcpy, NULL, gcpy)))
++        goto err;
++    pcpy = gcpy = NULL;
++    /* Test q is set if p and g are provided */
++    if (!TEST_ptr(DH_get0_q(dh2)))
++        goto err;
++
++    /* Test that setting p &amp; g manually returns that it is a named group */
++    if (!TEST_int_eq(DH_get_nid(dh2), NID_ffdhe2048))
++        goto err;
++
++    /* Test that after changing g it is no longer a named group */
++    if (!TEST_ptr(gcpy = BN_dup(BN_value_one())))
++       goto err;
++    if (!TEST_true(DH_set0_pqg(dh2, NULL, NULL, gcpy)))
++       goto err;
++    gcpy = NULL;
++    if (!TEST_int_eq(DH_get_nid(dh2), NID_undef))
++        goto err;
++
++    /* Test that setting an incorrect q results in this not being a named group */
++    if (!TEST_ptr(pcpy = BN_dup(p))
++        || !TEST_ptr(qcpy = BN_dup(q))
++        || !TEST_ptr(gcpy = BN_dup(g))
++        || !TEST_int_eq(BN_add_word(qcpy, 2), 1)
++        || !TEST_true(DH_set0_pqg(dh2, pcpy, qcpy, gcpy)))
++        goto err;
++    pcpy = qcpy = gcpy = NULL;
++    if (!TEST_int_eq(DH_get_nid(dh2), NID_undef))
++        goto err;
++
++    ok = 1;
++err:
++    BN_free(pcpy);
++    BN_free(qcpy);
++    BN_free(gcpy);
++    DH_free(dh2);
++    DH_free(dh1);
++    return ok;
++}
++
+ #endif
+ 
+ 
+@@ -726,6 +796,7 @@ int setup_tests(void)
+     ADD_TEST(rfc5114_test);
+     ADD_TEST(rfc7919_test);
+     ADD_ALL_TESTS(dh_test_prime_groups, OSSL_NELEM(prime_groups));
++    ADD_TEST(dh_get_nid);
+ #endif
+     return 1;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027820.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027826.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27823">[ date ]</a>
+              <a href="thread.html#27823">[ thread ]</a>
+              <a href="subject.html#27823">[ subject ]</a>
+              <a href="author.html#27823">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

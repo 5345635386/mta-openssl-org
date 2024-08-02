@@ -1,0 +1,515 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1574047857.044987.11250.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026257.html">
+   <LINK REL="Next"  HREF="026261.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1574047857.044987.11250.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Mon Nov 18 03:30:57 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026257.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026261.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26259">[ date ]</a>
+              <a href="thread.html#26259">[ thread ]</a>
+              <a href="subject.html#26259">[ subject ]</a>
+              <a href="author.html#26259">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f75abcc0f073b1c3e2d81df3fcde8fe45dd1e61f (commit)
+      from  de0799b0fc845869d775520382b4e7f9995732e5 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f75abcc0f073b1c3e2d81df3fcde8fe45dd1e61f
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Mon Nov 18 13:13:05 2019 +1000
+
+    Fix Use after free when copying cipher ctx
+    
+    Fixes #10438
+    issue found by clusterfuzz/ossfuzz
+    
+    The dest was getting a copy of the src structure which contained a pointer that should point to an offset inside itself - because of the copy it was pointing to the original structure.
+    
+    The setup for a ctx is mainly done by the initkey method in the PROV_CIPHER_HW structure. Because of this it makes sense that the structure should also contain a copyctx method that is use to resolve any pointers that need to be setup.
+    
+    A dup_ctx has been added to the cipher_enc tests in evp_test. It does a dup after setup and then frees the original ctx. This detects any floating pointers in the duplicated context that were pointing back to the freed ctx.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10443">https://github.com/openssl/openssl/pull/10443</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/common/include/prov/ciphercommon.h       | 11 +++++++
+ providers/implementations/ciphers/cipher_aes.c     |  2 +-
+ providers/implementations/ciphers/cipher_aes_hw.c  |  5 +++-
+ .../ciphers/cipher_aes_hw_aesni.inc                |  3 +-
+ .../ciphers/cipher_aes_hw_s390x.inc                |  1 +
+ .../implementations/ciphers/cipher_aes_hw_t4.inc   |  3 +-
+ providers/implementations/ciphers/cipher_aes_ocb.c |  4 +--
+ providers/implementations/ciphers/cipher_aes_xts.c |  2 +-
+ .../implementations/ciphers/cipher_aes_xts_hw.c    | 20 +++++++++++--
+ providers/implementations/ciphers/cipher_aria.c    |  2 +-
+ providers/implementations/ciphers/cipher_aria_hw.c |  5 +++-
+ .../implementations/ciphers/cipher_camellia.c      |  2 +-
+ .../implementations/ciphers/cipher_camellia_hw.c   |  5 +++-
+ .../ciphers/cipher_camellia_hw_t4.inc              |  3 +-
+ providers/implementations/ciphers/cipher_sm4.c     |  2 +-
+ providers/implementations/ciphers/cipher_sm4_hw.c  |  5 +++-
+ test/evp_test.c                                    | 34 +++++++++++++++-------
+ 17 files changed, 82 insertions(+), 27 deletions(-)
+
+diff --git a/providers/common/include/prov/ciphercommon.h b/providers/common/include/prov/ciphercommon.h
+index 2f77f48712..c9b0034017 100644
+--- a/providers/common/include/prov/ciphercommon.h
++++ b/providers/common/include/prov/ciphercommon.h
+@@ -68,6 +68,7 @@ struct prov_cipher_ctx_st {
+ struct prov_cipher_hw_st {
+     int (*init)(PROV_CIPHER_CTX *dat, const uint8_t *key, size_t keylen);
+     PROV_CIPHER_HW_FN *cipher;
++    void (*copyctx)(PROV_CIPHER_CTX *dst, const PROV_CIPHER_CTX *src);
+ };
+ 
+ OSSL_OP_cipher_encrypt_init_fn cipher_generic_einit;
+@@ -233,6 +234,16 @@ static int cipher_hw_##NAME##_##MODE##_cipher(PROV_CIPHER_CTX *ctx,            \
+     return 1;                                                                  \
+ }
+ 
++#define IMPLEMENT_CIPHER_HW_COPYCTX(name, CTX_TYPE)                            \
++static void name(PROV_CIPHER_CTX *dst, const PROV_CIPHER_CTX *src)             \
++{                                                                              \
++    CTX_TYPE *sctx = (CTX_TYPE *)src;                                          \
++    CTX_TYPE *dctx = (CTX_TYPE *)dst;                                          \
++                                                                               \
++    *dctx = *sctx;                                                             \
++    dst-&gt;ks = &amp;dctx-&gt;ks.ks;                                                    \
++}
++
+ #define CIPHER_DEFAULT_GETTABLE_CTX_PARAMS_START(name)                         \
+ static const OSSL_PARAM name##_known_gettable_ctx_params[] = {                 \
+     OSSL_PARAM_size_t(OSSL_CIPHER_PARAM_KEYLEN, NULL),                         \
+diff --git a/providers/implementations/ciphers/cipher_aes.c b/providers/implementations/ciphers/cipher_aes.c
+index c62d2d2c29..561377a27b 100644
+--- a/providers/implementations/ciphers/cipher_aes.c
++++ b/providers/implementations/ciphers/cipher_aes.c
+@@ -31,7 +31,7 @@ static void *aes_dupctx(void *ctx)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    *ret = *in;
++    in-&gt;base.hw-&gt;copyctx(&amp;ret-&gt;base, &amp;in-&gt;base);
+ 
+     return ret;
+ }
+diff --git a/providers/implementations/ciphers/cipher_aes_hw.c b/providers/implementations/ciphers/cipher_aes_hw.c
+index 8519662e73..bc733ee16a 100644
+--- a/providers/implementations/ciphers/cipher_aes_hw.c
++++ b/providers/implementations/ciphers/cipher_aes_hw.c
+@@ -106,10 +106,13 @@ static int cipher_hw_aes_initkey(PROV_CIPHER_CTX *dat,
+     return 1;
+ }
+ 
++IMPLEMENT_CIPHER_HW_COPYCTX(cipher_hw_aes_copyctx, PROV_AES_CTX)
++
+ #define PROV_CIPHER_HW_aes_mode(mode)                                          \
+ static const PROV_CIPHER_HW aes_##mode = {                                     \
+     cipher_hw_aes_initkey,                                                     \
+-    cipher_hw_generic_##mode                                                   \
++    cipher_hw_generic_##mode,                                                  \
++    cipher_hw_aes_copyctx                                                      \
+ };                                                                             \
+ PROV_CIPHER_HW_declare(mode)                                                   \
+ const PROV_CIPHER_HW *PROV_CIPHER_HW_aes_##mode(size_t keybits)                \
+diff --git a/providers/implementations/ciphers/cipher_aes_hw_aesni.inc b/providers/implementations/ciphers/cipher_aes_hw_aesni.inc
+index 6070939dee..8d3aef69b7 100644
+--- a/providers/implementations/ciphers/cipher_aes_hw_aesni.inc
++++ b/providers/implementations/ciphers/cipher_aes_hw_aesni.inc
+@@ -76,7 +76,8 @@ static int cipher_hw_aesni_ecb(PROV_CIPHER_CTX *ctx, unsigned char *out,
+ #define PROV_CIPHER_HW_declare(mode)                                           \
+ static const PROV_CIPHER_HW aesni_##mode = {                                   \
+     cipher_hw_aesni_initkey,                                                   \
+-    cipher_hw_aesni_##mode                                                     \
++    cipher_hw_aesni_##mode,                                                    \
++    cipher_hw_aes_copyctx                                                      \
+ };
+ #define PROV_CIPHER_HW_select(mode)                                            \
+ if (AESNI_CAPABLE)                                                             \
+diff --git a/providers/implementations/ciphers/cipher_aes_hw_s390x.inc b/providers/implementations/ciphers/cipher_aes_hw_s390x.inc
+index 805fa91e5f..f60ca9cba8 100644
+--- a/providers/implementations/ciphers/cipher_aes_hw_s390x.inc
++++ b/providers/implementations/ciphers/cipher_aes_hw_s390x.inc
+@@ -194,6 +194,7 @@ static int s390x_aes_cfb8_cipher_hw(PROV_CIPHER_CTX *dat, unsigned char *out,
+ static const PROV_CIPHER_HW s390x_aes_##mode = {                               \
+     s390x_aes_##mode##_initkey,                                                \
+     s390x_aes_##mode##_cipher_hw                                               \
++    cipher_hw_aes_copyctx                                                      \
+ };
+ #define PROV_CIPHER_HW_select(mode)                                            \
+ if ((keybits == 128 &amp;&amp; S390X_aes_128_##mode##_CAPABLE)                         \
+diff --git a/providers/implementations/ciphers/cipher_aes_hw_t4.inc b/providers/implementations/ciphers/cipher_aes_hw_t4.inc
+index 21b672710a..07b65789f1 100644
+--- a/providers/implementations/ciphers/cipher_aes_hw_t4.inc
++++ b/providers/implementations/ciphers/cipher_aes_hw_t4.inc
+@@ -88,7 +88,8 @@ static int cipher_hw_aes_t4_initkey(PROV_CIPHER_CTX *dat,
+ #define PROV_CIPHER_HW_declare(mode)                                           \
+ static const PROV_CIPHER_HW aes_t4_##mode = {                                  \
+     cipher_hw_aes_t4_initkey,                                                  \
+-    cipher_hw_generic_##mode                                                   \
++    cipher_hw_generic_##mode,                                                  \
++    cipher_hw_aes_copyctx                                                      \
+ };
+ #define PROV_CIPHER_HW_select(mode)                                            \
+     if (SPARC_AES_CAPABLE)                                                     \
+diff --git a/providers/implementations/ciphers/cipher_aes_ocb.c b/providers/implementations/ciphers/cipher_aes_ocb.c
+index d30a666fc5..ba4e4f29f8 100644
+--- a/providers/implementations/ciphers/cipher_aes_ocb.c
++++ b/providers/implementations/ciphers/cipher_aes_ocb.c
+@@ -84,8 +84,8 @@ static ossl_inline int aes_generic_ocb_cipher(PROV_AES_OCB_CTX *ctx,
+ static ossl_inline int aes_generic_ocb_copy_ctx(PROV_AES_OCB_CTX *dst,
+                                                 PROV_AES_OCB_CTX *src)
+ {
+-    return (!CRYPTO_ocb128_copy_ctx(&amp;dst-&gt;ocb, &amp;src-&gt;ocb,
+-                                    &amp;src-&gt;ksenc.ks, &amp;src-&gt;ksdec.ks));
++    return CRYPTO_ocb128_copy_ctx(&amp;dst-&gt;ocb, &amp;src-&gt;ocb,
++                                  &amp;dst-&gt;ksenc.ks, &amp;dst-&gt;ksdec.ks);
+ }
+ 
+ /*-
+diff --git a/providers/implementations/ciphers/cipher_aes_xts.c b/providers/implementations/ciphers/cipher_aes_xts.c
+index 2ad1fbe84a..d60e08e194 100644
+--- a/providers/implementations/ciphers/cipher_aes_xts.c
++++ b/providers/implementations/ciphers/cipher_aes_xts.c
+@@ -134,7 +134,7 @@ static void *aes_xts_dupctx(void *vctx)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    *ret = *in;
++    in-&gt;base.hw-&gt;copyctx(&amp;ret-&gt;base, &amp;in-&gt;base);
+     return ret;
+ }
+ 
+diff --git a/providers/implementations/ciphers/cipher_aes_xts_hw.c b/providers/implementations/ciphers/cipher_aes_xts_hw.c
+index 9ac70c4fa8..b9472b266e 100644
+--- a/providers/implementations/ciphers/cipher_aes_xts_hw.c
++++ b/providers/implementations/ciphers/cipher_aes_xts_hw.c
+@@ -76,6 +76,17 @@ static int cipher_hw_aes_xts_generic_initkey(PROV_CIPHER_CTX *ctx,
+     return 1;
+ }
+ 
++static void cipher_hw_aes_xts_copyctx(PROV_CIPHER_CTX *dst,
++                                      const PROV_CIPHER_CTX *src)
++{
++    PROV_AES_XTS_CTX *sctx = (PROV_AES_XTS_CTX *)src;
++    PROV_AES_XTS_CTX *dctx = (PROV_AES_XTS_CTX *)dst;
++
++    *dctx = *sctx;
++    dctx-&gt;xts.key1 = &amp;dctx-&gt;ks1.ks;
++    dctx-&gt;xts.key2 = &amp;dctx-&gt;ks2.ks;
++}
++
+ #if defined(AESNI_CAPABLE)
+ 
+ static int cipher_hw_aesni_xts_initkey(PROV_CIPHER_CTX *ctx,
+@@ -92,7 +103,8 @@ static int cipher_hw_aesni_xts_initkey(PROV_CIPHER_CTX *ctx,
+ # define PROV_CIPHER_HW_declare_xts()                                          \
+ static const PROV_CIPHER_HW aesni_xts = {                                      \
+     cipher_hw_aesni_xts_initkey,                                               \
+-    NULL                                                                       \
++    NULL,                                                                      \
++    cipher_hw_aes_xts_copyctx                                                  \
+ };
+ # define PROV_CIPHER_HW_select_xts()                                           \
+ if (AESNI_CAPABLE)                                                             \
+@@ -130,7 +142,8 @@ static int cipher_hw_aes_xts_t4_initkey(PROV_CIPHER_CTX *ctx,
+ # define PROV_CIPHER_HW_declare_xts()                                          \
+ static const PROV_CIPHER_HW aes_xts_t4 = {                                     \
+     cipher_hw_aes_xts_t4_initkey,                                              \
+-    NULL                                                                       \
++    NULL,                                                                      \
++    cipher_hw_aes_xts_copyctx                                                  \
+ };
+ # define PROV_CIPHER_HW_select_xts()                                           \
+ if (SPARC_AES_CAPABLE)                                                         \
+@@ -143,7 +156,8 @@ if (SPARC_AES_CAPABLE)                                                         \
+ 
+ static const PROV_CIPHER_HW aes_generic_xts = {
+     cipher_hw_aes_xts_generic_initkey,
+-    NULL
++    NULL,
++    cipher_hw_aes_xts_copyctx
+ };
+ PROV_CIPHER_HW_declare_xts()
+ const PROV_CIPHER_HW *PROV_CIPHER_HW_aes_xts(size_t keybits)
+diff --git a/providers/implementations/ciphers/cipher_aria.c b/providers/implementations/ciphers/cipher_aria.c
+index da864015bd..37afa06cb5 100644
+--- a/providers/implementations/ciphers/cipher_aria.c
++++ b/providers/implementations/ciphers/cipher_aria.c
+@@ -31,7 +31,7 @@ static void *aria_dupctx(void *ctx)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    *ret = *in;
++    in-&gt;base.hw-&gt;copyctx(&amp;ret-&gt;base, &amp;in-&gt;base);
+ 
+     return ret;
+ }
+diff --git a/providers/implementations/ciphers/cipher_aria_hw.c b/providers/implementations/ciphers/cipher_aria_hw.c
+index b644be8dda..b0c5675f1b 100644
+--- a/providers/implementations/ciphers/cipher_aria_hw.c
++++ b/providers/implementations/ciphers/cipher_aria_hw.c
+@@ -29,10 +29,13 @@ static int cipher_hw_aria_initkey(PROV_CIPHER_CTX *dat,
+     return 1;
+ }
+ 
++IMPLEMENT_CIPHER_HW_COPYCTX(cipher_hw_aria_copyctx, PROV_ARIA_CTX)
++
+ # define PROV_CIPHER_HW_aria_mode(mode)                                        \
+ static const PROV_CIPHER_HW aria_##mode = {                                    \
+     cipher_hw_aria_initkey,                                                    \
+-    cipher_hw_chunked_##mode                                                   \
++    cipher_hw_chunked_##mode,                                                  \
++    cipher_hw_aria_copyctx                                                     \
+ };                                                                             \
+ const PROV_CIPHER_HW *PROV_CIPHER_HW_aria_##mode(size_t keybits)               \
+ {                                                                              \
+diff --git a/providers/implementations/ciphers/cipher_camellia.c b/providers/implementations/ciphers/cipher_camellia.c
+index cf9af3db32..d796f3635c 100644
+--- a/providers/implementations/ciphers/cipher_camellia.c
++++ b/providers/implementations/ciphers/cipher_camellia.c
+@@ -31,7 +31,7 @@ static void *camellia_dupctx(void *ctx)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    *ret = *in;
++    in-&gt;base.hw-&gt;copyctx(&amp;ret-&gt;base, &amp;in-&gt;base);
+ 
+     return ret;
+ }
+diff --git a/providers/implementations/ciphers/cipher_camellia_hw.c b/providers/implementations/ciphers/cipher_camellia_hw.c
+index 39ba4bd0ac..fe844ae1a2 100644
+--- a/providers/implementations/ciphers/cipher_camellia_hw.c
++++ b/providers/implementations/ciphers/cipher_camellia_hw.c
+@@ -35,6 +35,8 @@ static int cipher_hw_camellia_initkey(PROV_CIPHER_CTX *dat,
+     return 1;
+ }
+ 
++IMPLEMENT_CIPHER_HW_COPYCTX(cipher_hw_camellia_copyctx, PROV_CAMELLIA_CTX)
++
+ # if defined(SPARC_CMLL_CAPABLE)
+ #  include &quot;cipher_camellia_hw_t4.inc&quot;
+ # else
+@@ -46,7 +48,8 @@ static int cipher_hw_camellia_initkey(PROV_CIPHER_CTX *dat,
+ #define PROV_CIPHER_HW_camellia_mode(mode)                                     \
+ static const PROV_CIPHER_HW camellia_##mode = {                                \
+     cipher_hw_camellia_initkey,                                                \
+-    cipher_hw_generic_##mode                                                   \
++    cipher_hw_generic_##mode,                                                  \
++    cipher_hw_camellia_copyctx                                                 \
+ };                                                                             \
+ PROV_CIPHER_HW_declare(mode)                                                   \
+ const PROV_CIPHER_HW *PROV_CIPHER_HW_camellia_##mode(size_t keybits)           \
+diff --git a/providers/implementations/ciphers/cipher_camellia_hw_t4.inc b/providers/implementations/ciphers/cipher_camellia_hw_t4.inc
+index 24e104646b..96e5e20dbc 100644
+--- a/providers/implementations/ciphers/cipher_camellia_hw_t4.inc
++++ b/providers/implementations/ciphers/cipher_camellia_hw_t4.inc
+@@ -76,7 +76,8 @@ static int cipher_hw_camellia_t4_initkey(PROV_CIPHER_CTX *dat,
+ #define PROV_CIPHER_HW_declare(mode)                                           \
+ static const PROV_CIPHER_HW t4_camellia_##mode = {                             \
+     cipher_hw_camellia_t4_initkey,                                             \
+-    cipher_hw_generic_##mode                                                   \
++    cipher_hw_generic_##mode,                                                  \
++    cipher_hw_camellia_copyctx                                                 \
+ };
+ #define PROV_CIPHER_HW_select(mode)                                            \
+ if (SPARC_CMLL_CAPABLE)                                                        \
+diff --git a/providers/implementations/ciphers/cipher_sm4.c b/providers/implementations/ciphers/cipher_sm4.c
+index bf9d220923..caa7ff9c21 100644
+--- a/providers/implementations/ciphers/cipher_sm4.c
++++ b/providers/implementations/ciphers/cipher_sm4.c
+@@ -31,7 +31,7 @@ static void *sm4_dupctx(void *ctx)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    *ret = *in;
++    in-&gt;base.hw-&gt;copyctx(&amp;ret-&gt;base, &amp;in-&gt;base);
+ 
+     return ret;
+ }
+diff --git a/providers/implementations/ciphers/cipher_sm4_hw.c b/providers/implementations/ciphers/cipher_sm4_hw.c
+index 9ecaf0b997..73e88280c2 100644
+--- a/providers/implementations/ciphers/cipher_sm4_hw.c
++++ b/providers/implementations/ciphers/cipher_sm4_hw.c
+@@ -26,10 +26,13 @@ static int cipher_hw_sm4_initkey(PROV_CIPHER_CTX *ctx,
+     return 1;
+ }
+ 
++IMPLEMENT_CIPHER_HW_COPYCTX(cipher_hw_sm4_copyctx, PROV_SM4_CTX)
++
+ # define PROV_CIPHER_HW_sm4_mode(mode)                                         \
+ static const PROV_CIPHER_HW sm4_##mode = {                                     \
+     cipher_hw_sm4_initkey,                                                     \
+-    cipher_hw_chunked_##mode                                                   \
++    cipher_hw_chunked_##mode,                                                  \
++    cipher_hw_sm4_copyctx                                                      \
+ };                                                                             \
+ const PROV_CIPHER_HW *PROV_CIPHER_HW_sm4_##mode(size_t keybits)                \
+ {                                                                              \
+diff --git a/test/evp_test.c b/test/evp_test.c
+index 1039c2131a..43d6c48e84 100644
+--- a/test/evp_test.c
++++ b/test/evp_test.c
+@@ -621,12 +621,15 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+     unsigned char *in, *expected_out, *tmp = NULL;
+     size_t in_len, out_len, donelen = 0;
+     int ok = 0, tmplen, chunklen, tmpflen, i;
++    EVP_CIPHER_CTX *ctx_base = NULL;
+     EVP_CIPHER_CTX *ctx = NULL;
+ 
+     t-&gt;err = &quot;TEST_FAILURE&quot;;
++    if (!TEST_ptr(ctx_base = EVP_CIPHER_CTX_new()))
++        goto err;
+     if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new()))
+         goto err;
+-    EVP_CIPHER_CTX_set_flags(ctx, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
++    EVP_CIPHER_CTX_set_flags(ctx_base, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
+     if (enc) {
+         in = expected-&gt;plaintext;
+         in_len = expected-&gt;plaintext_len;
+@@ -663,18 +666,18 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+         in = memcpy(tmp + out_misalign + in_len + 2 * EVP_MAX_BLOCK_LENGTH +
+                     inp_misalign, in, in_len);
+     }
+-    if (!EVP_CipherInit_ex(ctx, expected-&gt;cipher, NULL, NULL, NULL, enc)) {
++    if (!EVP_CipherInit_ex(ctx_base, expected-&gt;cipher, NULL, NULL, NULL, enc)) {
+         t-&gt;err = &quot;CIPHERINIT_ERROR&quot;;
+         goto err;
+     }
+     if (expected-&gt;iv) {
+         if (expected-&gt;aead) {
+-            if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
++            if (!EVP_CIPHER_CTX_ctrl(ctx_base, EVP_CTRL_AEAD_SET_IVLEN,
+                                      expected-&gt;iv_len, 0)) {
+                 t-&gt;err = &quot;INVALID_IV_LENGTH&quot;;
+                 goto err;
+             }
+-        } else if (expected-&gt;iv_len != (size_t)EVP_CIPHER_CTX_iv_length(ctx)) {
++        } else if (expected-&gt;iv_len != (size_t)EVP_CIPHER_CTX_iv_length(ctx_base)) {
+             t-&gt;err = &quot;INVALID_IV_LENGTH&quot;;
+             goto err;
+         }
+@@ -693,7 +696,7 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+             tag = expected-&gt;tag;
+         }
+         if (tag || expected-&gt;aead != EVP_CIPH_GCM_MODE) {
+-            if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
++            if (!EVP_CIPHER_CTX_ctrl(ctx_base, EVP_CTRL_AEAD_SET_TAG,
+                                      expected-&gt;tag_len, tag))
+                 goto err;
+         }
+@@ -702,25 +705,25 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+     if (expected-&gt;rounds &gt; 0) {
+         int  rounds = (int)expected-&gt;rounds;
+ 
+-        if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_SET_RC5_ROUNDS, rounds, NULL)) {
++        if (!EVP_CIPHER_CTX_ctrl(ctx_base, EVP_CTRL_SET_RC5_ROUNDS, rounds, NULL)) {
+             t-&gt;err = &quot;INVALID_ROUNDS&quot;;
+             goto err;
+         }
+     }
+ 
+-    if (!EVP_CIPHER_CTX_set_key_length(ctx, expected-&gt;key_len)) {
++    if (!EVP_CIPHER_CTX_set_key_length(ctx_base, expected-&gt;key_len)) {
+         t-&gt;err = &quot;INVALID_KEY_LENGTH&quot;;
+         goto err;
+     }
+     if (expected-&gt;key_bits &gt; 0) {
+         int bits = (int)expected-&gt;key_bits;
+ 
+-        if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_SET_RC2_KEY_BITS, bits, NULL)) {
++        if (!EVP_CIPHER_CTX_ctrl(ctx_base, EVP_CTRL_SET_RC2_KEY_BITS, bits, NULL)) {
+             t-&gt;err = &quot;INVALID KEY BITS&quot;;
+             goto err;
+         }
+     }
+-    if (!EVP_CipherInit_ex(ctx, NULL, NULL, expected-&gt;key, expected-&gt;iv, -1)) {
++    if (!EVP_CipherInit_ex(ctx_base, NULL, NULL, expected-&gt;key, expected-&gt;iv, -1)) {
+         t-&gt;err = &quot;KEY_SET_ERROR&quot;;
+         goto err;
+     }
+@@ -729,11 +732,20 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+     if (expected-&gt;iv != NULL
+         &amp;&amp; (EVP_CIPHER_flags(expected-&gt;cipher) &amp; EVP_CIPH_CUSTOM_IV) == 0
+         &amp;&amp; !TEST_mem_eq(expected-&gt;iv, expected-&gt;iv_len,
+-                        EVP_CIPHER_CTX_iv(ctx), expected-&gt;iv_len)) {
++                        EVP_CIPHER_CTX_iv(ctx_base), expected-&gt;iv_len)) {
+         t-&gt;err = &quot;INVALID_IV&quot;;
+         goto err;
+     }
+ 
++    /* Test that the cipher dup functions correctly if it is supported */
++    if (EVP_CIPHER_CTX_copy(ctx, ctx_base)) {
++        EVP_CIPHER_CTX_free(ctx_base);
++        ctx_base = NULL;
++    } else {
++        EVP_CIPHER_CTX_free(ctx);
++        ctx = ctx_base;
++    }
++
+     if (expected-&gt;aead == EVP_CIPH_CCM_MODE) {
+         if (!EVP_CipherUpdate(ctx, NULL, &amp;tmplen, NULL, out_len)) {
+             t-&gt;err = &quot;CCM_PLAINTEXT_LENGTH_SET_ERROR&quot;;
+@@ -840,6 +852,8 @@ static int cipher_test_enc(EVP_TEST *t, int enc,
+     ok = 1;
+  err:
+     OPENSSL_free(tmp);
++    if (ctx != ctx_base)
++        EVP_CIPHER_CTX_free(ctx_base);
+     EVP_CIPHER_CTX_free(ctx);
+     return ok;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026257.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026261.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26259">[ date ]</a>
+              <a href="thread.html#26259">[ thread ]</a>
+              <a href="subject.html#26259">[ subject ]</a>
+              <a href="author.html#26259">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

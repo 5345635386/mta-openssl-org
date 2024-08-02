@@ -1,0 +1,656 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1525353205.251510.11103.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019235.html">
+   <LINK REL="Next"  HREF="019238.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1525353205.251510.11103.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu May  3 13:13:25 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019235.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019238.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19237">[ date ]</a>
+              <a href="thread.html#19237">[ thread ]</a>
+              <a href="subject.html#19237">[ subject ]</a>
+              <a href="author.html#19237">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  463e6ef500ead3fefccc470ce2f82429bb060e70 (commit)
+       via  ce147f7333fa56ab87a0878b34649991a5dae8f5 (commit)
+      from  b1860d6c71733314417d053a72af66ae72e8268e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 463e6ef500ead3fefccc470ce2f82429bb060e70
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed May 2 06:16:04 2018 +0200
+
+    VMS: modernise rand_pool_acquire_entropy, step 2
+    
+    Add more items that could serve as entropy source.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6151">https://github.com/openssl/openssl/pull/6151</A>)
+
+commit ce147f7333fa56ab87a0878b34649991a5dae8f5
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Mon Apr 30 18:04:10 2018 +0200
+
+    VMS: modernise rand_pool_acquire_entropy, step 1
+    
+    Stop redefining structures that are already defined in system
+    headers.  This also means we can stop setting the pointer size
+    globally, because the system structures will have the correct pointer
+    sizes either way.  The only exception is passing the right pointer
+    size to a function.
+    
+    Stop trying to twist things around with rand(), that's the job of the
+    DRBG that we feed.
+    
+    Stop assuming the location of the JPI$_FINALEXC item, look it up
+    instead.
+    
+    Signal an exception if the sys$getjpiw call fails (it means the item
+    list isn't set up right, so works as an assertion, but using VMS
+    methodology).
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6151">https://github.com/openssl/openssl/pull/6151</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/rand_vms.c | 474 ++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 393 insertions(+), 81 deletions(-)
+
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index 5561abc..0037466 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -10,16 +10,24 @@
+ #include &quot;e_os.h&quot;
+ 
+ #if defined(OPENSSL_SYS_VMS)
++# define __NEW_STARLET 1         /* New starlet definitions since VMS 7.0 */
+ # include &lt;unistd.h&gt;
+ # include &quot;internal/cryptlib.h&quot;
+ # include &lt;openssl/rand.h&gt;
+ # include &quot;internal/rand_int.h&quot;
+ # include &quot;rand_lcl.h&quot;
+ # include &lt;descrip.h&gt;
++# include &lt;dvidef.h&gt;
+ # include &lt;jpidef.h&gt;
++# include &lt;rmidef.h&gt;
++# include &lt;syidef.h&gt;
+ # include &lt;ssdef.h&gt;
+ # include &lt;starlet.h&gt;
+-# include &lt;efndef&gt;
++# include &lt;efndef.h&gt;
++# include &lt;gen64def.h&gt;
++# include &lt;iosbdef.h&gt;
++# include &lt;iledef.h&gt;
++# include &lt;lib$routines.h&gt;
+ # ifdef __DECC
+ #  pragma message disable DOLLARID
+ # endif
+@@ -28,106 +36,410 @@
+ #  error &quot;Unsupported seeding method configured; must be os&quot;
+ # endif
+ 
+-/*
+- * Use 32-bit pointers almost everywhere.  Define the type to which to cast a
+- * pointer passed to an external function.
+- */
++/* We need to make sure we have the right size pointer in some cases */
+ # if __INITIAL_POINTER_SIZE == 64
+-#  define PTR_T __void_ptr64
+ #  pragma pointer_size save
+ #  pragma pointer_size 32
+-# else
+-#  define PTR_T void *
++# endif
++typedef uint32_t *uint32_t__ptr32;
++# if __INITIAL_POINTER_SIZE == 64
++#  pragma pointer_size restore
+ # endif
+ 
+-static struct items_data_st {
++struct item_st {
+     short length, code;         /* length is number of bytes */
+-} items_data[] = {
+-    {4, JPI$_BUFIO},
+-    {4, JPI$_CPUTIM},
+-    {4, JPI$_DIRIO},
+-    {4, JPI$_IMAGECOUNT},
+-    {8, JPI$_LAST_LOGIN_I},
+-    {8, JPI$_LOGINTIM},
+-    {4, JPI$_PAGEFLTS},
+-    {4, JPI$_PID},
+-    {4, JPI$_PPGCNT},
+-    {4, JPI$_WSPEAK},
+-    {4, JPI$_FINALEXC},
+-    {0, 0}
+ };
+ 
++static const struct item_st DVI_item_data[] = {
++    {4,   DVI$_ERRCNT},
++    {4,   DVI$_REFCNT},
++};
++
++static const struct item_st JPI_item_data[] = {
++    {4,   JPI$_BUFIO},
++    {4,   JPI$_CPUTIM},
++    {4,   JPI$_DIRIO},
++    {4,   JPI$_IMAGECOUNT},
++    {4,   JPI$_PAGEFLTS},
++    {4,   JPI$_PID},
++    {4,   JPI$_PPGCNT},
++    {4,   JPI$_WSPEAK},
++    /*
++     * Note: the direct result is just a 32-bit address.  However, it points
++     * to a list of 4 32-bit words, so we make extra space for them so we can
++     * do in-place replacement of values
++     */
++    {16,  JPI$_FINALEXC},
++};
++
++static const struct item_st JPI_item_data_64bit[] = {
++    {8,   JPI$_LAST_LOGIN_I},
++    {8,   JPI$_LOGINTIM},
++};
++
++static const struct item_st RMI_item_data[] = {
++    {4,   RMI$_COLPG},
++    {4,   RMI$_MWAIT},
++    {4,   RMI$_CEF},
++    {4,   RMI$_PFW},
++    {4,   RMI$_LEF},
++    {4,   RMI$_LEFO},
++    {4,   RMI$_HIB},
++    {4,   RMI$_HIBO},
++    {4,   RMI$_SUSP},
++    {4,   RMI$_SUSPO},
++    {4,   RMI$_FPG},
++    {4,   RMI$_COM},
++    {4,   RMI$_COMO},
++    {4,   RMI$_CUR},
++#if defined __alpha
++    {4,   RMI$_FRLIST},
++    {4,   RMI$_MODLIST},
++#endif
++    {4,   RMI$_FAULTS},
++    {4,   RMI$_PREADS},
++    {4,   RMI$_PWRITES},
++    {4,   RMI$_PWRITIO},
++    {4,   RMI$_PREADIO},
++    {4,   RMI$_GVALFLTS},
++    {4,   RMI$_WRTINPROG},
++    {4,   RMI$_FREFLTS},
++    {4,   RMI$_DZROFLTS},
++    {4,   RMI$_SYSFAULTS},
++    {4,   RMI$_ISWPCNT},
++    {4,   RMI$_DIRIO},
++    {4,   RMI$_BUFIO},
++    {4,   RMI$_MBREADS},
++    {4,   RMI$_MBWRITES},
++    {4,   RMI$_LOGNAM},
++    {4,   RMI$_FCPCALLS},
++    {4,   RMI$_FCPREAD},
++    {4,   RMI$_FCPWRITE},
++    {4,   RMI$_FCPCACHE},
++    {4,   RMI$_FCPCPU},
++    {4,   RMI$_FCPHIT},
++    {4,   RMI$_FCPSPLIT},
++    {4,   RMI$_FCPFAULT},
++    {4,   RMI$_ENQNEW},
++    {4,   RMI$_ENQCVT},
++    {4,   RMI$_DEQ},
++    {4,   RMI$_BLKAST},
++    {4,   RMI$_ENQWAIT},
++    {4,   RMI$_ENQNOTQD},
++    {4,   RMI$_DLCKSRCH},
++    {4,   RMI$_DLCKFND},
++    {4,   RMI$_NUMLOCKS},
++    {4,   RMI$_NUMRES},
++    {4,   RMI$_ARRLOCPK},
++    {4,   RMI$_DEPLOCPK},
++    {4,   RMI$_ARRTRAPK},
++    {4,   RMI$_TRCNGLOS},
++    {4,   RMI$_RCVBUFFL},
++    {4,   RMI$_ENQNEWLOC},
++    {4,   RMI$_ENQNEWIN},
++    {4,   RMI$_ENQNEWOUT},
++    {4,   RMI$_ENQCVTLOC},
++    {4,   RMI$_ENQCVTIN},
++    {4,   RMI$_ENQCVTOUT},
++    {4,   RMI$_DEQLOC},
++    {4,   RMI$_DEQIN},
++    {4,   RMI$_DEQOUT},
++    {4,   RMI$_BLKLOC},
++    {4,   RMI$_BLKIN},
++    {4,   RMI$_BLKOUT},
++    {4,   RMI$_DIRIN},
++    {4,   RMI$_DIROUT},
++    /* We currently get a fault when trying these.  TODO: To be figured out. */
++#if 0
++    {140, RMI$_MSCP_EVERYTHING},   /* 35 32-bit words */
++    {152, RMI$_DDTM_ALL},          /* 38 32-bit words */
++    {80,  RMI$_TMSCP_EVERYTHING}   /* 20 32-bit words */
++#endif
++    {4,   RMI$_LPZ_PAGCNT},
++    {4,   RMI$_LPZ_HITS},
++    {4,   RMI$_LPZ_MISSES},
++    {4,   RMI$_LPZ_EXPCNT},
++    {4,   RMI$_LPZ_ALLOCF},
++    {4,   RMI$_LPZ_ALLOC2},
++    {4,   RMI$_ACCESS},
++    {4,   RMI$_ALLOC},
++    {4,   RMI$_FCPCREATE},
++    {4,   RMI$_VOLWAIT},
++    {4,   RMI$_FCPTURN},
++    {4,   RMI$_FCPERASE},
++    {4,   RMI$_OPENS},
++    {4,   RMI$_FIDHIT},
++    {4,   RMI$_FIDMISS},
++    {4,   RMI$_FILHDR_HIT},
++    {4,   RMI$_DIRFCB_HIT},
++    {4,   RMI$_DIRFCB_MISS},
++    {4,   RMI$_DIRDATA_HIT},
++    {4,   RMI$_EXTHIT},
++    {4,   RMI$_EXTMISS},
++    {4,   RMI$_QUOHIT},
++    {4,   RMI$_QUOMISS},
++    {4,   RMI$_STORAGMAP_HIT},
++    {4,   RMI$_VOLLCK},
++    {4,   RMI$_SYNCHLCK},
++    {4,   RMI$_SYNCHWAIT},
++    {4,   RMI$_ACCLCK},
++    {4,   RMI$_XQPCACHEWAIT},
++    {4,   RMI$_DIRDATA_MISS},
++    {4,   RMI$_FILHDR_MISS},
++    {4,   RMI$_STORAGMAP_MISS},
++    {4,   RMI$_PROCCNTMAX},
++    {4,   RMI$_PROCBATCNT},
++    {4,   RMI$_PROCINTCNT},
++    {4,   RMI$_PROCNETCNT},
++    {4,   RMI$_PROCSWITCHCNT},
++    {4,   RMI$_PROCBALSETCNT},
++    {4,   RMI$_PROCLOADCNT},
++    {4,   RMI$_BADFLTS},
++    {4,   RMI$_EXEFAULTS},
++    {4,   RMI$_HDRINSWAPS},
++    {4,   RMI$_HDROUTSWAPS},
++    {4,   RMI$_IOPAGCNT},
++    {4,   RMI$_ISWPCNTPG},
++    {4,   RMI$_OSWPCNT},
++    {4,   RMI$_OSWPCNTPG},
++    {4,   RMI$_RDFAULTS},
++    {4,   RMI$_TRANSFLTS},
++    {4,   RMI$_WRTFAULTS},
++#if defined __alpha
++    {4,   RMI$_USERPAGES},
++#endif
++    {4,   RMI$_VMSPAGES},
++    {4,   RMI$_TTWRITES},
++    {4,   RMI$_BUFOBJPAG},
++    {4,   RMI$_BUFOBJPAGPEAK},
++    {4,   RMI$_BUFOBJPAGS01},
++    {4,   RMI$_BUFOBJPAGS2},
++    {4,   RMI$_BUFOBJPAGMAXS01},
++    {4,   RMI$_BUFOBJPAGMAXS2},
++    {4,   RMI$_BUFOBJPAGPEAKS01},
++    {4,   RMI$_BUFOBJPAGPEAKS2},
++    {4,   RMI$_BUFOBJPGLTMAXS01},
++    {4,   RMI$_BUFOBJPGLTMAXS2},
++    {4,   RMI$_DLCK_INCMPLT},
++    {4,   RMI$_DLCKMSGS_IN},
++    {4,   RMI$_DLCKMSGS_OUT},
++    {4,   RMI$_MCHKERRS},
++    {4,   RMI$_MEMERRS},
++};
++
++static const struct item_st RMI_item_data_64bit[] = {
++#if defined __ia64
++    {8,   RMI$_FRLIST},
++    {8,   RMI$_MODLIST},
++#endif
++    {8,   RMI$_LCKMGR_REQCNT},
++    {8,   RMI$_LCKMGR_REQTIME},
++    {8,   RMI$_LCKMGR_SPINCNT},
++    {8,   RMI$_LCKMGR_SPINTIME},
++    {8,   RMI$_CPUINTSTK},
++    {8,   RMI$_CPUMPSYNCH},
++    {8,   RMI$_CPUKERNEL},
++    {8,   RMI$_CPUEXEC},
++    {8,   RMI$_CPUSUPER},
++    {8,   RMI$_CPUUSER},
++#if defined __ia64
++    {8,   RMI$_USERPAGES},
++#endif
++    {8,   RMI$_TQETOTAL},
++    {8,   RMI$_TQESYSUB},
++    {8,   RMI$_TQEUSRTIMR},
++    {8,   RMI$_TQEUSRWAKE},
++};
++
++static const struct item_st SYI_item_data[] = {
++    {4,   SYI$_PAGEFILE_FREE},
++};
++
++/*
++ * Input:
++ * items_data           - an array of lengths and codes
++ * items_data_num       - number of elements in that array
++ *
++ * Output:
++ * items                - pre-allocated ILE3 array to be filled.
++ *                        It's assumed to have items_data_num elements plus
++ *                        one extra for the terminating NULL element
++ * databuffer           - pre-allocated 32-bit word array.
++ *
++ * Returns the number of elements used in databuffer
++ */
++static size_t prepare_item_list(const struct item_st *items_input,
++                                size_t items_input_num,
++                                ILE3 *items,
++                                uint32_t__ptr32 databuffer)
++{
++    size_t data_sz = 0;
++
++    for (; items_input_num-- &gt; 0; items_input++, items++) {
++
++        /* Special treatment of JPI$_FINALEXC */
++        if (items-&gt;ile3$w_code == JPI$_FINALEXC)
++            items-&gt;ile3$w_length = 4;
++        else
++            items-&gt;ile3$w_length = items_input-&gt;length;
++
++        items-&gt;ile3$w_code = items_input-&gt;code;
++        items-&gt;ile3$ps_bufaddr = databuffer;
++        items-&gt;ile3$ps_retlen_addr = 0;
++
++        databuffer += items_input-&gt;length / sizeof(databuffer[0]);
++        data_sz += items_input-&gt;length;
++    }
++    /* Terminating NULL entry */
++    items-&gt;ile3$w_length = items-&gt;ile3$w_code = 0;
++    items-&gt;ile3$ps_bufaddr = items-&gt;ile3$ps_retlen_addr = NULL;
++
++    return data_sz / sizeof(databuffer[0]);
++}
++
++static void massage_JPI(ILE3 *items)
++{
++    /*
++     * Special treatment of JPI$_FINALEXC
++     * The result of that item's data buffer is a 32-bit address to a list of
++     * 4 32-bit words.
++     */
++    for (; items-&gt;ile3$w_length != 0; items++) {
++        if (items-&gt;ile3$w_code == JPI$_FINALEXC) {
++            uint32_t *data = items-&gt;ile3$ps_bufaddr;
++            uint32_t *ptr = (uint32_t *)*data;
++            size_t j;
++
++            /*
++             * We know we made space for 4 32-bit words, so we can do in-place
++             * replacement.
++             */
++            for (j = 0; j &lt; 4; j++)
++                data[j] = ptr[j];
++
++            break;
++        }
++    }
++}
++
+ /*
+  * This number expresses how many bits of data contain 1 bit of entropy.
+  *
+- * For the moment, we assume about 0.5 entropy bits per data bit, or 1
+- * bit of entropy per 2 data bits.
++ * For the moment, we assume about 0.05 entropy bits per data bit, or 1
++ * bit of entropy per 20 data bits.
+  */
+-#define ENTROPY_FACTOR  2
++#define ENTROPY_FACTOR  20
+ 
+ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ {
+-    /* determine the number of items in the JPI array */
+-    struct items_data_st item_entry;
+-    size_t item_entry_count = OSSL_NELEM(items_data);
+-    /* Create the 32-bit JPI itemlist array to hold item_data content */
+-    struct {
+-        uint16_t length, code;
+-        uint32_t *buffer;
+-        uint32_t *retlen;
+-    } item[item_entry_count], *pitem;
+-    struct items_data_st *pitems_data;
+-    /* 8 bytes (two longs) per entry max */
+-    uint32_t data_buffer[(item_entry_count * 2) + 4];
+-    uint32_t iosb[2];
+-    uint32_t sys_time[2];
+-    uint32_t *ptr;
+-    size_t i, j ;
+-    size_t tmp_length   = 0;
++    ILE3 JPI_items_64bit[OSSL_NELEM(JPI_item_data_64bit) + 1];
++    ILE3 RMI_items_64bit[OSSL_NELEM(RMI_item_data_64bit) + 1];
++    ILE3 DVI_items[OSSL_NELEM(DVI_item_data) + 1];
++    ILE3 JPI_items[OSSL_NELEM(JPI_item_data) + 1];
++    ILE3 RMI_items[OSSL_NELEM(RMI_item_data) + 1];
++    ILE3 SYI_items[OSSL_NELEM(SYI_item_data) + 1];
++    union {
++        /* This ensures buffer starts at 64 bit boundary */
++        uint64_t dummy;
++        uint32_t buffer[OSSL_NELEM(JPI_item_data_64bit) * 2
++                        + OSSL_NELEM(RMI_item_data_64bit) * 2
++                        + OSSL_NELEM(DVI_item_data)
++                        + OSSL_NELEM(JPI_item_data)
++                        + OSSL_NELEM(RMI_item_data)
++                        + OSSL_NELEM(SYI_item_data)
++                        + 4 /* For JPI$_FINALEXC */];
++    } data;
++    size_t total_elems = 0;
+     size_t total_length = 0;
+     size_t bytes_needed = rand_pool_bytes_needed(pool, ENTROPY_FACTOR);
+     size_t bytes_remaining = rand_pool_bytes_remaining(pool);
+ 
+-    /* Setup itemlist for GETJPI */
+-    pitems_data = items_data;
+-    for (pitem = item; pitems_data-&gt;length != 0; pitem++) {
+-        pitem-&gt;length = pitems_data-&gt;length;
+-        pitem-&gt;code   = pitems_data-&gt;code;
+-        pitem-&gt;buffer = &amp;data_buffer[total_length];
+-        pitem-&gt;retlen = 0;
+-        /* total_length is in longwords */
+-        total_length += pitems_data-&gt;length / 4;
+-        pitems_data++;
+-    }
+-    pitem-&gt;length = pitem-&gt;code = 0;
++    /* Take all the 64-bit items first, to ensure proper alignment of data */
++    total_elems +=
++        prepare_item_list(JPI_item_data_64bit, OSSL_NELEM(JPI_item_data_64bit),
++                          JPI_items_64bit, &amp;data.buffer[total_elems]);
++    total_elems +=
++        prepare_item_list(RMI_item_data_64bit, OSSL_NELEM(RMI_item_data_64bit),
++                          RMI_items_64bit, &amp;data.buffer[total_elems]);
++    /* Now the 32-bit items */
++    total_elems += prepare_item_list(DVI_item_data, OSSL_NELEM(DVI_item_data),
++                                     DVI_items, &amp;data.buffer[total_elems]);
++    total_elems += prepare_item_list(JPI_item_data, OSSL_NELEM(JPI_item_data),
++                                     JPI_items, &amp;data.buffer[total_elems]);
++    total_elems += prepare_item_list(RMI_item_data, OSSL_NELEM(RMI_item_data),
++                                     RMI_items, &amp;data.buffer[total_elems]);
++    total_elems += prepare_item_list(SYI_item_data, OSSL_NELEM(SYI_item_data),
++                                     SYI_items, &amp;data.buffer[total_elems]);
++    total_length = total_elems * sizeof(data.buffer[0]);
+ 
+-    /* Fill data_buffer with various info bits from this process */
+-    if (sys$getjpiw(EFN$C_ENF, NULL, NULL, item, &amp;iosb, 0, 0) != SS$_NORMAL)
+-        return 0;
++    /* Fill data.buffer with various info bits from this process */
++    {
++        uint32_t status;
++        uint32_t efn;
++        IOSB iosb;
++        $DESCRIPTOR(SYSDEVICE,&quot;SYS$SYSDEVICE:&quot;);
+ 
+-    /* Now twist that data to seed the SSL random number init */
+-    for (i = 0; i &lt; total_length; i++) {
+-        sys$gettim((struct _generic_64 *)&amp;sys_time[0]);
+-        srand(sys_time[0] * data_buffer[0] * data_buffer[1] + i);
+-
+-        if (i == (total_length - 1)) { /* for JPI$_FINALEXC */
+-            ptr = &amp;data_buffer[i];
+-            for (j = 0; j &lt; 4; j++) {
+-                data_buffer[i + j] = ptr[j];
+-                /* OK to use rand() just to scramble the seed */
+-                data_buffer[i + j] ^= (sys_time[0] ^ rand());
+-                tmp_length++;
+-            }
+-        } else {
+-            /* OK to use rand() just to scramble the seed */
+-            data_buffer[i] ^= (sys_time[0] ^ rand());
++        if ((status = sys$getdviw(EFN$C_ENF, 0, &amp;SYSDEVICE, DVI_items,
++                                  0, 0, 0, 0, 0)) != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$getjpiw(EFN$C_ENF, 0, 0, JPI_items_64bit, 0, 0, 0))
++            != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$getjpiw(EFN$C_ENF, 0, 0, JPI_items, 0, 0, 0))
++            != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$getsyiw(EFN$C_ENF, 0, 0, SYI_items, 0, 0, 0))
++            != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        /*
++         * The RMI service is a bit special, as there is no synchronous
++         * variant, so we MUST create an event flag to synchronise on.
++         */
++        if ((status = lib$get_ef(&amp;efn)) != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$getrmi(efn, 0, 0, RMI_items_64bit, &amp;iosb, 0, 0))
++            != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$synch(efn, &amp;iosb)) != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if (iosb.iosb$l_getxxi_status != SS$_NORMAL) {
++            lib$signal(iosb.iosb$l_getxxi_status);
++            return 0;
++        }
++        if ((status = sys$getrmi(efn, 0, 0, RMI_items, &amp;iosb, 0, 0))
++            != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if ((status = sys$synch(efn, &amp;iosb)) != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
++        }
++        if (iosb.iosb$l_getxxi_status != SS$_NORMAL) {
++            lib$signal(iosb.iosb$l_getxxi_status);
++            return 0;
++        }
++        if ((status = lib$free_ef(&amp;efn)) != SS$_NORMAL) {
++            lib$signal(status);
++            return 0;
+         }
+     }
+ 
+-    total_length += (tmp_length - 1);
+-
+-    /* Change the total length to number of bytes */
+-    total_length *= 4;
++    massage_JPI(JPI_items);
+ 
+     /*
+      * If we can't feed the requirements from the caller, we're in deep trouble.
+@@ -152,8 +464,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+         total_length = bytes_remaining;
+ 
+     /* We give the pessimistic value for the amount of entropy */
+-    rand_pool_add(pool, (PTR_T)data_buffer, total_length,
+-                  total_length / ENTROPY_FACTOR);
++    rand_pool_add(pool, (unsigned char *)data.buffer, total_length,
++                  8 * total_length / ENTROPY_FACTOR);
+     return rand_pool_entropy_available(pool);
+ }
+ 
+@@ -172,7 +484,7 @@ int rand_pool_add_nonce_data(RAND_POOL *pool)
+      */
+     data.pid = getpid();
+     data.tid = CRYPTO_THREAD_get_current_id();
+-    sys$gettim_prec((struct _generic_64 *)&amp;data.time);
++    sys$gettim_prec(&amp;data.time);
+ 
+     return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
+ }
+@@ -190,7 +502,7 @@ int rand_pool_add_additional_data(RAND_POOL *pool)
+      * concurrently (which is the case for the &lt;master&gt; drbg).
+      */
+     data.tid = CRYPTO_THREAD_get_current_id();
+-    sys$gettim_prec((struct _generic_64 *)&amp;data.time);
++    sys$gettim_prec(&amp;data.time);
+ 
+     return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019235.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019238.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19237">[ date ]</a>
+              <a href="thread.html#19237">[ thread ]</a>
+              <a href="subject.html#19237">[ subject ]</a>
+              <a href="author.html#19237">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

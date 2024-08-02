@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1617782913.185988.26596.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033765.html">
+   <LINK REL="Next"  HREF="033767.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1617782913.185988.26596.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Wed Apr  7 08:08:33 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033765.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033767.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33766">[ date ]</a>
+              <a href="thread.html#33766">[ thread ]</a>
+              <a href="subject.html#33766">[ subject ]</a>
+              <a href="author.html#33766">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  86522324d2a398ad3ed2f648a66b62b0a6176258 (commit)
+      from  581c4b1d5357bdf858a6675ea0b3121731bca5c3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 86522324d2a398ad3ed2f648a66b62b0a6176258
+Author: Sahana Prasad &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">sahana at redhat.com</A>&gt;
+Date:   Mon Mar 22 23:44:22 2021 +0100
+
+    Adds a new lock to read default_path and uses a strdup() on default_path before using it
+    Fixes #14483
+    Signed-off-by: Sahana Prasad &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">sahana at redhat.com</A>&gt;
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14650">https://github.com/openssl/openssl/pull/14650</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_core.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 632ea72a5d..ac094f0bdd 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -114,6 +114,7 @@ static int ossl_provider_cmp(const OSSL_PROVIDER * const *a,
+ 
+ struct provider_store_st {
+     STACK_OF(OSSL_PROVIDER) *providers;
++    CRYPTO_RWLOCK *default_path_lock;
+     CRYPTO_RWLOCK *lock;
+     char *default_path;
+     unsigned int use_fallbacks:1;
+@@ -140,6 +141,7 @@ static void provider_store_free(void *vstore)
+         return;
+     OPENSSL_free(store-&gt;default_path);
+     sk_OSSL_PROVIDER_pop_free(store-&gt;providers, provider_deactivate_free);
++    CRYPTO_THREAD_lock_free(store-&gt;default_path_lock);
+     CRYPTO_THREAD_lock_free(store-&gt;lock);
+     OPENSSL_free(store);
+ }
+@@ -151,6 +153,7 @@ static void *provider_store_new(OSSL_LIB_CTX *ctx)
+ 
+     if (store == NULL
+         || (store-&gt;providers = sk_OSSL_PROVIDER_new(ossl_provider_cmp)) == NULL
++        || (store-&gt;default_path_lock = CRYPTO_THREAD_lock_new()) == NULL
+         || (store-&gt;lock = CRYPTO_THREAD_lock_new()) == NULL) {
+         provider_store_free(store);
+         return NULL;
+@@ -461,10 +464,10 @@ int OSSL_PROVIDER_set_default_search_path(OSSL_LIB_CTX *libctx,
+         }
+     }
+     if ((store = get_provider_store(libctx)) != NULL
+-            &amp;&amp; CRYPTO_THREAD_write_lock(store-&gt;lock)) {
++            &amp;&amp; CRYPTO_THREAD_write_lock(store-&gt;default_path_lock)) {
+         OPENSSL_free(store-&gt;default_path);
+         store-&gt;default_path = p;
+-        CRYPTO_THREAD_unlock(store-&gt;lock);
++        CRYPTO_THREAD_unlock(store-&gt;default_path_lock);
+         return 1;
+     }
+     OPENSSL_free(p);
+@@ -513,6 +516,7 @@ static int provider_init(OSSL_PROVIDER *prov)
+             const char *module_path = NULL;
+             char *merged_path = NULL;
+             const char *load_dir = NULL;
++            char *allocated_load_dir = NULL;
+             struct provider_store_st *store;
+ 
+             if ((prov-&gt;module = DSO_new()) == NULL) {
+@@ -521,10 +525,20 @@ static int provider_init(OSSL_PROVIDER *prov)
+             }
+ 
+             if ((store = get_provider_store(prov-&gt;libctx)) == NULL
+-                    || !CRYPTO_THREAD_read_lock(store-&gt;lock))
++                    || !CRYPTO_THREAD_read_lock(store-&gt;default_path_lock))
+                 goto end;
+-            load_dir = store-&gt;default_path;
+-            CRYPTO_THREAD_unlock(store-&gt;lock);
++
++            if (store-&gt;default_path != NULL) {
++                allocated_load_dir = OPENSSL_strdup(store-&gt;default_path);
++                CRYPTO_THREAD_unlock(store-&gt;default_path_lock);
++                if (allocated_load_dir == NULL) {
++                    ERR_raise(ERR_LIB_CRYPTO, ERR_R_MALLOC_FAILURE);
++                    goto end;
++                }
++                load_dir = allocated_load_dir;
++            } else {
++                CRYPTO_THREAD_unlock(store-&gt;default_path_lock);
++            }
+ 
+             if (load_dir == NULL) {
+                 load_dir = ossl_safe_getenv(&quot;OPENSSL_MODULES&quot;);
+@@ -550,6 +564,7 @@ static int provider_init(OSSL_PROVIDER *prov)
+ 
+             OPENSSL_free(merged_path);
+             OPENSSL_free(allocated_path);
++            OPENSSL_free(allocated_load_dir);
+         }
+ 
+         if (prov-&gt;module != NULL)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033765.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033767.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33766">[ date ]</a>
+              <a href="thread.html#33766">[ thread ]</a>
+              <a href="subject.html#33766">[ subject ]</a>
+              <a href="author.html#33766">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

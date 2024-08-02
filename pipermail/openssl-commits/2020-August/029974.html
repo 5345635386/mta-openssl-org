@@ -1,0 +1,697 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596507607.608282.5945.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029968.html">
+   <LINK REL="Next"  HREF="029975.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596507607.608282.5945.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Tue Aug  4 02:20:07 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029968.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029975.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29974">[ date ]</a>
+              <a href="thread.html#29974">[ thread ]</a>
+              <a href="subject.html#29974">[ subject ]</a>
+              <a href="author.html#29974">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e5b2cd5899b2631363740a40c76d96fd15d32d1c (commit)
+      from  37d898df348b87a423133afdbb828383be22fda7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e5b2cd5899b2631363740a40c76d96fd15d32d1c
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Tue Aug 4 12:18:51 2020 +1000
+
+    Change the provider implementation of X942kdf to use wpacket to do der encoding of sharedInfo
+    
+    Added der_writer functions for writing octet string primitives.
+    Generate OID's for key wrapping algorithms used by X942 KDF.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12554">https://github.com/openssl/openssl/pull/12554</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ .gitignore                                         |   2 +
+ crypto/der_writer.c                                |  23 ++
+ doc/internal/man3/DER_w_bn.pod                     |  12 +-
+ include/internal/der.h                             |   3 +
+ providers/common/der/build.info                    |  15 +-
+ .../common/der/{der_dsa_gen.c.in =&gt; der_wrap.h.in} |   6 +-
+ .../der/{der_dsa_gen.c.in =&gt; der_wrap_gen.c.in}    |   4 +-
+ providers/common/der/wrap.asn1                     |  19 ++
+ providers/implementations/exchange/ecdh_exch.c     |   2 -
+ providers/implementations/kdfs/build.info          |   1 +
+ providers/implementations/kdfs/x942kdf.c           | 254 +++++++++++----------
+ test/recipes/30-test_evp_data/evpkdf.txt           |  12 +-
+ 12 files changed, 226 insertions(+), 127 deletions(-)
+ copy providers/common/der/{der_dsa_gen.c.in =&gt; der_wrap.h.in} (81%)
+ copy providers/common/der/{der_dsa_gen.c.in =&gt; der_wrap_gen.c.in} (84%)
+ create mode 100644 providers/common/der/wrap.asn1
+
+diff --git a/.gitignore b/.gitignore
+index 3a0dafda11..ecbc524829 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -34,10 +34,12 @@ providers/common/der/der_digests_gen.c
+ providers/common/der/der_dsa_gen.c
+ providers/common/der/der_ec_gen.c
+ providers/common/der/der_rsa_gen.c
++providers/common/der/der_wrap_gen.c
+ providers/common/include/prov/der_dsa.h
+ providers/common/include/prov/der_ec.h
+ providers/common/include/prov/der_rsa.h
+ providers/common/include/prov/der_digests.h
++providers/common/include/prov/der_wrap.h
+ 
+ # error code files
+ /crypto/err/openssl.txt.old
+diff --git a/crypto/der_writer.c b/crypto/der_writer.c
+index 117b5dff90..8210327f06 100644
+--- a/crypto/der_writer.c
++++ b/crypto/der_writer.c
+@@ -66,6 +66,29 @@ int DER_w_boolean(WPACKET *pkt, int tag, int b)
+         &amp;&amp; int_end_context(pkt, tag);
+ }
+ 
++int DER_w_octet_string(WPACKET *pkt, int tag,
++                       const unsigned char *data, size_t data_n)
++{
++    return int_start_context(pkt, tag)
++        &amp;&amp; WPACKET_start_sub_packet(pkt)
++        &amp;&amp; WPACKET_memcpy(pkt, data, data_n)
++        &amp;&amp; WPACKET_close(pkt)
++        &amp;&amp; WPACKET_put_bytes_u8(pkt, DER_P_OCTET_STRING)
++        &amp;&amp; int_end_context(pkt, tag);
++}
++
++int DER_w_octet_string_uint32(WPACKET *pkt, int tag, uint32_t value)
++{
++    unsigned char tmp[4] = { 0, 0, 0, 0 };
++    unsigned char *pbuf = tmp + (sizeof(tmp) - 1);
++
++    while (value &gt; 0) {
++        *pbuf-- = (value &amp; 0xFF);
++        value &gt;&gt;= 8;
++    }
++    return DER_w_octet_string(pkt, tag, tmp, sizeof(tmp));
++}
++
+ static int int_der_w_integer(WPACKET *pkt, int tag,
+                              int (*put_bytes)(WPACKET *pkt, const void *v,
+                                               unsigned int *top_byte),
+diff --git a/doc/internal/man3/DER_w_bn.pod b/doc/internal/man3/DER_w_bn.pod
+index c51223f71a..deea5de346 100644
+--- a/doc/internal/man3/DER_w_bn.pod
++++ b/doc/internal/man3/DER_w_bn.pod
+@@ -2,7 +2,8 @@
+ 
+ =head1 NAME
+ 
+-DER_w_boolean, DER_w_ulong, DER_w_bn, DER_w_null
++DER_w_boolean, DER_w_ulong, DER_w_bn, DER_w_null,
++DER_w_octet_string, DER_w_octet_string_uint32
+ - internal DER writers for DER primitives
+ 
+ =head1 SYNOPSIS
+@@ -13,6 +14,9 @@ DER_w_boolean, DER_w_ulong, DER_w_bn, DER_w_null
+  int DER_w_ulong(WPACKET *pkt, int tag, unsigned long v);
+  int DER_w_bn(WPACKET *pkt, int tag, const BIGNUM *v);
+  int DER_w_null(WPACKET *pkt, int tag);
++ int DER_w_octet_string(WPACKET *pkt, int tag,
++                        const unsigned char *data, size_t data_n);
++ int DER_w_octet_string_uint32(WPACKET *pkt, int tag, uint32_t value);
+ 
+ =head1 DESCRIPTION
+ 
+@@ -33,6 +37,12 @@ added.
+ 
+ DER_w_null() writes the primitive NULL.
+ 
++DER_w_octet_string() writes the primitive OCTET STRING using the bytes from
++I&lt;data&gt; with a length of I&lt;data_n&gt;.
++
++DER_w_octet_string_uint32() writes the primitive OCTET STRING using a 32 bit
++value in I&lt;value&gt;.
++
+ =head1 RETURN VALUES
+ 
+ All the functions return 1 on success and 0 on failure.  Failure may
+diff --git a/include/internal/der.h b/include/internal/der.h
+index 118aa9857c..ce667dc869 100644
+--- a/include/internal/der.h
++++ b/include/internal/der.h
+@@ -76,6 +76,9 @@ int DER_w_boolean(WPACKET *pkt, int tag, int b);
+ int DER_w_ulong(WPACKET *pkt, int tag, unsigned long v);
+ int DER_w_bn(WPACKET *pkt, int tag, const BIGNUM *v);
+ int DER_w_null(WPACKET *pkt, int tag);
++int DER_w_octet_string(WPACKET *pkt, int tag,
++                       const unsigned char *data, size_t data_n);
++int DER_w_octet_string_uint32(WPACKET *pkt, int tag, uint32_t value);
+ 
+ /*
+  * All constructors for constructed elements have a begin and a end function
+diff --git a/providers/common/der/build.info b/providers/common/der/build.info
+index 7bb1d0dc46..f7eb86fdfb 100644
+--- a/providers/common/der/build.info
++++ b/providers/common/der/build.info
+@@ -50,6 +50,17 @@ DEPEND[${DER_EC_GEN/.c/.o}]=$DER_EC_H
+ GENERATE[$DER_EC_H]=der_ec.h.in
+ DEPEND[$DER_EC_H]=oids_to_c.pm
+ 
++#----- KEY WRAP
++$DER_WRAP_H=../include/prov/der_wrap.h
++$DER_WRAP_GEN=der_wrap_gen.c
++
++GENERATE[$DER_WRAP_GEN]=der_wrap_gen.c.in
++DEPEND[$DER_WRAP_GEN]=oids_to_c.pm
++
++DEPEND[${DER_WRAP_GEN/.c/.o}]=$DER_WRAP_H
++GENERATE[$DER_WRAP_H]=der_wrap.h.in
++DEPEND[$DER_WRAP_H]=oids_to_c.pm
++
+ #----- Conclusion
+ 
+ # TODO(3.0) $COMMON should go to libcommon.a, but this currently leads
+@@ -59,6 +70,8 @@ $COMMON=\
+         $DER_RSA_COMMON \
+         $DER_DSA_GEN $DER_DSA_AUX \
+         $DER_EC_GEN $DER_EC_AUX \
+-        $DER_DIGESTS_GEN
++        $DER_DIGESTS_GEN \
++        $DER_WRAP_GEN
++
+ SOURCE[../../libfips.a]=$COMMON $DER_RSA_FIPSABLE
+ SOURCE[../../libnonfips.a]=$COMMON $DER_RSA_FIPSABLE
+diff --git a/providers/common/der/der_dsa_gen.c.in b/providers/common/der/der_wrap.h.in
+similarity index 81%
+copy from providers/common/der/der_dsa_gen.c.in
+copy to providers/common/der/der_wrap.h.in
+index 95f1f5cdd1..5348fc4697 100644
+--- a/providers/common/der/der_dsa_gen.c.in
++++ b/providers/common/der/der_wrap.h.in
+@@ -7,11 +7,11 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-#include &quot;prov/der_dsa.h&quot;
++#include &quot;internal/der.h&quot;
+ 
+ /* Well known OIDs precompiled */
+ {-
+-    $OUT = oids_to_c::process_leaves('providers/common/der/DSA.asn1',
++    $OUT = oids_to_c::process_leaves('providers/common/der/wrap.asn1',
+                                      { dir =&gt; $config{sourcedir},
+-                                       filter =&gt; \&amp;oids_to_c::filter_to_C });
++                                       filter =&gt; \&amp;oids_to_c::filter_to_H });
+ -}
+diff --git a/providers/common/der/der_dsa_gen.c.in b/providers/common/der/der_wrap_gen.c.in
+similarity index 84%
+copy from providers/common/der/der_dsa_gen.c.in
+copy to providers/common/der/der_wrap_gen.c.in
+index 95f1f5cdd1..b74c334b53 100644
+--- a/providers/common/der/der_dsa_gen.c.in
++++ b/providers/common/der/der_wrap_gen.c.in
+@@ -7,11 +7,11 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-#include &quot;prov/der_dsa.h&quot;
++#include &quot;prov/der_wrap.h&quot;
+ 
+ /* Well known OIDs precompiled */
+ {-
+-    $OUT = oids_to_c::process_leaves('providers/common/der/DSA.asn1',
++    $OUT = oids_to_c::process_leaves('providers/common/der/wrap.asn1',
+                                      { dir =&gt; $config{sourcedir},
+                                        filter =&gt; \&amp;oids_to_c::filter_to_C });
+ -}
+diff --git a/providers/common/der/wrap.asn1 b/providers/common/der/wrap.asn1
+new file mode 100644
+index 0000000000..006ea0b16c
+--- /dev/null
++++ b/providers/common/der/wrap.asn1
+@@ -0,0 +1,19 @@
++-- -------------------------------------------------------------------
++-- Taken from RFC 3370, Section 4.3.1 Triple-DES Key Wrap
++-- (<A HREF="https://tools.ietf.org/html/rfc3370">https://tools.ietf.org/html/rfc3370</A>)
++
++id-alg-CMS3DESwrap OBJECT IDENTIFIER ::= {
++    iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) alg(3) 6
++}
++
++-- -------------------------------------------------------------------
++-- Taken from RFC 3394, Section 3. Object Identifiers
++-- (<A HREF="https://tools.ietf.org/html/rfc3565">https://tools.ietf.org/html/rfc3565</A>)
++
++aes  OBJECT IDENTIFIER  ::=  {
++    joint-iso-itu-t(2) country(16) us(840) organization(1) gov(101) csor(3) nistAlgorithm(4) 1
++}
++
++id-aes128-wrap OBJECT IDENTIFIER ::= { aes 5 }
++id-aes192-wrap OBJECT IDENTIFIER ::= { aes 25 }
++id-aes256-wrap OBJECT IDENTIFIER ::= { aes 45 }
+diff --git a/providers/implementations/exchange/ecdh_exch.c b/providers/implementations/exchange/ecdh_exch.c
+index 6334d0e8bd..ba28d5102e 100644
+--- a/providers/implementations/exchange/ecdh_exch.c
++++ b/providers/implementations/exchange/ecdh_exch.c
+@@ -521,8 +521,6 @@ int ecdh_derive(void *vpecdhctx, unsigned char *secret,
+     return 0;
+ }
+ 
+-
+-
+ const OSSL_DISPATCH ecdh_keyexch_functions[] = {
+     { OSSL_FUNC_KEYEXCH_NEWCTX, (void (*)(void))ecdh_newctx },
+     { OSSL_FUNC_KEYEXCH_INIT, (void (*)(void))ecdh_init },
+diff --git a/providers/implementations/kdfs/build.info b/providers/implementations/kdfs/build.info
+index 2c6b2ce1c8..3b3884436a 100644
+--- a/providers/implementations/kdfs/build.info
++++ b/providers/implementations/kdfs/build.info
+@@ -30,3 +30,4 @@ SOURCE[$SSKDF_GOAL]=sskdf.c
+ SOURCE[$SCRYPT_GOAL]=scrypt.c
+ SOURCE[$SSHKDF_GOAL]=sshkdf.c
+ SOURCE[$X942KDF_GOAL]=x942kdf.c
++DEPEND[x942kdf.o]=../../common/include/prov/der_wrap.h
+diff --git a/providers/implementations/kdfs/x942kdf.c b/providers/implementations/kdfs/x942kdf.c
+index be141c0d88..cf0ad0bcda 100644
+--- a/providers/implementations/kdfs/x942kdf.c
++++ b/providers/implementations/kdfs/x942kdf.c
+@@ -9,28 +9,20 @@
+  */
+ 
+ #include &quot;e_os.h&quot;
+-
+-#ifndef OPENSSL_NO_CMS
+-
+-# include &lt;stdlib.h&gt;
+-# include &lt;stdarg.h&gt;
+-# include &lt;string.h&gt;
+-# include &lt;openssl/hmac.h&gt;
+-# include &lt;openssl/cms.h&gt;
+-# include &lt;openssl/evp.h&gt;
+-# include &lt;openssl/kdf.h&gt;
+-# include &lt;openssl/x509.h&gt;
+-# include &lt;openssl/obj_mac.h&gt;
+-# include &lt;openssl/core_names.h&gt;
+-# include &quot;internal/cryptlib.h&quot;
+-# include &quot;internal/numbers.h&quot;
+-# include &quot;crypto/evp.h&quot;
+-# include &quot;prov/provider_ctx.h&quot;
+-# include &quot;prov/providercommonerr.h&quot;
+-# include &quot;prov/implementations.h&quot;
+-# include &quot;prov/provider_util.h&quot;
+-
+-# define X942KDF_MAX_INLEN (1 &lt;&lt; 30)
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/core_dispatch.h&gt;
++#include &lt;openssl/err.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &quot;internal/packet.h&quot;
++#include &quot;internal/der.h&quot;
++#include &quot;prov/provider_ctx.h&quot;
++#include &quot;prov/providercommonerr.h&quot;
++#include &quot;prov/implementations.h&quot;
++#include &quot;prov/provider_util.h&quot;
++#include &quot;prov/der_wrap.h&quot;
++
++#define X942KDF_MAX_INLEN (1 &lt;&lt; 30)
+ 
+ static OSSL_FUNC_kdf_newctx_fn x942kdf_new;
+ static OSSL_FUNC_kdf_freectx_fn x942kdf_free;
+@@ -46,42 +38,83 @@ typedef struct {
+     PROV_DIGEST digest;
+     unsigned char *secret;
+     size_t secret_len;
+-    int cek_nid;
+     unsigned char *ukm;
+     size_t ukm_len;
+     size_t dkm_len;
++    const unsigned char *cek_oid;
++    size_t cek_oid_len;
+ } KDF_X942;
+ 
+-/* A table of allowed wrapping algorithms and the associated output lengths */
++/*
++ * A table of allowed wrapping algorithms, oids and the associated output
++ * lengths.
++ * NOTE: RC2wrap and camellia128_wrap have been removed as there are no
++ * corresponding ciphers for these operations.
++ */
+ static const struct {
+-    int nid;
++    const char *name;
++    const unsigned char *oid;
++    size_t oid_len;
+     size_t keklen; /* size in bytes */
+ } kek_algs[] = {
+-    { NID_id_smime_alg_CMS3DESwrap, 24 },
+-    { NID_id_smime_alg_CMSRC2wrap, 16 },
+-    { NID_id_aes128_wrap, 16 },
+-    { NID_id_aes192_wrap, 24 },
+-    { NID_id_aes256_wrap, 32 },
+-    { NID_id_camellia128_wrap, 16 },
+-    { NID_id_camellia192_wrap, 24 },
+-    { NID_id_camellia256_wrap, 32 }
++    { &quot;AES-128-WRAP&quot;, der_oid_id_aes128_wrap, DER_OID_SZ_id_aes128_wrap, 16 },
++    { &quot;AES-192-WRAP&quot;, der_oid_id_aes192_wrap, DER_OID_SZ_id_aes192_wrap, 24 },
++    { &quot;AES-256-WRAP&quot;, der_oid_id_aes256_wrap, DER_OID_SZ_id_aes256_wrap, 32 },
++#ifndef FIPS_MODULE
++    { &quot;DES3-WRAP&quot;, der_oid_id_alg_CMS3DESwrap, DER_OID_SZ_id_alg_CMS3DESwrap,
++      24 },
++#endif
+ };
+ 
+-/* Skip past an ASN1 structure: for OBJECT skip content octets too */
+-static int skip_asn1(unsigned char **pp, long *plen, int exptag)
++static int find_alg_id(OPENSSL_CTX *libctx, const char *algname, size_t *id)
+ {
+-    int i, tag, xclass;
+-    long tmplen;
+-    const unsigned char *q = *pp;
++    int ret = 1;
++    size_t i;
++    EVP_CIPHER *cipher;
+ 
+-    i = ASN1_get_object(&amp;q, &amp;tmplen, &amp;tag, &amp;xclass, *plen);
+-    if ((i &amp; 0x80) != 0 || tag != exptag || xclass != V_ASN1_UNIVERSAL)
+-        return 0;
+-    if (tag == V_ASN1_OBJECT)
+-        q += tmplen;
+-    *pp = (unsigned char *)q;
+-    *plen -= q - *pp;
+-    return 1;
++    cipher = EVP_CIPHER_fetch(libctx, algname, NULL);
++    if (cipher != NULL) {
++        for (i = 0; i &lt; OSSL_NELEM(kek_algs); i++) {
++            if (EVP_CIPHER_is_a(cipher, kek_algs[i].name)) {
++                *id = i;
++                goto end;
++            }
++        }
++    }
++    ret = 0;
++    ERR_raise(ERR_LIB_PROV, PROV_R_UNSUPPORTED_CEK_ALG);
++end:
++    EVP_CIPHER_free(cipher);
++    return ret;
++}
++
++static int DER_w_keyinfo(WPACKET *pkt,
++                         const unsigned char *der_oid, size_t der_oidlen,
++                         unsigned char **pcounter)
++{
++    return DER_w_begin_sequence(pkt, -1)
++           /* Store the initial value of 1 into the counter */
++           &amp;&amp; DER_w_octet_string_uint32(pkt, -1, 1)
++           /* Remember where we stored the counter in the buffer */
++           &amp;&amp; (pcounter == NULL
++               || (*pcounter = WPACKET_get_curr(pkt)) != NULL)
++           &amp;&amp; DER_w_precompiled(pkt, -1, der_oid, der_oidlen)
++           &amp;&amp; DER_w_end_sequence(pkt, -1);
++}
++
++static int der_encode_sharedinfo(WPACKET *pkt, unsigned char *buf, size_t buflen,
++                                 const unsigned char *der_oid, size_t der_oidlen,
++                                 const unsigned char *ukm, size_t ukmlen,
++                                 uint32_t keylen_bits, unsigned char **pcounter)
++{
++    return (buf != NULL ? WPACKET_init_der(pkt, buf, buflen) :
++                          WPACKET_init_null_der(pkt))
++           &amp;&amp; DER_w_begin_sequence(pkt, -1)
++           &amp;&amp; DER_w_octet_string_uint32(pkt, 2, keylen_bits)
++           &amp;&amp; (ukm == NULL || DER_w_octet_string(pkt, 0, ukm, ukmlen))
++           &amp;&amp; DER_w_keyinfo(pkt, der_oid, der_oidlen, pcounter)
++           &amp;&amp; DER_w_end_sequence(pkt, -1)
++           &amp;&amp; WPACKET_finish(pkt);
+ }
+ 
+ /*
+@@ -94,15 +127,18 @@ static int skip_asn1(unsigned char **pp, long *plen, int exptag)
+  *      partyAInfo [0] OCTET STRING OPTIONAL,
+  *      suppPubInfo [2] OCTET STRING
+  *  }
++ *  Note suppPubInfo is the key length (in bits) (stored into 4 bytes)
++ *
+  *
+  *  KeySpecificInfo ::= SEQUENCE {
+  *      algorithm OBJECT IDENTIFIER,
+  *      counter OCTET STRING SIZE (4..4)
+  *  }
+  *
+- * |nid| is the algorithm object identifier.
+  * |keylen| is the length (in bytes) of the generated KEK. It is stored into
+  * suppPubInfo (in bits).
++ * |cek_oid| The oid of the key wrapping algorithm.
++ * |cek_oidlen| The length (in bytes) of the key wrapping algorithm oid,
+  * |ukm| is the optional user keying material that is stored into partyAInfo. It
+  * can be NULL.
+  * |ukmlen| is the user keying material length (in bytes).
+@@ -114,66 +150,60 @@ static int skip_asn1(unsigned char **pp, long *plen, int exptag)
+  * Returns: 1 if successfully encoded, or 0 otherwise.
+  * Assumptions: |der|, |der_len| &amp; |out_ctr| are not NULL.
+  */
+-static int x942_encode_otherinfo(int nid, size_t keylen,
++static int x942_encode_otherinfo(size_t keylen,
++                                 const unsigned char *cek_oid, size_t cek_oidlen,
+                                  const unsigned char *ukm, size_t ukmlen,
+                                  unsigned char **der, size_t *der_len,
+                                  unsigned char **out_ctr)
+ {
+-    unsigned char *p, *encoded = NULL;
+-    int ret = 0, encoded_len;
+-    long tlen;
+-    /* &quot;magic&quot; value to check offset is sane */
+-    static unsigned char ctr[4] = { 0x00, 0x00, 0x00, 0x01 };
+-    X509_ALGOR *ksi = NULL;
+-    ASN1_OBJECT *alg_oid = NULL;
+-    ASN1_OCTET_STRING *ctr_oct = NULL, *ukm_oct = NULL;
+-
+-    /* set the KeySpecificInfo - which contains an algorithm oid and counter */
+-    ksi = X509_ALGOR_new();
+-    alg_oid = OBJ_dup(OBJ_nid2obj(nid));
+-    ctr_oct = ASN1_OCTET_STRING_new();
+-    if (ksi == NULL
+-        || alg_oid == NULL
+-        || ctr_oct == NULL
+-        || !ASN1_OCTET_STRING_set(ctr_oct, ctr, sizeof(ctr))
+-        || !X509_ALGOR_set0(ksi, alg_oid, V_ASN1_OCTET_STRING, ctr_oct))
++    int ret = 0;
++    unsigned char *pcounter = NULL, *der_buf = NULL;
++    size_t der_buflen = 0;
++    WPACKET pkt;
++    uint32_t keylen_bits;
++
++    /* keylenbits must fit into 4 bytes */
++    if (keylen &gt; 0xFFFFFF)
+         goto err;
+-    /* NULL these as they now belong to ksi */
+-    alg_oid = NULL;
+-    ctr_oct = NULL;
+-
+-    /* Set the optional partyAInfo */
+-    if (ukm != NULL) {
+-        ukm_oct = ASN1_OCTET_STRING_new();
+-        if (ukm_oct == NULL)
+-            goto err;
+-        ASN1_OCTET_STRING_set(ukm_oct, (unsigned char *)ukm, ukmlen);
+-    }
+-    /* Generate the OtherInfo DER data */
+-    encoded_len = CMS_SharedInfo_encode(&amp;encoded, ksi, ukm_oct, keylen);
+-    if (encoded_len &lt;= 0)
++    keylen_bits = 8 * keylen;
++
++    /* Calculate the size of the buffer */
++    if (!der_encode_sharedinfo(&amp;pkt, NULL, 0, cek_oid, cek_oidlen, ukm, ukmlen,
++                               keylen_bits, NULL)
++        || !WPACKET_get_total_written(&amp;pkt, &amp;der_buflen))
++        goto err;
++    WPACKET_cleanup(&amp;pkt);
++    /* Alloc the buffer */
++    der_buf = OPENSSL_zalloc(der_buflen);
++    if (der_buf == NULL)
++        goto err;
++    /* Encode into the buffer */
++    if (!der_encode_sharedinfo(&amp;pkt, der_buf, der_buflen, cek_oid, cek_oidlen,
++                               ukm, ukmlen, keylen_bits, &amp;pcounter))
++        goto err;
++    /*
++     * Since we allocated the exact size required, the buffer should point to the
++     * start of the alllocated buffer at this point.
++     */
++    if (WPACKET_get_curr(&amp;pkt) != der_buf)
+         goto err;
+ 
+-    /* Parse the encoded data to find the offset of the counter data */
+-    p = encoded;
+-    tlen = (long)encoded_len;
+-    if (skip_asn1(&amp;p, &amp;tlen, V_ASN1_SEQUENCE)
+-        &amp;&amp; skip_asn1(&amp;p, &amp;tlen, V_ASN1_SEQUENCE)
+-        &amp;&amp; skip_asn1(&amp;p, &amp;tlen, V_ASN1_OBJECT)
+-        &amp;&amp; skip_asn1(&amp;p, &amp;tlen, V_ASN1_OCTET_STRING)
+-        &amp;&amp; CRYPTO_memcmp(p, ctr, 4) == 0) {
+-        *out_ctr = p;
+-        *der = encoded;
+-        *der_len = (size_t)encoded_len;
+-        ret = 1;
+-    }
++    /*
++     * The data for the DER encoded octet string of a 32 bit counter = 1
++     * should be 04 04 00 00 00 01
++     * So just check the header is correct and skip over it.
++     * This counter will be incremented in the kdf update loop.
++     */
++    if (pcounter == NULL
++        || pcounter[0] != 0x04
++        || pcounter[1] != 0x04)
++        goto err;
++    *out_ctr = (pcounter + 2);
++    *der = der_buf;
++    *der_len = der_buflen;
++    ret = 1;
+ err:
+-    if (ret != 1)
+-        OPENSSL_free(encoded);
+-    ASN1_OCTET_STRING_free(ctr_oct);
+-    ASN1_OCTET_STRING_free(ukm_oct);
+-    ASN1_OBJECT_free(alg_oid);
+-    X509_ALGOR_free(ksi);
++    WPACKET_cleanup(&amp;pkt);
+     return ret;
+ }
+ 
+@@ -315,7 +345,7 @@ static int x942kdf_derive(void *vctx, unsigned char *key, size_t keylen)
+         ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_MESSAGE_DIGEST);
+         return 0;
+     }
+-    if (ctx-&gt;cek_nid == NID_undef) {
++    if (ctx-&gt;cek_oid == NULL || ctx-&gt;cek_oid_len == 0) {
+         ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_CEK_ALG);
+         return 0;
+     }
+@@ -327,12 +357,9 @@ static int x942kdf_derive(void *vctx, unsigned char *key, size_t keylen)
+         ERR_raise(ERR_LIB_PROV, PROV_R_INAVLID_UKM_LENGTH);
+         return 0;
+     }
+-    if (keylen != ctx-&gt;dkm_len) {
+-        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_CEK_ALG);
+-        return 0;
+-    }
+     /* generate the otherinfo der */
+-    if (!x942_encode_otherinfo(ctx-&gt;cek_nid, ctx-&gt;dkm_len,
++    if (!x942_encode_otherinfo(ctx-&gt;dkm_len,
++                               ctx-&gt;cek_oid, ctx-&gt;cek_oid_len,
+                                ctx-&gt;ukm, ctx-&gt;ukm_len,
+                                &amp;der, &amp;der_len, &amp;ctr)) {
+         ERR_raise(ERR_LIB_PROV, PROV_R_BAD_ENCODING);
+@@ -349,7 +376,7 @@ static int x942kdf_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+     const OSSL_PARAM *p;
+     KDF_X942 *ctx = vctx;
+     OPENSSL_CTX *provctx = PROV_LIBRARY_CONTEXT_OF(ctx-&gt;provctx);
+-    size_t i;
++    size_t id;
+ 
+     if (!ossl_prov_digest_load_from_params(&amp;ctx-&gt;digest, params, provctx))
+         return 0;
+@@ -366,14 +393,11 @@ static int x942kdf_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+     if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_CEK_ALG)) != NULL) {
+         if (p-&gt;data_type != OSSL_PARAM_UTF8_STRING)
+             return 0;
+-        ctx-&gt;cek_nid = OBJ_sn2nid(p-&gt;data);
+-        for (i = 0; i &lt; OSSL_NELEM(kek_algs); i++)
+-            if (kek_algs[i].nid == ctx-&gt;cek_nid)
+-                goto cek_found;
+-        ERR_raise(ERR_LIB_PROV, PROV_R_UNSUPPORTED_CEK_ALG);
+-        return 0;
+-cek_found:
+-        ctx-&gt;dkm_len = kek_algs[i].keklen;
++        if (find_alg_id(provctx, p-&gt;data, &amp;id) == 0)
++            return 0;
++        ctx-&gt;cek_oid = kek_algs[id].oid;
++        ctx-&gt;cek_oid_len = kek_algs[id].oid_len;
++        ctx-&gt;dkm_len = kek_algs[id].keklen;
+     }
+     return 1;
+ }
+@@ -424,5 +448,3 @@ const OSSL_DISPATCH kdf_x942_kdf_functions[] = {
+     { OSSL_FUNC_KDF_GET_CTX_PARAMS, (void(*)(void))x942kdf_get_ctx_params },
+     { 0, NULL }
+ };
+-
+-#endif /* OPENSSL_NO_CMS */
+diff --git a/test/recipes/30-test_evp_data/evpkdf.txt b/test/recipes/30-test_evp_data/evpkdf.txt
+index 73d3b3ca9e..85bc53991b 100644
+--- a/test/recipes/30-test_evp_data/evpkdf.txt
++++ b/test/recipes/30-test_evp_data/evpkdf.txt
+@@ -6517,12 +6517,20 @@ Ctrl.hexsecret = hexsecret:000102030405060708090a0b0c0d0e0f10111213
+ Ctrl.cekalg = cekalg:id-smime-alg-CMS3DESwrap
+ Output = a09661392376f7044d9052a397883246b67f5f1ef63eb5fb
+ 
++Title = X9.42 KDF tests (RFC3565 2.3.2 Examples)
++
++KDF = X942KDF
++Ctrl.digest = digest:SHA1
++Ctrl.hexsecret = hexsecret:000102030405060708090a0b0c0d0e0f10111213
++Ctrl.cekalg = cekalg:id-aes128-wrap
++Output = d6d6b094c1027a7de6e3117294a35364
++
+ KDF = X942KDF
+ Ctrl.digest = digest:SHA1
+ Ctrl.hexsecret = hexsecret:000102030405060708090a0b0c0d0e0f10111213
+-Ctrl.cekalg = cekalg:id-smime-alg-CMSRC2wrap
++Ctrl.cekalg = cekalg:id-aes256-wrap
+ Ctrl.hexukm = hexukm:0123456789abcdeffedcba98765432010123456789abcdeffedcba98765432010123456789abcdeffedcba98765432010123456789abcdeffedcba9876543201
+-Output = 48950c46e0530075403cce72889604e0
++Output = 8890585C4E281A5C1167CAA530BED59B3230D893CBA8F922BD1B56A0
+ 
+ Title = KRB5KDF tests (from RFC 3961 test vectors and krb5 sources)
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029968.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029975.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29974">[ date ]</a>
+              <a href="thread.html#29974">[ thread ]</a>
+              <a href="subject.html#29974">[ subject ]</a>
+              <a href="author.html#29974">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

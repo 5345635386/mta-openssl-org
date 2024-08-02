@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1517518390.319396.7805.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017897.html">
+   <LINK REL="Next"  HREF="017901.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1517518390.319396.7805.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Thu Feb  1 20:53:10 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017897.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="017901.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17899">[ date ]</a>
+              <a href="thread.html#17899">[ thread ]</a>
+              <a href="subject.html#17899">[ subject ]</a>
+              <a href="author.html#17899">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f345b1f39d9b4e4c9ef07e7522e9b2a870c9ca09 (commit)
+      from  39eeb64f59ff838f976ad305de7d15747d47a41c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f345b1f39d9b4e4c9ef07e7522e9b2a870c9ca09
+Author: David Benjamin &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">davidben at google.com</A>&gt;
+Date:   Wed Jan 31 14:47:41 2018 -0500
+
+    Fix timing leak in BN_from_montgomery_word.
+    
+    BN_from_montgomery_word doesn't have a constant memory access pattern.
+    Replace the pointer trick with a constant-time select. There is, of
+    course, still the bn_correct_top leak pervasive in BIGNUM itself.
+    
+    See also <A HREF="https://boringssl-review.googlesource.com/22904">https://boringssl-review.googlesource.com/22904</A> from BoringSSL.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5228">https://github.com/openssl/openssl/pull/5228</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/bn_mont.c | 57 +++++++++++++++++++----------------------------------
+ 1 file changed, 20 insertions(+), 37 deletions(-)
+
+diff --git a/crypto/bn/bn_mont.c b/crypto/bn/bn_mont.c
+index 2119bfa..6357c60 100644
+--- a/crypto/bn/bn_mont.c
++++ b/crypto/bn/bn_mont.c
+@@ -101,6 +101,11 @@ static int BN_from_montgomery_word(BIGNUM *ret, BIGNUM *r, BN_MONT_CTX *mont)
+     r-&gt;top = max;
+     n0 = mont-&gt;n0[0];
+ 
++    /*
++     * Add multiples of |n| to |r| until R = 2^(nl * BN_BITS2) divides it. On
++     * input, we had |r| &lt; |n| * R, so now |r| &lt; 2 * |n| * R. Note that |r|
++     * includes |carry| which is stored separately.
++     */
+     for (carry = 0, i = 0; i &lt; nl; i++, rp++) {
+         v = bn_mul_add_words(rp, np, nl, (rp[0] * n0) &amp; BN_MASK2);
+         v = (v + carry + rp[nl]) &amp; BN_MASK2;
+@@ -115,46 +120,24 @@ static int BN_from_montgomery_word(BIGNUM *ret, BIGNUM *r, BN_MONT_CTX *mont)
+     ret-&gt;neg = r-&gt;neg;
+ 
+     rp = ret-&gt;d;
+-    ap = &amp;(r-&gt;d[nl]);
+ 
+-# define BRANCH_FREE 1
+-# if BRANCH_FREE
+-    {
+-        BN_ULONG *nrp;
+-        size_t m;
++    /*
++     * Shift |nl| words to divide by R. We have |ap| &lt; 2 * |n|. Note that |ap|
++     * includes |carry| which is stored separately.
++     */
++    ap = &amp;(r-&gt;d[nl]);
+ 
+-        v = bn_sub_words(rp, ap, np, nl) - carry;
+-        /*
+-         * if subtraction result is real, then trick unconditional memcpy
+-         * below to perform in-place &quot;refresh&quot; instead of actual copy.
+-         */
+-        m = (0 - (size_t)v);
+-        nrp =
+-            (BN_ULONG *)(((PTR_SIZE_INT) rp &amp; ~m) | ((PTR_SIZE_INT) ap &amp; m));
+-
+-        for (i = 0, nl -= 4; i &lt; nl; i += 4) {
+-            BN_ULONG t1, t2, t3, t4;
+-
+-            t1 = nrp[i + 0];
+-            t2 = nrp[i + 1];
+-            t3 = nrp[i + 2];
+-            ap[i + 0] = 0;
+-            t4 = nrp[i + 3];
+-            ap[i + 1] = 0;
+-            rp[i + 0] = t1;
+-            ap[i + 2] = 0;
+-            rp[i + 1] = t2;
+-            ap[i + 3] = 0;
+-            rp[i + 2] = t3;
+-            rp[i + 3] = t4;
+-        }
+-        for (nl += 4; i &lt; nl; i++)
+-            rp[i] = nrp[i], ap[i] = 0;
++    /*
++     * |v| is one if |ap| - |np| underflowed or zero if it did not. Note |v|
++     * cannot be -1. That would imply the subtraction did not fit in |nl| words,
++     * and we know at most one subtraction is needed.
++     */
++    v = bn_sub_words(rp, ap, np, nl) - carry;
++    v = 0 - v;
++    for (i = 0; i &lt; nl; i++) {
++        rp[i] = (v &amp; ap[i]) | (~v &amp; rp[i]);
++        ap[i] = 0;
+     }
+-# else
+-    if (bn_sub_words(rp, ap, np, nl) - carry)
+-        memcpy(rp, ap, nl * sizeof(BN_ULONG));
+-# endif
+     bn_correct_top(r);
+     bn_correct_top(ret);
+     bn_check_top(ret);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017897.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="017901.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17899">[ date ]</a>
+              <a href="thread.html#17899">[ thread ]</a>
+              <a href="subject.html#17899">[ subject ]</a>
+              <a href="author.html#17899">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461333763.879614.24471.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006575.html">
+   <LINK REL="Next"  HREF="006578.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461333763.879614.24471.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Fri Apr 22 14:02:43 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006575.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="006578.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6576">[ date ]</a>
+              <a href="thread.html#6576">[ thread ]</a>
+              <a href="subject.html#6576">[ subject ]</a>
+              <a href="author.html#6576">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  48c1e15ceb2252e65ba63f93a7bf39c1d368f38f (commit)
+      from  f0483bf7d2ffdf1b92c71318678a61603a9fa56d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 48c1e15ceb2252e65ba63f93a7bf39c1d368f38f
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Wed Apr 20 21:37:57 2016 +0100
+
+    Extensions to d2i_test.
+    
+    Using ASN1_ITEM tables in d2i_test: this then uses consistent names and
+    makes it easier to extend.
+    
+    Add bio, reencode and compare tests.
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/d2i_test.c            | 116 +++++++++++++++++++++++++++++++++++++++------
+ test/recipes/25-test_d2i.t |   4 +-
+ 2 files changed, 103 insertions(+), 17 deletions(-)
+
+diff --git a/test/d2i_test.c b/test/d2i_test.c
+index 6ffdf55..49882a3 100644
+--- a/test/d2i_test.c
++++ b/test/d2i_test.c
+@@ -16,19 +16,36 @@
+ #include &quot;testutil.h&quot;
+ 
+ #include &lt;openssl/asn1.h&gt;
++#include &lt;openssl/asn1t.h&gt;
+ #include &lt;openssl/bio.h&gt;
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/x509v3.h&gt;
++#include &quot;e_os.h&quot;
+ 
+ static const ASN1_ITEM *item_type;
+ static const char *test_file;
+ 
++typedef enum {
++    ASN1_UNKNOWN,
++    ASN1_OK,
++    ASN1_BIO,
++    ASN1_DECODE,
++    ASN1_ENCODE,
++    ASN1_COMPARE
++} expected_error_t;
++
++typedef struct {
++    const char *str;
++    expected_error_t code;
++} error_enum;
++
++static expected_error_t expected_error = ASN1_UNKNOWN;
++
+ typedef struct d2i_test_fixture {
+     const char *test_case_name;
+ } D2I_TEST_FIXTURE;
+ 
+-
+ static D2I_TEST_FIXTURE set_up(const char *const test_case_name)
+ {
+     D2I_TEST_FIXTURE fixture;
+@@ -43,27 +60,56 @@ static int execute_test(D2I_TEST_FIXTURE fixture)
+     int ret = 0;
+     unsigned char buf[2048];
+     const unsigned char *buf_ptr = buf;
++    unsigned char *der = NULL;
++    int derlen;
+     int len;
+ 
+     if ((bio = BIO_new_file(test_file, &quot;r&quot;)) == NULL)
+         return 0;
+ 
++    if (expected_error == ASN1_BIO) {
++        value = ASN1_item_d2i_bio(item_type, bio, NULL);
++        if (value == NULL)
++            ret = 1;
++        goto err;
++    }
++
+     /*
+-     * We don't use ASN1_item_d2i_bio because it, apparently,
+-     * errors too early for some inputs.
++     * Unless we are testing it we don't use ASN1_item_d2i_bio because it
++     * performs sanity checks on the input and can reject it before the
++     * decoder is called.
+      */
+     len = BIO_read(bio, buf, sizeof buf);
+     if (len &lt; 0)
+         goto err;
+ 
+     value = ASN1_item_d2i(NULL, &amp;buf_ptr, len, item_type);
+-    if (value != NULL)
++    if (value == NULL) {
++        if (expected_error == ASN1_DECODE)
++            ret = 1;
+         goto err;
++    }
++
++    derlen = ASN1_item_i2d(value, &amp;der, item_type);
+ 
+-    ret = 1;
++    if (der == NULL || derlen &lt; 0) {
++        if (expected_error == ASN1_ENCODE)
++            ret = 1;
++        goto err;
++    }
++
++    if (derlen != len || memcmp(der, buf, derlen) != 0) {
++        if (expected_error == ASN1_COMPARE)
++            ret = 1;
++        goto err;
++    }
++
++    if (expected_error == ASN1_OK)
++        ret = 1;
+ 
+  err:
+     BIO_free(bio);
++    OPENSSL_free(der);
+     ASN1_item_free(value, item_type);
+     return ret;
+ }
+@@ -93,19 +139,59 @@ int main(int argc, char **argv)
+ {
+     int result = 0;
+     const char *test_type_name;
+-
+-    if (argc != 3)
++    const char *expected_error_string;
++
++    size_t i;
++    static ASN1_ITEM_EXP *items[] = {
++        ASN1_ITEM_ref(ASN1_ANY),
++        ASN1_ITEM_ref(X509),
++        ASN1_ITEM_ref(GENERAL_NAME)
++    };
++
++    static error_enum expected_errors[] = {
++        {&quot;OK&quot;, ASN1_OK},
++        {&quot;BIO&quot;, ASN1_BIO},
++        {&quot;decode&quot;, ASN1_DECODE},
++        {&quot;encode&quot;, ASN1_ENCODE},
++        {&quot;compare&quot;, ASN1_COMPARE}
++    };
++
++    if (argc != 4) {
++        fprintf(stderr,
++                &quot;Usage: d2i_test item_name expected_error file.der\n&quot;);
+         return 1;
++    }
+ 
+     test_type_name = argv[1];
+-    test_file = argv[2];
+-
+-    if (strcmp(test_type_name, &quot;generalname&quot;) == 0) {
+-        item_type = ASN1_ITEM_rptr(GENERAL_NAME);
+-    } else if (strcmp(test_type_name, &quot;x509&quot;) == 0) {
+-        item_type = ASN1_ITEM_rptr(X509);
+-    } else {
+-        fprintf(stderr, &quot;Bad type %s\n&quot;, test_type_name);
++    expected_error_string = argv[2];
++    test_file = argv[3];
++
++    for (i = 0; i &lt; OSSL_NELEM(items); i++) {
++        const ASN1_ITEM *it = ASN1_ITEM_ptr(items[i]);
++        if (strcmp(test_type_name, it-&gt;sname) == 0) {
++            item_type = it;
++            break;
++        }
++    }
++    if (item_type == NULL) {
++        fprintf(stderr, &quot;Unknown type %s\n&quot;, test_type_name);
++        fprintf(stderr, &quot;Supported types:\n&quot;);
++        for (i = 0; i &lt; OSSL_NELEM(items); i++) {
++            const ASN1_ITEM *it = ASN1_ITEM_ptr(items[i]);
++            fprintf(stderr, &quot;\t%s\n&quot;, it-&gt;sname);
++        }
++        return 1;
++    }
++
++    for (i = 0; i &lt; OSSL_NELEM(expected_errors); i++) {
++        if (strcmp(expected_errors[i].str, expected_error_string) == 0) {
++            expected_error = expected_errors[i].code;
++            break;
++        }
++    }
++
++    if (expected_error == ASN1_UNKNOWN) {
++        fprintf(stderr, &quot;Unknown expected error %s\n&quot;, expected_error_string);
+         return 1;
+     }
+ 
+diff --git a/test/recipes/25-test_d2i.t b/test/recipes/25-test_d2i.t
+index b7563a2..111fa5b 100644
+--- a/test/recipes/25-test_d2i.t
++++ b/test/recipes/25-test_d2i.t
+@@ -17,10 +17,10 @@ setup(&quot;test_d2i&quot;);
+ 
+ plan tests =&gt; 2;
+ 
+-ok(run(test([&quot;d2i_test&quot;, &quot;x509&quot;,
++ok(run(test([&quot;d2i_test&quot;, &quot;X509&quot;, &quot;decode&quot;,
+              srctop_file('test','d2i-tests','bad_cert.der')])),
+    &quot;Running d2i_test bad_cert.der&quot;);
+ 
+-ok(run(test([&quot;d2i_test&quot;, &quot;generalname&quot;,
++ok(run(test([&quot;d2i_test&quot;, &quot;GENERAL_NAME&quot;, &quot;decode&quot;,
+              srctop_file('test','d2i-tests','bad_generalname.der')])),
+    &quot;Running d2i_test bad_generalname.der&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006575.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="006578.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6576">[ date ]</a>
+              <a href="thread.html#6576">[ thread ]</a>
+              <a href="subject.html#6576">[ subject ]</a>
+              <a href="author.html#6576">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,212 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1605902108.032104.19177.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032156.html">
+   <LINK REL="Next"  HREF="032258.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1605902108.032104.19177.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Nov 20 19:55:08 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032156.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032258.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32174">[ date ]</a>
+              <a href="thread.html#32174">[ thread ]</a>
+              <a href="subject.html#32174">[ subject ]</a>
+              <a href="author.html#32174">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5053394aa6bc989e1ce8f0e47578c691aee6aa47 (commit)
+      from  f87ead980187ba39c66eb6ed5825603ea343b73f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5053394aa6bc989e1ce8f0e47578c691aee6aa47
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sun Oct 25 07:09:04 2020 +0100
+
+    util/fix-deprecation: DEPRECATEDIN conversion util for public headers
+    
+    Use this for quick and easy conversion of old-style to new-style deprecation:
+    
+        perl util/fix-deprecation \
+             &lt; include/openssl/rsa.h &gt; include/openssl/rsa.h.new
+        mv include/openssl/rsa.h.new include/openssl/rsa.h
+    
+    This is not a perfect utility, but it does the job.  It doesn't try to
+    re-indent, that's left for manual post processing.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13239">https://github.com/openssl/openssl/pull/13239</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ util/fix-deprecation | 114 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+ create mode 100644 util/fix-deprecation
+
+diff --git a/util/fix-deprecation b/util/fix-deprecation
+new file mode 100644
+index 0000000000..a87d4fb9d1
+--- /dev/null
++++ b/util/fix-deprecation
+@@ -0,0 +1,114 @@
++#! /usr/bin/perl
++
++use strict;
++use warnings;
++
++my $debug = $ENV{DEBUG};
++
++# This scripts finds DEPRECATEDIN declarations and converts them to
++# C declarations with the corresponding OSSL_DEPRECATEDIN attribute
++# macro.  It also makes sure they are guarded them with a corresponding
++# '#ifndef OPENSSL_NO_DEPRECATED', and pays extra attention to only have
++# one such guard around a group of deprecations for the same version.
++
++my $parens_re =
++    qr/(
++           \(                   # The start of what we recurse on
++               (?:
++                   (?&gt; [^()]+ )     # Non-parens, without backtracking
++               |
++                   (?-1)            # Recurse to start of parens group
++               )*
++           \)                   # The end of what we recurse on
++       )/x;
++
++my $deprecated_kw_re = qr/(DEPRECATEDIN)_(\d+_\d+(?:_\d+)?)/;
++my $deprecated_re =
++    qr/
++          $deprecated_kw_re
++          \(
++          (
++              (?:
++                  (?&gt; [^()]+ )
++              |
++                  $parens_re
++              )*
++          )
++          \)
++    /x;
++my $headertext;
++{
++    local $/;
++    $headertext = &lt;STDIN&gt;;
++}
++$headertext =~ s/\R/\n/g;
++
++my $cppspaces = '';
++my $last_cppspaces = '';
++my $currentguard = &quot;&quot;;
++my $cnt = 0;
++while ( $headertext =~ m/(.*?)                          # $1
++                         (                              # $2
++                             ^
++                             (?|
++                                 (\#)(\s*)(if)?.*?      # $3 ('#')
++                                                        # $4 (spaces)
++                                                        # $5 ('if'?)
++                             |
++                                 \s*$deprecated_kw_re\(.*?
++                                                        # $3 = 'DEPRECATEDIN'
++                                                        # $4 (vers)
++                             )
++                             \n
++                         )
++                        /msx ) {
++    my $before = $1;
++    my $capture = $2;
++    my $after = $';
++
++    my $deprecation = '';
++    my $test = $capture.$';
++    my $version = undef;
++
++    print STDERR &quot;DEBUG: captured:\n$capture&quot;
++        if $debug;
++
++    if ($3 eq '#') {
++        # Treat preprocessor lines (count spaces)
++        $cppspaces = $4;
++        $cppspaces .= ' ' if (defined $5 &amp;&amp; $5 eq 'if');
++        print STDERR &quot;DEBUG: cpp spaces set to &quot;, length($cppspaces), &quot;\n&quot;
++            if $debug;
++        $before .= $capture;
++    } elsif ($test =~ m/^\s*$deprecated_re(.*?\n)/) {
++        # Treat DEPRECATEDIN_...
++        $version = $2;
++        $deprecation = &quot;OSSL_DEPRECATEDIN_$version $3;$5&quot;;
++        $after = $';            # Different from the previous!
++        print STDERR &quot;DEBUG: changed to:\n$deprecation\n&quot;
++            if $debug;
++    }
++
++    if ($currentguard ne ''
++        &amp;&amp; (defined $version &amp;&amp; $currentguard ne $version
++            || $before !~ /^\s*$/s)) {
++        print &quot;#${last_cppspaces}endif\n&quot;;
++        $cppspaces = substr($cppspaces, 0, -1);
++        $currentguard = &quot;&quot;;
++    }
++    print $before;
++    if ($deprecation) {
++        if ($currentguard eq '' &amp;&amp; defined $version) {
++            $currentguard = $version;
++            print &quot;#${cppspaces}ifndef OPENSSL_NO_DEPRECATED_$version\n&quot;;
++            $last_cppspaces = $cppspaces;
++            $cppspaces .= ' ';
++            print STDERR &quot;DEBUG: cpp spaces set to &quot;, length($cppspaces), &quot;\n&quot;
++                if $debug;
++        }
++        print $deprecation;
++    }
++    $headertext = $after;
++}
++print &quot;#endif\n&quot; if $currentguard ne '';
++print $headertext;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032156.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032258.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32174">[ date ]</a>
+              <a href="thread.html#32174">[ thread ]</a>
+              <a href="subject.html#32174">[ subject ]</a>
+              <a href="author.html#32174">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

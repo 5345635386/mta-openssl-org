@@ -1,0 +1,329 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1579010301.373981.10823.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027053.html">
+   <LINK REL="Next"  HREF="027055.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1579010301.373981.10823.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jan 14 13:58:21 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027053.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027055.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27054">[ date ]</a>
+              <a href="thread.html#27054">[ thread ]</a>
+              <a href="subject.html#27054">[ subject ]</a>
+              <a href="author.html#27054">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7c66ad65f959fa05ad7b95b0c84384d6e63e56f1 (commit)
+      from  8f020c3da571fd56c4a1ce16daad553193549a67 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7c66ad65f959fa05ad7b95b0c84384d6e63e56f1
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Jan 8 14:58:34 2020 +0100
+
+    PROV: Fix mixup between general and specialized GCM implementations
+    
+    providers/implementations/ciphers/ciphercommon_gcm_hw.c had an AES
+    specific GCM update function, while
+    providers/implementations/ciphers/cipher_aria_gcm_hw.c had the more
+    general implementation.
+    
+    This moves them around to have the more general implementation in the
+    common source, and place the AES specialiation where it belongs.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10783">https://github.com/openssl/openssl/pull/10783</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ .../implementations/ciphers/cipher_aes_gcm_hw.c    | 71 +++++++++++++++++++++-
+ .../ciphers/cipher_aes_gcm_hw_aesni.inc            |  2 +-
+ .../ciphers/cipher_aes_gcm_hw_armv8.inc            |  2 +-
+ .../ciphers/cipher_aes_gcm_hw_t4.inc               |  2 +-
+ .../implementations/ciphers/cipher_aria_gcm_hw.c   | 15 +----
+ .../implementations/ciphers/ciphercommon_gcm_hw.c  | 60 ++----------------
+ 6 files changed, 76 insertions(+), 76 deletions(-)
+
+diff --git a/providers/implementations/ciphers/cipher_aes_gcm_hw.c b/providers/implementations/ciphers/cipher_aes_gcm_hw.c
+index 0eb799451d..76c9b00c53 100644
+--- a/providers/implementations/ciphers/cipher_aes_gcm_hw.c
++++ b/providers/implementations/ciphers/cipher_aes_gcm_hw.c
+@@ -17,7 +17,7 @@
+ 
+ #include &quot;cipher_aes_gcm.h&quot;
+ 
+-static int generic_aes_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
++static int aes_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
+                                    size_t keylen)
+ {
+     PROV_AES_GCM_CTX *actx = (PROV_AES_GCM_CTX *)ctx;
+@@ -59,11 +59,76 @@ static int generic_aes_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
+     return 1;
+ }
+ 
++static int generic_aes_gcm_cipher_update(PROV_GCM_CTX *ctx, const unsigned char *in,
++                                         size_t len, unsigned char *out)
++{
++    if (ctx-&gt;enc) {
++        if (ctx-&gt;ctr != NULL) {
++#if defined(AES_GCM_ASM)
++            size_t bulk = 0;
++
++            if (len &gt;= AES_GCM_ENC_BYTES &amp;&amp; AES_GCM_ASM(ctx)) {
++                size_t res = (16 - ctx-&gt;gcm.mres) % 16;
++
++                if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, res))
++                    return 0;
++
++                bulk = AES_gcm_encrypt(in + res, out + res, len - res,
++                                       ctx-&gt;gcm.key,
++                                       ctx-&gt;gcm.Yi.c, ctx-&gt;gcm.Xi.u);
++
++                ctx-&gt;gcm.len.u[1] += bulk;
++                bulk += res;
++            }
++            if (CRYPTO_gcm128_encrypt_ctr32(&amp;ctx-&gt;gcm, in + bulk, out + bulk,
++                                            len - bulk, ctx-&gt;ctr))
++                return 0;
++#else
++            if (CRYPTO_gcm128_encrypt_ctr32(&amp;ctx-&gt;gcm, in, out, len, ctx-&gt;ctr))
++                return 0;
++#endif /* AES_GCM_ASM */
++        } else {
++            if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, len))
++                return 0;
++        }
++    } else {
++        if (ctx-&gt;ctr != NULL) {
++#if defined(AES_GCM_ASM)
++            size_t bulk = 0;
++
++            if (len &gt;= AES_GCM_DEC_BYTES &amp;&amp; AES_GCM_ASM(ctx)) {
++                size_t res = (16 - ctx-&gt;gcm.mres) % 16;
++
++                if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, res))
++                    return -1;
++
++                bulk = AES_gcm_decrypt(in + res, out + res, len - res,
++                                       ctx-&gt;gcm.key,
++                                       ctx-&gt;gcm.Yi.c, ctx-&gt;gcm.Xi.u);
++
++                ctx-&gt;gcm.len.u[1] += bulk;
++                bulk += res;
++            }
++            if (CRYPTO_gcm128_decrypt_ctr32(&amp;ctx-&gt;gcm, in + bulk, out + bulk,
++                                            len - bulk, ctx-&gt;ctr))
++                return 0;
++#else
++            if (CRYPTO_gcm128_decrypt_ctr32(&amp;ctx-&gt;gcm, in, out, len, ctx-&gt;ctr))
++                return 0;
++#endif /* AES_GCM_ASM */
++        } else {
++            if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, len))
++                return 0;
++        }
++    }
++    return 1;
++}
++
+ static const PROV_GCM_HW aes_gcm = {
+-    generic_aes_gcm_initkey,
++    aes_gcm_initkey,
+     gcm_setiv,
+     gcm_aad_update,
+-    gcm_cipher_update,
++    generic_aes_gcm_cipher_update,
+     gcm_cipher_final,
+     gcm_one_shot
+ };
+diff --git a/providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc b/providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc
+index 2fc86982c0..ce558dc26e 100644
+--- a/providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc
++++ b/providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc
+@@ -26,7 +26,7 @@ static const PROV_GCM_HW aesni_gcm = {
+     aesni_gcm_initkey,
+     gcm_setiv,
+     gcm_aad_update,
+-    gcm_cipher_update,
++    generic_aes_gcm_cipher_update,
+     gcm_cipher_final,
+     gcm_one_shot
+ };
+diff --git a/providers/implementations/ciphers/cipher_aes_gcm_hw_armv8.inc b/providers/implementations/ciphers/cipher_aes_gcm_hw_armv8.inc
+index 4e8cc9c54e..6f3c545369 100644
+--- a/providers/implementations/ciphers/cipher_aes_gcm_hw_armv8.inc
++++ b/providers/implementations/ciphers/cipher_aes_gcm_hw_armv8.inc
+@@ -72,7 +72,7 @@ static const PROV_GCM_HW armv8_aes_gcm = {
+     armv8_aes_gcm_initkey,
+     gcm_setiv,
+     gcm_aad_update,
+-    gcm_cipher_update,
++    generic_aes_gcm_cipher_update,
+     gcm_cipher_final,
+     gcm_one_shot
+ };
+diff --git a/providers/implementations/ciphers/cipher_aes_gcm_hw_t4.inc b/providers/implementations/ciphers/cipher_aes_gcm_hw_t4.inc
+index cc7d4ba528..c45a449302 100644
+--- a/providers/implementations/ciphers/cipher_aes_gcm_hw_t4.inc
++++ b/providers/implementations/ciphers/cipher_aes_gcm_hw_t4.inc
+@@ -42,7 +42,7 @@ static const PROV_GCM_HW t4_aes_gcm = {
+     t4_aes_gcm_initkey,
+     gcm_setiv,
+     gcm_aad_update,
+-    gcm_cipher_update,
++    generic_aes_gcm_cipher_update,
+     gcm_cipher_final,
+     gcm_one_shot
+ };
+diff --git a/providers/implementations/ciphers/cipher_aria_gcm_hw.c b/providers/implementations/ciphers/cipher_aria_gcm_hw.c
+index ed1e1851dc..04db40b53b 100644
+--- a/providers/implementations/ciphers/cipher_aria_gcm_hw.c
++++ b/providers/implementations/ciphers/cipher_aria_gcm_hw.c
+@@ -23,24 +23,11 @@ static int aria_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
+     return 1;
+ }
+ 
+-static int aria_cipher_update(PROV_GCM_CTX *ctx, const unsigned char *in,
+-                              size_t len, unsigned char *out)
+-{
+-    if (ctx-&gt;enc) {
+-        if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, len))
+-            return 0;
+-    } else {
+-        if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, len))
+-            return 0;
+-    }
+-    return 1;
+-}
+-
+ static const PROV_GCM_HW aria_gcm = {
+     aria_gcm_initkey,
+     gcm_setiv,
+     gcm_aad_update,
+-    aria_cipher_update,
++    gcm_cipher_update,
+     gcm_cipher_final,
+     gcm_one_shot
+ };
+diff --git a/providers/implementations/ciphers/ciphercommon_gcm_hw.c b/providers/implementations/ciphers/ciphercommon_gcm_hw.c
+index 1114c36b3f..e5998c4aa4 100644
+--- a/providers/implementations/ciphers/ciphercommon_gcm_hw.c
++++ b/providers/implementations/ciphers/ciphercommon_gcm_hw.c
+@@ -26,63 +26,11 @@ int gcm_cipher_update(PROV_GCM_CTX *ctx, const unsigned char *in,
+                       size_t len, unsigned char *out)
+ {
+     if (ctx-&gt;enc) {
+-        if (ctx-&gt;ctr != NULL) {
+-#if defined(AES_GCM_ASM)
+-            size_t bulk = 0;
+-
+-            if (len &gt;= AES_GCM_ENC_BYTES &amp;&amp; AES_GCM_ASM(ctx)) {
+-                size_t res = (16 - ctx-&gt;gcm.mres) % 16;
+-
+-                if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, res))
+-                    return 0;
+-
+-                bulk = AES_gcm_encrypt(in + res, out + res, len - res,
+-                                       ctx-&gt;gcm.key,
+-                                       ctx-&gt;gcm.Yi.c, ctx-&gt;gcm.Xi.u);
+-
+-                ctx-&gt;gcm.len.u[1] += bulk;
+-                bulk += res;
+-            }
+-            if (CRYPTO_gcm128_encrypt_ctr32(&amp;ctx-&gt;gcm, in + bulk, out + bulk,
+-                                            len - bulk, ctx-&gt;ctr))
+-                return 0;
+-#else
+-            if (CRYPTO_gcm128_encrypt_ctr32(&amp;ctx-&gt;gcm, in, out, len, ctx-&gt;ctr))
+-                return 0;
+-#endif /* AES_GCM_ASM */
+-        } else {
+-            if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, len))
+-                return 0;
+-        }
++        if (CRYPTO_gcm128_encrypt(&amp;ctx-&gt;gcm, in, out, len))
++            return 0;
+     } else {
+-        if (ctx-&gt;ctr != NULL) {
+-#if defined(AES_GCM_ASM)
+-            size_t bulk = 0;
+-
+-            if (len &gt;= AES_GCM_DEC_BYTES &amp;&amp; AES_GCM_ASM(ctx)) {
+-                size_t res = (16 - ctx-&gt;gcm.mres) % 16;
+-
+-                if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, res))
+-                    return -1;
+-
+-                bulk = AES_gcm_decrypt(in + res, out + res, len - res,
+-                                       ctx-&gt;gcm.key,
+-                                       ctx-&gt;gcm.Yi.c, ctx-&gt;gcm.Xi.u);
+-
+-                ctx-&gt;gcm.len.u[1] += bulk;
+-                bulk += res;
+-            }
+-            if (CRYPTO_gcm128_decrypt_ctr32(&amp;ctx-&gt;gcm, in + bulk, out + bulk,
+-                                            len - bulk, ctx-&gt;ctr))
+-                return 0;
+-#else
+-            if (CRYPTO_gcm128_decrypt_ctr32(&amp;ctx-&gt;gcm, in, out, len, ctx-&gt;ctr))
+-                return 0;
+-#endif /* AES_GCM_ASM */
+-        } else {
+-            if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, len))
+-                return 0;
+-        }
++        if (CRYPTO_gcm128_decrypt(&amp;ctx-&gt;gcm, in, out, len))
++            return 0;
+     }
+     return 1;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027053.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027055.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27054">[ date ]</a>
+              <a href="thread.html#27054">[ thread ]</a>
+              <a href="subject.html#27054">[ subject ]</a>
+              <a href="author.html#27054">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,736 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1562824463.129562.9057.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023907.html">
+   <LINK REL="Next"  HREF="023927.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1562824463.129562.9057.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Thu Jul 11 05:54:23 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023907.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="023927.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23908">[ date ]</a>
+              <a href="thread.html#23908">[ thread ]</a>
+              <a href="subject.html#23908">[ subject ]</a>
+              <a href="author.html#23908">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  b60cba3c5d25dcd5cea2c97193a30b730c8a0f28 (commit)
+      from  06c8331c51797f43881e5262b4c114aacc6d0ca0 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit b60cba3c5d25dcd5cea2c97193a30b730c8a0f28
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Thu Jul 11 15:53:59 2019 +1000
+
+    Make allocation/free/clean available to providers
+    
+    Also make OPENSSL_hexstr2buf available to providers.
+    EVP control functions need hexstring conversion, so move any
+    memory-allocating functions in o_str.c into new file mem_str.c
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8886">https://github.com/openssl/openssl/pull/8886</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/build.info              |   5 +-
+ crypto/{o_str.c =&gt; mem_str.c}  | 122 ----------------------------
+ crypto/o_str.c                 | 122 ----------------------------
+ crypto/provider_core.c         |  24 ++++++
+ include/openssl/core_numbers.h |  57 ++++++++++++-
+ providers/fips/fipsprov.c      | 176 +++++++++++++++++++++++++++++++++++------
+ 6 files changed, 236 insertions(+), 270 deletions(-)
+ copy crypto/{o_str.c =&gt; mem_str.c} (53%)
+
+diff --git a/crypto/build.info b/crypto/build.info
+index e64a8de..fccca08 100644
+--- a/crypto/build.info
++++ b/crypto/build.info
+@@ -66,13 +66,14 @@ SOURCE[../providers/fips]=$CORE_COMMON
+ 
+ # Central utilities
+ $UTIL_COMMON=\
+-        cryptlib.c mem.c mem_sec.c params.c bsearch.c ex_data.c o_str.c \
++        cryptlib.c params.c bsearch.c ex_data.c o_str.c \
+         ctype.c threads_pthread.c threads_win.c threads_none.c initthread.c \
+         context.c sparse_array.c $CPUIDASM
+ $UTIL_DEFINE=$CPUIDDEF
+ 
+ SOURCE[../libcrypto]=$UTIL_COMMON \
+-        mem_dbg.c cversion.c info.c cpt_err.c ebcdic.c uid.c o_time.c o_dir.c \
++        mem.c mem_sec.c mem_str.c mem_dbg.c \
++        cversion.c info.c cpt_err.c ebcdic.c uid.c o_time.c o_dir.c \
+         o_fopen.c getenv.c o_init.c o_fips.c init.c trace.c provider.c \
+         $UPLINKSRC
+ DEFINE[../libcrypto]=$UTIL_DEFINE $UPLINKDEF
+diff --git a/crypto/o_str.c b/crypto/mem_str.c
+similarity index 53%
+copy from crypto/o_str.c
+copy to crypto/mem_str.c
+index 467ceb2..da13ea4 100644
+--- a/crypto/o_str.c
++++ b/crypto/mem_str.c
+@@ -57,78 +57,6 @@ void *CRYPTO_memdup(const void *data, size_t siz, const char* file, int line)
+     return memcpy(ret, data, siz);
+ }
+ 
+-size_t OPENSSL_strnlen(const char *str, size_t maxlen)
+-{
+-    const char *p;
+-
+-    for (p = str; maxlen-- != 0 &amp;&amp; *p != '\0'; ++p) ;
+-
+-    return p - str;
+-}
+-
+-size_t OPENSSL_strlcpy(char *dst, const char *src, size_t size)
+-{
+-    size_t l = 0;
+-    for (; size &gt; 1 &amp;&amp; *src; size--) {
+-        *dst++ = *src++;
+-        l++;
+-    }
+-    if (size)
+-        *dst = '\0';
+-    return l + strlen(src);
+-}
+-
+-size_t OPENSSL_strlcat(char *dst, const char *src, size_t size)
+-{
+-    size_t l = 0;
+-    for (; size &gt; 0 &amp;&amp; *dst; size--, dst++)
+-        l++;
+-    return l + OPENSSL_strlcpy(dst, src, size);
+-}
+-
+-int OPENSSL_hexchar2int(unsigned char c)
+-{
+-#ifdef CHARSET_EBCDIC
+-    c = os_toebcdic[c];
+-#endif
+-
+-    switch (c) {
+-    case '0':
+-        return 0;
+-    case '1':
+-        return 1;
+-    case '2':
+-        return 2;
+-    case '3':
+-        return 3;
+-    case '4':
+-          return 4;
+-    case '5':
+-          return 5;
+-    case '6':
+-          return 6;
+-    case '7':
+-          return 7;
+-    case '8':
+-          return 8;
+-    case '9':
+-          return 9;
+-    case 'a': case 'A':
+-          return 0x0A;
+-    case 'b': case 'B':
+-          return 0x0B;
+-    case 'c': case 'C':
+-          return 0x0C;
+-    case 'd': case 'D':
+-          return 0x0D;
+-    case 'e': case 'E':
+-          return 0x0E;
+-    case 'f': case 'F':
+-          return 0x0F;
+-    }
+-    return -1;
+-}
+-
+ /*
+  * Give a string of hex digits convert to a buffer
+  */
+@@ -184,9 +112,7 @@ char *OPENSSL_buf2hexstr(const unsigned char *buffer, long len)
+     int i;
+ 
+     if (len == 0)
+-    {
+         return OPENSSL_zalloc(1);
+-    }
+ 
+     if ((tmp = OPENSSL_malloc(len * 3)) == NULL) {
+         CRYPTOerr(CRYPTO_F_OPENSSL_BUF2HEXSTR, ERR_R_MALLOC_FAILURE);
+@@ -205,51 +131,3 @@ char *OPENSSL_buf2hexstr(const unsigned char *buffer, long len)
+ 
+     return tmp;
+ }
+-
+-int openssl_strerror_r(int errnum, char *buf, size_t buflen)
+-{
+-#if defined(_MSC_VER) &amp;&amp; _MSC_VER&gt;=1400
+-    return !strerror_s(buf, buflen, errnum);
+-#elif defined(_GNU_SOURCE)
+-    char *err;
+-
+-    /*
+-     * GNU strerror_r may not actually set buf.
+-     * It can return a pointer to some (immutable) static string in which case
+-     * buf is left unused.
+-     */
+-    err = strerror_r(errnum, buf, buflen);
+-    if (err == NULL || buflen == 0)
+-        return 0;
+-    /*
+-     * If err is statically allocated, err != buf and we need to copy the data.
+-     * If err points somewhere inside buf, OPENSSL_strlcpy can handle this,
+-     * since src and dest are not annotated with __restrict and the function
+-     * reads src byte for byte and writes to dest.
+-     * If err == buf we do not have to copy anything.
+-     */
+-    if (err != buf)
+-        OPENSSL_strlcpy(buf, err, buflen);
+-    return 1;
+-#elif (defined(_POSIX_C_SOURCE) &amp;&amp; _POSIX_C_SOURCE &gt;= 200112L) || \
+-      (defined(_XOPEN_SOURCE) &amp;&amp; _XOPEN_SOURCE &gt;= 600)
+-    /*
+-     * We can use &quot;real&quot; strerror_r. The OpenSSL version differs in that it
+-     * gives 1 on success and 0 on failure for consistency with other OpenSSL
+-     * functions. Real strerror_r does it the other way around
+-     */
+-    return !strerror_r(errnum, buf, buflen);
+-#else
+-    char *err;
+-
+-    /* Fall back to non-thread safe strerror()...its all we can do */
+-    if (buflen &lt; 2)
+-        return 0;
+-    err = strerror(errnum);
+-    /* Can this ever happen? */
+-    if (err == NULL)
+-        return 0;
+-    OPENSSL_strlcpy(buf, err, buflen);
+-    return 1;
+-#endif
+-}
+diff --git a/crypto/o_str.c b/crypto/o_str.c
+index 467ceb2..35bb654 100644
+--- a/crypto/o_str.c
++++ b/crypto/o_str.c
+@@ -12,51 +12,6 @@
+ #include &lt;openssl/crypto.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
+ 
+-char *CRYPTO_strdup(const char *str, const char* file, int line)
+-{
+-    char *ret;
+-
+-    if (str == NULL)
+-        return NULL;
+-    ret = CRYPTO_malloc(strlen(str) + 1, file, line);
+-    if (ret != NULL)
+-        strcpy(ret, str);
+-    return ret;
+-}
+-
+-char *CRYPTO_strndup(const char *str, size_t s, const char* file, int line)
+-{
+-    size_t maxlen;
+-    char *ret;
+-
+-    if (str == NULL)
+-        return NULL;
+-
+-    maxlen = OPENSSL_strnlen(str, s);
+-
+-    ret = CRYPTO_malloc(maxlen + 1, file, line);
+-    if (ret) {
+-        memcpy(ret, str, maxlen);
+-        ret[maxlen] = '\0';
+-    }
+-    return ret;
+-}
+-
+-void *CRYPTO_memdup(const void *data, size_t siz, const char* file, int line)
+-{
+-    void *ret;
+-
+-    if (data == NULL || siz &gt;= INT_MAX)
+-        return NULL;
+-
+-    ret = CRYPTO_malloc(siz, file, line);
+-    if (ret == NULL) {
+-        CRYPTOerr(CRYPTO_F_CRYPTO_MEMDUP, ERR_R_MALLOC_FAILURE);
+-        return NULL;
+-    }
+-    return memcpy(ret, data, siz);
+-}
+-
+ size_t OPENSSL_strnlen(const char *str, size_t maxlen)
+ {
+     const char *p;
+@@ -129,83 +84,6 @@ int OPENSSL_hexchar2int(unsigned char c)
+     return -1;
+ }
+ 
+-/*
+- * Give a string of hex digits convert to a buffer
+- */
+-unsigned char *OPENSSL_hexstr2buf(const char *str, long *len)
+-{
+-    unsigned char *hexbuf, *q;
+-    unsigned char ch, cl;
+-    int chi, cli;
+-    const unsigned char *p;
+-    size_t s;
+-
+-    s = strlen(str);
+-    if ((hexbuf = OPENSSL_malloc(s &gt;&gt; 1)) == NULL) {
+-        CRYPTOerr(CRYPTO_F_OPENSSL_HEXSTR2BUF, ERR_R_MALLOC_FAILURE);
+-        return NULL;
+-    }
+-    for (p = (const unsigned char *)str, q = hexbuf; *p; ) {
+-        ch = *p++;
+-        if (ch == ':')
+-            continue;
+-        cl = *p++;
+-        if (!cl) {
+-            CRYPTOerr(CRYPTO_F_OPENSSL_HEXSTR2BUF,
+-                      CRYPTO_R_ODD_NUMBER_OF_DIGITS);
+-            OPENSSL_free(hexbuf);
+-            return NULL;
+-        }
+-        cli = OPENSSL_hexchar2int(cl);
+-        chi = OPENSSL_hexchar2int(ch);
+-        if (cli &lt; 0 || chi &lt; 0) {
+-            OPENSSL_free(hexbuf);
+-            CRYPTOerr(CRYPTO_F_OPENSSL_HEXSTR2BUF, CRYPTO_R_ILLEGAL_HEX_DIGIT);
+-            return NULL;
+-        }
+-        *q++ = (unsigned char)((chi &lt;&lt; 4) | cli);
+-    }
+-
+-    if (len)
+-        *len = q - hexbuf;
+-    return hexbuf;
+-}
+-
+-/*
+- * Given a buffer of length 'len' return a OPENSSL_malloc'ed string with its
+- * hex representation @@@ (Contents of buffer are always kept in ASCII, also
+- * on EBCDIC machines)
+- */
+-char *OPENSSL_buf2hexstr(const unsigned char *buffer, long len)
+-{
+-    static const char hexdig[] = &quot;0123456789ABCDEF&quot;;
+-    char *tmp, *q;
+-    const unsigned char *p;
+-    int i;
+-
+-    if (len == 0)
+-    {
+-        return OPENSSL_zalloc(1);
+-    }
+-
+-    if ((tmp = OPENSSL_malloc(len * 3)) == NULL) {
+-        CRYPTOerr(CRYPTO_F_OPENSSL_BUF2HEXSTR, ERR_R_MALLOC_FAILURE);
+-        return NULL;
+-    }
+-    q = tmp;
+-    for (i = 0, p = buffer; i &lt; len; i++, p++) {
+-        *q++ = hexdig[(*p &gt;&gt; 4) &amp; 0xf];
+-        *q++ = hexdig[*p &amp; 0xf];
+-        *q++ = ':';
+-    }
+-    q[-1] = 0;
+-#ifdef CHARSET_EBCDIC
+-    ebcdic2ascii(tmp, tmp, q - tmp - 1);
+-#endif
+-
+-    return tmp;
+-}
+-
+ int openssl_strerror_r(int errnum, char *buf, size_t buflen)
+ {
+ #if defined(_MSC_VER) &amp;&amp; _MSC_VER&gt;=1400
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 5860448..c16e91d 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -796,6 +796,10 @@ static void core_add_error_vdata(const OSSL_PROVIDER *prov,
+ }
+ #endif
+ 
++/*
++ * Functions provided by the core.  Blank line separates &quot;families&quot; of related
++ * functions.
++ */
+ static const OSSL_DISPATCH core_dispatch_[] = {
+     { OSSL_FUNC_CORE_GET_PARAM_TYPES, (void (*)(void))core_get_param_types },
+     { OSSL_FUNC_CORE_GET_PARAMS, (void (*)(void))core_get_params },
+@@ -805,6 +809,26 @@ static const OSSL_DISPATCH core_dispatch_[] = {
+     { OSSL_FUNC_CORE_PUT_ERROR, (void (*)(void))core_put_error },
+     { OSSL_FUNC_CORE_ADD_ERROR_VDATA, (void (*)(void))core_add_error_vdata },
+ #endif
++
++    { OSSL_FUNC_CRYPTO_MALLOC, (void (*)(void))CRYPTO_malloc },
++    { OSSL_FUNC_CRYPTO_ZALLOC, (void (*)(void))CRYPTO_zalloc },
++    { OSSL_FUNC_CRYPTO_MEMDUP, (void (*)(void))CRYPTO_memdup },
++    { OSSL_FUNC_CRYPTO_STRDUP, (void (*)(void))CRYPTO_strdup },
++    { OSSL_FUNC_CRYPTO_STRNDUP, (void (*)(void))CRYPTO_strndup },
++    { OSSL_FUNC_CRYPTO_FREE, (void (*)(void))CRYPTO_free },
++    { OSSL_FUNC_CRYPTO_CLEAR_FREE, (void (*)(void))CRYPTO_clear_free },
++    { OSSL_FUNC_CRYPTO_REALLOC, (void (*)(void))CRYPTO_realloc },
++    { OSSL_FUNC_CRYPTO_CLEAR_REALLOC, (void (*)(void))CRYPTO_clear_realloc },
++    { OSSL_FUNC_CRYPTO_SECURE_MALLOC, (void (*)(void))CRYPTO_secure_malloc },
++    { OSSL_FUNC_CRYPTO_SECURE_ZALLOC, (void (*)(void))CRYPTO_secure_zalloc },
++    { OSSL_FUNC_CRYPTO_SECURE_FREE, (void (*)(void))CRYPTO_secure_free },
++    { OSSL_FUNC_CRYPTO_SECURE_CLEAR_FREE,
++        (void (*)(void))CRYPTO_secure_clear_free },
++    { OSSL_FUNC_CRYPTO_SECURE_ALLOCATED,
++        (void (*)(void))CRYPTO_secure_allocated },
++    { OSSL_FUNC_OPENSSL_CLEANSE, (void (*)(void))OPENSSL_cleanse },
++    { OSSL_FUNC_OPENSSL_HEXSTR2BUF, (void (*)(void))OPENSSL_hexstr2buf },
++
+     { 0, NULL }
+ };
+ static const OSSL_DISPATCH *core_dispatch = core_dispatch_;
+diff --git a/include/openssl/core_numbers.h b/include/openssl/core_numbers.h
+index 0901ed3..0542732 100644
+--- a/include/openssl/core_numbers.h
++++ b/include/openssl/core_numbers.h
+@@ -35,7 +35,12 @@ extern &quot;C&quot; {
+  * - a function pointer extractor function with the name OSSL_'foo'
+  */
+ 
+-/* Helper macro to create the function signature typedef and the extractor */
++/*
++ * Helper macro to create the function signature typedef and the extractor
++ * |type| is the return-type of the function, |name| is the name of the
++ * function to fetch, and |args| is a parenthesized list of parameters
++ * for the function (that is, it is |name|'s function signature).
++ */
+ #define OSSL_CORE_MAKE_FUNC(type,name,args)                             \
+     typedef type (OSSL_##name##_fn)args;                                \
+     static ossl_inline \
+@@ -73,6 +78,56 @@ OSSL_CORE_MAKE_FUNC(OPENSSL_CTX *,core_get_library_context,
+                     (const OSSL_PROVIDER *prov))
+ 
+ 
++/* Memory allocation, freeing, clearing. */
++#define OSSL_FUNC_CRYPTO_MALLOC               10
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_malloc, (size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_ZALLOC               11
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_zalloc, (size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_MEMDUP               12
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_memdup, (const void *str, size_t siz, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_STRDUP               13
++OSSL_CORE_MAKE_FUNC(char *,
++        CRYPTO_strdup, (const char *str, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_STRNDUP              14
++OSSL_CORE_MAKE_FUNC(char *,
++        CRYPTO_strndup, (const char *str, size_t s, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_FREE                 15
++OSSL_CORE_MAKE_FUNC(void,
++        CRYPTO_free, (void *ptr, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_CLEAR_FREE           16
++OSSL_CORE_MAKE_FUNC(void,
++        CRYPTO_clear_free, (void *ptr, size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_REALLOC              17
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_realloc, (void *addr, size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_CLEAR_REALLOC        18
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_clear_realloc, (void *addr, size_t old_num, size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_SECURE_MALLOC        19
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_secure_malloc, (size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_SECURE_ZALLOC        20
++OSSL_CORE_MAKE_FUNC(void *,
++        CRYPTO_secure_zalloc, (size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_SECURE_FREE          21
++OSSL_CORE_MAKE_FUNC(void,
++        CRYPTO_secure_free, (void *ptr, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_SECURE_CLEAR_FREE    22
++OSSL_CORE_MAKE_FUNC(void,
++        CRYPTO_secure_clear_free, (void *ptr, size_t num, const char *file, int line))
++#define OSSL_FUNC_CRYPTO_SECURE_ALLOCATED     23
++OSSL_CORE_MAKE_FUNC(int,
++        CRYPTO_secure_allocated, (const void *ptr))
++#define OSSL_FUNC_OPENSSL_CLEANSE             24
++OSSL_CORE_MAKE_FUNC(void,
++        OPENSSL_cleanse, (void *ptr, size_t len))
++# define OSSL_FUNC_OPENSSL_HEXSTR2BUF         25
++OSSL_CORE_MAKE_FUNC(unsigned char *,
++        OPENSSL_hexstr2buf, (const char *str, long *len))
++
+ /* Functions provided by the provider to the Core, reserved numbers 1024-1535 */
+ # define OSSL_FUNC_PROVIDER_TEARDOWN         1024
+ OSSL_CORE_MAKE_FUNC(void,provider_teardown,(void *provctx))
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index 0f0a962..8978d1b 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -27,19 +27,35 @@
+ #include &quot;internal/provider_ctx.h&quot;
+ #include &quot;internal/providercommon.h&quot;
+ 
++extern OSSL_core_thread_start_fn *c_thread_start;
++
+ /*
+  * TODO(3.0): Should these be stored in the provider side provctx? Could they
+  * ever be different from one init to the next? Unfortunately we can't do this
+- * at the moment because c_put_error/c_add_error_vdata do not provide us with
+- * the OPENSSL_CTX as a parameter.
++ * at the moment because c_put_error/c_add_error_vdata do not provide
++ * us with the OPENSSL_CTX as a parameter.
+  */
+ /* Functions provided by the core */
+-static OSSL_core_get_param_types_fn *c_get_param_types = NULL;
+-static OSSL_core_get_params_fn *c_get_params = NULL;
+-extern OSSL_core_thread_start_fn *c_thread_start;
+-OSSL_core_thread_start_fn *c_thread_start = NULL;
+-static OSSL_core_put_error_fn *c_put_error = NULL;
+-static OSSL_core_add_error_vdata_fn *c_add_error_vdata = NULL;
++static OSSL_core_get_param_types_fn *c_get_param_types;
++static OSSL_core_get_params_fn *c_get_params;
++OSSL_core_thread_start_fn *c_thread_start;
++static OSSL_core_put_error_fn *c_put_error;
++static OSSL_core_add_error_vdata_fn *c_add_error_vdata;
++static OSSL_CRYPTO_malloc_fn *c_CRYPTO_malloc;
++static OSSL_CRYPTO_zalloc_fn *c_CRYPTO_zalloc;
++static OSSL_CRYPTO_memdup_fn *c_CRYPTO_memdup;
++static OSSL_CRYPTO_strdup_fn *c_CRYPTO_strdup;
++static OSSL_CRYPTO_strndup_fn *c_CRYPTO_strndup;
++static OSSL_CRYPTO_free_fn *c_CRYPTO_free;
++static OSSL_CRYPTO_clear_free_fn *c_CRYPTO_clear_free;
++static OSSL_CRYPTO_realloc_fn *c_CRYPTO_realloc;
++static OSSL_CRYPTO_clear_realloc_fn *c_CRYPTO_clear_realloc;
++static OSSL_CRYPTO_secure_malloc_fn *c_CRYPTO_secure_malloc;
++static OSSL_CRYPTO_secure_zalloc_fn *c_CRYPTO_secure_zalloc;
++static OSSL_CRYPTO_secure_free_fn *c_CRYPTO_secure_free;
++static OSSL_CRYPTO_secure_clear_free_fn *c_CRYPTO_secure_clear_free;
++static OSSL_CRYPTO_secure_allocated_fn *c_CRYPTO_secure_allocated;
++static OSSL_OPENSSL_hexstr2buf_fn *c_OPENSSL_hexstr2buf;
+ 
+ typedef struct fips_global_st {
+     const OSSL_PROVIDER *prov;
+@@ -299,24 +315,66 @@ int OSSL_provider_init(const OSSL_PROVIDER *provider,
+         case OSSL_FUNC_CORE_ADD_ERROR_VDATA:
+             c_add_error_vdata = OSSL_get_core_add_error_vdata(in);
+             break;
+-        /* Just ignore anything we don't understand */
++        case OSSL_FUNC_CRYPTO_MALLOC:
++            c_CRYPTO_malloc = OSSL_get_CRYPTO_malloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_ZALLOC:
++            c_CRYPTO_zalloc = OSSL_get_CRYPTO_zalloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_MEMDUP:
++            c_CRYPTO_memdup = OSSL_get_CRYPTO_memdup(in);
++            break;
++        case OSSL_FUNC_CRYPTO_STRDUP:
++            c_CRYPTO_strdup = OSSL_get_CRYPTO_strdup(in);
++            break;
++        case OSSL_FUNC_CRYPTO_STRNDUP:
++            c_CRYPTO_strndup = OSSL_get_CRYPTO_strndup(in);
++            break;
++        case OSSL_FUNC_CRYPTO_FREE:
++            c_CRYPTO_free = OSSL_get_CRYPTO_free(in);
++            break;
++        case OSSL_FUNC_CRYPTO_CLEAR_FREE:
++            c_CRYPTO_clear_free = OSSL_get_CRYPTO_clear_free(in);
++            break;
++        case OSSL_FUNC_CRYPTO_REALLOC:
++            c_CRYPTO_realloc = OSSL_get_CRYPTO_realloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_CLEAR_REALLOC:
++            c_CRYPTO_clear_realloc = OSSL_get_CRYPTO_clear_realloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_SECURE_MALLOC:
++            c_CRYPTO_secure_malloc = OSSL_get_CRYPTO_secure_malloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_SECURE_ZALLOC:
++            c_CRYPTO_secure_zalloc = OSSL_get_CRYPTO_secure_zalloc(in);
++            break;
++        case OSSL_FUNC_CRYPTO_SECURE_FREE:
++            c_CRYPTO_secure_free = OSSL_get_CRYPTO_secure_free(in);
++            break;
++        case OSSL_FUNC_CRYPTO_SECURE_CLEAR_FREE:
++            c_CRYPTO_secure_clear_free = OSSL_get_CRYPTO_secure_clear_free(in);
++            break;
++        case OSSL_FUNC_CRYPTO_SECURE_ALLOCATED:
++            c_CRYPTO_secure_allocated = OSSL_get_CRYPTO_secure_allocated(in);
++            break;
++        case OSSL_FUNC_OPENSSL_HEXSTR2BUF:
++            c_OPENSSL_hexstr2buf = OSSL_get_OPENSSL_hexstr2buf(in);
++            break;
+         default:
++            /* Just ignore anything we don't understand */
+             break;
+         }
+     }
+ 
+-    ctx = OPENSSL_CTX_new();
+-    if (ctx == NULL)
++    /*  Create a context. */
++    if ((ctx = OPENSSL_CTX_new()) == NULL)
+         return 0;
+-
+-    fgbl = openssl_ctx_get_data(ctx, OPENSSL_CTX_FIPS_PROV_INDEX,
+-                                &amp;fips_prov_ossl_ctx_method);
+-
+-    if (fgbl == NULL)
+-        goto err;
+-
++    if ((fgbl = openssl_ctx_get_data(ctx, OPENSSL_CTX_FIPS_PROV_INDEX,
++                                     &amp;fips_prov_ossl_ctx_method)) == NULL) {
++        OPENSSL_CTX_free(ctx);
++        return 0;
++    }
+     fgbl-&gt;prov = provider;
+-
+     *out = fips_dispatch_table;
+     *provctx = ctx;
+ 
+@@ -331,10 +389,6 @@ int OSSL_provider_init(const OSSL_PROVIDER *provider,
+     }
+ 
+     return 1;
+-
+- err:
+-    OPENSSL_CTX_free(ctx);
+-    return 0;
+ }
+ 
+ /*
+@@ -413,3 +467,79 @@ const OSSL_PROVIDER *FIPS_get_provider(OPENSSL_CTX *ctx)
+ 
+     return fgbl-&gt;prov;
+ }
++
++void *CRYPTO_malloc(size_t num, const char *file, int line)
++{
++    return c_CRYPTO_malloc(num, file, line);
++}
++
++void *CRYPTO_zalloc(size_t num, const char *file, int line)
++{
++    return c_CRYPTO_zalloc(num, file, line);
++}
++
++void *CRYPTO_memdup(const void *str, size_t siz, const char *file, int line)
++{
++    return c_CRYPTO_memdup(str, siz, file, line);
++}
++
++char *CRYPTO_strdup(const char *str, const char *file, int line)
++{
++    return c_CRYPTO_strdup(str, file, line);
++}
++
++char *CRYPTO_strndup(const char *str, size_t s, const char *file, int line)
++{
++    return c_CRYPTO_strndup(str, s, file, line);
++}
++
++void CRYPTO_free(void *ptr, const char *file, int line)
++{
++    c_CRYPTO_free(ptr, file, line);
++}
++
++void CRYPTO_clear_free(void *ptr, size_t num, const char *file, int line)
++{
++    c_CRYPTO_clear_free(ptr, num, file, line);
++}
++
++void *CRYPTO_realloc(void *addr, size_t num, const char *file, int line)
++{
++    return c_CRYPTO_realloc(addr, num, file, line);
++}
++
++void *CRYPTO_clear_realloc(void *addr, size_t old_num, size_t num,
++                           const char *file, int line)
++{
++    return c_CRYPTO_clear_realloc(addr, old_num, num, file, line);
++}
++
++void *CRYPTO_secure_malloc(size_t num, const char *file, int line)
++{
++    return c_CRYPTO_secure_malloc(num, file, line);
++}
++
++void *CRYPTO_secure_zalloc(size_t num, const char *file, int line)
++{
++    return c_CRYPTO_secure_zalloc(num, file, line);
++}
++
++void CRYPTO_secure_free(void *ptr, const char *file, int line)
++{
++    c_CRYPTO_secure_free(ptr, file, line);
++}
++
++void CRYPTO_secure_clear_free(void *ptr, size_t num, const char *file, int line)
++{
++    c_CRYPTO_secure_clear_free(ptr, num, file, line);
++}
++
++unsigned char *OPENSSL_hexstr2buf(const char *str, long *len)
++{
++    return c_OPENSSL_hexstr2buf(str, len);
++}
++
++int CRYPTO_secure_allocated(const void *ptr)
++{
++    return c_CRYPTO_secure_allocated(ptr);
++}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023907.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="023927.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23908">[ date ]</a>
+              <a href="thread.html#23908">[ thread ]</a>
+              <a href="subject.html#23908">[ subject ]</a>
+              <a href="author.html#23908">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

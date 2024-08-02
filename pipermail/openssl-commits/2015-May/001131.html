@@ -1,0 +1,782 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432159109.696998.19520.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001127.html">
+   <LINK REL="Next"  HREF="001132.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432159109.696998.19520.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed May 20 21:58:29 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001127.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001132.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1131">[ date ]</a>
+              <a href="thread.html#1131">[ thread ]</a>
+              <a href="subject.html#1131">[ subject ]</a>
+              <a href="author.html#1131">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3e8e688f867a1ec1e554da67f111fa58a6ee1138 (commit)
+      from  ac38115c1a4fb61c66c2a8cd2a9800751828d328 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3e8e688f867a1ec1e554da67f111fa58a6ee1138
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Fri May 15 16:32:49 2015 -0400
+
+    Replace switch/assignments with table lookup
+    
+    Typedef STRINT_PAIR to be the same as OPT_PAIR, and use that structure and
+    a bunch of tables instead of switch statements to lookup various values
+    out of the SSL/TLS message buffers.  Shrinks a bunch of code.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/apps.h |   9 +-
+ apps/s_cb.c | 552 ++++++++++++++++++------------------------------------------
+ 2 files changed, 173 insertions(+), 388 deletions(-)
+
+diff --git a/apps/apps.h b/apps/apps.h
+index e55dcd6..7033d2e 100644
+--- a/apps/apps.h
++++ b/apps/apps.h
+@@ -340,10 +340,15 @@ typedef struct options_st {
+     const char *helpstr;
+ } OPTIONS;
+ 
+-typedef struct opt_pair_st {
++/*
++ * A string/int pairing; widely use for option value lookup, hence the
++ * name OPT_PAIR. But that name is misleading in s_cb.c, so we also use
++ * the &quot;generic&quot; name STRINT_PAIR.
++ */
++typedef struct string_int_pair_st {
+     const char *name;
+     int retval;
+-} OPT_PAIR;
++} OPT_PAIR, STRINT_PAIR;
+ 
+ /* Flags to pass into opt_format; see FORMAT_xxx, below. */
+ # define OPT_FMT_PEMDER          (1L &lt;&lt;  1)
+diff --git a/apps/s_cb.c b/apps/s_cb.c
+index 4979edf..35366c5 100644
+--- a/apps/s_cb.c
++++ b/apps/s_cb.c
+@@ -135,6 +135,14 @@ int verify_return_error = 0;
+ unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
+ int cookie_initialized = 0;
+ 
++static const char *lookup(int val, const STRINT_PAIR* list, const char* def)
++{
++    for ( ; list-&gt;name; ++list)
++        if (list-&gt;retval == val)
++            return list-&gt;name;
++    return def;
++}
++
+ int verify_callback(int ok, X509_STORE_CTX *ctx)
+ {
+     X509 *err_cert;
+@@ -273,6 +281,19 @@ int set_cert_key_stuff(SSL_CTX *ctx, X509 *cert, EVP_PKEY *key,
+     return 1;
+ }
+ 
++static STRINT_PAIR cert_type_list[] = {
++    {&quot;RSA sign&quot;, TLS_CT_RSA_SIGN},
++    {&quot;DSA sign&quot;, TLS_CT_DSS_SIGN},
++    {&quot;RSA fixed DH&quot;, TLS_CT_RSA_FIXED_DH},
++    {&quot;DSS fixed DH&quot;, TLS_CT_DSS_FIXED_DH},
++    {&quot;ECDSA sign&quot;, TLS_CT_ECDSA_SIGN},
++    {&quot;RSA fixed ECDH&quot;, TLS_CT_RSA_FIXED_ECDH},
++    {&quot;ECDSA fixed ECDH&quot;, TLS_CT_ECDSA_FIXED_ECDH},
++    {&quot;GOST94 Sign&quot;, TLS_CT_GOST94_SIGN},
++    {&quot;GOST01 Sign&quot;, TLS_CT_GOST01_SIGN},
++    {NULL}
++};
++
+ static void ssl_print_client_cert_types(BIO *bio, SSL *s)
+ {
+     const unsigned char *p;
+@@ -283,51 +304,10 @@ static void ssl_print_client_cert_types(BIO *bio, SSL *s)
+     BIO_puts(bio, &quot;Client Certificate Types: &quot;);
+     for (i = 0; i &lt; cert_type_num; i++) {
+         unsigned char cert_type = p[i];
+-        char *cname;
+-        switch (cert_type) {
+-        case TLS_CT_RSA_SIGN:
+-            cname = &quot;RSA sign&quot;;
+-            break;
+-
+-        case TLS_CT_DSS_SIGN:
+-            cname = &quot;DSA sign&quot;;
+-            break;
+-
+-        case TLS_CT_RSA_FIXED_DH:
+-            cname = &quot;RSA fixed DH&quot;;
+-            break;
+-
+-        case TLS_CT_DSS_FIXED_DH:
+-            cname = &quot;DSS fixed DH&quot;;
+-            break;
+-
+-        case TLS_CT_ECDSA_SIGN:
+-            cname = &quot;ECDSA sign&quot;;
+-            break;
+-
+-        case TLS_CT_RSA_FIXED_ECDH:
+-            cname = &quot;RSA fixed ECDH&quot;;
+-            break;
+-
+-        case TLS_CT_ECDSA_FIXED_ECDH:
+-            cname = &quot;ECDSA fixed ECDH&quot;;
+-            break;
+-
+-        case TLS_CT_GOST94_SIGN:
+-            cname = &quot;GOST94 Sign&quot;;
+-            break;
+-
+-        case TLS_CT_GOST01_SIGN:
+-            cname = &quot;GOST01 Sign&quot;;
+-            break;
+-
+-        default:
+-            cname = NULL;
+-        }
++        const char *cname = lookup((int)cert_type, cert_type_list, NULL);
+ 
+         if (i)
+             BIO_puts(bio, &quot;, &quot;);
+-
+         if (cname)
+             BIO_puts(bio, cname);
+         else
+@@ -571,36 +551,71 @@ void apps_ssl_info_callback(const SSL *s, int where, int ret)
+     }
+ }
+ 
+-static const char *ssl_version_str(int version)
+-{
+-    switch (version) {
+-    case SSL3_VERSION:
+-        return &quot;SSL 3.0&quot;;
+-    case TLS1_VERSION:
+-        return &quot;TLS 1.0&quot;;
+-    case TLS1_1_VERSION:
+-        return &quot;TLS 1.1&quot;;
+-    case TLS1_2_VERSION:
+-        return &quot;TLS 1.2&quot;;
+-    case DTLS1_VERSION:
+-        return &quot;DTLS 1.0&quot;;
+-    case DTLS1_BAD_VER:
+-        return &quot;DTLS 1.0 (bad)&quot;;
+-    default:
+-        return &quot;???&quot;;
+-    }
+-}
++static STRINT_PAIR ssl_versions[] = {
++    {&quot;SSL 3.0&quot;, SSL3_VERSION},
++    {&quot;TLS 1.0&quot;, TLS1_VERSION},
++    {&quot;TLS 1.1&quot;, TLS1_1_VERSION},
++    {&quot;TLS 1.2&quot;, TLS1_2_VERSION},
++    {&quot;DTLS 1.0&quot;, DTLS1_VERSION},
++    {&quot;DTLS 1.0 (bad)&quot;, DTLS1_BAD_VER},
++    {NULL}
++};
++static STRINT_PAIR alert_types[] = {
++    {&quot; close_notify&quot;, 0},
++    {&quot; unexpected_message&quot;, 10},
++    {&quot; bad_record_mac&quot;, 20},
++    {&quot; decryption_failed&quot;, 21},
++    {&quot; record_overflow&quot;, 22},
++    {&quot; decompression_failure&quot;, 30},
++    {&quot; handshake_failure&quot;, 40},
++    {&quot; bad_certificate&quot;, 42},
++    {&quot; unsupported_certificate&quot;, 43},
++    {&quot; certificate_revoked&quot;, 44},
++    {&quot; certificate_expired&quot;, 45},
++    {&quot; certificate_unknown&quot;, 46},
++    {&quot; illegal_parameter&quot;, 47},
++    {&quot; unknown_ca&quot;, 48},
++    {&quot; access_denied&quot;, 49},
++    {&quot; decode_error&quot;, 50},
++    {&quot; decrypt_error&quot;, 51},
++    {&quot; export_restriction&quot;, 60},
++    {&quot; protocol_version&quot;, 70},
++    {&quot; insufficient_security&quot;, 71},
++    {&quot; internal_error&quot;, 80},
++    {&quot; user_canceled&quot;, 90},
++    {&quot; no_renegotiation&quot;, 100},
++    {&quot; unsupported_extension&quot;, 110},
++    {&quot; certificate_unobtainable&quot;, 111},
++    {&quot; unrecognized_name&quot;, 112},
++    {&quot; bad_certificate_status_response&quot;, 113},
++    {&quot; bad_certificate_hash_value&quot;, 114},
++    {&quot; unknown_psk_identity&quot;, 115},
++    {NULL}
++};
++
++static STRINT_PAIR handshakes[] = {
++    {&quot;, HelloRequest&quot;, 0},
++    {&quot;, ClientHello&quot;, 1},
++    {&quot;, ServerHello&quot;, 2},
++    {&quot;, HelloVerifyRequest&quot;, 3},
++    {&quot;, Certificate&quot;, 11},
++    {&quot;, ServerKeyExchange&quot;, 12},
++    {&quot;, CertificateRequest&quot;, 13},
++    {&quot;, ServerHelloDone&quot;, 14},
++    {&quot;, CertificateVerify&quot;, 15},
++    {&quot;, ClientKeyExchange&quot;, 16},
++    {&quot;, Finished&quot;, 20},
++    {NULL}
++};
+ 
+ void msg_cb(int write_p, int version, int content_type, const void *buf,
+             size_t len, SSL *ssl, void *arg)
+ {
+     BIO *bio = arg;
+-    const char *str_write_p, *str_version, *str_content_type =
+-        &quot;&quot;, *str_details1 = &quot;&quot;, *str_details2 = &quot;&quot;;
+-
+-    str_write_p = write_p ? &quot;&gt;&gt;&gt;&quot; : &quot;&lt;&lt;&lt;&quot;;
+-
+-    str_version = ssl_version_str(version);
++    const char *str_write_p = write_p ? &quot;&gt;&gt;&gt;&quot; : &quot;&lt;&lt;&lt;&quot;;
++    const char *str_version = lookup(version, ssl_versions, &quot;???&quot;);
++    const char *str_content_type = &quot;&quot;, *str_details1 = &quot;&quot;, *str_details2 = &quot;&quot;;
++    const unsigned char* bp = buf;
+ 
+     if (version == SSL3_VERSION ||
+         version == TLS1_VERSION ||
+@@ -613,17 +628,9 @@ void msg_cb(int write_p, int version, int content_type, const void *buf,
+             break;
+         case 21:
+             str_content_type = &quot;Alert&quot;;
+-            break;
+-        case 22:
+-            str_content_type = &quot;Handshake&quot;;
+-            break;
+-        }
+-
+-        if (content_type == 21) { /* Alert */
+             str_details1 = &quot;, ???&quot;;
+-
+             if (len == 2) {
+-                switch (((const unsigned char *)buf)[0]) {
++                switch (bp[0]) {
+                 case 1:
+                     str_details1 = &quot;, warning&quot;;
+                     break;
+@@ -631,147 +638,21 @@ void msg_cb(int write_p, int version, int content_type, const void *buf,
+                     str_details1 = &quot;, fatal&quot;;
+                     break;
+                 }
+-
+-                str_details2 = &quot; ???&quot;;
+-                switch (((const unsigned char *)buf)[1]) {
+-                case 0:
+-                    str_details2 = &quot; close_notify&quot;;
+-                    break;
+-                case 10:
+-                    str_details2 = &quot; unexpected_message&quot;;
+-                    break;
+-                case 20:
+-                    str_details2 = &quot; bad_record_mac&quot;;
+-                    break;
+-                case 21:
+-                    str_details2 = &quot; decryption_failed&quot;;
+-                    break;
+-                case 22:
+-                    str_details2 = &quot; record_overflow&quot;;
+-                    break;
+-                case 30:
+-                    str_details2 = &quot; decompression_failure&quot;;
+-                    break;
+-                case 40:
+-                    str_details2 = &quot; handshake_failure&quot;;
+-                    break;
+-                case 42:
+-                    str_details2 = &quot; bad_certificate&quot;;
+-                    break;
+-                case 43:
+-                    str_details2 = &quot; unsupported_certificate&quot;;
+-                    break;
+-                case 44:
+-                    str_details2 = &quot; certificate_revoked&quot;;
+-                    break;
+-                case 45:
+-                    str_details2 = &quot; certificate_expired&quot;;
+-                    break;
+-                case 46:
+-                    str_details2 = &quot; certificate_unknown&quot;;
+-                    break;
+-                case 47:
+-                    str_details2 = &quot; illegal_parameter&quot;;
+-                    break;
+-                case 48:
+-                    str_details2 = &quot; unknown_ca&quot;;
+-                    break;
+-                case 49:
+-                    str_details2 = &quot; access_denied&quot;;
+-                    break;
+-                case 50:
+-                    str_details2 = &quot; decode_error&quot;;
+-                    break;
+-                case 51:
+-                    str_details2 = &quot; decrypt_error&quot;;
+-                    break;
+-                case 60:
+-                    str_details2 = &quot; export_restriction&quot;;
+-                    break;
+-                case 70:
+-                    str_details2 = &quot; protocol_version&quot;;
+-                    break;
+-                case 71:
+-                    str_details2 = &quot; insufficient_security&quot;;
+-                    break;
+-                case 80:
+-                    str_details2 = &quot; internal_error&quot;;
+-                    break;
+-                case 90:
+-                    str_details2 = &quot; user_canceled&quot;;
+-                    break;
+-                case 100:
+-                    str_details2 = &quot; no_renegotiation&quot;;
+-                    break;
+-                case 110:
+-                    str_details2 = &quot; unsupported_extension&quot;;
+-                    break;
+-                case 111:
+-                    str_details2 = &quot; certificate_unobtainable&quot;;
+-                    break;
+-                case 112:
+-                    str_details2 = &quot; unrecognized_name&quot;;
+-                    break;
+-                case 113:
+-                    str_details2 = &quot; bad_certificate_status_response&quot;;
+-                    break;
+-                case 114:
+-                    str_details2 = &quot; bad_certificate_hash_value&quot;;
+-                    break;
+-                case 115:
+-                    str_details2 = &quot; unknown_psk_identity&quot;;
+-                    break;
+-                }
++                str_details2 = lookup((int)bp[1], alert_types, &quot; ???&quot;);
+             }
+-        }
+-
+-        if (content_type == 22) { /* Handshake */
++            break;
++        case 22:
++            str_content_type = &quot;Handshake&quot;;
+             str_details1 = &quot;???&quot;;
+-
+-            if (len &gt; 0) {
+-                switch (((const unsigned char *)buf)[0]) {
+-                case 0:
+-                    str_details1 = &quot;, HelloRequest&quot;;
+-                    break;
+-                case 1:
+-                    str_details1 = &quot;, ClientHello&quot;;
+-                    break;
+-                case 2:
+-                    str_details1 = &quot;, ServerHello&quot;;
+-                    break;
+-                case 3:
+-                    str_details1 = &quot;, HelloVerifyRequest&quot;;
+-                    break;
+-                case 11:
+-                    str_details1 = &quot;, Certificate&quot;;
+-                    break;
+-                case 12:
+-                    str_details1 = &quot;, ServerKeyExchange&quot;;
+-                    break;
+-                case 13:
+-                    str_details1 = &quot;, CertificateRequest&quot;;
+-                    break;
+-                case 14:
+-                    str_details1 = &quot;, ServerHelloDone&quot;;
+-                    break;
+-                case 15:
+-                    str_details1 = &quot;, CertificateVerify&quot;;
+-                    break;
+-                case 16:
+-                    str_details1 = &quot;, ClientKeyExchange&quot;;
+-                    break;
+-                case 20:
+-                    str_details1 = &quot;, Finished&quot;;
+-                    break;
+-                }
+-            }
+-        }
++            if (len &gt; 0)
++                str_details1 = lookup((int)bp[0], handshakes, &quot;???&quot;);
++            break;
+ #ifndef OPENSSL_NO_HEARTBEATS
+-        if (content_type == 24) { /* Heartbeat */
++        case 24:
+             str_details1 = &quot;, Heartbeat&quot;;
+ 
+             if (len &gt; 0) {
+-                switch (((const unsigned char *)buf)[0]) {
++                switch (bp[0]) {
+                 case 1:
+                     str_details1 = &quot;, HeartbeatRequest&quot;;
+                     break;
+@@ -780,8 +661,9 @@ void msg_cb(int write_p, int version, int content_type, const void *buf,
+                     break;
+                 }
+             }
+-        }
++            break;
+ #endif
++        }
+     }
+ 
+     BIO_printf(bio, &quot;%s %s%s [length %04lx]%s%s\n&quot;, str_write_p, str_version,
+@@ -805,104 +687,40 @@ void msg_cb(int write_p, int version, int content_type, const void *buf,
+     (void)BIO_flush(bio);
+ }
+ 
+-void tlsext_cb(SSL *s, int client_server, int type,
+-               unsigned char *data, int len, void *arg)
+-{
+-    BIO *bio = arg;
+-    char *extname;
+-
+-    switch (type) {
+-    case TLSEXT_TYPE_server_name:
+-        extname = &quot;server name&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_max_fragment_length:
+-        extname = &quot;max fragment length&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_client_certificate_url:
+-        extname = &quot;client certificate URL&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_trusted_ca_keys:
+-        extname = &quot;trusted CA keys&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_truncated_hmac:
+-        extname = &quot;truncated HMAC&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_status_request:
+-        extname = &quot;status request&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_user_mapping:
+-        extname = &quot;user mapping&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_client_authz:
+-        extname = &quot;client authz&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_server_authz:
+-        extname = &quot;server authz&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_cert_type:
+-        extname = &quot;cert type&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_elliptic_curves:
+-        extname = &quot;elliptic curves&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_ec_point_formats:
+-        extname = &quot;EC point formats&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_srp:
+-        extname = &quot;SRP&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_signature_algorithms:
+-        extname = &quot;signature algorithms&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_use_srtp:
+-        extname = &quot;use SRTP&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_heartbeat:
+-        extname = &quot;heartbeat&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_session_ticket:
+-        extname = &quot;session ticket&quot;;
+-        break;
+-
+-    case TLSEXT_TYPE_renegotiate:
+-        extname = &quot;renegotiation info&quot;;
+-        break;
+-
++static STRINT_PAIR tlsext_types[] = {
++    {&quot;server name&quot;, TLSEXT_TYPE_server_name},
++    {&quot;max fragment length&quot;, TLSEXT_TYPE_max_fragment_length},
++    {&quot;client certificate URL&quot;, TLSEXT_TYPE_client_certificate_url},
++    {&quot;trusted CA keys&quot;, TLSEXT_TYPE_trusted_ca_keys},
++    {&quot;truncated HMAC&quot;, TLSEXT_TYPE_truncated_hmac},
++    {&quot;status request&quot;, TLSEXT_TYPE_status_request},
++    {&quot;user mapping&quot;, TLSEXT_TYPE_user_mapping},
++    {&quot;client authz&quot;, TLSEXT_TYPE_client_authz},
++    {&quot;server authz&quot;, TLSEXT_TYPE_server_authz},
++    {&quot;cert type&quot;, TLSEXT_TYPE_cert_type},
++    {&quot;elliptic curves&quot;, TLSEXT_TYPE_elliptic_curves},
++    {&quot;EC point formats&quot;, TLSEXT_TYPE_ec_point_formats},
++    {&quot;SRP&quot;, TLSEXT_TYPE_srp},
++    {&quot;signature algorithms&quot;, TLSEXT_TYPE_signature_algorithms},
++    {&quot;use SRTP&quot;, TLSEXT_TYPE_use_srtp},
++    {&quot;heartbeat&quot;, TLSEXT_TYPE_heartbeat},
++    {&quot;session ticket&quot;, TLSEXT_TYPE_session_ticket},
++    {&quot;renegotiation info&quot;, TLSEXT_TYPE_renegotiate},
++    {&quot;TLS padding&quot;, TLSEXT_TYPE_padding},
+ #ifdef TLSEXT_TYPE_next_proto_neg
+-    case TLSEXT_TYPE_next_proto_neg:
+-        extname = &quot;next protocol&quot;;
+-        break;
++    {&quot;next protocol&quot;, TLSEXT_TYPE_next_proto_neg},
+ #endif
+ #ifdef TLSEXT_TYPE_encrypt_then_mac
+-    case TLSEXT_TYPE_encrypt_then_mac:
+-        extname = &quot;encrypt-then-mac&quot;;
+-        break;
++    {&quot;encrypt-then-mac&quot;, TLSEXT_TYPE_encrypt_then_mac},
+ #endif
+-    case TLSEXT_TYPE_padding:
+-        extname = &quot;TLS padding&quot;;
+-        break;
+-
+-    default:
+-        extname = &quot;unknown&quot;;
+-        break;
++    {NULL}
++};
+ 
+-    }
++void tlsext_cb(SSL *s, int client_server, int type,
++               unsigned char *data, int len, void *arg)
++{
++    BIO *bio = arg;
++    const char *extname = lookup(type, tlsext_types, &quot;unknown&quot;);
+ 
+     BIO_printf(bio, &quot;TLS %s extension \&quot;%s\&quot; (id=%d), len=%d\n&quot;,
+                client_server ? &quot;server&quot; : &quot;client&quot;, extname, type, len);
+@@ -1073,33 +891,27 @@ struct ssl_excert_st {
+     struct ssl_excert_st *next, *prev;
+ };
+ 
+-struct chain_flags {
+-    int flag;
+-    const char *name;
+-};
+-
+-struct chain_flags chain_flags_list[] = {
+-    {CERT_PKEY_VALID, &quot;Overall Validity&quot;},
+-    {CERT_PKEY_SIGN, &quot;Sign with EE key&quot;},
+-    {CERT_PKEY_EE_SIGNATURE, &quot;EE signature&quot;},
+-    {CERT_PKEY_CA_SIGNATURE, &quot;CA signature&quot;},
+-    {CERT_PKEY_EE_PARAM, &quot;EE key parameters&quot;},
+-    {CERT_PKEY_CA_PARAM, &quot;CA key parameters&quot;},
+-    {CERT_PKEY_EXPLICIT_SIGN, &quot;Explicity sign with EE key&quot;},
+-    {CERT_PKEY_ISSUER_NAME, &quot;Issuer Name&quot;},
+-    {CERT_PKEY_CERT_TYPE, &quot;Certificate Type&quot;},
+-    {0, NULL}
++static STRINT_PAIR chain_flags[] = {
++    {&quot;Overall Validity&quot;, CERT_PKEY_VALID},
++    {&quot;Sign with EE key&quot;, CERT_PKEY_SIGN},
++    {&quot;EE signature&quot;, CERT_PKEY_EE_SIGNATURE},
++    {&quot;CA signature&quot;, CERT_PKEY_CA_SIGNATURE},
++    {&quot;EE key parameters&quot;, CERT_PKEY_EE_PARAM},
++    {&quot;CA key parameters&quot;, CERT_PKEY_CA_PARAM},
++    {&quot;Explicity sign with EE key&quot;, CERT_PKEY_EXPLICIT_SIGN},
++    {&quot;Issuer Name&quot;, CERT_PKEY_ISSUER_NAME},
++    {&quot;Certificate Type&quot;, CERT_PKEY_CERT_TYPE},
++    {NULL}
+ };
+ 
+ static void print_chain_flags(SSL *s, int flags)
+ {
+-    struct chain_flags *ctmp = chain_flags_list;
++    STRINT_PAIR *pp;
+ 
+-    while (ctmp-&gt;name) {
+-        BIO_printf(bio_err, &quot;\t%s: %s\n&quot;, ctmp-&gt;name,
+-                   flags &amp; ctmp-&gt;flag ? &quot;OK&quot; : &quot;NOT OK&quot;);
+-        ctmp++;
+-    }
++    for (pp = chain_flags; pp-&gt;name; ++pp)
++        BIO_printf(bio_err, &quot;\t%s: %s\n&quot;,
++                   pp-&gt;name,
++                   (flags &amp; pp-&gt;retval) ? &quot;OK&quot; : &quot;NOT OK&quot;);
+     BIO_printf(bio_err, &quot;\tSuite B: &quot;);
+     if (SSL_set_cert_flags(s, 0) &amp; SSL_CERT_FLAG_SUITEB_128_LOS)
+         BIO_puts(bio_err, flags &amp; CERT_PKEY_SUITEB ? &quot;OK\n&quot; : &quot;NOT OK\n&quot;);
+@@ -1499,6 +1311,31 @@ typedef struct {
+                    void *other, void *ex);
+ } security_debug_ex;
+ 
++static STRINT_PAIR callback_types[] = {
++    {&quot;Supported Ciphersuite&quot;, SSL_SECOP_CIPHER_SUPPORTED},
++    {&quot;Shared Ciphersuite&quot;, SSL_SECOP_CIPHER_SHARED},
++    {&quot;Check Ciphersuite&quot;, SSL_SECOP_CIPHER_CHECK},
++#ifndef OPENSSL_NO_DH
++    {&quot;Temp DH key bits&quot;, SSL_SECOP_TMP_DH},
++#endif
++    {&quot;Supported Curve&quot;, SSL_SECOP_CURVE_SUPPORTED},
++    {&quot;Shared Curve&quot;, SSL_SECOP_CURVE_SHARED},
++    {&quot;Check Curve&quot;, SSL_SECOP_CURVE_CHECK},
++    {&quot;Supported Signature Algorithm digest&quot;, SSL_SECOP_SIGALG_SUPPORTED},
++    {&quot;Shared Signature Algorithm digest&quot;, SSL_SECOP_SIGALG_SHARED},
++    {&quot;Check Signature Algorithm digest&quot;, SSL_SECOP_SIGALG_CHECK},
++    {&quot;Signature Algorithm mask&quot;, SSL_SECOP_SIGALG_MASK},
++    {&quot;Certificate chain EE key&quot;, SSL_SECOP_EE_KEY},
++    {&quot;Certificate chain CA key&quot;, SSL_SECOP_CA_KEY},
++    {&quot;Peer Chain EE key&quot;, SSL_SECOP_PEER_EE_KEY},
++    {&quot;Peer Chain CA key&quot;, SSL_SECOP_PEER_CA_KEY},
++    {&quot;Certificate chain CA digest&quot;, SSL_SECOP_CA_MD},
++    {&quot;Peer chain CA digest&quot;, SSL_SECOP_PEER_CA_MD},
++    {&quot;SSL compression&quot;, SSL_SECOP_COMPRESSION},
++    {&quot;Session ticket&quot;, SSL_SECOP_TICKET},
++    {NULL}
++};
++
+ static int security_callback_debug(SSL *s, SSL_CTX *ctx,
+                                    int op, int bits, int nid,
+                                    void *other, void *ex)
+@@ -1511,79 +1348,22 @@ static int security_callback_debug(SSL *s, SSL_CTX *ctx,
+         return 1;
+     BIO_puts(sdb-&gt;out, &quot;Security callback: &quot;);
+ 
++    nm = lookup(op, callback_types, NULL);
+     switch (op) {
+-    case SSL_SECOP_CIPHER_SUPPORTED:
+-        nm = &quot;Supported Ciphersuite&quot;;
+-        break;
+-    case SSL_SECOP_CIPHER_SHARED:
+-        nm = &quot;Shared Ciphersuite&quot;;
+-        break;
+-    case SSL_SECOP_CIPHER_CHECK:
+-        nm = &quot;Check Ciphersuite&quot;;
+-        break;
+     case SSL_SECOP_TICKET:
+-        BIO_puts(sdb-&gt;out, &quot;Session ticket&quot;);
+-        show_bits = 0;
+-        nm = NULL;
+-        break;
+     case SSL_SECOP_COMPRESSION:
+-        BIO_puts(sdb-&gt;out, &quot;SSL compression&quot;);
+         show_bits = 0;
+         nm = NULL;
+         break;
+-#ifndef OPENSSL_NO_DH
+-    case SSL_SECOP_TMP_DH:
+-        nm = &quot;Temp DH key bits&quot;;
+-        break;
+-#endif
+-    case SSL_SECOP_CURVE_SUPPORTED:
+-        nm = &quot;Supported Curve&quot;;
+-        break;
+-    case SSL_SECOP_CURVE_SHARED:
+-        nm = &quot;Shared Curve&quot;;
+-        break;
+-    case SSL_SECOP_CURVE_CHECK:
+-        nm = &quot;Check Curve&quot;;
+-        break;
+     case SSL_SECOP_VERSION:
+-        BIO_printf(sdb-&gt;out, &quot;Version=%s&quot;, ssl_version_str(nid));
++        BIO_printf(sdb-&gt;out, &quot;Version=%s&quot;, lookup(nid, ssl_versions, &quot;???&quot;));
+         show_bits = 0;
+         nm = NULL;
+         break;
+-    case SSL_SECOP_SIGALG_SUPPORTED:
+-        nm = &quot;Supported Signature Algorithm digest&quot;;
+-        break;
+-    case SSL_SECOP_SIGALG_SHARED:
+-        nm = &quot;Shared Signature Algorithm digest&quot;;
+-        break;
+-    case SSL_SECOP_SIGALG_CHECK:
+-        nm = &quot;Check Signature Algorithm digest&quot;;
+-        break;
+-    case SSL_SECOP_SIGALG_MASK:
+-        nm = &quot;Signature Algorithm mask&quot;;
+-        break;
+-    case SSL_SECOP_EE_KEY:
+-        nm = &quot;Certificate chain EE key&quot;;
+-        break;
+-    case SSL_SECOP_CA_KEY:
+-        nm = &quot;Certificate chain CA key&quot;;
+-        break;
+     case SSL_SECOP_CA_MD:
+-        cert_md = 1;
+-        nm = &quot;Certificate chain CA digest&quot;;
+-        break;
+-    case SSL_SECOP_PEER_EE_KEY:
+-        nm = &quot;Peer Chain EE key&quot;;
+-        break;
+-    case SSL_SECOP_PEER_CA_KEY:
+-        nm = &quot;Peer Chain CA key&quot;;
+-        break;
+     case SSL_SECOP_PEER_CA_MD:
+         cert_md = 1;
+-        nm = &quot;Peer chain CA digest&quot;;
+         break;
+-    default:
+-        nm = NULL;
+     }
+     if (nm)
+         BIO_printf(sdb-&gt;out, &quot;%s=&quot;, nm);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001127.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001132.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1131">[ date ]</a>
+              <a href="thread.html#1131">[ thread ]</a>
+              <a href="subject.html#1131">[ subject ]</a>
+              <a href="author.html#1131">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

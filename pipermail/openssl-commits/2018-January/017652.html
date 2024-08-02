@@ -1,0 +1,233 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1516353153.824989.31104.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017645.html">
+   <LINK REL="Next"  HREF="017657.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1516353153.824989.31104.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Jan 19 09:12:33 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017645.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="017657.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17652">[ date ]</a>
+              <a href="thread.html#17652">[ thread ]</a>
+              <a href="subject.html#17652">[ subject ]</a>
+              <a href="author.html#17652">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c7454e1af74b1b99f3f47f782a6ac484c4c55b7f (commit)
+      from  e44c7d02ddac975ec6abff7901e77a0c37f9949d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c7454e1af74b1b99f3f47f782a6ac484c4c55b7f
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Jan 17 11:22:47 2018 +0100
+
+    Create one permanent proxy socket per TLSProxy::Proxy instance
+    
+    On Windows, we sometimes see a behavior with SO_REUSEADDR where there
+    remains lingering listening sockets on the same address and port as a
+    newly created one.
+    
+    To avoid this scenario, we don't create a new proxy port for each new
+    client run.  Instead, we create one proxy socket when the proxy object
+    is created, and close it when destroying that object.
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5095">https://github.com/openssl/openssl/pull/5095</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ util/perl/TLSProxy/Proxy.pm | 65 +++++++++++++++++++++++----------------------
+ 1 file changed, 33 insertions(+), 32 deletions(-)
+
+diff --git a/util/perl/TLSProxy/Proxy.pm b/util/perl/TLSProxy/Proxy.pm
+index 8c7b6d6..ca49b33 100644
+--- a/util/perl/TLSProxy/Proxy.pm
++++ b/util/perl/TLSProxy/Proxy.pm
+@@ -101,9 +101,35 @@ sub new
+         }
+     }
+ 
++    # Create the Proxy socket
++    my $proxaddr = $self-&gt;{proxy_addr};
++    $proxaddr =~ s/[\[\]]//g; # Remove [ and ]
++    my @proxyargs = (
++        LocalHost   =&gt; $proxaddr,
++        LocalPort   =&gt; $self-&gt;{proxy_port},
++        Proto       =&gt; &quot;tcp&quot;,
++        Listen      =&gt; SOMAXCONN,
++       );
++    push @proxyargs, ReuseAddr =&gt; 1
++        unless $^O eq &quot;MSWin32&quot;;
++    $self-&gt;{proxy_sock} = $IP_factory-&gt;(@proxyargs);
++
++    if ($self-&gt;{proxy_sock}) {
++        print &quot;Proxy started on port &quot;.$self-&gt;{proxy_port}.&quot;\n&quot;;
++    } else {
++        warn &quot;Failed creating proxy socket (&quot;.$proxaddr.&quot;,&quot;.$self-&gt;{proxy_port}.&quot;): $!\n&quot;;
++    }
++
+     return bless $self, $class;
+ }
+ 
++sub DESTROY
++{
++    my $self = shift;
++
++    $self-&gt;{proxy_sock}-&gt;close() if $self-&gt;{proxy_sock};
++}
++
+ sub clearClient
+ {
+     my $self = shift;
+@@ -155,6 +181,10 @@ sub start
+     my ($self) = shift;
+     my $pid;
+ 
++    if ($self-&gt;{proxy_sock} == 0) {
++        return 0;
++    }
++
+     $pid = fork();
+     if ($pid == 0) {
+         my $execcmd = $self-&gt;execute
+@@ -186,26 +216,6 @@ sub clientstart
+     my ($self) = shift;
+     my $oldstdout;
+ 
+-    # Create the Proxy socket
+-    my $proxaddr = $self-&gt;proxy_addr;
+-    $proxaddr =~ s/[\[\]]//g; # Remove [ and ]
+-    my @proxyargs = (
+-        LocalHost   =&gt; $proxaddr,
+-        LocalPort   =&gt; $self-&gt;proxy_port,
+-        Proto       =&gt; &quot;tcp&quot;,
+-        Listen      =&gt; SOMAXCONN,
+-       );
+-    push @proxyargs, ReuseAddr =&gt; 1
+-        unless $^O eq &quot;MSWin32&quot;;
+-    my $proxy_sock = $IP_factory-&gt;(@proxyargs);
+-
+-    if ($proxy_sock) {
+-        print &quot;Proxy started on port &quot;.$self-&gt;proxy_port.&quot;\n&quot;;
+-    } else {
+-        warn &quot;Failed creating proxy socket (&quot;.$proxaddr.&quot;,&quot;.$self-&gt;proxy_port.&quot;): $!\n&quot;;
+-        return 0;
+-    }
+-
+     if ($self-&gt;execute) {
+         my $pid = fork();
+         if ($pid == 0) {
+@@ -240,7 +250,7 @@ sub clientstart
+ 
+     # Wait for incoming connection from client
+     my $client_sock;
+-    if(!($client_sock = $proxy_sock-&gt;accept())) {
++    if(!($client_sock = $self-&gt;{proxy_sock}-&gt;accept())) {
+         warn &quot;Failed accepting incoming connection: $!\n&quot;;
+         return 0;
+     }
+@@ -324,9 +334,6 @@ sub clientstart
+         #Closing this also kills the child process
+         $client_sock-&gt;close();
+     }
+-    if($proxy_sock) {
+-        $proxy_sock-&gt;close();
+-    }
+     if(!$self-&gt;debug) {
+         select($oldstdout);
+     }
+@@ -436,24 +443,18 @@ sub supports_IPv6
+     my $self = shift;
+     return $have_IPv6;
+ }
+-
+-#Read/write accessors
+ sub proxy_addr
+ {
+     my $self = shift;
+-    if (@_) {
+-        $self-&gt;{proxy_addr} = shift;
+-    }
+     return $self-&gt;{proxy_addr};
+ }
+ sub proxy_port
+ {
+     my $self = shift;
+-    if (@_) {
+-        $self-&gt;{proxy_port} = shift;
+-    }
+     return $self-&gt;{proxy_port};
+ }
++
++#Read/write accessors
+ sub server_addr
+ {
+     my $self = shift;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017645.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="017657.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17652">[ date ]</a>
+              <a href="thread.html#17652">[ thread ]</a>
+              <a href="subject.html#17652">[ subject ]</a>
+              <a href="author.html#17652">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

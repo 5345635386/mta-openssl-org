@@ -1,0 +1,899 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1573725306.641833.20829.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026198.html">
+   <LINK REL="Next"  HREF="026200.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1573725306.641833.20829.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Nov 14 09:55:06 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026198.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026200.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26199">[ date ]</a>
+              <a href="thread.html#26199">[ thread ]</a>
+              <a href="subject.html#26199">[ subject ]</a>
+              <a href="author.html#26199">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  1640d48c5b4ee0a3ff5a2a5015ee17ac163d9cd4 (commit)
+      from  726ad13c4e720daeda5f56326aebcd27b4615d6c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1640d48c5b4ee0a3ff5a2a5015ee17ac163d9cd4
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Nov 8 15:24:42 2019 +0100
+
+    CORE &amp; PROV: make export of key data leaner through callback
+    
+    Exporting data from a provider owned domainparams or key is quite an
+    ordeal, with having to figure out what parameter keys an
+    implementation supports, call the export function a first time to find
+    out how large each parameter buffer must be, allocate the necessary
+    space for it, and call the export function again.
+    
+    So how about letting the export function build up the key data params
+    and call back with that?  This change implements exactly such a
+    mechanism.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10414">https://github.com/openssl/openssl/pull/10414</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/keymgmt_lib.c                      | 169 +++++++-------------------
+ include/crypto/evp.h                          |   7 +-
+ include/openssl/core_numbers.h                |  12 +-
+ providers/implementations/keymgmt/dh_kmgmt.c  |  61 ++++++----
+ providers/implementations/keymgmt/dsa_kmgmt.c |  63 ++++++----
+ providers/implementations/keymgmt/rsa_kmgmt.c |  55 +++++----
+ test/keymgmt_internal_test.c                  | 102 +++++++++++++---
+ 7 files changed, 252 insertions(+), 217 deletions(-)
+
+diff --git a/crypto/evp/keymgmt_lib.c b/crypto/evp/keymgmt_lib.c
+index 583e8b362a..4163bca5bb 100644
+--- a/crypto/evp/keymgmt_lib.c
++++ b/crypto/evp/keymgmt_lib.c
+@@ -11,84 +11,24 @@
+ #include &quot;internal/nelem.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;crypto/asn1.h&quot;
++#include &quot;internal/core.h&quot;
+ #include &quot;internal/provider.h&quot;
+ #include &quot;evp_local.h&quot;
+ 
+-static OSSL_PARAM *paramdefs_to_params(const OSSL_PARAM *paramdefs)
+-{
+-    size_t cnt;
+-    const OSSL_PARAM *p;
+-    OSSL_PARAM *params = NULL, *q;
+-
+-    for (cnt = 1, p = paramdefs; p-&gt;key != NULL; p++, cnt++)
+-        continue;
+-
+-    params = OPENSSL_zalloc(cnt * sizeof(*params));
+-    if (params == NULL)
+-        return NULL;
+-
+-    for (p = paramdefs, q = params; ; p++, q++) {
+-        *q = *p;
+-        if (p-&gt;key == NULL)
+-            break;
+-
+-        q-&gt;data = NULL;          /* In case the provider used it */
+-        q-&gt;return_size = 0;
+-    }
++struct import_data_st {
++    void *provctx;
++    void *(*importfn)(void *provctx, const OSSL_PARAM params[]);
+ 
+-    return params;
+-}
++    /* Result */
++    void *provdata;
++};
+ 
+-static OSSL_PARAM *reduce_params(OSSL_PARAM *params)
++static int try_import(const OSSL_PARAM params[], void *arg)
+ {
+-    OSSL_PARAM *curr, *next;
+-    size_t cnt;
+-
+-    for (cnt = 0, curr = next = params; next-&gt;key != NULL; next++) {
+-        if (next-&gt;return_size == 0)
+-            continue;
+-        if (curr != next)
+-            *curr = *next;
+-        curr++;
+-        cnt++;
+-    }
+-    *curr = *next;               /* Terminating record */
+-    cnt++;
+-
+-    curr = OPENSSL_realloc(params, cnt * sizeof(*params));
+-    if (curr == NULL)
+-        return params;
+-    return curr;
+-}
+-
+-typedef union align_block_un {
+-    OSSL_UNION_ALIGN;
+-} ALIGN_BLOCK;
+-
+-#define ALIGN_SIZE  sizeof(ALIGN_BLOCK)
+-
+-static void *allocate_params_space(OSSL_PARAM *params)
+-{
+-    unsigned char *data = NULL;
+-    size_t space;
+-    OSSL_PARAM *p;
+-
+-    for (space = 0, p = params; p-&gt;key != NULL; p++)
+-        space += ((p-&gt;return_size + ALIGN_SIZE - 1) / ALIGN_SIZE) * ALIGN_SIZE;
+-
+-    if (space == 0)
+-        return NULL;
+-
+-    data = OPENSSL_zalloc(space);
+-    if (data == NULL)
+-        return NULL;
+-
+-    for (space = 0, p = params; p-&gt;key != NULL; p++) {
+-        p-&gt;data = data + space;
+-        space += ((p-&gt;return_size + ALIGN_SIZE - 1) / ALIGN_SIZE) * ALIGN_SIZE;
+-    }
++    struct import_data_st *data = arg;
+ 
+-    return data;
++    data-&gt;provdata = data-&gt;importfn(data-&gt;provctx, params);
++    return data-&gt;provdata != NULL;
+ }
+ 
+ void *evp_keymgmt_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt,
+@@ -147,69 +87,39 @@ void *evp_keymgmt_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt,
+          * the new provider.
+          */
+ 
+-        void *(*importfn)(void *provctx, const OSSL_PARAM params[]) =
++        /* Setup for the export callback */
++        struct import_data_st import_data;
++
++        import_data.importfn =
+             want_domainparams ? keymgmt-&gt;importdomparams : keymgmt-&gt;importkey;
++        import_data.provdata = NULL;
+ 
+         /*
+          * If the given keymgmt doesn't have an import function, give up
+          */
+-        if (importfn == NULL)
++        if (import_data.importfn == NULL)
+             return NULL;
+ 
+         for (j = 0; j &lt; i &amp;&amp; pk-&gt;pkeys[j].keymgmt != NULL; j++) {
+-            if (pk-&gt;pkeys[j].keymgmt-&gt;exportkey != NULL) {
+-                const OSSL_PARAM *paramdefs = NULL;
+-                OSSL_PARAM *params = NULL;
+-                void *data = NULL;
+-                void *provctx =
+-                    ossl_provider_ctx(EVP_KEYMGMT_provider(keymgmt));
+-                int (*exportfn)(void *provctx, OSSL_PARAM params[]) = NULL;
+-
+-                if (pk-&gt;pkeys[j].domainparams != want_domainparams)
+-                    continue;
++            int (*exportfn)(void *provctx, OSSL_CALLBACK *cb, void *cbarg) =
++                want_domainparams
++                ? pk-&gt;pkeys[j].keymgmt-&gt;exportdomparams
++                : pk-&gt;pkeys[j].keymgmt-&gt;exportkey;
+ 
+-                exportfn = want_domainparams
+-                    ? pk-&gt;pkeys[j].keymgmt-&gt;exportdomparams
+-                    : pk-&gt;pkeys[j].keymgmt-&gt;exportkey;
+-
+-                paramdefs = pk-&gt;pkeys[j].keymgmt-&gt;exportkey_types();
+-                /*
+-                 * All params have 'data' set to NULL.  In that case,
+-                 * the exportkey call should just fill in 'return_size'
+-                 * in all applicable params.
+-                 */
+-                params = paramdefs_to_params(paramdefs);
+-                /* Get 'return_size' filled */
+-                exportfn(pk-&gt;pkeys[j].provdata, params);
+-
+-                /*
+-                 * Reduce the params by removing any entry that got return
+-                 * size zero, then allocate space and assign 'data' to point
+-                 * into the data block
+-                 */
+-                params = reduce_params(params);
+-                if ((data = allocate_params_space(params)) == NULL)
+-                    goto cont;
++            if (exportfn != NULL) {
++                import_data.provctx =
++                    ossl_provider_ctx(EVP_KEYMGMT_provider(keymgmt));
+ 
+                 /*
+-                 * Call the exportkey function a second time, to get
+-                 * the data filled.
+-                 * If something goes wrong, go to the next cached key.
+-                 */
+-                if (!exportfn(pk-&gt;pkeys[j].provdata, params))
+-                    goto cont;
++                 * The export function calls the callback (try_import), which
++                 * does the import for us.
++                 * Even though we got a success return, we double check that
++                 * we actually got something, just in case some implementation
++                 * forgets to check the return value.
+ 
+-                /*
+-                 * We should have all the data at this point, so import
+-                 * into the new provider and hope to get a key back.
+                  */
+-                provdata = importfn(provctx, params);
+-
+-             cont:
+-                OPENSSL_free(params);
+-                OPENSSL_free(data);
+-
+-                if (provdata != NULL)
++                if (exportfn(pk-&gt;pkeys[j].provdata, &amp;try_import, &amp;import_data)
++                    &amp;&amp; (provdata = import_data.provdata) != NULL)
+                     break;
+             }
+         }
+@@ -298,9 +208,10 @@ void evp_keymgmt_freedomparams(const EVP_KEYMGMT *keymgmt,
+ }
+ 
+ int evp_keymgmt_exportdomparams(const EVP_KEYMGMT *keymgmt,
+-                                void *provdomparams, OSSL_PARAM params[])
++                                void *provdomparams,
++                                OSSL_CALLBACK *param_cb, void *cbarg)
+ {
+-    return keymgmt-&gt;exportdomparams(provdomparams, params);
++    return keymgmt-&gt;exportdomparams(provdomparams, param_cb, cbarg);
+ }
+ 
+ const OSSL_PARAM *evp_keymgmt_importdomparam_types(const EVP_KEYMGMT *keymgmt)
+@@ -308,6 +219,10 @@ const OSSL_PARAM *evp_keymgmt_importdomparam_types(const EVP_KEYMGMT *keymgmt)
+     return keymgmt-&gt;importdomparam_types();
+ }
+ 
++/*
++ * TODO(v3.0) investigate if we need this function.  'openssl provider' may
++ * be a caller...
++ */
+ const OSSL_PARAM *evp_keymgmt_exportdomparam_types(const EVP_KEYMGMT *keymgmt)
+ {
+     return keymgmt-&gt;exportdomparam_types();
+@@ -344,9 +259,9 @@ void evp_keymgmt_freekey(const EVP_KEYMGMT *keymgmt, void *provkey)
+ }
+ 
+ int evp_keymgmt_exportkey(const EVP_KEYMGMT *keymgmt, void *provkey,
+-                          OSSL_PARAM params[])
++                          OSSL_CALLBACK *param_cb, void *cbarg)
+ {
+-    return keymgmt-&gt;exportkey(provkey, params);
++    return keymgmt-&gt;exportkey(provkey, param_cb, cbarg);
+ }
+ 
+ const OSSL_PARAM *evp_keymgmt_importkey_types(const EVP_KEYMGMT *keymgmt)
+@@ -354,6 +269,10 @@ const OSSL_PARAM *evp_keymgmt_importkey_types(const EVP_KEYMGMT *keymgmt)
+     return keymgmt-&gt;importkey_types();
+ }
+ 
++/*
++ * TODO(v3.0) investigate if we need this function.  'openssl provider' may
++ * be a caller...
++ */
+ const OSSL_PARAM *evp_keymgmt_exportkey_types(const EVP_KEYMGMT *keymgmt)
+ {
+     return keymgmt-&gt;exportkey_types();
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 7f5e405486..592cbdd536 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -602,7 +602,8 @@ void *evp_keymgmt_gendomparams(const EVP_KEYMGMT *keymgmt,
+ void evp_keymgmt_freedomparams(const EVP_KEYMGMT *keymgmt,
+                                void *provdomparams);
+ int evp_keymgmt_exportdomparams(const EVP_KEYMGMT *keymgmt,
+-                                void *provdomparams, OSSL_PARAM params[]);
++                                void *provdomparams,
++                                OSSL_CALLBACK *param_cb, void *cbarg);
+ const OSSL_PARAM *
+ evp_keymgmt_importdomparam_types(const EVP_KEYMGMT *keymgmt);
+ const OSSL_PARAM *
+@@ -615,8 +616,8 @@ void *evp_keymgmt_genkey(const EVP_KEYMGMT *keymgmt, void *domparams,
+ void *evp_keymgmt_loadkey(const EVP_KEYMGMT *keymgmt,
+                           void *id, size_t idlen);
+ void evp_keymgmt_freekey(const EVP_KEYMGMT *keymgmt, void *provkey);
+-int evp_keymgmt_exportkey(const EVP_KEYMGMT *keymgmt,
+-                               void *provkey, OSSL_PARAM params[]);
++int evp_keymgmt_exportkey(const EVP_KEYMGMT *keymgmt, void *provkey,
++                          OSSL_CALLBACK *param_cb, void *cbarg);
+ const OSSL_PARAM *evp_keymgmt_importkey_types(const EVP_KEYMGMT *keymgmt);
+ const OSSL_PARAM *evp_keymgmt_exportkey_types(const EVP_KEYMGMT *keymgmt);
+ 
+diff --git a/include/openssl/core_numbers.h b/include/openssl/core_numbers.h
+index 54241c7623..686944c28d 100644
+--- a/include/openssl/core_numbers.h
++++ b/include/openssl/core_numbers.h
+@@ -347,9 +347,13 @@ OSSL_CORE_MAKE_FUNC(void, OP_keymgmt_freedomparams, (void *domparams))
+ /* Key domain parameter export */
+ # define OSSL_FUNC_KEYMGMT_EXPORTDOMPARAMS          4
+ OSSL_CORE_MAKE_FUNC(int, OP_keymgmt_exportdomparams,
+-                    (void *domparams, OSSL_PARAM params[]))
++                    (void *domparams, OSSL_CALLBACK *param_cb, void *cbarg))
+ 
+ /* Key domain parameter discovery */
++/*
++ * TODO(v3.0) investigate if we need OP_keymgmt_exportdomparam_types.
++ * 'openssl provider' may be a caller...
++ */
+ # define OSSL_FUNC_KEYMGMT_IMPORTDOMPARAM_TYPES     5
+ # define OSSL_FUNC_KEYMGMT_EXPORTDOMPARAM_TYPES     6
+ OSSL_CORE_MAKE_FUNC(const OSSL_PARAM *, OP_keymgmt_importdomparam_types,
+@@ -374,9 +378,13 @@ OSSL_CORE_MAKE_FUNC(void, OP_keymgmt_freekey, (void *key))
+ /* Key export */
+ # define OSSL_FUNC_KEYMGMT_EXPORTKEY               14
+ OSSL_CORE_MAKE_FUNC(int, OP_keymgmt_exportkey,
+-                    (void *key, OSSL_PARAM params[]))
++                    (void *key, OSSL_CALLBACK *param_cb, void *cbarg))
+ 
+ /* Key discovery */
++/*
++ * TODO(v3.0) investigate if we need OP_keymgmt_exportkey_types.
++ * 'openssl provider' may be a caller...
++ */
+ # define OSSL_FUNC_KEYMGMT_IMPORTKEY_TYPES         15
+ # define OSSL_FUNC_KEYMGMT_EXPORTKEY_TYPES         16
+ OSSL_CORE_MAKE_FUNC(const OSSL_PARAM *, OP_keymgmt_importkey_types, (void))
+diff --git a/providers/implementations/keymgmt/dh_kmgmt.c b/providers/implementations/keymgmt/dh_kmgmt.c
+index 4120155619..c38c5f2bd5 100644
+--- a/providers/implementations/keymgmt/dh_kmgmt.c
++++ b/providers/implementations/keymgmt/dh_kmgmt.c
+@@ -12,7 +12,9 @@
+ #include &lt;openssl/bn.h&gt;
+ #include &lt;openssl/dh.h&gt;
+ #include &lt;openssl/params.h&gt;
++#include &quot;internal/param_build.h&quot;
+ #include &quot;prov/implementations.h&quot;
++#include &quot;prov/providercommon.h&quot;
+ 
+ static OSSL_OP_keymgmt_importdomparams_fn dh_importdomparams;
+ static OSSL_OP_keymgmt_exportdomparams_fn dh_exportdomparams;
+@@ -45,20 +47,19 @@ static int params_to_domparams(DH *dh, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-static int domparams_to_params(DH *dh, OSSL_PARAM params[])
++static int domparams_to_params(DH *dh, OSSL_PARAM_BLD *tmpl)
+ {
+-    OSSL_PARAM *p;
+     const BIGNUM *dh_p = NULL, *dh_g = NULL;
+ 
+     if (dh == NULL)
+         return 0;
+ 
+     DH_get0_pqg(dh, &amp;dh_p, NULL, &amp;dh_g);
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_FFC_P)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, dh_p))
++    if (dh_p != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_P, dh_p))
+         return 0;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_FFC_G)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, dh_g))
++    if (dh_g != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_G, dh_g))
+         return 0;
+ 
+     return 1;
+@@ -105,24 +106,21 @@ static int params_to_key(DH *dh, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-static int key_to_params(DH *dh, OSSL_PARAM params[])
++static int key_to_params(DH *dh, OSSL_PARAM_BLD *tmpl)
+ {
+-    OSSL_PARAM *p;
+     const BIGNUM *priv_key = NULL, *pub_key = NULL;
+ 
+     if (dh == NULL)
+         return 0;
+-    if (!domparams_to_params(dh, params))
++    if (!domparams_to_params(dh, tmpl))
+         return 0;
+ 
+     DH_get0_key(dh, &amp;pub_key, &amp;priv_key);
+-    if ((p = OSSL_PARAM_locate(params,
+-                                     OSSL_PKEY_PARAM_DH_PRIV_KEY)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, priv_key))
++    if (priv_key != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_DH_PRIV_KEY, priv_key))
+         return 0;
+-    if ((p = OSSL_PARAM_locate(params,
+-                                     OSSL_PKEY_PARAM_DH_PUB_KEY)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, pub_key))
++    if (pub_key != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_DH_PUB_KEY, pub_key))
+         return 0;
+ 
+     return 1;
+@@ -140,11 +138,22 @@ static void *dh_importdomparams(void *provctx, const OSSL_PARAM params[])
+     return dh;
+ }
+ 
+-static int dh_exportdomparams(void *domparams, OSSL_PARAM params[])
++static int dh_exportdomparams(void *domparams, OSSL_CALLBACK *param_cb,
++                              void *cbarg)
+ {
+     DH *dh = domparams;
+-
+-    return dh != NULL &amp;&amp; !domparams_to_params(dh, params);
++    OSSL_PARAM_BLD tmpl;
++    OSSL_PARAM *params = NULL;
++    int ret;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (dh == NULL
++        || !domparams_to_params(dh, &amp;tmpl)
++        || (params = ossl_param_bld_to_param(&amp;tmpl)) == NULL)
++        return 0;
++    ret = param_cb(params, cbarg);
++    ossl_param_bld_free(params);
++    return ret;
+ }
+ 
+ static void *dh_importkey(void *provctx, const OSSL_PARAM params[])
+@@ -159,11 +168,21 @@ static void *dh_importkey(void *provctx, const OSSL_PARAM params[])
+     return dh;
+ }
+ 
+-static int dh_exportkey(void *key, OSSL_PARAM params[])
++static int dh_exportkey(void *key, OSSL_CALLBACK *param_cb, void *cbarg)
+ {
+     DH *dh = key;
+-
+-    return dh != NULL &amp;&amp; !key_to_params(dh, params);
++    OSSL_PARAM_BLD tmpl;
++    OSSL_PARAM *params = NULL;
++    int ret;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (dh == NULL
++        || !key_to_params(dh, &amp;tmpl)
++        || (params = ossl_param_bld_to_param(&amp;tmpl)) == NULL)
++        return 0;
++    ret = param_cb(params, cbarg);
++    ossl_param_bld_free(params);
++    return ret;
+ }
+ 
+ const OSSL_DISPATCH dh_keymgmt_functions[] = {
+diff --git a/providers/implementations/keymgmt/dsa_kmgmt.c b/providers/implementations/keymgmt/dsa_kmgmt.c
+index a3bf11a570..ca4354af59 100644
+--- a/providers/implementations/keymgmt/dsa_kmgmt.c
++++ b/providers/implementations/keymgmt/dsa_kmgmt.c
+@@ -12,7 +12,9 @@
+ #include &lt;openssl/bn.h&gt;
+ #include &lt;openssl/dsa.h&gt;
+ #include &lt;openssl/params.h&gt;
++#include &quot;internal/param_build.h&quot;
+ #include &quot;prov/implementations.h&quot;
++#include &quot;prov/providercommon.h&quot;
+ 
+ static OSSL_OP_keymgmt_importdomparams_fn dsa_importdomparams;
+ static OSSL_OP_keymgmt_exportdomparams_fn dsa_exportdomparams;
+@@ -48,23 +50,22 @@ static int params_to_domparams(DSA *dsa, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-static int domparams_to_params(DSA *dsa, OSSL_PARAM params[])
++static int domparams_to_params(DSA *dsa, OSSL_PARAM_BLD *tmpl)
+ {
+-    OSSL_PARAM *p;
+     const BIGNUM *dsa_p = NULL, *dsa_q = NULL, *dsa_g = NULL;
+ 
+     if (dsa == NULL)
+         return 0;
+ 
+     DSA_get0_pqg(dsa, &amp;dsa_p, &amp;dsa_q, &amp;dsa_g);
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_FFC_P)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, dsa_p))
++    if (dsa_p != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_P, dsa_p))
+         return 0;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_FFC_Q)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, dsa_q))
++    if (dsa_q != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_Q, dsa_q))
+         return 0;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_FFC_G)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, dsa_g))
++    if (dsa_g != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_G, dsa_g))
+         return 0;
+ 
+     return 1;
+@@ -110,22 +111,21 @@ static int params_to_key(DSA *dsa, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-static int key_to_params(DSA *dsa, OSSL_PARAM params[])
++static int key_to_params(DSA *dsa, OSSL_PARAM_BLD *tmpl)
+ {
+-    OSSL_PARAM *p;
+     const BIGNUM *priv_key = NULL, *pub_key = NULL;
+ 
+     if (dsa == NULL)
+         return 0;
+-    if (!domparams_to_params(dsa, params))
++    if (!domparams_to_params(dsa, tmpl))
+         return 0;
+ 
+     DSA_get0_key(dsa, &amp;pub_key, &amp;priv_key);
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DSA_PRIV_KEY)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, priv_key))
++    if (priv_key != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_DSA_PRIV_KEY, priv_key))
+         return 0;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DSA_PUB_KEY)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, pub_key))
++    if (pub_key != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_DSA_PUB_KEY, pub_key))
+         return 0;
+ 
+     return 1;
+@@ -143,11 +143,22 @@ static void *dsa_importdomparams(void *provctx, const OSSL_PARAM params[])
+     return dsa;
+ }
+ 
+-static int dsa_exportdomparams(void *domparams, OSSL_PARAM params[])
++static int dsa_exportdomparams(void *domparams,
++                               OSSL_CALLBACK *param_cb, void *cbarg)
+ {
+     DSA *dsa = domparams;
+-
+-    return dsa != NULL &amp;&amp; !domparams_to_params(dsa, params);
++    OSSL_PARAM_BLD tmpl;
++    OSSL_PARAM *params = NULL;
++    int ret;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (dsa == NULL
++        || !domparams_to_params(dsa, &amp;tmpl)
++        || (params = ossl_param_bld_to_param(&amp;tmpl)) == NULL)
++        return 0;
++    ret = param_cb(params, cbarg);
++    ossl_param_bld_free(params);
++    return ret;
+ }
+ 
+ static void *dsa_importkey(void *provctx, const OSSL_PARAM params[])
+@@ -162,11 +173,21 @@ static void *dsa_importkey(void *provctx, const OSSL_PARAM params[])
+     return dsa;
+ }
+ 
+-static int dsa_exportkey(void *key, OSSL_PARAM params[])
++static int dsa_exportkey(void *key, OSSL_CALLBACK *param_cb, void *cbarg)
+ {
+     DSA *dsa = key;
+-
+-    return dsa != NULL &amp;&amp; !key_to_params(dsa, params);
++    OSSL_PARAM_BLD tmpl;
++    OSSL_PARAM *params = NULL;
++    int ret;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (dsa == NULL
++        || !key_to_params(dsa, &amp;tmpl)
++        || (params = ossl_param_bld_to_param(&amp;tmpl)) == NULL)
++        return 0;
++    ret = param_cb(params, cbarg);
++    ossl_param_bld_free(params);
++    return ret;
+ }
+ 
+ const OSSL_DISPATCH dsa_keymgmt_functions[] = {
+diff --git a/providers/implementations/keymgmt/rsa_kmgmt.c b/providers/implementations/keymgmt/rsa_kmgmt.c
+index aaa9815aa9..451f227775 100644
+--- a/providers/implementations/keymgmt/rsa_kmgmt.c
++++ b/providers/implementations/keymgmt/rsa_kmgmt.c
+@@ -13,7 +13,9 @@
+ #include &lt;openssl/rsa.h&gt;
+ #include &lt;openssl/params.h&gt;
+ #include &lt;openssl/types.h&gt;
++#include &quot;internal/param_build.h&quot;
+ #include &quot;prov/implementations.h&quot;
++#include &quot;prov/providercommon.h&quot;
+ #include &quot;crypto/rsa.h&quot;
+ 
+ static OSSL_OP_keymgmt_importkey_fn rsa_importkey;
+@@ -96,10 +98,9 @@ static int params_to_key(RSA *rsa, const OSSL_PARAM params[])
+     return 0;
+ }
+ 
+-static int export_numbers(OSSL_PARAM params[], const char *key,
++static int export_numbers(OSSL_PARAM_BLD *tmpl, const char *key,
+                           STACK_OF(BIGNUM_const) *numbers)
+ {
+-    OSSL_PARAM *p = NULL;
+     int i, nnum;
+ 
+     if (numbers == NULL)
+@@ -107,24 +108,18 @@ static int export_numbers(OSSL_PARAM params[], const char *key,
+ 
+     nnum = sk_BIGNUM_const_num(numbers);
+ 
+-    for (p = params, i = 0;
+-         i &lt; nnum &amp;&amp; (p = OSSL_PARAM_locate(p, key)) != NULL;
+-         p++, i++) {
+-        if (!OSSL_PARAM_set_BN(p, sk_BIGNUM_const_value(numbers, i)))
++    for (i = 0; i &lt; nnum; i++) {
++        if (!ossl_param_bld_push_BN(tmpl, key,
++                                    sk_BIGNUM_const_value(numbers, i)))
+             return 0;
+     }
+ 
+-    /*
+-     * If we didn't export the amount of numbers we have, the caller didn't
+-     * specify enough OSSL_PARAM entries named |key|.
+-     */
+-    return i == nnum;
++    return 1;
+ }
+ 
+-static int key_to_params(RSA *rsa, OSSL_PARAM params[])
++static int key_to_params(RSA *rsa, OSSL_PARAM_BLD *tmpl)
+ {
+     int ret = 0;
+-    OSSL_PARAM *p;
+     const BIGNUM *rsa_d = NULL, *rsa_n = NULL, *rsa_e = NULL;
+     STACK_OF(BIGNUM_const) *factors = sk_BIGNUM_const_new_null();
+     STACK_OF(BIGNUM_const) *exps = sk_BIGNUM_const_new_null();
+@@ -136,19 +131,19 @@ static int key_to_params(RSA *rsa, OSSL_PARAM params[])
+     RSA_get0_key(rsa, &amp;rsa_n, &amp;rsa_e, &amp;rsa_d);
+     rsa_get0_all_params(rsa, factors, exps, coeffs);
+ 
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_RSA_N)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, rsa_n))
++    if (rsa_n != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_RSA_N, rsa_n))
+         goto err;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_RSA_E)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, rsa_e))
++    if (rsa_e != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_RSA_E, rsa_e))
+         goto err;
+-    if ((p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_RSA_D)) != NULL
+-        &amp;&amp; !OSSL_PARAM_set_BN(p, rsa_d))
++    if (rsa_d != NULL
++        &amp;&amp; !ossl_param_bld_push_BN(tmpl, OSSL_PKEY_PARAM_RSA_D, rsa_d))
+         goto err;
+ 
+-    if (!export_numbers(params, OSSL_PKEY_PARAM_RSA_FACTOR, factors)
+-        || !export_numbers(params, OSSL_PKEY_PARAM_RSA_EXPONENT, exps)
+-        || !export_numbers(params, OSSL_PKEY_PARAM_RSA_COEFFICIENT, coeffs))
++    if (!export_numbers(tmpl, OSSL_PKEY_PARAM_RSA_FACTOR, factors)
++        || !export_numbers(tmpl, OSSL_PKEY_PARAM_RSA_EXPONENT, exps)
++        || !export_numbers(tmpl, OSSL_PKEY_PARAM_RSA_COEFFICIENT, coeffs))
+         goto err;
+ 
+     ret = 1;
+@@ -171,11 +166,21 @@ static void *rsa_importkey(void *provctx, const OSSL_PARAM params[])
+     return rsa;
+ }
+ 
+-static int rsa_exportkey(void *key, OSSL_PARAM params[])
++static int rsa_exportkey(void *key, OSSL_CALLBACK *param_callback, void *cbarg)
+ {
+     RSA *rsa = key;
+-
+-    return rsa != NULL &amp;&amp; key_to_params(rsa, params);
++    OSSL_PARAM_BLD tmpl;
++    OSSL_PARAM *params = NULL;
++    int ret;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (rsa == NULL
++        || !key_to_params(rsa, &amp;tmpl)
++        || (params = ossl_param_bld_to_param(&amp;tmpl)) == NULL)
++        return 0;
++    ret = param_callback(params, cbarg);
++    ossl_param_bld_free(params);
++    return ret;
+ }
+ 
+ /*
+diff --git a/test/keymgmt_internal_test.c b/test/keymgmt_internal_test.c
+index 1fd831d72f..e621412390 100644
+--- a/test/keymgmt_internal_test.c
++++ b/test/keymgmt_internal_test.c
+@@ -15,6 +15,7 @@
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/provider.h&gt;
+ #include &lt;openssl/core_names.h&gt;
++#include &quot;internal/core.h&quot;
+ #include &quot;internal/nelem.h&quot;
+ #include &quot;crypto/evp.h&quot;          /* For the internal API */
+ #include &quot;testutil.h&quot;
+@@ -54,9 +55,7 @@ static FIXTURE *set_up(const char *testcase_name)
+     return fixture;
+ }
+ 
+-static int test_pass_rsa(FIXTURE *fixture)
+-{
+-    /* Array indexes */
++/* Array indexes */
+ #define N       0
+ #define E       1
+ #define D       2
+@@ -69,6 +68,77 @@ static int test_pass_rsa(FIXTURE *fixture)
+ #define QINV    9
+ #define C3      10               /* Extra coefficient */
+ 
++/*
++ * We have to do this because OSSL_PARAM_get_ulong() can't handle params
++ * holding data that isn't exactly sizeof(uint32_t) or sizeof(uint64_t),
++ * and because the other end deals with BIGNUM, the resulting param might
++ * be any size.  In this particular test, we know that the expected data
++ * fits within an unsigned long, and we want to get the data in that form
++ * to make testing of values easier.
++ */
++static int get_ulong_via_BN(const OSSL_PARAM *p, unsigned long *goal)
++{
++    BIGNUM *n = NULL;
++    int ret = 1;                 /* Ever so hopeful */
++
++    if (!TEST_true(OSSL_PARAM_get_BN(p, &amp;n))
++        || !TEST_true(BN_bn2nativepad(n, (unsigned char *)goal, sizeof(*goal))))
++        ret = 0;
++    BN_free(n);
++    return ret;
++}
++
++static int export_cb(const OSSL_PARAM *params, void *arg)
++{
++    unsigned long *keydata = arg;
++    const OSSL_PARAM *p = NULL;
++    int factors_idx;
++    int exponents_idx;
++    int coefficients_idx;
++    int ret = 1;                 /* Ever so hopeful */
++
++    if (keydata == NULL)
++        return 0;
++
++    if (!TEST_ptr(p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_N))
++        || !TEST_true(get_ulong_via_BN(p, &amp;keydata[N]))
++        || !TEST_ptr(p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_E))
++        || !TEST_true(get_ulong_via_BN(p, &amp;keydata[E]))
++        || !TEST_ptr(p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_D))
++        || !TEST_true(get_ulong_via_BN(p, &amp;keydata[D])))
++        ret = 0;
++
++    for (p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_FACTOR),
++             factors_idx = P;
++         p != NULL &amp;&amp; factors_idx &lt;= F3;
++         p = OSSL_PARAM_locate_const(p + 1, OSSL_PKEY_PARAM_RSA_FACTOR),
++         factors_idx++)
++        if (!TEST_true(get_ulong_via_BN(p, &amp;keydata[factors_idx])))
++            ret = 0;
++    for (p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_EXPONENT),
++             exponents_idx = DP;
++         p != NULL &amp;&amp; exponents_idx &lt;= E3;
++         p = OSSL_PARAM_locate_const(p + 1, OSSL_PKEY_PARAM_RSA_EXPONENT),
++         exponents_idx++)
++        if (!TEST_true(get_ulong_via_BN(p, &amp;keydata[exponents_idx])))
++            ret = 0;
++    for (p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_RSA_COEFFICIENT),
++             coefficients_idx = QINV;
++         p != NULL &amp;&amp; coefficients_idx &lt;= C3;
++         p = OSSL_PARAM_locate_const(p + 1, OSSL_PKEY_PARAM_RSA_COEFFICIENT),
++         coefficients_idx++)
++        if (!TEST_true(get_ulong_via_BN(p, &amp;keydata[coefficients_idx])))
++            ret = 0;
++
++    if (!TEST_int_le(factors_idx, F3)
++        || !TEST_int_le(exponents_idx, E3)
++        || !TEST_int_le(coefficients_idx, C3))
++        ret = 0;
++    return ret;
++}
++
++static int test_pass_rsa(FIXTURE *fixture)
++{
+     size_t i;
+     int ret = 0;
+     RSA *rsa = NULL;
+@@ -97,20 +167,6 @@ static int test_pass_rsa(FIXTURE *fixture)
+         0                        /* Extra, should remain zero */
+     };
+     static unsigned long keydata[OSSL_NELEM(expected)] = { 0, };
+-    OSSL_PARAM params[] = {
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_N, &amp;keydata[N]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_E, &amp;keydata[E]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_D, &amp;keydata[D]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_FACTOR, &amp;keydata[P]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_FACTOR, &amp;keydata[Q]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_FACTOR, &amp;keydata[F3]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_EXPONENT, &amp;keydata[DP]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_EXPONENT, &amp;keydata[DQ]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_EXPONENT, &amp;keydata[E3]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_COEFFICIENT, &amp;keydata[QINV]),
+-        OSSL_PARAM_ulong(OSSL_PKEY_PARAM_RSA_COEFFICIENT, &amp;keydata[C3]),
+-        OSSL_PARAM_END
+-    };
+ 
+     if (!TEST_ptr(rsa = RSA_new()))
+         goto err;
+@@ -155,7 +211,7 @@ static int test_pass_rsa(FIXTURE *fixture)
+         || !TEST_ptr(provdata = evp_keymgmt_export_to_provider(pk, km2, 0)))
+         goto err;
+ 
+-    if (!TEST_true(evp_keymgmt_exportkey(km2, provdata, params)))
++    if (!TEST_true(evp_keymgmt_exportkey(km2, provdata, &amp;export_cb, keydata)))
+         goto err;
+ 
+     /*
+@@ -163,8 +219,14 @@ static int test_pass_rsa(FIXTURE *fixture)
+      * from the key.
+      */
+ 
+-    for (i = 0; i &lt; OSSL_NELEM(expected); i++)
+-        ret += !! TEST_int_eq(expected[i], keydata[i]);
++    for (i = 0; i &lt; OSSL_NELEM(expected); i++) {
++        int rv = TEST_int_eq(expected[i], keydata[i]);
++
++        if (!rv)
++            TEST_info(&quot;i = %zu&quot;, i);
++        else
++            ret++;
++    }
+ 
+     ret = (ret == OSSL_NELEM(expected));
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026198.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026200.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26199">[ date ]</a>
+              <a href="thread.html#26199">[ thread ]</a>
+              <a href="subject.html#26199">[ subject ]</a>
+              <a href="author.html#26199">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,468 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [web]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bweb%5D%20%20master%20update&In-Reply-To=%3C1523544423.121601.17782.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018887.html">
+   <LINK REL="Next"  HREF="019008.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [web]  master update</H1>
+    <B>Mark J. Cox</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bweb%5D%20%20master%20update&In-Reply-To=%3C1523544423.121601.17782.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [web]  master update">mark at openssl.org
+       </A><BR>
+    <I>Thu Apr 12 14:47:03 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018887.html">[openssl-commits] [web]  master update
+</A></li>
+        <LI>Next message: <A HREF="019008.html">[openssl-commits] [web]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18976">[ date ]</a>
+              <a href="thread.html#18976">[ thread ]</a>
+              <a href="subject.html#18976">[ subject ]</a>
+              <a href="author.html#18976">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e73e4460aa47e8cb6c694625584c26e9298d0bb5 (commit)
+      from  a2e614d7f5554b477dedd0066709df3cd3e14990 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e73e4460aa47e8cb6c694625584c26e9298d0bb5
+Author: Mark J. Cox &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">mark at awe.com</A>&gt;
+Date:   Thu Apr 12 15:46:30 2018 +0100
+
+    Use a unified converter tool with Apache by making it handle both formats and abstracting the differences
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ bin/vulnxml2json.py        | 137 ++++++++++++++++++++++++---------------------
+ bin/vulnxml2jsonproject.py |  43 ++++++++++++++
+ 2 files changed, 117 insertions(+), 63 deletions(-)
+ create mode 100644 bin/vulnxml2jsonproject.py
+
+diff --git a/bin/vulnxml2json.py b/bin/vulnxml2json.py
+index b905da1..cffa29f 100755
+--- a/bin/vulnxml2json.py
++++ b/bin/vulnxml2json.py
+@@ -3,8 +3,11 @@
+ # Convert our XML file to a JSON file as accepted by Mitre for CNA purposes
+ # as per <A HREF="https://github.com/CVEProject/automation-working-group/blob/master/cve_json_schema/DRAFT-JSON-file-format-v4.md">https://github.com/CVEProject/automation-working-group/blob/master/cve_json_schema/DRAFT-JSON-file-format-v4.md</A>
+ #
++# ASF httpd and OpenSSL use quite similar files, so this script is designed to work with either
++#
+ 
+ from xml.dom import minidom
++import HTMLParser
+ import simplejson as json
+ import codecs
+ import re
+@@ -17,45 +20,15 @@ from jsonschema import validate
+ from jsonschema import Draft4Validator
+ import urllib
+ 
+-# Versions of OpenSSL we never released, to allow us to display ranges
+-neverreleased = &quot;1.0.0h,&quot;;
++# Specific project stuff is here
++import vulnxml2jsonproject as cfg
+ 
+ # Location of CVE JSON schema (default, can use local file etc)
+ default_cve_schema = &quot;<A HREF="https://raw.githubusercontent.com/CVEProject/automation-working-group/master/cve_json_schema/CVE_JSON_4.0_min_public.schema">https://raw.githubusercontent.com/CVEProject/automation-working-group/master/cve_json_schema/CVE_JSON_4.0_min_public.schema</A>&quot;
+ 
+-def merge_affects(issue,base):
+-    # let's merge the affects into a nice list which is better for Mitre text but we have to take into account our stange lettering scheme
+-    prev = &quot;&quot;
+-    anext = &quot;&quot;
+-    alist = list()
+-    vlist = list()
+-    for affects in issue.getElementsByTagName('affects'): # so we can sort them
+-       version = affects.getAttribute(&quot;version&quot;)
+-       if (not base or base in version):
+-           vlist.append(version)
+-    for ver in sorted(vlist):
+-       # print &quot;version %s (last was %s, next was %s)&quot; %(ver,prev,anext)
+-       if (ver != anext):
+-          alist.append([ver])
+-       elif len(alist[-1]) &gt; 1:
+-          alist[-1][-1] = ver
+-       else:
+-          alist[-1].append(ver)
+-       prev = ver
+-       if (unicode.isdigit(ver[-1])):   # First version after 1.0.1 is 1.0.1a
+-           anext = ver + &quot;a&quot;
+-       elif (ver[-1] == &quot;y&quot;):
+-           anext = ver[:-1] + &quot;za&quot;    # We ran out of letters once so y-&gt;za-&gt;zb....
+-       else:
+-           anext = ver[:-1]+chr(ord(ver[-1])+1) # otherwise after 1.0.1a is 1.0.1b
+-       while (anext in neverreleased): # skip unreleased versions
+-          anext = anext[:-1]+chr(ord(anext[-1])+1)
+-
+-    return &quot;,&quot;.join(['-'.join(map(str,aff)) for aff in alist])
+-        
+ parser = OptionParser()
+ parser.add_option(&quot;-s&quot;, &quot;--schema&quot;, help=&quot;location of schema to check (default &quot;+default_cve_schema+&quot;)&quot;, default=default_cve_schema,dest=&quot;schema&quot;)
+-parser.add_option(&quot;-i&quot;, &quot;--input&quot;, help=&quot;input vulnerability file live openssl-web/news/vulnerabilities.xml&quot;, dest=&quot;input&quot;)
++parser.add_option(&quot;-i&quot;, &quot;--input&quot;, help=&quot;input vulnerability file vulnerabilities.xml&quot;, dest=&quot;input&quot;)
+ parser.add_option(&quot;-c&quot;, &quot;--cve&quot;, help=&quot;comma separated list of cve names to generate a json file for (or all)&quot;, dest=&quot;cves&quot;)
+ parser.add_option(&quot;-o&quot;, &quot;--outputdir&quot;, help=&quot;output directory for json file (default ./)&quot;, default=&quot;.&quot;, dest=&quot;outputdir&quot;)
+ (options, args) = parser.parse_args()
+@@ -74,61 +47,99 @@ cvej = list()
+ with codecs.open(options.input,&quot;r&quot;,&quot;utf-8&quot;) as vulnfile:
+     vulns = vulnfile.read()
+ dom = minidom.parseString(vulns.encode(&quot;utf-8&quot;))
+-issues = dom.getElementsByTagName('issue')
+-for issue in issues:
+-    cve = issue.getElementsByTagName('cve')[0].getAttribute('name')
+-    if (cve == &quot;&quot;):
++
++for issue in dom.getElementsByTagName('issue'):
++    if not issue.getElementsByTagName('cve'):
++        continue
++    # ASF httpd has CVE- prefix, but OpenSSL does not, make either work
++    cvename = issue.getElementsByTagName('cve')[0].getAttribute('name').replace('CVE-','')
++    if (cvename == &quot;&quot;):
+        continue
+-    if (options.cves):
+-       if (not cve in options.cves):
++    if (options.cves): # If we only want a certain list of CVEs, skip the rest
++       if (not cvename in options.cves):
+           continue
++
+     cve = dict()
+     cve['data_type']=&quot;CVE&quot;
+     cve['data_format']=&quot;MITRE&quot;
+     cve['data_version']=&quot;4.0&quot;
+-    cve['CVE_data_meta']= { &quot;ID&quot;: &quot;CVE-&quot;+issue.getElementsByTagName('cve')[0].getAttribute('name'), &quot;ASSIGNER&quot;: &quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-security at openssl.org</A>&quot;, &quot;STATE&quot;:&quot;PUBLIC&quot; }
++    cve['CVE_data_meta']= { &quot;ID&quot;: &quot;CVE-&quot;+cvename, &quot;ASSIGNER&quot;: cfg.config['cve_meta_assigner'], &quot;STATE&quot;:&quot;PUBLIC&quot; }
+     datepublic = issue.getAttribute(&quot;public&quot;)
+-    cve['CVE_data_meta']['DATE_PUBLIC'] = datepublic[:4]+'-'+datepublic[4:6]+'-'+datepublic[6:8]
++    if datepublic:
++       cve['CVE_data_meta']['DATE_PUBLIC'] = datepublic[:4]+'-'+datepublic[4:6]+'-'+datepublic[6:8]
+     if issue.getElementsByTagName('title'):
+-        cve['CVE_data_meta']['TITLE'] = issue.getElementsByTagName('title')[0].childNodes[0].nodeValue.strip()            
+-    desc = issue.getElementsByTagName('description')[0].childNodes[0].nodeValue.strip()
++        cve['CVE_data_meta']['TITLE'] = issue.getElementsByTagName('title')[0].childNodes[0].nodeValue.strip()
++    desc = &quot;&quot;
++    for d in issue.getElementsByTagName('description')[0].childNodes:
++#        if d.nodeType == d.ELEMENT_NODE:
++            if desc:
++                desc += &quot; &quot;
++            desc += re.sub('&lt;[^&lt;]+?&gt;', '', d.toxml().strip())
++    desc = HTMLParser.HTMLParser().unescape(desc)
+     problemtype = &quot;(undefined)&quot;
+     if issue.getElementsByTagName('problemtype'):
+         problemtype = issue.getElementsByTagName('problemtype')[0].childNodes[0].nodeValue.strip()    
+     cve['problemtype'] = { &quot;problemtype_data&quot;: [ { &quot;description&quot; : [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;: problemtype} ] } ] }
+-    impact = issue.getElementsByTagName('impact')
++    impact = issue.getElementsByTagName('impact') # openssl does it like this
+     if impact:
+-        cve['impact'] = [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:impact[0].getAttribute('severity'), &quot;url&quot;:&quot;<A HREF="https://www.openssl.org/policies/secpolicy.html#">https://www.openssl.org/policies/secpolicy.html#</A>&quot;+impact[0].getAttribute('severity') } ]
+-    for reported in issue.getElementsByTagName('reported'):
+-        cve['credit'] = [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:reported.getAttribute(&quot;source&quot;)} ]
++        cve['impact'] = [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:impact[0].getAttribute('severity'), &quot;url&quot;:cfg.config['security_policy_url']+impact[0].getAttribute('severity') } ]
++    impact = issue.getElementsByTagName('severity')  # httpd does it like this
++    if impact:
++        cve['impact'] = [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:impact[0].childNodes[0].nodeValue, &quot;url&quot;:cfg.config['security_policy_url']+impact[0].childNodes[0].nodeValue } ]
++
++    # Create the list of credits
++    
++    credit = list()
++    for reported in issue.getElementsByTagName('reported'):  # openssl style credits
++        credit.append( { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:re.sub('[\n ]+',' ', reported.getAttribute(&quot;source&quot;))} )
++    for reported in issue.getElementsByTagName('acknowledgements'): # ASF httpd style credits
++        credit.append(  { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;:re.sub('[\n ]+',' ', reported.childNodes[0].nodeValue.strip())} )
++    if credit:
++        cve['credit']=credit        
++
++    # Create the list of references
++        
+     refs = list()
+     for adv in issue.getElementsByTagName('advisory'):
+        url = adv.getAttribute(&quot;url&quot;)
+        if (not url.startswith(&quot;htt&quot;)):
+-          url = &quot;<A HREF="https://www.openssl.org">https://www.openssl.org</A>&quot;+url
+-       refs.append({&quot;url&quot;:url})
+-    for git in issue.getElementsByTagName('git'):
+-       refs.append({&quot;url&quot;:&quot;<A HREF="https://git.openssl.org/gitweb/?p=openssl.git;a=commitdiff;h=">https://git.openssl.org/gitweb/?p=openssl.git;a=commitdiff;h=</A>&quot;+git.getAttribute(&quot;hash&quot;)})
++          url = cfg.config['default_reference_prefix']+url
++       refs.append({&quot;url&quot;:url,&quot;name&quot;:url,&quot;refsource&quot;:&quot;CONFIRM&quot;})
++    for git in issue.getElementsByTagName('git'): # openssl style references to git
++       url = cfg.config['git_prefix']+git.getAttribute(&quot;hash&quot;)
++       refs.append({&quot;url&quot;:url,&quot;name&quot;:url,&quot;refsource&quot;:&quot;CONFIRM&quot;})       
++    if cfg.config['project'] == 'httpd': # ASF httpd has no references so fake them
++       for fixed in issue.getElementsByTagName('fixed'):
++          base = &quot;&quot;.join(fixed.getAttribute(&quot;version&quot;).split('.')[:-1])
++          refurl = cfg.config['default_reference']+base+&quot;.html#CVE-&quot;+cvename
++          refs.append({&quot;url&quot;:refurl,&quot;name&quot;:refurl,&quot;refsource&quot;:&quot;CONFIRM&quot;})
+     if refs:
+         cve['references'] = { &quot;reference_data&quot;: refs  }
+ 
+-    vv = list()
+-    for affects in issue.getElementsByTagName('fixed'):
+-        text = &quot;Fixed in OpenSSL %s (Affected %s)&quot; %(affects.getAttribute('version'),merge_affects(issue,affects.getAttribute(&quot;base&quot;)))
+-        # Let's condense into a list form since the format of this field is 'free text' at the moment, not machine readable (as per mail with George Theall)
+-        vv.append({&quot;version_value&quot;:text})
+-        # Mitre want the fixed/affected versions in the text too
+-        desc += &quot; &quot;+text+&quot;.&quot;
+-
+-    cve['affects'] = { &quot;vendor&quot; : { &quot;vendor_data&quot; : [ { &quot;vendor_name&quot;: &quot;OpenSSL&quot;, &quot;product&quot;: { &quot;product_data&quot; : [ { &quot;product_name&quot;: &quot;OpenSSL&quot;, &quot;version&quot;: { &quot;version_data&quot; : vv}}]}}]}}
++    # Create the &quot;affected products&quot; list
+         
++    vv = list()
++    for affects in issue.getElementsByTagName('fixed'): # OpenSSL and httpd since April 2018 does it this way
++       text = &quot;Fixed in %s %s (Affected %s)&quot; %(cfg.config['product_name'],affects.getAttribute('version'),cfg.merge_affects(issue,affects.getAttribute(&quot;base&quot;)))
++       # Let's condense into a list form since the format of this field is 'free text' at the moment, not machine readable (as per mail with George Theall)
++       vv.append({&quot;version_value&quot;:text})
++       # Mitre want the fixed/affected versions in the text too
++       desc += &quot; &quot;+text+&quot;.&quot;
++
++#    if issue.getAttribute('fixed'): # httpd used to do it this way
++#        base = &quot;.&quot;.join(issue.getAttribute(&quot;fixed&quot;).split('.')[:-1])+&quot;.&quot;
++#        text = &quot;Fixed in %s %s (Affected %s)&quot; %(cfg.config['product_name'],issue.getAttribute('fixed'),cfg.merge_affects(issue,base))
++#        vv.append({&quot;version_value&quot;:text})
++#        # Mitre want the fixed/affected versions in the text too
++#        desc += &quot; &quot;+text+&quot;.&quot;            
++
++    cve['affects'] = { &quot;vendor&quot; : { &quot;vendor_data&quot; : [ { &quot;vendor_name&quot;: cfg.config['vendor_name'], &quot;product&quot;: { &quot;product_data&quot; : [ { &quot;product_name&quot;: cfg.config['product_name'], &quot;version&quot;: { &quot;version_data&quot; : vv}}]}}]}}
++            
+     # Mitre want newlines and excess spaces stripped
+-    desc = re.sub('[\n ]+',' ', desc)
+-        
++    desc = re.sub('[\n ]+',' ', desc)        
+     cve['description'] = { &quot;description_data&quot;: [ { &quot;lang&quot;:&quot;eng&quot;, &quot;value&quot;: desc} ] }
+     cvej.append(cve)
+         
+-
+ for issue in cvej:
+     fn = issue['CVE_data_meta']['ID'] + &quot;.json&quot;
+     if not issue:
+diff --git a/bin/vulnxml2jsonproject.py b/bin/vulnxml2jsonproject.py
+new file mode 100644
+index 0000000..bd7ba65
+--- /dev/null
++++ b/bin/vulnxml2jsonproject.py
+@@ -0,0 +1,43 @@
++#! /usr/bin/python
++
++# project specific details
++config = dict()
++config['project'] = &quot;openssl&quot;
++config['vendor_name'] = &quot;OpenSSL&quot;
++config['product_name'] = &quot;OpenSSL&quot;
++config['cve_meta_assigner'] = &quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-security at openssl.org</A>&quot;
++# Versions of OpenSSL we never released, to allow us to display ranges
++config['neverreleased'] = &quot;1.0.0h,&quot;
++config['security_policy_url'] = &quot;<A HREF="https://www.openssl.org/policies/secpolicy.html#">https://www.openssl.org/policies/secpolicy.html#</A>&quot;
++config['git_prefix'] = &quot;<A HREF="https://git.openssl.org/gitweb/?p=openssl.git;a=commitdiff;h=">https://git.openssl.org/gitweb/?p=openssl.git;a=commitdiff;h=</A>&quot;
++config['default_reference_prefix'] = &quot;<A HREF="https://www.openssl.org">https://www.openssl.org</A>&quot;
++
++def merge_affects(issue,base):
++    # let's merge the affects into a nice list which is better for Mitre text but we have to take into account our stange lettering scheme
++    prev = &quot;&quot;
++    anext = &quot;&quot;
++    alist = list()
++    vlist = list()
++    for affects in issue.getElementsByTagName('affects'): # so we can sort them
++       version = affects.getAttribute(&quot;version&quot;)
++       if (not base or base in version):
++           vlist.append(version)
++    for ver in sorted(vlist):
++       # print &quot;version %s (last was %s, next was %s)&quot; %(ver,prev,anext)
++       if (ver != anext):
++          alist.append([ver])
++       elif len(alist[-1]) &gt; 1:
++          alist[-1][-1] = ver
++       else:
++          alist[-1].append(ver)
++       prev = ver
++       if (unicode.isdigit(ver[-1])):   # First version after 1.0.1 is 1.0.1a
++           anext = ver + &quot;a&quot;
++       elif (ver[-1] == &quot;y&quot;):
++           anext = ver[:-1] + &quot;za&quot;    # We ran out of letters once so y-&gt;za-&gt;zb....
++       else:
++           anext = ver[:-1]+chr(ord(ver[-1])+1) # otherwise after 1.0.1a is 1.0.1b
++       while (anext in config['neverreleased']): # skip unreleased versions
++          anext = anext[:-1]+chr(ord(anext[-1])+1)
++
++    return &quot;,&quot;.join(['-'.join(map(str,aff)) for aff in alist])
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018887.html">[openssl-commits] [web]  master update
+</A></li>
+	<LI>Next message: <A HREF="019008.html">[openssl-commits] [web]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18976">[ date ]</a>
+              <a href="thread.html#18976">[ thread ]</a>
+              <a href="subject.html#18976">[ subject ]</a>
+              <a href="author.html#18976">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

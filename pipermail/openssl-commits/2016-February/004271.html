@@ -1,0 +1,495 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1455899526.611357.8831.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004269.html">
+   <LINK REL="Next"  HREF="004274.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1455899526.611357.8831.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Fri Feb 19 16:32:06 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004269.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="004274.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4271">[ date ]</a>
+              <a href="thread.html#4271">[ thread ]</a>
+              <a href="subject.html#4271">[ subject ]</a>
+              <a href="author.html#4271">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  aa474d1fb172aabb29dad04cb6aaeca601a4378c (commit)
+      from  f0496ad71fbacccf5a95f40d31d251bc8cf9dcfb (commit)
+
+
+- Log -----------------------------------------------------------------
+commit aa474d1fb172aabb29dad04cb6aaeca601a4378c
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Fri Feb 19 17:24:44 2016 +0100
+
+    TLS: reject duplicate extensions
+    
+    Adapted from BoringSSL. Added a test.
+    
+    The extension parsing code is already attempting to already handle this for
+    some individual extensions, but it is doing so inconsistently. Duplicate
+    efforts in individual extension parsing will be cleaned up in a follow-up.
+    
+    Reviewed-by: Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ include/openssl/ssl.h                 |  1 +
+ ssl/ssl_err.c                         |  2 +
+ ssl/t1_lib.c                          | 84 ++++++++++++++++++++++++++++++++++-
+ test/recipes/70-test_sslcertstatus.t  |  2 +-
+ test/recipes/70-test_sslextension.t   | 59 ++++++++++++++++++++++--
+ test/recipes/70-test_sslsessiontick.t |  4 +-
+ test/recipes/70-test_tlsextms.t       |  6 +--
+ util/TLSProxy/ClientHello.pm          | 21 +++++----
+ util/TLSProxy/Message.pm              | 10 +++++
+ util/TLSProxy/ServerHello.pm          |  7 ++-
+ 10 files changed, 175 insertions(+), 21 deletions(-)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 36d17dd..9709103 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2123,6 +2123,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_STATE_MACHINE                              353
+ # define SSL_F_TLS12_CHECK_PEER_SIGALG                    333
+ # define SSL_F_TLS1_CHANGE_CIPHER_STATE                   209
++# define SSL_F_TLS1_CHECK_DUPLICATE_EXTENSIONS            341
+ # define SSL_F_TLS1_CHECK_SERVERHELLO_TLSEXT              274
+ # define SSL_F_TLS1_EXPORT_KEYING_MATERIAL                314
+ # define SSL_F_TLS1_GET_CURVELIST                         338
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index e6b9bbd..46f483f 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -273,6 +273,8 @@ static ERR_STRING_DATA SSL_str_functs[] = {
+     {ERR_FUNC(SSL_F_STATE_MACHINE), &quot;state_machine&quot;},
+     {ERR_FUNC(SSL_F_TLS12_CHECK_PEER_SIGALG), &quot;tls12_check_peer_sigalg&quot;},
+     {ERR_FUNC(SSL_F_TLS1_CHANGE_CIPHER_STATE), &quot;tls1_change_cipher_state&quot;},
++    {ERR_FUNC(SSL_F_TLS1_CHECK_DUPLICATE_EXTENSIONS),
++     &quot;tls1_check_duplicate_extensions&quot;},
+     {ERR_FUNC(SSL_F_TLS1_CHECK_SERVERHELLO_TLSEXT),
+      &quot;TLS1_CHECK_SERVERHELLO_TLSEXT&quot;},
+     {ERR_FUNC(SSL_F_TLS1_EXPORT_KEYING_MATERIAL),
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 7a2047d..db5f0f6 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -109,6 +109,7 @@
+  */
+ 
+ #include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
+ #include &lt;openssl/objects.h&gt;
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/hmac.h&gt;
+@@ -124,7 +125,7 @@ static int tls_decrypt_ticket(SSL *s, const unsigned char *tick, int ticklen,
+                               const unsigned char *sess_id, int sesslen,
+                               SSL_SESSION **psess);
+ static int ssl_check_clienthello_tlsext_early(SSL *s);
+-int ssl_check_serverhello_tlsext(SSL *s);
++static int ssl_check_serverhello_tlsext(SSL *s);
+ 
+ SSL3_ENC_METHOD const TLSv1_enc_data = {
+     tls1_enc,
+@@ -1037,6 +1038,79 @@ static int tls_use_ticket(SSL *s)
+     return ssl_security(s, SSL_SECOP_TICKET, 0, 0, NULL);
+ }
+ 
++static int compare_uint(const void *p1, const void *p2) {
++    unsigned int u1 = *((const unsigned int *)p1);
++    unsigned int u2 = *((const unsigned int *)p2);
++    if (u1 &lt; u2)
++        return -1;
++    else if (u1 &gt; u2)
++        return 1;
++    else
++        return 0;
++}
++
++/*
++ * Per <A HREF="http://tools.ietf.org/html/rfc5246#section-7.4.1.4,">http://tools.ietf.org/html/rfc5246#section-7.4.1.4,</A> there may not be
++ * more than one extension of the same type in a ClientHello or ServerHello.
++ * This function does an initial scan over the extensions block to filter those
++ * out. It returns 1 if all extensions are unique, and 0 if the extensions
++ * contain duplicates, could not be successfully parsed, or an internal error
++ * occurred.
++ */
++static int tls1_check_duplicate_extensions(const PACKET *packet) {
++    PACKET extensions = *packet;
++    size_t num_extensions = 0, i = 0;
++    unsigned int *extension_types = NULL;
++    int ret = 0;
++
++    /* First pass: count the extensions. */
++    while (PACKET_remaining(&amp;extensions) &gt; 0) {
++        unsigned int type;
++        PACKET extension;
++        if (!PACKET_get_net_2(&amp;extensions, &amp;type) ||
++            !PACKET_get_length_prefixed_2(&amp;extensions, &amp;extension)) {
++            goto done;
++        }
++        num_extensions++;
++    }
++
++    if (num_extensions &lt;= 1)
++        return 1;
++
++    extension_types = OPENSSL_malloc(sizeof(unsigned int) * num_extensions);
++    if (extension_types == NULL) {
++        SSLerr(SSL_F_TLS1_CHECK_DUPLICATE_EXTENSIONS, ERR_R_MALLOC_FAILURE);
++        goto done;
++    }
++
++    /* Second pass: gather the extension types. */
++    extensions = *packet;
++    for (i = 0; i &lt; num_extensions; i++) {
++        PACKET extension;
++        if (!PACKET_get_net_2(&amp;extensions, &amp;extension_types[i]) ||
++            !PACKET_get_length_prefixed_2(&amp;extensions, &amp;extension)) {
++            /* This should not happen. */
++            SSLerr(SSL_F_TLS1_CHECK_DUPLICATE_EXTENSIONS, ERR_R_INTERNAL_ERROR);
++            goto done;
++        }
++    }
++
++    if (PACKET_remaining(&amp;extensions) != 0) {
++        SSLerr(SSL_F_TLS1_CHECK_DUPLICATE_EXTENSIONS, ERR_R_INTERNAL_ERROR);
++        goto done;
++    }
++    /* Sort the extensions and make sure there are no duplicates. */
++    qsort(extension_types, num_extensions, sizeof(unsigned int), compare_uint);
++    for (i = 1; i &lt; num_extensions; i++) {
++        if (extension_types[i - 1] == extension_types[i])
++            goto done;
++    }
++    ret = 1;
++ done:
++    OPENSSL_free(extension_types);
++    return ret;
++}
++
+ unsigned char *ssl_add_clienthello_tlsext(SSL *s, unsigned char *buf,
+                                           unsigned char *limit, int *al)
+ {
+@@ -1837,6 +1911,9 @@ static int ssl_scan_clienthello_tlsext(SSL *s, PACKET *pkt, int *al)
+     if (PACKET_remaining(pkt) != len)
+         goto err;
+ 
++    if (!tls1_check_duplicate_extensions(pkt))
++        goto err;
++
+     while (PACKET_get_net_2(pkt, &amp;type) &amp;&amp; PACKET_get_net_2(pkt, &amp;size)) {
+         PACKET subpkt;
+ 
+@@ -2301,6 +2378,11 @@ static int ssl_scan_serverhello_tlsext(SSL *s, PACKET *pkt, int *al)
+         return 0;
+     }
+ 
++    if (!tls1_check_duplicate_extensions(pkt)) {
++        *al = SSL_AD_DECODE_ERROR;
++        return 0;
++    }
++
+     while (PACKET_get_net_2(pkt, &amp;type) &amp;&amp; PACKET_get_net_2(pkt, &amp;size)) {
+         const unsigned char *data;
+         PACKET spkt;
+diff --git a/test/recipes/70-test_sslcertstatus.t b/test/recipes/70-test_sslcertstatus.t
+index 9a0c5f8..303de5e 100755
+--- a/test/recipes/70-test_sslcertstatus.t
++++ b/test/recipes/70-test_sslcertstatus.t
+@@ -99,7 +99,7 @@ sub certstatus_filter
+         if ($message-&gt;mt == TLSProxy::Message::MT_SERVER_HELLO) {
+             #Add the status_request to the ServerHello even though we are not
+             #going to send a CertificateStatus message
+-            $message-&gt;set_extension(TLSProxy::ClientHello::EXT_STATUS_REQUEST,
++            $message-&gt;set_extension(TLSProxy::Message::EXT_STATUS_REQUEST,
+                                     &quot;&quot;);
+ 
+             $message-&gt;repack();
+diff --git a/test/recipes/70-test_sslextension.t b/test/recipes/70-test_sslextension.t
+index 4582c5c..c253f74 100755
+--- a/test/recipes/70-test_sslextension.t
++++ b/test/recipes/70-test_sslextension.t
+@@ -78,9 +78,9 @@ my $proxy = TLSProxy::Proxy-&gt;new(
+     (!$ENV{HARNESS_ACTIVE} || $ENV{HARNESS_VERBOSE})
+ );
+ 
+-plan tests =&gt; 1;
++plan tests =&gt; 3;
+ 
+-#Test 1: Sending a zero length extension block should pass
++# Test 1: Sending a zero length extension block should pass
+ $proxy-&gt;start();
+ ok(TLSProxy::Message-&gt;success, &quot;Zero extension length test&quot;);
+ 
+@@ -95,13 +95,64 @@ sub extension_filter
+ 
+     foreach my $message (@{$proxy-&gt;message_list}) {
+         if ($message-&gt;mt == TLSProxy::Message::MT_CLIENT_HELLO) {
+-            #Remove all extensions and set the extension len to zero
++            # Remove all extensions and set the extension len to zero
+             $message-&gt;extension_data({});
+             $message-&gt;extensions_len(0);
+-            #Extensions have been removed so make sure we don't try to use them
++            # Extensions have been removed so make sure we don't try to use them
+             $message-&gt;process_extensions();
+ 
+             $message-&gt;repack();
+         }
+     }
+ }
++
++# Test 2-3: Sending a duplicate extension should fail.
++sub inject_duplicate_extension
++{
++  my ($proxy, $message_type) = @_;
++
++    foreach my $message (@{$proxy-&gt;message_list}) {
++        if ($message-&gt;mt == $message_type) {
++          my %extensions = %{$message-&gt;extension_data};
++            # Add a duplicate (unknown) extension.
++            $message-&gt;set_extension(TLSProxy::Message::EXT_DUPLICATE_EXTENSION, &quot;&quot;);
++            $message-&gt;set_extension(TLSProxy::Message::EXT_DUPLICATE_EXTENSION, &quot;&quot;);
++            $message-&gt;repack();
++        }
++    }
++}
++
++sub inject_duplicate_extension_clienthello
++{
++    my $proxy = shift;
++
++    # We're only interested in the initial ClientHello
++    if ($proxy-&gt;flight != 0) {
++        return;
++    }
++
++    inject_duplicate_extension($proxy, TLSProxy::Message::MT_CLIENT_HELLO);
++}
++
++sub inject_duplicate_extension_serverhello
++{
++    my $proxy = shift;
++
++    # We're only interested in the initial ServerHello
++    if ($proxy-&gt;flight != 1) {
++        return;
++    }
++
++    inject_duplicate_extension($proxy, TLSProxy::Message::MT_SERVER_HELLO);
++}
++
++$proxy-&gt;clear();
++$proxy-&gt;filter(\&amp;inject_duplicate_extension_clienthello);
++$proxy-&gt;start();
++ok(TLSProxy::Message-&gt;fail(), &quot;Duplicate ClientHello extension&quot;);
++
++$proxy-&gt;clear();
++$proxy-&gt;filter(\&amp;inject_duplicate_extension_serverhello);
++$proxy-&gt;start();
++ok(TLSProxy::Message-&gt;fail(), &quot;Duplicate ServerHello extension&quot;);
++
+diff --git a/test/recipes/70-test_sslsessiontick.t b/test/recipes/70-test_sslsessiontick.t
+index 8a361fd..4e9c85f 100755
+--- a/test/recipes/70-test_sslsessiontick.t
++++ b/test/recipes/70-test_sslsessiontick.t
+@@ -198,7 +198,7 @@ sub inject_empty_ticket_filter {
+     foreach my $message (@{$proxy-&gt;message_list}) {
+         push @new_message_list, $message;
+         if ($message-&gt;mt == TLSProxy::Message::MT_SERVER_HELLO) {
+-            $message-&gt;set_extension(TLSProxy::ClientHello::EXT_SESSION_TICKET, &quot;&quot;);
++            $message-&gt;set_extension(TLSProxy::Message::EXT_SESSION_TICKET, &quot;&quot;);
+             $message-&gt;repack();
+             # Tack NewSessionTicket onto the ServerHello record.
+             # This only works if the ServerHello is exactly one record.
+@@ -226,7 +226,7 @@ sub checkmessages($$$$$$)
+ 		#Get the extensions data
+ 		my %extensions = %{$message-&gt;extension_data};
+ 		if (defined
+-                    $extensions{TLSProxy::ClientHello::EXT_SESSION_TICKET}) {
++                    $extensions{TLSProxy::Message::EXT_SESSION_TICKET}) {
+ 		    if ($message-&gt;mt == TLSProxy::Message::MT_CLIENT_HELLO) {
+ 			$chellotickext = 1;
+ 		    } else {
+diff --git a/test/recipes/70-test_tlsextms.t b/test/recipes/70-test_tlsextms.t
+index 82cb856..022b3a8 100644
+--- a/test/recipes/70-test_tlsextms.t
++++ b/test/recipes/70-test_tlsextms.t
+@@ -215,11 +215,11 @@ sub extms_filter
+ 
+     foreach my $message (@{$proxy-&gt;message_list}) {
+         if ($crmextms &amp;&amp; $message-&gt;mt == TLSProxy::Message::MT_CLIENT_HELLO) {
+-            $message-&gt;delete_extension(TLSProxy::ClientHello::EXT_EXTENDED_MASTER_SECRET);
++            $message-&gt;delete_extension(TLSProxy::Message::EXT_EXTENDED_MASTER_SECRET);
+             $message-&gt;repack();
+         }
+         if ($srmextms &amp;&amp; $message-&gt;mt == TLSProxy::Message::MT_SERVER_HELLO) {
+-            $message-&gt;delete_extension(TLSProxy::ClientHello::EXT_EXTENDED_MASTER_SECRET);
++            $message-&gt;delete_extension(TLSProxy::Message::EXT_EXTENDED_MASTER_SECRET);
+             $message-&gt;repack();
+         }
+     }
+@@ -237,7 +237,7 @@ sub checkmessages($$$$$)
+         #Get the extensions data
+         my %extensions = %{$message-&gt;extension_data};
+         if (defined
+-            $extensions{TLSProxy::ClientHello::EXT_EXTENDED_MASTER_SECRET}) {
++            $extensions{TLSProxy::Message::EXT_EXTENDED_MASTER_SECRET}) {
+             if ($message-&gt;mt == TLSProxy::Message::MT_CLIENT_HELLO) {
+                 $cextms = 1;
+             } else {
+diff --git a/util/TLSProxy/ClientHello.pm b/util/TLSProxy/ClientHello.pm
+index 7266112..3830628 100644
+--- a/util/TLSProxy/ClientHello.pm
++++ b/util/TLSProxy/ClientHello.pm
+@@ -57,13 +57,6 @@ package TLSProxy::ClientHello;
+ 
+ use parent 'TLSProxy::Message';
+ 
+-use constant {
+-    EXT_STATUS_REQUEST =&gt; 5,
+-    EXT_ENCRYPT_THEN_MAC =&gt; 22,
+-    EXT_EXTENDED_MASTER_SECRET =&gt; 23,
+-    EXT_SESSION_TICKET =&gt; 35
+-};
+-
+ sub new
+ {
+     my $class = shift;
+@@ -90,7 +83,7 @@ sub new
+     $self-&gt;{comp_meth_len} = 0;
+     $self-&gt;{comp_meths} = [];
+     $self-&gt;{extensions_len} = 0;
+-    $self-&gt;{extensions_data} = &quot;&quot;;
++    $self-&gt;{extension_data} = &quot;&quot;;
+ 
+     return $self;
+ }
+@@ -161,7 +154,7 @@ sub process_extensions
+     #Clear any state from a previous run
+     TLSProxy::Record-&gt;etm(0);
+ 
+-    if (exists $extensions{&amp;EXT_ENCRYPT_THEN_MAC}) {
++    if (exists $extensions{TLSProxy::Message::EXT_ENCRYPT_THEN_MAC}) {
+         TLSProxy::Record-&gt;etm(1);
+     }
+ }
+@@ -187,6 +180,11 @@ sub set_message_contents
+         $extensions .= pack(&quot;n&quot;, $key);
+         $extensions .= pack(&quot;n&quot;, length($extdata));
+         $extensions .= $extdata;
++        if ($key == TLSProxy::Message::EXT_DUPLICATE_EXTENSION) {
++          $extensions .= pack(&quot;n&quot;, $key);
++          $extensions .= pack(&quot;n&quot;, length($extdata));
++          $extensions .= $extdata;
++        }
+     }
+ 
+     $data .= pack('n', length($extensions));
+@@ -276,6 +274,11 @@ sub extension_data
+     }
+     return $self-&gt;{extension_data};
+ }
++sub set_extension
++{
++    my ($self, $ext_type, $ext_data) = @_;
++    $self-&gt;{extension_data}{$ext_type} = $ext_data;
++}
+ sub delete_extension
+ {
+     my ($self, $ext_type) = @_;
+diff --git a/util/TLSProxy/Message.pm b/util/TLSProxy/Message.pm
+index ddd0a6d..bbb0ad7 100644
+--- a/util/TLSProxy/Message.pm
++++ b/util/TLSProxy/Message.pm
+@@ -101,6 +101,16 @@ my %message_type = (
+     MT_NEXT_PROTO, &quot;NextProto&quot;
+ );
+ 
++use constant {
++    EXT_STATUS_REQUEST =&gt; 5,
++    EXT_ENCRYPT_THEN_MAC =&gt; 22,
++    EXT_EXTENDED_MASTER_SECRET =&gt; 23,
++    EXT_SESSION_TICKET =&gt; 35,
++    # This extension does not exist and isn't recognised by OpenSSL.
++    # We use it to test handling of duplicate extensions.
++    EXT_DUPLICATE_EXTENSION =&gt; 1234
++};
++
+ my $payload = &quot;&quot;;
+ my $messlen = -1;
+ my $mt;
+diff --git a/util/TLSProxy/ServerHello.pm b/util/TLSProxy/ServerHello.pm
+index 487538a..7cf7535 100644
+--- a/util/TLSProxy/ServerHello.pm
++++ b/util/TLSProxy/ServerHello.pm
+@@ -80,7 +80,7 @@ sub new
+     $self-&gt;{session} = &quot;&quot;;
+     $self-&gt;{ciphersuite} = 0;
+     $self-&gt;{comp_meth} = 0;
+-    $self-&gt;{extensions_data} = &quot;&quot;;
++    $self-&gt;{extension_data} = &quot;&quot;;
+ 
+     return $self;
+ }
+@@ -161,6 +161,11 @@ sub set_message_contents
+         $extensions .= pack(&quot;n&quot;, $key);
+         $extensions .= pack(&quot;n&quot;, length($extdata));
+         $extensions .= $extdata;
++        if ($key == TLSProxy::Message::EXT_DUPLICATE_EXTENSION) {
++          $extensions .= pack(&quot;n&quot;, $key);
++          $extensions .= pack(&quot;n&quot;, length($extdata));
++          $extensions .= $extdata;
++        }
+     }
+ 
+     $data .= pack('n', length($extensions));
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004269.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="004274.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4271">[ date ]</a>
+              <a href="thread.html#4271">[ thread ]</a>
+              <a href="subject.html#4271">[ subject ]</a>
+              <a href="author.html#4271">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

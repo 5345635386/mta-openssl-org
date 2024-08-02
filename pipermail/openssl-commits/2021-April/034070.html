@@ -1,0 +1,285 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619788568.402175.22297.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034069.html">
+   <LINK REL="Next"  HREF="034071.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619788568.402175.22297.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Fri Apr 30 13:16:08 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034069.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034071.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34070">[ date ]</a>
+              <a href="thread.html#34070">[ thread ]</a>
+              <a href="subject.html#34070">[ subject ]</a>
+              <a href="author.html#34070">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  b594a227178ccd812e5bb196bcb59ebc52d538ab (commit)
+       via  2c181ac5a6fff474bc26bfa93f0c717eebc1ab1b (commit)
+      from  c230e938c75c7c2d24b5d1d322a34ec369d92696 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit b594a227178ccd812e5bb196bcb59ebc52d538ab
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Wed Apr 28 18:49:33 2021 +0200
+
+    SM2 signatures work correctly only with SM3 digests
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15074">https://github.com/openssl/openssl/pull/15074</A>)
+
+commit 2c181ac5a6fff474bc26bfa93f0c717eebc1ab1b
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Wed Apr 28 18:40:37 2021 +0200
+
+    sm2: Cleanup handling of DIGEST and DIGEST_SIZE parameters
+    
+    Fixes #14873
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15074">https://github.com/openssl/openssl/pull/15074</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/implementations/signature/sm2sig.c  | 90 ++++++++++++++-------------
+ test/recipes/30-test_evp_data/evppkey_sm2.txt |  1 +
+ 2 files changed, 48 insertions(+), 43 deletions(-)
+
+diff --git a/providers/implementations/signature/sm2sig.c b/providers/implementations/signature/sm2sig.c
+index 9016aefc02..8607a8b911 100644
+--- a/providers/implementations/signature/sm2sig.c
++++ b/providers/implementations/signature/sm2sig.c
+@@ -25,6 +25,7 @@
+ #include &quot;internal/nelem.h&quot;
+ #include &quot;internal/sizes.h&quot;
+ #include &quot;internal/cryptlib.h&quot;
++#include &quot;internal/sm3.h&quot;
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/provider_ctx.h&quot;
+ #include &quot;crypto/ec.h&quot;
+@@ -63,13 +64,6 @@ typedef struct {
+     char *propq;
+     EC_KEY *ec;
+ 
+-    /*
+-     * Flag to determine if the hash function can be changed (1) or not (0)
+-     * Because it's dangerous to change during a DigestSign or DigestVerify
+-     * operation, this flag is cleared by their Init function, and set again
+-     * by their Final function.
+-     */
+-    unsigned int flag_allow_md : 1;
+     /*
+      * Flag to termine if the 'z' digest needs to be computed and fed to the
+      * hash function.
+@@ -95,6 +89,21 @@ typedef struct {
+     size_t id_len;
+ } PROV_SM2_CTX;
+ 
++static int sm2sig_set_mdname(PROV_SM2_CTX *psm2ctx, const char *mdname)
++{
++    if (psm2ctx-&gt;md == NULL) /* We need an SM3 md to compare with */
++        psm2ctx-&gt;md = EVP_MD_fetch(psm2ctx-&gt;libctx, psm2ctx-&gt;mdname,
++                                   psm2ctx-&gt;propq);
++    if (psm2ctx-&gt;md == NULL
++        || strlen(mdname) &gt;= sizeof(psm2ctx-&gt;mdname)
++        || !EVP_MD_is_a(psm2ctx-&gt;md, mdname)) {
++        return 0;
++    }
++
++    OPENSSL_strlcpy(psm2ctx-&gt;mdname, mdname, sizeof(psm2ctx-&gt;mdname));
++    return 1;
++}
++
+ static void *sm2sig_newctx(void *provctx, const char *propq)
+ {
+     PROV_SM2_CTX *ctx = OPENSSL_zalloc(sizeof(PROV_SM2_CTX));
+@@ -108,8 +117,8 @@ static void *sm2sig_newctx(void *provctx, const char *propq)
+         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    /* don't allow to change MD, and in fact there is no such need */
+-    ctx-&gt;flag_allow_md = 0;
++    ctx-&gt;mdsize = SM3_DIGEST_LENGTH;
++    strcpy(ctx-&gt;mdname, OSSL_DIGEST_NAME_SM3);
+     return ctx;
+ }
+ 
+@@ -170,28 +179,27 @@ static void free_md(PROV_SM2_CTX *ctx)
+     EVP_MD_free(ctx-&gt;md);
+     ctx-&gt;mdctx = NULL;
+     ctx-&gt;md = NULL;
+-    ctx-&gt;mdsize = 0;
+ }
+ 
+ static int sm2sig_digest_signverify_init(void *vpsm2ctx, const char *mdname,
+                                          void *ec, const OSSL_PARAM params[])
+ {
+     PROV_SM2_CTX *ctx = (PROV_SM2_CTX *)vpsm2ctx;
+-    int md_nid = NID_sm3;
++    int md_nid;
+     WPACKET pkt;
+     int ret = 0;
+ 
+-    free_md(ctx);
+-
+-    if (!sm2sig_signature_init(vpsm2ctx, ec, params))
++    if (!sm2sig_signature_init(vpsm2ctx, ec, params)
++        || !sm2sig_set_mdname(ctx, mdname))
+         return ret;
+ 
+-    ctx-&gt;md = EVP_MD_fetch(ctx-&gt;libctx, mdname, ctx-&gt;propq);
+-    ctx-&gt;mdsize = EVP_MD_size(ctx-&gt;md);
++    EVP_MD_CTX_free(ctx-&gt;mdctx);
+     ctx-&gt;mdctx = EVP_MD_CTX_new();
+     if (ctx-&gt;mdctx == NULL)
+         goto error;
+ 
++    md_nid = EVP_MD_type(ctx-&gt;md);
++
+     /*
+      * We do not care about DER writing errors.
+      * All it really means is that for some reason, there's no
+@@ -285,10 +293,11 @@ int sm2sig_digest_verify_final(void *vpsm2ctx, const unsigned char *sig,
+     unsigned char digest[EVP_MAX_MD_SIZE];
+     unsigned int dlen = 0;
+ 
+-    if (psm2ctx == NULL || psm2ctx-&gt;mdctx == NULL)
++    if (psm2ctx == NULL
++        || psm2ctx-&gt;mdctx == NULL
++        || EVP_MD_size(psm2ctx-&gt;md) &gt; (int)sizeof(digest))
+         return 0;
+ 
+-    /* SM2 always use SM3 so it's not possible to exceed the limit */
+     if (!(sm2sig_compute_z_digest(psm2ctx)
+           &amp;&amp; EVP_DigestFinal_ex(psm2ctx-&gt;mdctx, digest, &amp;dlen)))
+         return 0;
+@@ -392,7 +401,7 @@ static int sm2sig_set_ctx_params(void *vpsm2ctx, const OSSL_PARAM params[])
+ {
+     PROV_SM2_CTX *psm2ctx = (PROV_SM2_CTX *)vpsm2ctx;
+     const OSSL_PARAM *p;
+-    char *mdname;
++    size_t mdsize;
+ 
+     if (psm2ctx == NULL)
+         return 0;
+@@ -417,28 +426,29 @@ static int sm2sig_set_ctx_params(void *vpsm2ctx, const OSSL_PARAM params[])
+         psm2ctx-&gt;id_len = tmp_idlen;
+     }
+ 
+-    if (psm2ctx-&gt;md != NULL) {
+-        /*
+-         * You cannot set the digest name/size when doing a DigestSign or
+-         * DigestVerify.
+-         */
+-        return 1;
+-    }
+-
++    /*
++     * The following code checks that the size is the same as the SM3 digest
++     * size returning an error otherwise.
++     * If there is ever any different digest algorithm allowed with SM2
++     * this needs to be adjusted accordingly.
++     */
+     p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_DIGEST_SIZE);
+-    if (p != NULL &amp;&amp; !OSSL_PARAM_get_size_t(p, &amp;psm2ctx-&gt;mdsize))
++    if (p != NULL &amp;&amp; (!OSSL_PARAM_get_size_t(p, &amp;mdsize)
++                      || mdsize != psm2ctx-&gt;mdsize))
+         return 0;
+ 
+-    /*
+-     * We never actually use the mdname, but we do support getting it later.
+-     * This can be useful for applications that want to know the MD that they
+-     * previously set.
+-     */
+     p = OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_DIGEST);
+-    mdname = psm2ctx-&gt;mdname;
+-    if (p != NULL
+-            &amp;&amp; !OSSL_PARAM_get_utf8_string(p, &amp;mdname, sizeof(psm2ctx-&gt;mdname)))
+-        return 0;
++    if (p != NULL) {
++        char *mdname = NULL;
++
++        if (!OSSL_PARAM_get_utf8_string(p, &amp;mdname, 0))
++            return 0;
++        if (!sm2sig_set_mdname(psm2ctx, mdname)) {
++            OPENSSL_free(mdname);
++            return 0;
++        }
++        OPENSSL_free(mdname);
++    }
+ 
+     return 1;
+ }
+@@ -453,12 +463,6 @@ static const OSSL_PARAM known_settable_ctx_params[] = {
+ static const OSSL_PARAM *sm2sig_settable_ctx_params(ossl_unused void *vpsm2ctx,
+                                                     ossl_unused void *provctx)
+ {
+-    /*
+-     * TODO(3.0): Should this function return a different set of settable ctx
+-     * params if the ctx is being used for a DigestSign/DigestVerify? In that
+-     * case it is not allowed to set the digest size/digest name because the
+-     * digest is explicitly set as part of the init.
+-     */
+     return known_settable_ctx_params;
+ }
+ 
+diff --git a/test/recipes/30-test_evp_data/evppkey_sm2.txt b/test/recipes/30-test_evp_data/evppkey_sm2.txt
+index db5f1db627..c32142d833 100644
+--- a/test/recipes/30-test_evp_data/evppkey_sm2.txt
++++ b/test/recipes/30-test_evp_data/evppkey_sm2.txt
+@@ -39,6 +39,7 @@ Verify = SM2_key1
+ Ctrl = digest:SHA512
+ Input = 40AA1B203C9D8EE150B21C3C7CDA8261492E5420C5F2B9F7380700E094C303B48E62F319C1DA0E32EB40D113C5F1749CC61AEB499167890AB82F2CC9BB706971
+ Output = 3046022100AE018933B9BA041784380069F2DDF609694DCD299FDBF23D09F4B711FBC103EC0221008440BB1A48C132DE4FB91BE9F43B958142FDD29FB9DABE01B17514023A2F638C
++Result = PKEY_CTRL_ERROR
+ 
+ Availablein = default
+ Decrypt = SM2_key1
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034069.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034071.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34070">[ date ]</a>
+              <a href="thread.html#34070">[ thread ]</a>
+              <a href="subject.html#34070">[ subject ]</a>
+              <a href="author.html#34070">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

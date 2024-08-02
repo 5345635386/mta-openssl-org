@@ -1,0 +1,364 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1462945841.413522.25576.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007083.html">
+   <LINK REL="Next"  HREF="007125.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1462945841.413522.25576.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">viktor at openssl.org
+       </A><BR>
+    <I>Wed May 11 05:50:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007083.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="007125.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7113">[ date ]</a>
+              <a href="thread.html#7113">[ thread ]</a>
+              <a href="subject.html#7113">[ subject ]</a>
+              <a href="author.html#7113">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  36c37944909496a123e2656ad1f651769a7cc72f (commit)
+      from  74d6762543335641e4155fd84deaba67cd0105e4 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 36c37944909496a123e2656ad1f651769a7cc72f
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Mon May 2 15:00:21 2016 -0400
+
+    Fix i2d_X509_AUX and update docs
+    
+    When *pp is NULL, don't write garbage, return an unexpected pointer
+    or leak memory on error.
+    
+    Reviewed-by: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/x_x509.c    | 54 +++++++++++++++++++++++++++++++++++++++++++++++--
+ doc/crypto/d2i_X509.pod | 14 ++++++++++++-
+ 2 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/asn1/x_x509.c b/crypto/asn1/x_x509.c
+index e31e1e7..aada4a8 100644
+--- a/crypto/asn1/x_x509.c
++++ b/crypto/asn1/x_x509.c
+@@ -199,12 +199,26 @@ X509 *d2i_X509_AUX(X509 **a, const unsigned char **pp, long length)
+     return NULL;
+ }
+ 
+-int i2d_X509_AUX(X509 *a, unsigned char **pp)
++/*
++ * Serialize trusted certificate to *pp or just return the required buffer
++ * length if pp == NULL.  We ultimately want to avoid modifying *pp in the
++ * error path, but that depends on similar hygiene in lower-level functions.
++ * Here we avoid compounding the problem.
++ */
++static int i2d_x509_aux_internal(X509 *a, unsigned char **pp)
+ {
+     int length, tmplen;
+     unsigned char *start = pp != NULL ? *pp : NULL;
++
++    OPENSSL_assert(pp == NULL || *pp != NULL);
++
++    /*
++     * This might perturb *pp on error, but fixing that belongs in i2d_X509()
++     * not here.  It should be that if a == NULL length is zero, but we check
++     * both just in case.
++     */
+     length = i2d_X509(a, pp);
+-    if (length &lt; 0 || a == NULL)
++    if (length &lt;= 0 || a == NULL)
+         return length;
+ 
+     tmplen = i2d_X509_CERT_AUX(a-&gt;aux, pp);
+@@ -218,6 +232,42 @@ int i2d_X509_AUX(X509 *a, unsigned char **pp)
+     return length;
+ }
+ 
++/*
++ * Serialize trusted certificate to *pp, or just return the required buffer
++ * length if pp == NULL.
++ *
++ * When pp is not NULL, but *pp == NULL, we allocate the buffer, but since
++ * we're writing two ASN.1 objects back to back, we can't have i2d_X509() do
++ * the allocation, nor can we allow i2d_X509_CERT_AUX() to increment the
++ * allocated buffer.
++ */
++int i2d_X509_AUX(X509 *a, unsigned char **pp)
++{
++    int length;
++    unsigned char *tmp;
++
++    /* Buffer provided by caller */
++    if (pp == NULL || *pp != NULL)
++        return i2d_x509_aux_internal(a, pp);
++
++    /* Obtain the combined length */
++    if ((length = i2d_x509_aux_internal(a, NULL)) &lt;= 0)
++        return length;
++
++    /* Allocate requisite combined storage */
++    *pp = tmp = OPENSSL_malloc(length);
++    if (tmp == NULL)
++        return -1; /* Push error onto error stack? */
++
++    /* Encode, but keep *pp at the originally malloced pointer */
++    length = i2d_x509_aux_internal(a, &amp;tmp);
++    if (length &lt;= 0) {
++        OPENSSL_free(*pp);
++        *pp = NULL;
++    }
++    return length;
++}
++
+ int i2d_re_X509_tbs(X509 *x, unsigned char **pp)
+ {
+     x-&gt;cert_info-&gt;enc.modified = 1;
+diff --git a/doc/crypto/d2i_X509.pod b/doc/crypto/d2i_X509.pod
+index 5b7c16f..2743bc7 100644
+--- a/doc/crypto/d2i_X509.pod
++++ b/doc/crypto/d2i_X509.pod
+@@ -9,8 +9,10 @@ i2d_X509_fp - X509 encode and decode functions
+ 
+  #include &lt;openssl/x509.h&gt;
+ 
+- X509 *d2i_X509(X509 **px, const unsigned char **in, int len);
++ X509 *d2i_X509(X509 **px, const unsigned char **in, long len);
++ X509 *d2i_X509_AUX(X509 **px, const unsigned char **in, long len);
+  int i2d_X509(X509 *x, unsigned char **out);
++ int i2d_X509_AUX(X509 *x, unsigned char **out);
+ 
+  X509 *d2i_X509_bio(BIO *bp, X509 **x);
+  X509 *d2i_X509_fp(FILE *fp, X509 **x);
+@@ -37,6 +39,11 @@ below, and the discussion in the RETURN VALUES section).
+ If the call is successful B&lt;*in&gt; is incremented to the byte following the
+ parsed data.
+ 
++d2i_X509_AUX() is similar to d2i_X509() but the input is expected to consist of
++an X509 certificate followed by auxiliary trust information.
++This is used by the PEM routines to read &quot;TRUSTED CERTIFICATE&quot; objects.
++This function should not be called on untrusted input.
++
+ i2d_X509() encodes the structure pointed to by B&lt;x&gt; into DER format.
+ If B&lt;out&gt; is not B&lt;NULL&gt; is writes the DER encoded data to the buffer
+ at B&lt;*out&gt;, and increments it to point after the data just written.
+@@ -48,6 +55,11 @@ allocated for a buffer and the encoded data written to it. In this
+ case B&lt;*out&gt; is not incremented and it points to the start of the
+ data just written.
+ 
++i2d_X509_AUX() is similar to i2d_X509(), but the encoded output contains both
++the certificate and any auxiliary trust information.
++This is used by the PEM routines to write &quot;TRUSTED CERTIFICATE&quot; objects.
++Note, this is a non-standard OpenSSL-specific data format.
++
+ d2i_X509_bio() is similar to d2i_X509() except it attempts
+ to parse data from BIO B&lt;bp&gt;.
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007083.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="007125.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7113">[ date ]</a>
+              <a href="thread.html#7113">[ thread ]</a>
+              <a href="subject.html#7113">[ subject ]</a>
+              <a href="author.html#7113">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

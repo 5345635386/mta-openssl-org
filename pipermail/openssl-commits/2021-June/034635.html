@@ -1,0 +1,189 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623136825.263496.15833.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034634.html">
+   <LINK REL="Next"  HREF="034636.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623136825.263496.15833.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Tue Jun  8 07:20:25 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034634.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034636.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34635">[ date ]</a>
+              <a href="thread.html#34635">[ thread ]</a>
+              <a href="subject.html#34635">[ subject ]</a>
+              <a href="author.html#34635">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  fccf3dcef42f12b0ac2b1ab8979125a2511dc271 (commit)
+      from  09345c8cab01d0030234a001c7b2d64eac1e75ae (commit)
+
+
+- Log -----------------------------------------------------------------
+commit fccf3dcef42f12b0ac2b1ab8979125a2511dc271
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Fri Jun 4 13:56:41 2021 +0200
+
+    X509_digest_sig: Handle RSA-PSS and EDDSA certificates
+    
+    Identify digest from sigalg params for RSA-PSS and fallback
+    to SHA-256 for EDDSA.
+    
+    Fixes #15477
+    
+    Reviewed-by: David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">david.von.oheimb at siemens.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15618">https://github.com/openssl/openssl/pull/15618</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_all.c      | 54 +++++++++++++++++++++++++++++++++++++++++-------
+ doc/man3/X509_digest.pod |  4 +++-
+ 2 files changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/crypto/x509/x_all.c b/crypto/x509/x_all.c
+index 88c75c3d36..a0ad56bca4 100644
+--- a/crypto/x509/x_all.c
++++ b/crypto/x509/x_all.c
+@@ -26,6 +26,7 @@
+ #include &quot;internal/asn1.h&quot;
+ #include &quot;crypto/pkcs7.h&quot;
+ #include &quot;crypto/x509.h&quot;
++#include &quot;crypto/rsa.h&quot;
+ 
+ int X509_verify(X509 *a, EVP_PKEY *r)
+ {
+@@ -437,8 +438,8 @@ ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert)
+ {
+     unsigned int len;
+     unsigned char hash[EVP_MAX_MD_SIZE];
+-    int md_NID;
+-    const EVP_MD *md = NULL;
++    int mdnid, pknid;
++    EVP_MD *md = NULL;
+     ASN1_OCTET_STRING *new = NULL;
+ 
+     if (cert == NULL) {
+@@ -446,18 +447,57 @@ ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert)
+         return NULL;
+     }
+ 
+-    if (!OBJ_find_sigid_algs(X509_get_signature_nid(cert), &amp;md_NID, NULL)
+-            || (md = EVP_get_digestbynid(md_NID)) == NULL) {
+-        ERR_raise(ERR_LIB_CMP, X509_R_UNSUPPORTED_ALGORITHM);
++    if (!OBJ_find_sigid_algs(X509_get_signature_nid(cert), &amp;mdnid, &amp;pknid)) {
++        ERR_raise(ERR_LIB_X509, X509_R_UNKNOWN_SIGID_ALGS);
++        return NULL;
++    }
++
++    if (mdnid == NID_undef) {
++        if (pknid == EVP_PKEY_RSA_PSS) {
++            RSA_PSS_PARAMS *pss = ossl_rsa_pss_decode(&amp;cert-&gt;sig_alg);
++            const EVP_MD *mgf1md, *mmd = NULL;
++            int saltlen, trailerfield;
++
++            if (pss == NULL
++                || !ossl_rsa_pss_get_param_unverified(pss, &amp;mmd, &amp;mgf1md,
++                                                      &amp;saltlen,
++                                                      &amp;trailerfield)
++                ||  mmd == NULL) {
++                RSA_PSS_PARAMS_free(pss);
++                ERR_raise(ERR_LIB_X509, X509_R_UNSUPPORTED_ALGORITHM);
++                return NULL;
++            }
++            RSA_PSS_PARAMS_free(pss);
++            /* Fetch explicitly and do not fallback */
++            if ((md = EVP_MD_fetch(cert-&gt;libctx, EVP_MD_get0_name(mmd),
++                                   cert-&gt;propq)) == NULL)
++                /* Error code from fetch is sufficient */
++                return NULL;
++        } else if (pknid != NID_undef) {
++            /* Default to SHA-256 for known algorithms without a digest */
++            if ((md = EVP_MD_fetch(cert-&gt;libctx, &quot;SHA256&quot;,
++                                   cert-&gt;propq)) == NULL)
++                return NULL;
++        } else {
++            /* A completely unknown algorithm */
++            ERR_raise(ERR_LIB_X509, X509_R_UNSUPPORTED_ALGORITHM);
++            return NULL;
++        }
++    } else if ((md = EVP_MD_fetch(cert-&gt;libctx, OBJ_nid2sn(mdnid),
++                                  cert-&gt;propq)) == NULL
++               &amp;&amp; (md = (EVP_MD *)EVP_get_digestbynid(mdnid)) == NULL) {
++        ERR_raise(ERR_LIB_X509, X509_R_UNSUPPORTED_ALGORITHM);
+         return NULL;
+     }
+     if (!X509_digest(cert, md, hash, &amp;len)
+             || (new = ASN1_OCTET_STRING_new()) == NULL)
+-        return NULL;
++        goto err;
+     if (!(ASN1_OCTET_STRING_set(new, hash, len))) {
+         ASN1_OCTET_STRING_free(new);
+-        return NULL;
++        new = NULL;
+     }
++ err:
++    EVP_MD_free(md);
+     return new;
+ }
+ 
+diff --git a/doc/man3/X509_digest.pod b/doc/man3/X509_digest.pod
+index 36af772cc7..5d6167934d 100644
+--- a/doc/man3/X509_digest.pod
++++ b/doc/man3/X509_digest.pod
+@@ -40,7 +40,9 @@ PKCS7_ISSUER_AND_SERIAL_digest
+ =head1 DESCRIPTION
+ 
+ X509_digest_sig() calculates a digest of the given certificate
+-using the same hash algorithm as in its signature.
++using the same hash algorithm as in its signature with a fallback to B&lt;SHA-256&gt;
++for algorithms where the digest is an integral part of the signature algorithm
++such as with B&lt;EdDSA&gt; signatures.
+ 
+ X509_pubkey_digest() returns a digest of the DER representation of the public
+ key in the specified X509 B&lt;data&gt; object.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034634.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034636.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34635">[ date ]</a>
+              <a href="thread.html#34635">[ thread ]</a>
+              <a href="subject.html#34635">[ subject ]</a>
+              <a href="author.html#34635">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

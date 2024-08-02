@@ -1,0 +1,186 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1605255726.353349.9865.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032017.html">
+   <LINK REL="Next"  HREF="032025.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1605255726.353349.9865.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Nov 13 08:22:06 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032017.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032025.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32024">[ date ]</a>
+              <a href="thread.html#32024">[ thread ]</a>
+              <a href="subject.html#32024">[ subject ]</a>
+              <a href="author.html#32024">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  31a6b52f6db009c639c67387a707dd235f29a430 (commit)
+      from  0bb450fe2fa9597ce8206cdd8177c5bd9aa15786 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 31a6b52f6db009c639c67387a707dd235f29a430
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Sep 25 20:02:56 2020 +0200
+
+    EVP: Adapt EVP_PKEY2PKCS8() to better handle provider-native keys
+    
+    It doesn't downgread the keys to legacy any more.  Instead, it uses
+    OSSL_ENCODER to encode the key to DER, and d2i_PKCS8_PRIV_KEY_INFO()
+    to make a PKCS8_PRIV_KEY_INFO structure from that.
+    
+    Fixes #12990
+    
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12995">https://github.com/openssl/openssl/pull/12995</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_pkey.c | 70 +++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 51 insertions(+), 19 deletions(-)
+
+diff --git a/crypto/evp/evp_pkey.c b/crypto/evp/evp_pkey.c
+index b5a8f1cd72..766dfb46ec 100644
+--- a/crypto/evp/evp_pkey.c
++++ b/crypto/evp/evp_pkey.c
+@@ -12,6 +12,8 @@
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/rand.h&gt;
++#include &lt;openssl/encoder.h&gt;
++#include &quot;internal/provider.h&quot;
+ #include &quot;crypto/asn1.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;crypto/x509.h&quot;
+@@ -69,35 +71,65 @@ EVP_PKEY *EVP_PKCS82PKEY(const PKCS8_PRIV_KEY_INFO *p8)
+ 
+ PKCS8_PRIV_KEY_INFO *EVP_PKEY2PKCS8(const EVP_PKEY *pkey)
+ {
+-    PKCS8_PRIV_KEY_INFO *p8 = PKCS8_PRIV_KEY_INFO_new();
+-    if (p8  == NULL) {
+-        EVPerr(EVP_F_EVP_PKEY2PKCS8, ERR_R_MALLOC_FAILURE);
+-        return NULL;
+-    }
++    PKCS8_PRIV_KEY_INFO *p8 = NULL;
++    OSSL_ENCODER_CTX *ctx = NULL;
++
++    /*
++     * The implementation for provider-native keys is to encode the
++     * key to a DER encoded PKCS#8 structure, then convert it to a
++     * PKCS8_PRIV_KEY_INFO with good old d2i functions.
++     */
++    if (evp_pkey_is_provided(pkey)) {
++        int selection = OSSL_KEYMGMT_SELECT_ALL;
++        const OSSL_PROVIDER *prov = EVP_KEYMGMT_provider(pkey-&gt;keymgmt);
++        OSSL_LIB_CTX *libctx = ossl_provider_libctx(prov);
++        unsigned char *der = NULL;
++        size_t derlen = 0;
++        const unsigned char *pp;
++
++        if ((ctx = OSSL_ENCODER_CTX_new_by_EVP_PKEY(pkey, selection,
++                                                    &quot;DER&quot;, &quot;pkcs8&quot;,
++                                                    libctx, NULL)) == NULL
++            || !OSSL_ENCODER_to_data(ctx, &amp;der, &amp;derlen))
++            goto error;
+ 
+-    /* Force a key downgrade if that's possible */
+-    /* TODO(3.0) Is there a better way for provider-native keys? */
+-    if (EVP_PKEY_get0(pkey) == NULL)
+-        goto error;
++        pp = der;
++        p8 = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;pp, (long)derlen);
++        OPENSSL_free(der);
++        if (p8 == NULL)
++            goto error;
++    } else {
++        p8 = PKCS8_PRIV_KEY_INFO_new();
++        if (p8  == NULL) {
++            EVPerr(EVP_F_EVP_PKEY2PKCS8, ERR_R_MALLOC_FAILURE);
++            return NULL;
++        }
+ 
+-    if (pkey-&gt;ameth) {
+-        if (pkey-&gt;ameth-&gt;priv_encode) {
+-            if (!pkey-&gt;ameth-&gt;priv_encode(p8, pkey)) {
+-                EVPerr(EVP_F_EVP_PKEY2PKCS8, EVP_R_PRIVATE_KEY_ENCODE_ERROR);
++        if (pkey-&gt;ameth != NULL) {
++            if (pkey-&gt;ameth-&gt;priv_encode != NULL) {
++                if (!pkey-&gt;ameth-&gt;priv_encode(p8, pkey)) {
++                    EVPerr(EVP_F_EVP_PKEY2PKCS8,
++                           EVP_R_PRIVATE_KEY_ENCODE_ERROR);
++                    goto error;
++                }
++            } else {
++                EVPerr(EVP_F_EVP_PKEY2PKCS8, EVP_R_METHOD_NOT_SUPPORTED);
+                 goto error;
+             }
+         } else {
+-            EVPerr(EVP_F_EVP_PKEY2PKCS8, EVP_R_METHOD_NOT_SUPPORTED);
++            EVPerr(EVP_F_EVP_PKEY2PKCS8,
++                   EVP_R_UNSUPPORTED_PRIVATE_KEY_ALGORITHM);
+             goto error;
+         }
+-    } else {
+-        EVPerr(EVP_F_EVP_PKEY2PKCS8, EVP_R_UNSUPPORTED_PRIVATE_KEY_ALGORITHM);
+-        goto error;
+     }
+-    return p8;
++    goto end;
+  error:
+     PKCS8_PRIV_KEY_INFO_free(p8);
+-    return NULL;
++    p8 = NULL;
++ end:
++    OSSL_ENCODER_CTX_free(ctx);
++    return p8;
++
+ }
+ 
+ /* EVP_PKEY attribute functions */
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032017.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032025.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32024">[ date ]</a>
+              <a href="thread.html#32024">[ thread ]</a>
+              <a href="subject.html#32024">[ subject ]</a>
+              <a href="author.html#32024">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

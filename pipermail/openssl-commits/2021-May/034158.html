@@ -1,0 +1,299 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620476050.028848.29571.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034157.html">
+   <LINK REL="Next"  HREF="034159.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620476050.028848.29571.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Sat May  8 12:14:10 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034157.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034159.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34158">[ date ]</a>
+              <a href="thread.html#34158">[ thread ]</a>
+              <a href="subject.html#34158">[ subject ]</a>
+              <a href="author.html#34158">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a1230dea4d255a1ea27b18af7a178fe2501e7dad (commit)
+      from  839261592ca447aa083403cee7b0ced97cef6159 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a1230dea4d255a1ea27b18af7a178fe2501e7dad
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+Date:   Fri May 7 16:58:16 2021 +1000
+
+    apps: add mac, cipher and digest arguments to the kdf applet.
+    
+    This adds -digest, -mac and -cipher which correspond to -kdfopt digest: and
+    -kdfopt mac: and -kdfopt cipher: respectively.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15190">https://github.com/openssl/openssl/pull/15190</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/kdf.c                  | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ doc/man1/openssl-kdf.pod.in | 33 +++++++++++++++++++++++++++++++--
+ test/recipes/20-test_kdf.t  | 38 ++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 111 insertions(+), 4 deletions(-)
+
+diff --git a/apps/kdf.c b/apps/kdf.c
+index b3865d9e87..7b016051f1 100644
+--- a/apps/kdf.c
++++ b/apps/kdf.c
+@@ -20,6 +20,7 @@
+ typedef enum OPTION_choice {
+     OPT_COMMON,
+     OPT_KDFOPT, OPT_BIN, OPT_KEYLEN, OPT_OUT,
++    OPT_CIPHER, OPT_DIGEST, OPT_MAC,
+     OPT_PROV_ENUM
+ } OPTION_CHOICE;
+ 
+@@ -29,6 +30,9 @@ const OPTIONS kdf_options[] = {
+     OPT_SECTION(&quot;General&quot;),
+     {&quot;help&quot;, OPT_HELP, '-', &quot;Display this summary&quot;},
+     {&quot;kdfopt&quot;, OPT_KDFOPT, 's', &quot;KDF algorithm control parameters in n:v form&quot;},
++    {&quot;cipher&quot;, OPT_CIPHER, 's', &quot;Cipher&quot;},
++    {&quot;digest&quot;, OPT_DIGEST, 's', &quot;Digest&quot;},
++    {&quot;mac&quot;, OPT_MAC, 's', &quot;MAC&quot;},
+     {OPT_MORE_STR, 1, '-', &quot;See 'Supported Controls' in the EVP_KDF_ docs\n&quot;},
+     {&quot;keylen&quot;, OPT_KEYLEN, 's', &quot;The size of the output derived key&quot;},
+ 
+@@ -44,6 +48,24 @@ const OPTIONS kdf_options[] = {
+     {NULL}
+ };
+ 
++static char *alloc_kdf_algorithm_name(STACK_OF(OPENSSL_STRING) **optp,
++                                      const char *name, const char *arg)
++{
++    size_t len = strlen(name) + strlen(arg) + 2;
++    char *res = app_malloc(len, &quot;algorithm name&quot;);
++
++    if (*optp == NULL)
++        *optp = sk_OPENSSL_STRING_new_null();
++    if (*optp == NULL)
++        return NULL;
++
++    BIO_snprintf(res, len, &quot;%s:%s&quot;, name, arg);
++    if (sk_OPENSSL_STRING_push(*optp, res))
++        return res;
++    OPENSSL_free(res);
++    return NULL;
++}
++
+ int kdf_main(int argc, char **argv)
+ {
+     int ret = 1, out_bin = 0;
+@@ -56,6 +78,7 @@ int kdf_main(int argc, char **argv)
+     BIO *out = NULL;
+     EVP_KDF *kdf = NULL;
+     EVP_KDF_CTX *ctx = NULL;
++    char *digest = NULL, *cipher = NULL, *mac = NULL;
+ 
+     prog = opt_init(argc, argv, kdf_options);
+     while ((o = opt_next()) != OPT_EOF) {
+@@ -83,6 +106,24 @@ opthelp:
+             if (opts == NULL || !sk_OPENSSL_STRING_push(opts, opt_arg()))
+                 goto opthelp;
+             break;
++        case OPT_CIPHER:
++            OPENSSL_free(cipher);
++            cipher = alloc_kdf_algorithm_name(&amp;opts, &quot;cipher&quot;, opt_arg());
++            if (cipher == NULL)
++                goto opthelp;
++            break;
++        case OPT_DIGEST:
++            OPENSSL_free(digest);
++            digest = alloc_kdf_algorithm_name(&amp;opts, &quot;digest&quot;, opt_arg());
++            if (digest == NULL)
++                goto opthelp;
++            break;
++        case OPT_MAC:
++            OPENSSL_free(mac);
++            mac = alloc_kdf_algorithm_name(&amp;opts, &quot;mac&quot;, opt_arg());
++            if (mac == NULL)
++                goto opthelp;
++            break;
+         case OPT_PROV_CASES:
+             if (!opt_provider(o))
+                 goto err;
+@@ -161,5 +202,8 @@ err:
+     EVP_KDF_CTX_free(ctx);
+     BIO_free(out);
+     OPENSSL_free(hexout);
++    OPENSSL_free(cipher);
++    OPENSSL_free(digest);
++    OPENSSL_free(mac);
+     return ret;
+ }
+diff --git a/doc/man1/openssl-kdf.pod.in b/doc/man1/openssl-kdf.pod.in
+index 3d532ebfc6..bc0fa82a88 100644
+--- a/doc/man1/openssl-kdf.pod.in
++++ b/doc/man1/openssl-kdf.pod.in
+@@ -9,6 +9,9 @@ openssl-kdf - perform Key Derivation Function operations
+ 
+ B&lt;openssl kdf&gt;
+ [B&lt;-help&gt;]
++[B&lt;-cipher&gt;]
++[B&lt;-digest&gt;]
++[B&lt;-mac&gt;]
+ [B&lt;-kdfopt&gt; I&lt;nm&gt;:I&lt;v&gt;]
+ [B&lt;-keylen&gt; I&lt;num&gt;]
+ [B&lt;-out&gt; I&lt;filename&gt;]
+@@ -41,6 +44,25 @@ Filename to output to, or standard output by default.
+ 
+ Output the derived key in binary form. Uses hexadecimal text format if not specified.
+ 
++=item B&lt;-cipher&gt; I&lt;name&gt;
++
++Specify the cipher to be used by the KDF.
++Not all KDFs require a cipher and it is an error to use this option in such
++cases.
++
++=item B&lt;-digest&gt; I&lt;name&gt;
++
++Specify the digest to be used by the KDF.
++Not all KDFs require a digest and it is an error to use this option in such
++cases.
++To see the list of supported digests, use C&lt;openssl list -digest-commands&gt;.
++
++=item B&lt;-mac&gt; I&lt;name&gt;
++
++Specify the MAC to be used by the KDF.
++Not all KDFs require a MAC and it is an error to use this option in such
++cases.
++
+ =item B&lt;-kdfopt&gt; I&lt;nm&gt;:I&lt;v&gt;
+ 
+ Passes options to the KDF algorithm.
+@@ -76,8 +98,15 @@ The password must be specified for PBKDF2 and scrypt.
+ 
+ =item B&lt;digest:&gt;I&lt;string&gt;
+ 
+-Specifies the name of a digest as an alphanumeric string.
+-To see the list of supported digests, use the command I&lt;list -digest-commands&gt;.
++This option is identical to the B&lt;-digest&gt; option.
++
++=item B&lt;cipher:&gt;I&lt;string&gt;
++
++This option is identical to the B&lt;-cipher&gt; option.
++
++=item B&lt;mac:&gt;I&lt;string&gt;
++
++This option is identical to the B&lt;-mac&gt; option.
+ 
+ =back
+ 
+diff --git a/test/recipes/20-test_kdf.t b/test/recipes/20-test_kdf.t
+index d0ea07ee9a..47b0632888 100755
+--- a/test/recipes/20-test_kdf.t
++++ b/test/recipes/20-test_kdf.t
+@@ -16,6 +16,32 @@ use OpenSSL::Test::Utils;
+ setup(&quot;test_kdf&quot;);
+ 
+ my @kdf_tests = (
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -digest SHA256 -kdfopt secret:secret -kdfopt seed:seed TLS1-PRF}],
++      expected =&gt; '8E:4D:93:25:30:D7:65:A0:AA:E9:74:C3:04:73:5E:CC',
++      desc =&gt; 'TLS1-PRF SHA256' },
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -digest MD5-SHA1 -kdfopt secret:secret -kdfopt seed:seed TLS1-PRF}],
++      expected =&gt; '65:6F:31:CB:04:03:D6:51:E2:E8:71:F8:20:04:AB:BA',
++      desc =&gt; 'TLS1-PRF MD5-SHA1' },
++    { cmd =&gt; [qw{openssl kdf -keylen 10 -digest SHA256 -kdfopt key:secret -kdfopt salt:salt -kdfopt info:label HKDF}],
++      expected =&gt; '2a:c4:36:9f:52:59:96:f8:de:13',
++      desc =&gt; 'HKDF SHA256' },
++    { cmd =&gt; [qw{openssl kdf -keylen 25 -digest SHA256 -kdfopt pass:passwordPASSWORDpassword -kdfopt salt:saltSALTsaltSALTsaltSALTsaltSALTsalt -kdfopt iter:4096 PBKDF2}],
++      expected =&gt; '34:8C:89:DB:CB:D3:2B:2F:32:D8:14:B8:11:6E:84:CF:2B:17:34:7E:BC:18:00:18:1C',
++      desc =&gt; 'PBKDF2 SHA256'},
++    { cmd =&gt; [qw{openssl kdf -keylen 64 -mac KMAC128 -kdfopt maclen:20 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++      expected =&gt; 'e9:c1:84:53:a0:62:b5:3b:db:fc:bb:5a:34:bd:b8:e5:e7:07:ee:bb:5d:d1:34:42:43:d8:cf:c2:c2:e6:33:2f:91:bd:a5:86:f3:7d:e4:8a:65:d4:c5:14:fd:ef:aa:1e:67:54:f3:73:d2:38:e1:95:ae:15:7e:1d:e8:14:98:03',
++      desc =&gt; 'SSKDF KMAC128'},
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -mac HMAC -digest SHA256 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++      expected =&gt; '44:f6:76:e8:5c:1b:1a:8b:bc:3d:31:92:18:63:1c:a3',
++      desc =&gt; 'SSKDF HMAC SHA256'},
++    { cmd =&gt; [qw{openssl kdf -keylen 14 -digest SHA224 -kdfopt hexkey:6dbdc23f045488e4062757b06b9ebae183fc5a5946d80db93fec6f62ec07e3727f0126aed12ce4b262f47d48d54287f81d474c7c3b1850e9 -kdfopt hexinfo:a1b2c3d4e54341565369643c832e9849dcdba71e9a3139e606e095de3c264a66e98a165854cd07989b1ee0ec3f8dbe SSKDF}],
++      expected =&gt; 'a4:62:de:16:a8:9d:e8:46:6e:f5:46:0b:47:b8',
++      desc =&gt; 'SSKDF HASH SHA224'},
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -digest SHA256 -kdfopt hexkey:0102030405 -kdfopt hexxcghash:06090A -kdfopt hexsession_id:01020304 -kdfopt type:A SSHKDF}],
++    expected =&gt; '5C:49:94:47:3B:B1:53:3A:58:EB:19:42:04:D3:78:16',
++    desc =&gt; 'SSHKDF SHA256'},
++
++    # Using the -kdfopt digest: option instead of -digest
+     { cmd =&gt; [qw{openssl kdf -keylen 16 -kdfopt digest:SHA256 -kdfopt secret:secret -kdfopt seed:seed TLS1-PRF}],
+       expected =&gt; '8E:4D:93:25:30:D7:65:A0:AA:E9:74:C3:04:73:5E:CC',
+       desc =&gt; 'TLS1-PRF SHA256' },
+@@ -28,10 +54,10 @@ my @kdf_tests = (
+     { cmd =&gt; [qw{openssl kdf -keylen 25 -kdfopt digest:SHA256 -kdfopt pass:passwordPASSWORDpassword -kdfopt salt:saltSALTsaltSALTsaltSALTsaltSALTsalt -kdfopt iter:4096 PBKDF2}],
+       expected =&gt; '34:8C:89:DB:CB:D3:2B:2F:32:D8:14:B8:11:6E:84:CF:2B:17:34:7E:BC:18:00:18:1C',
+       desc =&gt; 'PBKDF2 SHA256'},
+-    { cmd =&gt; [qw{openssl kdf -keylen 64 -kdfopt mac:KMAC128 -kdfopt maclen:20 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++    { cmd =&gt; [qw{openssl kdf -keylen 64 -mac KMAC128 -kdfopt maclen:20 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
+       expected =&gt; 'e9:c1:84:53:a0:62:b5:3b:db:fc:bb:5a:34:bd:b8:e5:e7:07:ee:bb:5d:d1:34:42:43:d8:cf:c2:c2:e6:33:2f:91:bd:a5:86:f3:7d:e4:8a:65:d4:c5:14:fd:ef:aa:1e:67:54:f3:73:d2:38:e1:95:ae:15:7e:1d:e8:14:98:03',
+       desc =&gt; 'SSKDF KMAC128'},
+-    { cmd =&gt; [qw{openssl kdf -keylen 16 -kdfopt mac:HMAC -kdfopt digest:SHA256 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -mac HMAC -kdfopt digest:SHA256 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
+       expected =&gt; '44:f6:76:e8:5c:1b:1a:8b:bc:3d:31:92:18:63:1c:a3',
+       desc =&gt; 'SSKDF HMAC SHA256'},
+     { cmd =&gt; [qw{openssl kdf -keylen 14 -kdfopt digest:SHA224 -kdfopt hexkey:6dbdc23f045488e4062757b06b9ebae183fc5a5946d80db93fec6f62ec07e3727f0126aed12ce4b262f47d48d54287f81d474c7c3b1850e9 -kdfopt hexinfo:a1b2c3d4e54341565369643c832e9849dcdba71e9a3139e606e095de3c264a66e98a165854cd07989b1ee0ec3f8dbe SSKDF}],
+@@ -40,6 +66,14 @@ my @kdf_tests = (
+     { cmd =&gt; [qw{openssl kdf -keylen 16 -kdfopt digest:SHA256 -kdfopt hexkey:0102030405 -kdfopt hexxcghash:06090A -kdfopt hexsession_id:01020304 -kdfopt type:A SSHKDF}],
+     expected =&gt; '5C:49:94:47:3B:B1:53:3A:58:EB:19:42:04:D3:78:16',
+     desc =&gt; 'SSHKDF SHA256'},
++
++    # Additionally using -kdfopt mac: instead of -mac
++    { cmd =&gt; [qw{openssl kdf -keylen 64 -kdfopt mac:KMAC128 -kdfopt maclen:20 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++      expected =&gt; 'e9:c1:84:53:a0:62:b5:3b:db:fc:bb:5a:34:bd:b8:e5:e7:07:ee:bb:5d:d1:34:42:43:d8:cf:c2:c2:e6:33:2f:91:bd:a5:86:f3:7d:e4:8a:65:d4:c5:14:fd:ef:aa:1e:67:54:f3:73:d2:38:e1:95:ae:15:7e:1d:e8:14:98:03',
++      desc =&gt; 'SSKDF KMAC128'},
++    { cmd =&gt; [qw{openssl kdf -keylen 16 -kdfopt mac:HMAC -kdfopt digest:SHA256 -kdfopt hexkey:b74a149a161546f8c20b06ac4ed4 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:3638271ccd68a25dc24ecddd39ef3f89 SSKDF}],
++      expected =&gt; '44:f6:76:e8:5c:1b:1a:8b:bc:3d:31:92:18:63:1c:a3',
++      desc =&gt; 'SSKDF HMAC SHA256'},
+ );
+ 
+ my @scrypt_tests = (
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034157.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034159.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34158">[ date ]</a>
+              <a href="thread.html#34158">[ thread ]</a>
+              <a href="subject.html#34158">[ subject ]</a>
+              <a href="author.html#34158">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

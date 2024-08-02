@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1591281772.086943.1480.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029094.html">
+   <LINK REL="Next"  HREF="029097.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1591281772.086943.1480.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Jun  4 14:42:52 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029094.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029097.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29095">[ date ]</a>
+              <a href="thread.html#29095">[ thread ]</a>
+              <a href="subject.html#29095">[ subject ]</a>
+              <a href="author.html#29095">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c8567c392c1dc3dd15651c0d2746a5b87b5a88dd (commit)
+       via  f995e5bdcd5d4c2143323ff78e4dcc0b95c5e024 (commit)
+      from  4cbb196b1b33d6ff2089537df0fdb76ac4741e2a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c8567c392c1dc3dd15651c0d2746a5b87b5a88dd
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat May 23 16:39:18 2020 +0200
+
+    CORE: make sure activated fallback providers stay activated
+    
+    Calling 'OSSL_PROVIDER_available(NULL, &quot;default&quot;)' would search for
+    the &quot;default&quot; provider, and in doing so, activate it if necessary,
+    thereby detecting that it's available...  and then immediately free
+    it, which could deactivate that provider, even though it should stay
+    available.
+    
+    We solve this by incrementing the refcount for activated fallbacks one
+    extra time, thereby simulating an explicit OSSL_PROVIDER_load(), and
+    compensate for it with an extra ossl_provider_free() when emptying the
+    provider store.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11926">https://github.com/openssl/openssl/pull/11926</A>)
+
+commit f995e5bdcd5d4c2143323ff78e4dcc0b95c5e024
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat May 23 16:34:07 2020 +0200
+
+    TEST: Add provider_fallback_test, to test aspects of fallback providers
+    
+    There are cases where the fallback providers aren't treated right.
+    For example, the following calls, in that order, will end up with
+    a failed EVP_KEYMGMT_fetch(), even thought the default provider
+    does supply an implementation of the &quot;RSA&quot; keytype.
+    
+        EVP_KEYMGMT *rsameth = NULL;
+    
+        OSSL_PROVIDER_available(NULL, &quot;default&quot;);
+        rsameth = EVP_KEYMGMT_fetch(NULL, &quot;RSA&quot;, NULL);
+    
+    For good measure, this also tests that explicit loading of the default
+    provider won't fail.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11926">https://github.com/openssl/openssl/pull/11926</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_core.c                             | 42 +++++++++++++---
+ test/build.info                                    |  5 ++
+ test/provider_fallback_test.c                      | 57 ++++++++++++++++++++++
+ ...t_internal_ec.t =&gt; 04-test_provider_fallback.t} | 13 +++--
+ 4 files changed, 103 insertions(+), 14 deletions(-)
+ create mode 100644 test/provider_fallback_test.c
+ copy test/recipes/{03-test_internal_ec.t =&gt; 04-test_provider_fallback.t} (52%)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index f8aa5721b4..8b868fdb6b 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -42,7 +42,8 @@ struct provider_store_st;        /* Forward declaration */
+ struct ossl_provider_st {
+     /* Flag bits */
+     unsigned int flag_initialized:1;
+-    unsigned int flag_fallback:1;
++    unsigned int flag_fallback:1; /* Can be used as fallback */
++    unsigned int flag_activated_as_fallback:1;
+ 
+     /* OpenSSL library side data */
+     CRYPTO_REF_COUNT refcnt;
+@@ -104,6 +105,24 @@ struct provider_store_st {
+     unsigned int use_fallbacks:1;
+ };
+ 
++/*
++ * provider_deactivate_free() is a wrapper around ossl_provider_free()
++ * that also makes sure that activated fallback providers are deactivated.
++ * This is simply done by freeing them an extra time, to compensate for the
++ * refcount that provider_activate_fallbacks() gives them.
++ * Since this is only called when the provider store is being emptied, we
++ * don't need to care about any lock.
++ */
++static void provider_deactivate_free(OSSL_PROVIDER *prov)
++{
++    int extra_free = (prov-&gt;flag_initialized
++                      &amp;&amp; prov-&gt;flag_activated_as_fallback);
++
++    if (extra_free)
++        ossl_provider_free(prov);
++    ossl_provider_free(prov);
++}
++
+ static void provider_store_free(void *vstore)
+ {
+     struct provider_store_st *store = vstore;
+@@ -111,7 +130,7 @@ static void provider_store_free(void *vstore)
+     if (store == NULL)
+         return;
+     OPENSSL_free(store-&gt;default_path);
+-    sk_OSSL_PROVIDER_pop_free(store-&gt;providers, ossl_provider_free);
++    sk_OSSL_PROVIDER_pop_free(store-&gt;providers, provider_deactivate_free);
+     CRYPTO_THREAD_lock_free(store-&gt;lock);
+     OPENSSL_free(store);
+ }
+@@ -654,13 +673,22 @@ static void provider_activate_fallbacks(struct provider_store_st *store)
+             OSSL_PROVIDER *prov = sk_OSSL_PROVIDER_value(store-&gt;providers, i);
+ 
+             /*
+-             * Note that we don't care if the activation succeeds or not.
+-             * If it doesn't succeed, then any attempt to use any of the
+-             * fallback providers will fail anyway.
++             * Activated fallback providers get an extra refcount, to
++             * simulate a regular load.
++             * Note that we don't care if the activation succeeds or not,
++             * other than to maintain a correct refcount.  If the activation
++             * doesn't succeed, then any future attempt to use the fallback
++             * provider will fail anyway.
+              */
+             if (prov-&gt;flag_fallback) {
+-                activated_fallback_count++;
+-                provider_activate(prov);
++                if (ossl_provider_up_ref(prov)) {
++                    if (!provider_activate(prov)) {
++                        ossl_provider_free(prov);
++                    } else {
++                        prov-&gt;flag_activated_as_fallback = 1;
++                        activated_fallback_count++;
++                    }
++                }
+             }
+         }
+ 
+diff --git a/test/build.info b/test/build.info
+index 9697e55f12..3255a836de 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -731,6 +731,11 @@ IF[{- !$disabled{tests} -}]
+   DEPEND[]=provider_internal_test.cnf
+   GENERATE[provider_internal_test.cnf]=provider_internal_test.cnf.in
+ 
++  PROGRAMS{noinst}=provider_fallback_test
++  SOURCE[provider_fallback_test]=provider_fallback_test.c
++  INCLUDE[provider_fallback_test]=../include ../apps/include
++  DEPEND[provider_fallback_test]=../libcrypto libtestutil.a
++
+   PROGRAMS{noinst}=params_test
+   SOURCE[params_test]=params_test.c
+   INCLUDE[params_test]=.. ../include ../apps/include
+diff --git a/test/provider_fallback_test.c b/test/provider_fallback_test.c
+new file mode 100644
+index 0000000000..ce62184551
+--- /dev/null
++++ b/test/provider_fallback_test.c
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;stddef.h&gt;
++#include &lt;openssl/provider.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &quot;testutil.h&quot;
++
++static int test_provider(OPENSSL_CTX *ctx)
++{
++    EVP_KEYMGMT *rsameth = NULL;
++    const OSSL_PROVIDER *prov = NULL;
++    int ok;
++
++    ok = TEST_true(OSSL_PROVIDER_available(ctx, &quot;default&quot;))
++        &amp;&amp; TEST_ptr(rsameth = EVP_KEYMGMT_fetch(ctx, &quot;RSA&quot;, NULL))
++        &amp;&amp; TEST_ptr(prov = EVP_KEYMGMT_provider(rsameth))
++        &amp;&amp; TEST_str_eq(OSSL_PROVIDER_name(prov), &quot;default&quot;);
++
++    EVP_KEYMGMT_free(rsameth);
++    return ok;
++}
++
++static int test_fallback_provider(void)
++{
++    return test_provider(NULL);
++}
++
++static int test_explicit_provider(void)
++{
++    OPENSSL_CTX *ctx = NULL;
++    OSSL_PROVIDER *prov = NULL;
++    int ok;
++
++    ok = TEST_ptr(ctx = OPENSSL_CTX_new())
++        &amp;&amp; TEST_ptr(prov = OSSL_PROVIDER_load(ctx, &quot;default&quot;))
++        &amp;&amp; test_provider(ctx)
++        &amp;&amp; TEST_true(OSSL_PROVIDER_unload(prov));
++
++    OPENSSL_CTX_free(ctx);
++    return ok;
++}
++
++
++int setup_tests(void)
++{
++    ADD_TEST(test_fallback_provider);
++    ADD_TEST(test_explicit_provider);
++    return 1;
++}
++
+diff --git a/test/recipes/03-test_internal_ec.t b/test/recipes/04-test_provider_fallback.t
+similarity index 52%
+copy from test/recipes/03-test_internal_ec.t
+copy to test/recipes/04-test_provider_fallback.t
+index 0d31d0ac07..39d3b105dc 100644
+--- a/test/recipes/03-test_internal_ec.t
++++ b/test/recipes/04-test_provider_fallback.t
+@@ -7,13 +7,12 @@
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ 
+ use strict;
+-use OpenSSL::Test;              # get 'plan'
++use File::Spec;
+ use OpenSSL::Test::Simple;
+-use OpenSSL::Test::Utils;
+ 
+-setup(&quot;test_internal_ec&quot;);
++# We must ensure that OPENSSL_CONF points at an empty file.  Otherwise, we
++# risk that the configuration file contains statements that load providers,
++# which defeats the purpose of this test.  The NUL device is good enough.
++$ENV{OPENSSL_CONF} = File::Spec-&gt;devnull();
+ 
+-plan skip_all =&gt; &quot;This test is unsupported in a no-ec build&quot;
+-    if disabled(&quot;ec&quot;);
+-
+-simple_test(&quot;test_internal_ec&quot;, &quot;ec_internal_test&quot;);
++simple_test(&quot;test_provider_fallback&quot;, &quot;provider_fallback_test&quot;);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029094.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029097.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29095">[ date ]</a>
+              <a href="thread.html#29095">[ thread ]</a>
+              <a href="subject.html#29095">[ subject ]</a>
+              <a href="author.html#29095">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

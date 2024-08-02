@@ -1,0 +1,846 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1523645390.355494.6682.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018994.html">
+   <LINK REL="Next"  HREF="018996.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>matthias.st.pierre at ncp-e.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1523645390.355494.6682.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matthias.st.pierre at ncp-e.com
+       </A><BR>
+    <I>Fri Apr 13 18:49:50 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018994.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018996.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18995">[ date ]</a>
+              <a href="thread.html#18995">[ thread ]</a>
+              <a href="subject.html#18995">[ subject ]</a>
+              <a href="author.html#18995">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5bc6bcf82d2adce982e04837b0810b1a6cd55a19 (commit)
+      from  0e3ecaec3ebf2ed0dfbcff07b7fa1cfdd8240d5c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5bc6bcf82d2adce982e04837b0810b1a6cd55a19
+Author: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+Date:   Tue Apr 10 10:22:52 2018 +0200
+
+    DRBG: implement a get_nonce() callback
+    
+    Fixes #5849
+    
+    In pull request #5503 a fallback was added which adds a random nonce of
+    security_strength/2 bits if no nonce callback is provided. This change raised
+    the entropy requirements form 256 to 384 bit, which can cause problems on some
+    platforms (e.g. VMS, see issue #5849).
+    
+    The requirements for the nonce are given in section 8.6.7 of NIST SP 800-90Ar1:
+    
+      A nonce may be required in the construction of a seed during instantiation
+      in order to provide a security cushion to block certain attacks.
+      The nonce shall be either:
+    
+      a) A value with at least (security_strength/2) bits of entropy, or
+    
+      b) A value that is expected to repeat no more often than a
+         (security_strength/2)-bit random string would be expected to repeat.
+    
+      Each nonce shall be unique to the cryptographic module in which instantiation
+      is performed, but need not be secret. When used, the nonce shall be considered
+      to be a critical security parameter.
+    
+    This commit implements a nonce of type b) in order to lower the entropy
+    requirements during instantiation back to 256 bits.
+    
+    The formulation &quot;shall be unique to the cryptographic module&quot; above implies
+    that the nonce needs to be unique among (with high probability) among all
+    DRBG instances in &quot;space&quot; and &quot;time&quot;. We try to achieve this goal by creating a
+    nonce of the following form
+    
+        nonce = app-specific-data || high-resolution-utc-timestamp || counter
+    
+    Where || denotes concatenation. The application specific data can be something
+    like the process or group id of the application. A utc timestamp is used because
+    it increases monotonically, provided the system time is synchronized. This approach
+    may not be perfect yet for a FIPS evaluation, but it should be good enough for the
+    moment.
+    
+    This commit also harmonizes the implementation of the get_nonce() and the
+    get_additional_data() callbacks and moves the platform specific parts from
+    rand_lib.c into rand_unix.c, rand_win.c, and rand_vms.c.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5920">https://github.com/openssl/openssl/pull/5920</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/include/internal/rand_int.h |  33 ++++++
+ crypto/rand/drbg_lib.c             |  19 +++-
+ crypto/rand/rand_lib.c             | 200 ++++++++++++-------------------------
+ crypto/rand/rand_unix.c            | 179 ++++++++++++++++++++++++++++++---
+ crypto/rand/rand_vms.c             |  39 ++++++++
+ crypto/rand/rand_win.c             |  38 +++++++
+ 6 files changed, 354 insertions(+), 154 deletions(-)
+
+diff --git a/crypto/include/internal/rand_int.h b/crypto/include/internal/rand_int.h
+index baa9bfe..cf82e4a 100644
+--- a/crypto/include/internal/rand_int.h
++++ b/crypto/include/internal/rand_int.h
+@@ -39,8 +39,15 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+                              int prediction_resistance);
+ void rand_drbg_cleanup_entropy(RAND_DRBG *drbg,
+                                unsigned char *out, size_t outlen);
++size_t rand_drbg_get_nonce(RAND_DRBG *drbg,
++                           unsigned char **pout,
++                           int entropy, size_t min_len, size_t max_len);
++void rand_drbg_cleanup_nonce(RAND_DRBG *drbg,
++                             unsigned char *out, size_t outlen);
++
+ size_t rand_drbg_get_additional_data(unsigned char **pout, size_t max_len);
+ 
++void rand_drbg_cleanup_additional_data(unsigned char *out, size_t outlen);
+ 
+ /*
+  * RAND_POOL functions
+@@ -77,4 +84,30 @@ int rand_pool_add_end(RAND_POOL *pool, size_t len, size_t entropy);
+  */
+ size_t rand_pool_acquire_entropy(RAND_POOL *pool);
+ 
++/*
++ * Add some application specific nonce data
++ *
++ * This function is platform specific and adds some application specific
++ * data to the nonce used for instantiating the drbg.
++ *
++ * This data currently consists of the process and thread id, and a high
++ * resolution timestamp. The data does not include an atomic counter,
++ * because that is added by the calling function rand_drbg_get_nonce().
++ *
++ * Returns 1 on success and 0 on failure.
++ */
++int rand_pool_add_nonce_data(RAND_POOL *pool);
++
++
++/*
++ * Add some platform specific additional data
++ *
++ * This function is platform specific and adds some random noise to the
++ * additional data used for generating random bytes and for reseeding
++ * the drbg.
++ *
++ * Returns 1 on success and 0 on failure.
++ */
++int rand_pool_add_additional_data(RAND_POOL *pool);
++
+ #endif
+diff --git a/crypto/rand/drbg_lib.c b/crypto/rand/drbg_lib.c
+index b9ad1b8..cc59236 100644
+--- a/crypto/rand/drbg_lib.c
++++ b/crypto/rand/drbg_lib.c
+@@ -184,9 +184,23 @@ static RAND_DRBG *rand_drbg_new(int secure,
+     drbg-&gt;parent = parent;
+ 
+     if (parent == NULL) {
++        drbg-&gt;get_entropy = rand_drbg_get_entropy;
++        drbg-&gt;cleanup_entropy = rand_drbg_cleanup_entropy;
++#ifndef RAND_DRBG_GET_RANDOM_NONCE
++        drbg-&gt;get_nonce = rand_drbg_get_nonce;
++        drbg-&gt;cleanup_nonce = rand_drbg_cleanup_nonce;
++#endif
++
+         drbg-&gt;reseed_interval = master_reseed_interval;
+         drbg-&gt;reseed_time_interval = master_reseed_time_interval;
+     } else {
++        drbg-&gt;get_entropy = rand_drbg_get_entropy;
++        drbg-&gt;cleanup_entropy = rand_drbg_cleanup_entropy;
++        /*
++         * Do not provide nonce callbacks, the child DRBGs will
++         * obtain their nonce using random bits from the parent.
++         */
++
+         drbg-&gt;reseed_interval = slave_reseed_interval;
+         drbg-&gt;reseed_time_interval = slave_reseed_time_interval;
+     }
+@@ -208,11 +222,6 @@ static RAND_DRBG *rand_drbg_new(int secure,
+         rand_drbg_unlock(parent);
+     }
+ 
+-    if (!RAND_DRBG_set_callbacks(drbg, rand_drbg_get_entropy,
+-                                 rand_drbg_cleanup_entropy,
+-                                 NULL, NULL))
+-        goto err;
+-
+     return drbg;
+ 
+ err:
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 6e98e4d..5ae51a1 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -15,49 +15,8 @@
+ #include &lt;openssl/engine.h&gt;
+ #include &quot;internal/thread_once.h&quot;
+ #include &quot;rand_lcl.h&quot;
+-#ifdef OPENSSL_SYS_UNIX
+-# include &lt;sys/types.h&gt;
+-# include &lt;unistd.h&gt;
+-# include &lt;sys/time.h&gt;
+-#endif
+ #include &quot;e_os.h&quot;
+ 
+-/* Macro to convert two thirty two bit values into a sixty four bit one */
+-#define TWO32TO64(a, b) ((((uint64_t)(a)) &lt;&lt; 32) + (b))
+-
+-/*
+- * Check for the existence and support of POSIX timers.  The standard
+- * says that the _POSIX_TIMERS macro will have a positive value if they
+- * are available.
+- *
+- * However, we want an additional constraint: that the timer support does
+- * not require an extra library dependency.  Early versions of glibc
+- * require -lrt to be specified on the link line to access the timers,
+- * so this needs to be checked for.
+- *
+- * It is worse because some libraries define __GLIBC__ but don't
+- * support the version testing macro (e.g. uClibc).  This means
+- * an extra check is needed.
+- *
+- * The final condition is:
+- *      &quot;have posix timers and either not glibc or glibc without -lrt&quot;
+- *
+- * The nested #if sequences are required to avoid using a parameterised
+- * macro that might be undefined.
+- */
+-#undef OSSL_POSIX_TIMER_OKAY
+-#if defined(_POSIX_TIMERS) &amp;&amp; _POSIX_TIMERS &gt; 0
+-# if defined(__GLIBC__)
+-#  if defined(__GLIBC_PREREQ)
+-#   if __GLIBC_PREREQ(2, 17)
+-#    define OSSL_POSIX_TIMER_OKAY
+-#   endif
+-#  endif
+-# else
+-#  define OSSL_POSIX_TIMER_OKAY
+-# endif
+-#endif
+-
+ #ifndef OPENSSL_NO_ENGINE
+ /* non-NULL if default_RAND_meth is ENGINE-provided */
+ static ENGINE *funct_ref;
+@@ -69,6 +28,9 @@ static CRYPTO_ONCE rand_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ int rand_fork_count;
+ 
++static CRYPTO_RWLOCK *rand_nonce_lock;
++static int rand_nonce_count;
++
+ #ifdef OPENSSL_RAND_SEED_RDTSC
+ /*
+  * IMPORTANT NOTE:  It is not currently possible to use this code
+@@ -247,72 +209,62 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+ }
+ 
+ /*
+- * Find a suitable source of time.  Start with the highest resolution source
+- * and work down to the slower ones.  This is added as additional data and
+- * isn't counted as randomness, so any result is acceptable.
++ * Implements the cleanup_entropy() callback (see RAND_DRBG_set_callbacks())
+  *
+- * Returns 0 when we weren't able to find any time source
+  */
+-static uint64_t get_timer_bits(void)
++void rand_drbg_cleanup_entropy(RAND_DRBG *drbg,
++                               unsigned char *out, size_t outlen)
+ {
+-    uint64_t res = OPENSSL_rdtsc();
++    OPENSSL_secure_clear_free(out, outlen);
++}
+ 
+-    if (res != 0)
+-        return res;
+-#if defined(_WIN32)
+-    {
+-        LARGE_INTEGER t;
+-        FILETIME ft;
+ 
+-        if (QueryPerformanceCounter(&amp;t) != 0)
+-            return t.QuadPart;
+-        GetSystemTimeAsFileTime(&amp;ft);
+-        return TWO32TO64(ft.dwHighDateTime, ft.dwLowDateTime);
+-    }
+-#elif defined(__sun) || defined(__hpux)
+-    return gethrtime();
+-#elif defined(_AIX)
+-    {
+-        timebasestruct_t t;
+-
+-        read_wall_time(&amp;t, TIMEBASE_SZ);
+-        return TWO32TO64(t.tb_high, t.tb_low);
+-    }
+-#else
++/*
++ * Implements the get_nonce() callback (see RAND_DRBG_set_callbacks())
++ *
++ */
++size_t rand_drbg_get_nonce(RAND_DRBG *drbg,
++                           unsigned char **pout,
++                           int entropy, size_t min_len, size_t max_len)
++{
++    size_t ret = 0;
++    RAND_POOL *pool;
+ 
+-# if defined(OSSL_POSIX_TIMER_OKAY)
+-    {
+-        struct timespec ts;
+-        clockid_t cid;
+-
+-#  ifdef CLOCK_BOOTTIME
+-        cid = CLOCK_BOOTTIME;
+-#  elif defined(_POSIX_MONOTONIC_CLOCK)
+-        cid = CLOCK_MONOTONIC;
+-#  else
+-        cid = CLOCK_REALTIME;
+-#  endif
+-
+-        if (clock_gettime(cid, &amp;ts) == 0)
+-            return TWO32TO64(ts.tv_sec, ts.tv_nsec);
+-    }
+-# endif
+-# if defined(__unix__) \
+-     || (defined(_POSIX_C_SOURCE) &amp;&amp; _POSIX_C_SOURCE &gt;= 200112L)
+-    {
+-        struct timeval tv;
+-
+-        if (gettimeofday(&amp;tv, NULL) == 0)
+-            return TWO32TO64(tv.tv_sec, tv.tv_usec);
+-    }
+-# endif
+-    {
+-        time_t t = time(NULL);
+-        if (t == (time_t)-1)
+-            return 0;
+-        return t;
+-    }
+-#endif
++    struct {
++        void * instance;
++        int count;
++    } data = { 0 };
++
++    pool = rand_pool_new(0, min_len, max_len);
++    if (pool == NULL)
++        return 0;
++
++    if (rand_pool_add_nonce_data(pool) == 0)
++        goto err;
++
++    data.instance = drbg;
++    CRYPTO_atomic_add(&amp;rand_nonce_count, 1, &amp;data.count, rand_nonce_lock);
++
++    if (rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0) == 0)
++        goto err;
++
++    ret   = rand_pool_length(pool);
++    *pout = rand_pool_detach(pool);
++
++ err:
++    rand_pool_free(pool);
++
++    return ret;
++}
++
++/*
++ * Implements the cleanup_nonce() callback (see RAND_DRBG_set_callbacks())
++ *
++ */
++void rand_drbg_cleanup_nonce(RAND_DRBG *drbg,
++                             unsigned char *out, size_t outlen)
++{
++    OPENSSL_secure_clear_free(out, outlen);
+ }
+ 
+ /*
+@@ -327,52 +279,26 @@ static uint64_t get_timer_bits(void)
+  */
+ size_t rand_drbg_get_additional_data(unsigned char **pout, size_t max_len)
+ {
++    size_t ret = 0;
+     RAND_POOL *pool;
+-    CRYPTO_THREAD_ID thread_id;
+-    size_t len;
+-#ifdef OPENSSL_SYS_UNIX
+-    pid_t pid;
+-#elif defined(OPENSSL_SYS_WIN32)
+-    DWORD pid;
+-#endif
+-    uint64_t tbits;
+ 
+     pool = rand_pool_new(0, 0, max_len);
+     if (pool == NULL)
+         return 0;
+ 
+-#ifdef OPENSSL_SYS_UNIX
+-    pid = getpid();
+-    rand_pool_add(pool, (unsigned char *)&amp;pid, sizeof(pid), 0);
+-#elif defined(OPENSSL_SYS_WIN32)
+-    pid = GetCurrentProcessId();
+-    rand_pool_add(pool, (unsigned char *)&amp;pid, sizeof(pid), 0);
+-#endif
+-
+-    thread_id = CRYPTO_THREAD_get_current_id();
+-    if (thread_id != 0)
+-        rand_pool_add(pool, (unsigned char *)&amp;thread_id, sizeof(thread_id), 0);
+-
+-    tbits = get_timer_bits();
+-    if (tbits != 0)
+-        rand_pool_add(pool, (unsigned char *)&amp;tbits, sizeof(tbits), 0);
++    if (rand_pool_add_additional_data(pool) == 0)
++        goto err;
+ 
+-    /* TODO: Use RDSEED? */
++    ret = rand_pool_length(pool);
++    *pout = rand_pool_detach(pool);
+ 
+-    len = rand_pool_length(pool);
+-    if (len != 0)
+-        *pout = rand_pool_detach(pool);
++ err:
+     rand_pool_free(pool);
+ 
+-    return len;
++    return ret;
+ }
+ 
+-/*
+- * Implements the cleanup_entropy() callback (see RAND_DRBG_set_callbacks())
+- *
+- */
+-void rand_drbg_cleanup_entropy(RAND_DRBG *drbg,
+-                               unsigned char *out, size_t outlen)
++void rand_drbg_cleanup_additional_data(unsigned char *out, size_t outlen)
+ {
+     OPENSSL_secure_clear_free(out, outlen);
+ }
+@@ -393,6 +319,9 @@ DEFINE_RUN_ONCE_STATIC(do_rand_init)
+     rand_meth_lock = CRYPTO_THREAD_lock_new();
+     ret &amp;= rand_meth_lock != NULL;
+ 
++    rand_nonce_lock = CRYPTO_THREAD_lock_new();
++    ret &amp;= rand_meth_lock != NULL;
++
+     return ret;
+ }
+ 
+@@ -407,6 +336,7 @@ void rand_cleanup_int(void)
+     CRYPTO_THREAD_lock_free(rand_engine_lock);
+ #endif
+     CRYPTO_THREAD_lock_free(rand_meth_lock);
++    CRYPTO_THREAD_lock_free(rand_nonce_lock);
+ }
+ 
+ /*
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index 0f9407f..beb35a3 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -14,6 +14,50 @@
+ #include &quot;rand_lcl.h&quot;
+ #include &quot;internal/rand_int.h&quot;
+ #include &lt;stdio.h&gt;
++#ifdef OPENSSL_SYS_UNIX
++# include &lt;sys/types.h&gt;
++# include &lt;unistd.h&gt;
++# include &lt;sys/time.h&gt;
++
++static uint64_t get_time_stamp(void);
++static uint64_t get_timer_bits(void);
++
++/* Macro to convert two thirty two bit values into a sixty four bit one */
++# define TWO32TO64(a, b) ((((uint64_t)(a)) &lt;&lt; 32) + (b))
++
++/*
++ * Check for the existence and support of POSIX timers.  The standard
++ * says that the _POSIX_TIMERS macro will have a positive value if they
++ * are available.
++ *
++ * However, we want an additional constraint: that the timer support does
++ * not require an extra library dependency.  Early versions of glibc
++ * require -lrt to be specified on the link line to access the timers,
++ * so this needs to be checked for.
++ *
++ * It is worse because some libraries define __GLIBC__ but don't
++ * support the version testing macro (e.g. uClibc).  This means
++ * an extra check is needed.
++ *
++ * The final condition is:
++ *      &quot;have posix timers and either not glibc or glibc without -lrt&quot;
++ *
++ * The nested #if sequences are required to avoid using a parameterised
++ * macro that might be undefined.
++ */
++# undef OSSL_POSIX_TIMER_OKAY
++# if defined(_POSIX_TIMERS) &amp;&amp; _POSIX_TIMERS &gt; 0
++#  if defined(__GLIBC__)
++#   if defined(__GLIBC_PREREQ)
++#    if __GLIBC_PREREQ(2, 17)
++#     define OSSL_POSIX_TIMER_OKAY
++#    endif
++#   endif
++#  else
++#   define OSSL_POSIX_TIMER_OKAY
++#  endif
++# endif
++#endif
+ 
+ #if (defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI)) &amp;&amp; \
+         !defined(OPENSSL_RAND_SEED_NONE)
+@@ -54,9 +98,6 @@
+ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ {
+     short int code;
+-    gid_t curr_gid;
+-    pid_t curr_pid;
+-    uid_t curr_uid;
+     int i, k;
+     size_t bytes_needed;
+     struct timespec ts;
+@@ -69,17 +110,6 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     extern void s$sleep2(long long *_duration, short int *_code);
+ #  endif
+ 
+-    /*
+-     * Seed with the gid, pid, and uid, to ensure *some* variation between
+-     * different processes.
+-     */
+-    curr_gid = getgid();
+-    rand_pool_add(pool, &amp;curr_gid, sizeof(curr_gid), 0);
+-    curr_pid = getpid();
+-    rand_pool_add(pool, &amp;curr_pid, sizeof(curr_pid), 0);
+-    curr_uid = getuid();
+-    rand_pool_add(pool, &amp;curr_uid, sizeof(curr_uid), 0);
+-
+     bytes_needed = rand_pool_bytes_needed(pool, 2 /*entropy_per_byte*/);
+ 
+     for (i = 0; i &lt; bytes_needed; i++) {
+@@ -256,5 +286,126 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ #  endif
+ }
+ # endif
++#endif
++
++#ifdef OPENSSL_SYS_UNIX
++int rand_pool_add_nonce_data(RAND_POOL *pool)
++{
++    struct {
++        pid_t pid;
++        CRYPTO_THREAD_ID tid;
++        uint64_t time;
++    } data = { 0 };
++
++    /*
++     * Add process id, thread id, and a high resolution timestamp to
++     * ensure that the nonce is unique whith high probability for
++     * different process instances.
++     */
++    data.pid = getpid();
++    data.tid = CRYPTO_THREAD_get_current_id();
++    data.time = get_time_stamp();
++
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
++int rand_pool_add_additional_data(RAND_POOL *pool)
++{
++    struct {
++        CRYPTO_THREAD_ID tid;
++        uint64_t time;
++    } data = { 0 };
++
++    /*
++     * Add some noise from the thread id and a high resolution timer.
++     * The thread id adds a little randomness if the drbg is accessed
++     * concurrently (which is the case for the &lt;master&gt; drbg).
++     */
++    data.tid = CRYPTO_THREAD_get_current_id();
++    data.time = get_timer_bits();
++
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
++
++
++/*
++ * Get the current time with the highest possible resolution
++ *
++ * The time stamp is added to the nonce, so it is optimized for not repeating.
++ * The current time is ideal for this purpose, provided the computer's clock
++ * is synchronized.
++ */
++static uint64_t get_time_stamp(void)
++{
++# if defined(OSSL_POSIX_TIMER_OKAY)
++    {
++        struct timespec ts;
++
++        if (clock_gettime(CLOCK_REALTIME, &amp;ts) == 0)
++            return TWO32TO64(ts.tv_sec, ts.tv_nsec);
++    }
++# endif
++# if defined(__unix__) \
++     || (defined(_POSIX_C_SOURCE) &amp;&amp; _POSIX_C_SOURCE &gt;= 200112L)
++    {
++        struct timeval tv;
++
++        if (gettimeofday(&amp;tv, NULL) == 0)
++            return TWO32TO64(tv.tv_sec, tv.tv_usec);
++    }
++# endif
++    return time(NULL);
++}
++
++/*
++ * Get an arbitrary timer value of the highest possible resolution
++ *
++ * The timer value is added as random noise to the additional data,
++ * which is not considered a trusted entropy sourec, so any result
++ * is acceptable.
++ */
++static uint64_t get_timer_bits(void)
++{
++    uint64_t res = OPENSSL_rdtsc();
++
++    if (res != 0)
++        return res;
++
++# if defined(__sun) || defined(__hpux)
++    return gethrtime();
++# elif defined(_AIX)
++    {
++        timebasestruct_t t;
++
++        read_wall_time(&amp;t, TIMEBASE_SZ);
++        return TWO32TO64(t.tb_high, t.tb_low);
++    }
++# elif defined(OSSL_POSIX_TIMER_OKAY)
++    {
++        struct timespec ts;
++
++#  ifdef CLOCK_BOOTTIME
++#   define CLOCK_TYPE CLOCK_BOOTTIME
++#  elif defined(_POSIX_MONOTONIC_CLOCK)
++#   define CLOCK_TYPE CLOCK_MONOTONIC
++#  else
++#   define CLOCK_TYPE CLOCK_REALTIME
++#  endif
++
++        if (clock_gettime(CLOCK_TYPE, &amp;ts) == 0)
++            return TWO32TO64(ts.tv_sec, ts.tv_nsec);
++    }
++# endif
++# if defined(__unix__) \
++     || (defined(_POSIX_C_SOURCE) &amp;&amp; _POSIX_C_SOURCE &gt;= 200112L)
++    {
++        struct timeval tv;
+ 
++        if (gettimeofday(&amp;tv, NULL) == 0)
++            return TWO32TO64(tv.tv_sec, tv.tv_usec);
++    }
++# endif
++    return time(NULL);
++}
+ #endif
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index 1507c6f..c50b4b2 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -10,6 +10,7 @@
+ #include &quot;e_os.h&quot;
+ 
+ #if defined(OPENSSL_SYS_VMS)
++# include &lt;unistd.h&gt;
+ # include &quot;internal/cryptlib.h&quot;
+ # include &lt;openssl/rand.h&gt;
+ # include &quot;internal/rand_int.h&quot;
+@@ -153,4 +154,42 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     return rand_pool_entropy_available(pool);
+ }
+ 
++int rand_pool_add_nonce_data(RAND_POOL *pool)
++{
++    struct {
++        pid_t pid;
++        CRYPTO_THREAD_ID tid;
++        uint64_t time;
++    } data = { 0 };
++
++    /*
++     * Add process id, thread id, and a high resolution timestamp to
++     * ensure that the nonce is unique whith high probability for
++     * different process instances.
++     */
++    data.pid = getpid();
++    data.tid = CRYPTO_THREAD_get_current_id();
++    sys$gettim_prec((struct _generic_64 *)&amp;data.time);
++
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
++int rand_pool_add_additional_data(RAND_POOL *pool)
++{
++    struct {
++        CRYPTO_THREAD_ID tid;
++        uint64_t time;
++    } data = { 0 };
++
++    /*
++     * Add some noise from the thread id and a high resolution timer.
++     * The thread id adds a little randomness if the drbg is accessed
++     * concurrently (which is the case for the &lt;master&gt; drbg).
++     */
++    data.tid = CRYPTO_THREAD_get_current_id();
++    sys$gettim_prec((struct _generic_64 *)&amp;data.time);
++
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
+ #endif
+diff --git a/crypto/rand/rand_win.c b/crypto/rand/rand_win.c
+index ad5e3d1..1d44204 100644
+--- a/crypto/rand/rand_win.c
++++ b/crypto/rand/rand_win.c
+@@ -118,6 +118,44 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     return rand_pool_entropy_available(pool);
+ }
+ 
++
++int rand_pool_add_nonce_data(RAND_POOL *pool)
++{
++    struct {
++        DWORD pid;
++        DWORD tid;
++        FILETIME time;
++    } data = { 0 };
++
++    /*
++     * Add process id, thread id, and a high resolution timestamp to
++     * ensure that the nonce is unique whith high probability for
++     * different process instances.
++     */
++    data.pid = GetCurrentProcessId();
++    data.tid = GetCurrentThreadId();
++    GetSystemTimeAsFileTime(&amp;data.time);
++
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
++int rand_pool_add_additional_data(RAND_POOL *pool)
++{
++    struct {
++        DWORD tid;
++        LARGE_INTEGER time;
++    } data = { 0 };
++
++    /*
++     * Add some noise from the thread id and a high resolution timer.
++     * The thread id adds a little randomness if the drbg is accessed
++     * concurrently (which is the case for the &lt;master&gt; drbg).
++     */
++    data.tid = GetCurrentThreadId();
++    QueryPerformanceCounter(&amp;data.time);
++    return rand_pool_add(pool, (unsigned char *)&amp;data, sizeof(data), 0);
++}
++
+ # if OPENSSL_API_COMPAT &lt; 0x10100000L
+ int RAND_event(UINT iMsg, WPARAM wParam, LPARAM lParam)
+ {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018994.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018996.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18995">[ date ]</a>
+              <a href="thread.html#18995">[ thread ]</a>
+              <a href="subject.html#18995">[ subject ]</a>
+              <a href="author.html#18995">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

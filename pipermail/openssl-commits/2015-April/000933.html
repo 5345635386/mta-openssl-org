@@ -1,0 +1,404 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429711359.491100.24958.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000932.html">
+   <LINK REL="Next"  HREF="000937.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429711359.491100.24958.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Wed Apr 22 14:02:39 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000932.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000937.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#933">[ date ]</a>
+              <a href="thread.html#933">[ thread ]</a>
+              <a href="subject.html#933">[ subject ]</a>
+              <a href="author.html#933">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  98c9ce2f55609d00a06c2106df03a5a7e9dbfa75 (commit)
+      from  b95de5ecdea29f0ac658b6ea86d0cd2d77efcb13 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 98c9ce2f55609d00a06c2106df03a5a7e9dbfa75
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Tue Apr 21 15:48:02 2015 +0100
+
+    SSL_CIPHER lookup functions.
+    
+    Add tables to convert between SSL_CIPHER fields and indices for ciphers
+    and MACs.
+    
+    Reorganise ssl_ciph.c to use tables to lookup values and load them.
+    
+    New functions SSL_CIPHER_get_cipher_nid and SSL_CIPHER_get_digest_nid.
+    
+    Add documentation.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ doc/ssl/SSL_CIPHER_get_name.pod |  10 ++
+ include/openssl/ssl.h           |   2 +
+ ssl/ssl_ciph.c                  | 220 +++++++++++++++++-----------------------
+ 3 files changed, 107 insertions(+), 125 deletions(-)
+
+diff --git a/doc/ssl/SSL_CIPHER_get_name.pod b/doc/ssl/SSL_CIPHER_get_name.pod
+index ec7011e..baac900 100644
+--- a/doc/ssl/SSL_CIPHER_get_name.pod
++++ b/doc/ssl/SSL_CIPHER_get_name.pod
+@@ -12,6 +12,8 @@ SSL_CIPHER_get_name, SSL_CIPHER_get_bits, SSL_CIPHER_get_version, SSL_CIPHER_des
+  int SSL_CIPHER_get_bits(const SSL_CIPHER *cipher, int *alg_bits);
+  char *SSL_CIPHER_get_version(const SSL_CIPHER *cipher);
+  char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf, int size);
++ int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *c);
++ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *c);
+ 
+ =head1 DESCRIPTION
+ 
+@@ -37,6 +39,14 @@ returned. If B&lt;buf&gt; is NULL, a buffer of 128 bytes is allocated using
+ OPENSSL_malloc(). If the allocation fails, a pointer to the string
+ &quot;OPENSSL_malloc Error&quot; is returned.
+ 
++SSL_CIPHER_get_cipher_nid() returns the cipher NID corresponding to B&lt;c&gt;.
++If there is no cipher (e.g. for ciphersuites with no encryption) then
++B&lt;NID_undef&gt; is returned.
++
++SSL_CIPHER_get_digest_nid() returns the digest NID corresponding to the MAC
++used by B&lt;c&gt;. If there is no digest (e.g. for AEAD ciphersuites) then
++B&lt;NID_undef&gt; is returned.
++
+ =head1 NOTES
+ 
+ The number of bits processed can be different from the secret bits. An
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index a24f742..ecd6c69 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1789,6 +1789,8 @@ __owur int SSL_COMP_add_compression_method(int id, void *cm);
+ # endif
+ 
+ const SSL_CIPHER *SSL_CIPHER_find(SSL *ssl, const unsigned char *ptr);
++int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *c);
++int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *c);
+ 
+ /* TLS extensions functions */
+ __owur int SSL_set_session_ticket_ext(SSL *s, void *ext_data, int ext_len);
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index cd86fcc..580098a 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -166,6 +166,31 @@
+ #define SSL_ENC_AES256GCM_IDX   13
+ #define SSL_ENC_NUM_IDX         14
+ 
++/* NB: make sure indices in these tables match values above */
++
++typedef struct {
++    unsigned long mask;
++    int nid;
++} ssl_cipher_table;
++
++/* Table of NIDs for each cipher */
++static const ssl_cipher_table ssl_cipher_table_cipher[SSL_ENC_NUM_IDX] = {
++    {SSL_DES, NID_des_cbc},     /* SSL_ENC_DES_IDX 0 */
++    {SSL_3DES, NID_des_ede3_cbc}, /* SSL_ENC_3DES_IDX 1 */
++    {SSL_RC4, NID_rc4},         /* SSL_ENC_RC4_IDX 2 */
++    {SSL_RC2, NID_rc2_cbc},     /* SSL_ENC_RC2_IDX 3 */
++    {SSL_IDEA, NID_idea_cbc},   /* SSL_ENC_IDEA_IDX 4 */
++    {SSL_eNULL, NID_undef},     /* SSL_ENC_NULL_IDX 5 */
++    {SSL_AES128, NID_aes_128_cbc}, /* SSL_ENC_AES128_IDX 6 */
++    {SSL_AES256, NID_aes_256_cbc}, /* SSL_ENC_AES256_IDX 7 */
++    {SSL_CAMELLIA128, NID_camellia_128_cbc}, /* SSL_ENC_CAMELLIA128_IDX 8 */
++    {SSL_CAMELLIA256, NID_camellia_256_cbc}, /* SSL_ENC_CAMELLIA256_IDX 9 */
++    {SSL_eGOST2814789CNT, NID_gost89_cnt}, /* SSL_ENC_GOST89_IDX 10 */
++    {SSL_SEED, NID_seed_cbc},   /* SSL_ENC_SEED_IDX 11 */
++    {SSL_AES128GCM, NID_aes_128_gcm}, /* SSL_ENC_AES128GCM_IDX 12 */
++    {SSL_AES256GCM, NID_aes_256_gcm} /* SSL_ENC_AES256GCM_IDX 13 */
++};
++
+ static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX] = {
+     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL
+@@ -187,11 +212,38 @@ static STACK_OF(SSL_COMP) *ssl_comp_methods = NULL;
+  * Constant SSL_MAX_DIGEST equal to size of digests array should be defined
+  * in the ssl_locl.h
+  */
++
+ #define SSL_MD_NUM_IDX  SSL_MAX_DIGEST
++
++/* NB: make sure indices in this table matches values above */
++static const ssl_cipher_table ssl_cipher_table_mac[SSL_MD_NUM_IDX] = {
++    {SSL_MD5, NID_md5},         /* SSL_MD_MD5_IDX 0 */
++    {SSL_SHA1, NID_sha1},       /* SSL_MD_SHA1_IDX 1 */
++    {SSL_GOST94, NID_id_GostR3411_94}, /* SSL_MD_GOST94_IDX 2 */
++    {SSL_GOST89MAC, NID_id_Gost28147_89_MAC}, /* SSL_MD_GOST89MAC_IDX 3 */
++    {SSL_SHA256, NID_sha256},   /* SSL_MD_SHA256_IDX 4 */
++    {SSL_SHA384, NID_sha384}    /* SSL_MD_SHA384_IDX 5 */
++};
++
+ static const EVP_MD *ssl_digest_methods[SSL_MD_NUM_IDX] = {
+     NULL, NULL, NULL, NULL, NULL, NULL
+ };
+ 
++/* Utility function for table lookup */
++static int ssl_cipher_info_find(const ssl_cipher_table * table,
++                                size_t table_cnt, unsigned long mask)
++{
++    size_t i;
++    for (i = 0; i &lt; table_cnt; i++, table++) {
++        if (table-&gt;mask == mask)
++            return i;
++    }
++    return -1;
++}
++
++#define ssl_cipher_info_lookup(table, x) \
++    ssl_cipher_info_find(table, sizeof(table)/sizeof(*table), x)
++
+ /*
+  * PKEY_TYPE for GOST89MAC is known in advance, but, because implementation
+  * is engine-provided, we'll fill it only if corresponding EVP_PKEY_METHOD is
+@@ -403,61 +455,25 @@ static int get_optional_pkey_id(const char *pkey_name)
+ 
+ void ssl_load_ciphers(void)
+ {
+-    ssl_cipher_methods[SSL_ENC_DES_IDX] = EVP_get_cipherbyname(SN_des_cbc);
+-    ssl_cipher_methods[SSL_ENC_3DES_IDX] =
+-        EVP_get_cipherbyname(SN_des_ede3_cbc);
+-    ssl_cipher_methods[SSL_ENC_RC4_IDX] = EVP_get_cipherbyname(SN_rc4);
+-    ssl_cipher_methods[SSL_ENC_RC2_IDX] = EVP_get_cipherbyname(SN_rc2_cbc);
+-#ifndef OPENSSL_NO_IDEA
+-    ssl_cipher_methods[SSL_ENC_IDEA_IDX] = EVP_get_cipherbyname(SN_idea_cbc);
+-#else
+-    ssl_cipher_methods[SSL_ENC_IDEA_IDX] = NULL;
+-#endif
+-    ssl_cipher_methods[SSL_ENC_AES128_IDX] =
+-        EVP_get_cipherbyname(SN_aes_128_cbc);
+-    ssl_cipher_methods[SSL_ENC_AES256_IDX] =
+-        EVP_get_cipherbyname(SN_aes_256_cbc);
+-    ssl_cipher_methods[SSL_ENC_CAMELLIA128_IDX] =
+-        EVP_get_cipherbyname(SN_camellia_128_cbc);
+-    ssl_cipher_methods[SSL_ENC_CAMELLIA256_IDX] =
+-        EVP_get_cipherbyname(SN_camellia_256_cbc);
+-    ssl_cipher_methods[SSL_ENC_GOST89_IDX] =
+-        EVP_get_cipherbyname(SN_gost89_cnt);
+-    ssl_cipher_methods[SSL_ENC_SEED_IDX] = EVP_get_cipherbyname(SN_seed_cbc);
+-
+-    ssl_cipher_methods[SSL_ENC_AES128GCM_IDX] =
+-        EVP_get_cipherbyname(SN_aes_128_gcm);
+-    ssl_cipher_methods[SSL_ENC_AES256GCM_IDX] =
+-        EVP_get_cipherbyname(SN_aes_256_gcm);
+-
+-    ssl_digest_methods[SSL_MD_MD5_IDX] = EVP_get_digestbyname(SN_md5);
+-    ssl_mac_secret_size[SSL_MD_MD5_IDX] =
+-        EVP_MD_size(ssl_digest_methods[SSL_MD_MD5_IDX]);
+-    OPENSSL_assert(ssl_mac_secret_size[SSL_MD_MD5_IDX] &gt;= 0);
+-    ssl_digest_methods[SSL_MD_SHA1_IDX] = EVP_get_digestbyname(SN_sha1);
+-    ssl_mac_secret_size[SSL_MD_SHA1_IDX] =
+-        EVP_MD_size(ssl_digest_methods[SSL_MD_SHA1_IDX]);
+-    OPENSSL_assert(ssl_mac_secret_size[SSL_MD_SHA1_IDX] &gt;= 0);
+-    ssl_digest_methods[SSL_MD_GOST94_IDX] =
+-        EVP_get_digestbyname(SN_id_GostR3411_94);
+-    if (ssl_digest_methods[SSL_MD_GOST94_IDX]) {
+-        ssl_mac_secret_size[SSL_MD_GOST94_IDX] =
+-            EVP_MD_size(ssl_digest_methods[SSL_MD_GOST94_IDX]);
+-        OPENSSL_assert(ssl_mac_secret_size[SSL_MD_GOST94_IDX] &gt;= 0);
+-    }
+-    ssl_digest_methods[SSL_MD_GOST89MAC_IDX] =
+-        EVP_get_digestbyname(SN_id_Gost28147_89_MAC);
+-    ssl_mac_pkey_id[SSL_MD_GOST89MAC_IDX] = get_optional_pkey_id(&quot;gost-mac&quot;);
+-    if (ssl_mac_pkey_id[SSL_MD_GOST89MAC_IDX]) {
+-        ssl_mac_secret_size[SSL_MD_GOST89MAC_IDX] = 32;
++    size_t i;
++    const ssl_cipher_table *t;
++    for (i = 0, t = ssl_cipher_table_cipher; i &lt; SSL_ENC_NUM_IDX; i++, t++) {
++        if (t-&gt;nid == NID_undef)
++            ssl_cipher_methods[i] = NULL;
++        else
++            ssl_cipher_methods[i] = EVP_get_cipherbynid(t-&gt;nid);
+     }
+ 
+-    ssl_digest_methods[SSL_MD_SHA256_IDX] = EVP_get_digestbyname(SN_sha256);
+-    ssl_mac_secret_size[SSL_MD_SHA256_IDX] =
+-        EVP_MD_size(ssl_digest_methods[SSL_MD_SHA256_IDX]);
+-    ssl_digest_methods[SSL_MD_SHA384_IDX] = EVP_get_digestbyname(SN_sha384);
+-    ssl_mac_secret_size[SSL_MD_SHA384_IDX] =
+-        EVP_MD_size(ssl_digest_methods[SSL_MD_SHA384_IDX]);
++    for (i = 0, t = ssl_cipher_table_mac; i &lt; SSL_MD_NUM_IDX; i++, t++) {
++        ssl_digest_methods[i] = EVP_get_digestbynid(t-&gt;nid);
++        if (ssl_digest_methods[i]) {
++            ssl_mac_secret_size[i] = EVP_MD_size(ssl_digest_methods[i]);
++            OPENSSL_assert(ssl_mac_secret_size[i] &gt;= 0);
++        }
++    }
++    /* Make sure we can access MD5 and SHA1 */
++    OPENSSL_assert(ssl_digest_methods[SSL_MD_MD5_IDX] != NULL);
++    OPENSSL_assert(ssl_digest_methods[SSL_MD_SHA1_IDX] != NULL);
+ }
+ 
+ #ifndef OPENSSL_NO_COMP
+@@ -540,55 +556,9 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
+     if ((enc == NULL) || (md == NULL))
+         return 0;
+ 
+-    switch (c-&gt;algorithm_enc) {
+-    case SSL_DES:
+-        i = SSL_ENC_DES_IDX;
+-        break;
+-    case SSL_3DES:
+-        i = SSL_ENC_3DES_IDX;
+-        break;
+-    case SSL_RC4:
+-        i = SSL_ENC_RC4_IDX;
+-        break;
+-    case SSL_RC2:
+-        i = SSL_ENC_RC2_IDX;
+-        break;
+-    case SSL_IDEA:
+-        i = SSL_ENC_IDEA_IDX;
+-        break;
+-    case SSL_eNULL:
+-        i = SSL_ENC_NULL_IDX;
+-        break;
+-    case SSL_AES128:
+-        i = SSL_ENC_AES128_IDX;
+-        break;
+-    case SSL_AES256:
+-        i = SSL_ENC_AES256_IDX;
+-        break;
+-    case SSL_CAMELLIA128:
+-        i = SSL_ENC_CAMELLIA128_IDX;
+-        break;
+-    case SSL_CAMELLIA256:
+-        i = SSL_ENC_CAMELLIA256_IDX;
+-        break;
+-    case SSL_eGOST2814789CNT:
+-        i = SSL_ENC_GOST89_IDX;
+-        break;
+-    case SSL_SEED:
+-        i = SSL_ENC_SEED_IDX;
+-        break;
+-    case SSL_AES128GCM:
+-        i = SSL_ENC_AES128GCM_IDX;
+-        break;
+-    case SSL_AES256GCM:
+-        i = SSL_ENC_AES256GCM_IDX;
+-        break;
+-    default:
+-        i = -1;
+-        break;
+-    }
++    i = ssl_cipher_info_lookup(ssl_cipher_table_cipher, c-&gt;algorithm_enc);
+ 
+-    if ((i &lt; 0) || (i &gt;= SSL_ENC_NUM_IDX))
++    if (i == -1)
+         *enc = NULL;
+     else {
+         if (i == SSL_ENC_NULL_IDX)
+@@ -597,30 +567,8 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
+             *enc = ssl_cipher_methods[i];
+     }
+ 
+-    switch (c-&gt;algorithm_mac) {
+-    case SSL_MD5:
+-        i = SSL_MD_MD5_IDX;
+-        break;
+-    case SSL_SHA1:
+-        i = SSL_MD_SHA1_IDX;
+-        break;
+-    case SSL_SHA256:
+-        i = SSL_MD_SHA256_IDX;
+-        break;
+-    case SSL_SHA384:
+-        i = SSL_MD_SHA384_IDX;
+-        break;
+-    case SSL_GOST94:
+-        i = SSL_MD_GOST94_IDX;
+-        break;
+-    case SSL_GOST89MAC:
+-        i = SSL_MD_GOST89MAC_IDX;
+-        break;
+-    default:
+-        i = -1;
+-        break;
+-    }
+-    if ((i &lt; 0) || (i &gt;= SSL_MD_NUM_IDX)) {
++    i = ssl_cipher_info_lookup(ssl_cipher_table_mac, c-&gt;algorithm_mac);
++    if (i == -1) {
+         *md = NULL;
+         if (mac_pkey_type != NULL)
+             *mac_pkey_type = NID_undef;
+@@ -2073,3 +2021,25 @@ const SSL_CIPHER *SSL_CIPHER_find(SSL *ssl, const unsigned char *ptr)
+ {
+     return ssl-&gt;method-&gt;get_cipher_by_char(ptr);
+ }
++
++int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *c)
++{
++    int i;
++    if (c == NULL)
++        return -1;
++    i = ssl_cipher_info_lookup(ssl_cipher_table_cipher, c-&gt;algorithm_enc);
++    if (i == -1)
++        return -1;
++    return ssl_cipher_table_cipher[i].nid;
++}
++
++int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *c)
++{
++    int i;
++    if (c == NULL)
++        return -1;
++    i = ssl_cipher_info_lookup(ssl_cipher_table_mac, c-&gt;algorithm_mac);
++    if (i == -1)
++        return -1;
++    return ssl_cipher_table_mac[i].nid;
++}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000932.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000937.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#933">[ date ]</a>
+              <a href="thread.html#933">[ thread ]</a>
+              <a href="subject.html#933">[ subject ]</a>
+              <a href="author.html#933">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

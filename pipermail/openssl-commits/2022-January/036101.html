@@ -1,0 +1,1309 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2022-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1642503161.601702.1299636.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="036099.html">
+   <LINK REL="Next"  HREF="036104.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1642503161.601702.1299636.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Tue Jan 18 10:52:41 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="036099.html">[openssl]  master update
+</A></li>
+        <LI>Next message (by thread): <A HREF="036104.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36101">[ date ]</a>
+              <a href="thread.html#36101">[ thread ]</a>
+              <a href="subject.html#36101">[ subject ]</a>
+              <a href="author.html#36101">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  15b7175f558bf9eb057ec3266685486f727dd70f (commit)
+      from  c1167f09d840b109ef1c1c1485e3de64be2fc625 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 15b7175f558bf9eb057ec3266685486f727dd70f
+Author: Daniel Hu &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Daniel.Hu at arm.com</A>&gt;
+Date:   Tue Oct 19 22:49:05 2021 +0100
+
+    SM4 optimization for ARM by HW instruction
+    
+    This patch implements the SM4 optimization for ARM processor,
+    using SM4 HW instruction, which is an optional feature of
+    crypto extension for aarch64 V8.
+    
+    Tested on some modern ARM micro-architectures with SM4 support, the
+    performance uplift can be observed around 8X~40X over existing
+    C implementation in openssl. Algorithms that can be parallelized
+    (like CTR, ECB, CBC decryption) are on higher end, with algorithm
+    like CBC encryption on lower end (due to inter-block dependency)
+    
+    Perf data on Yitian-710 2.75GHz hardware, before and after optimization:
+    
+    Before:
+      type      16 bytes     64 bytes    256 bytes    1024 bytes   8192 bytes  16384 bytes
+      SM4-CTR  105787.80k   107837.87k   108380.84k   108462.08k   108549.46k   108554.92k
+      SM4-ECB  111924.58k   118173.76k   119776.00k   120093.70k   120264.02k   120274.94k
+      SM4-CBC  106428.09k   109190.98k   109674.33k   109774.51k   109827.41k   109827.41k
+    
+    After (7.4x - 36.6x faster):
+      type      16 bytes     64 bytes    256 bytes    1024 bytes   8192 bytes  16384 bytes
+      SM4-CTR  781979.02k  2432994.28k  3437753.86k  3834177.88k  3963715.58k  3974556.33k
+      SM4-ECB  937590.69k  2941689.02k  3945751.81k  4328655.87k  4459181.40k  4468692.31k
+      SM4-CBC  890639.88k  1027746.58k  1050621.78k  1056696.66k  1058613.93k  1058701.31k
+    
+    Signed-off-by: Daniel Hu &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Daniel.Hu at arm.com</A>&gt;
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/17455">https://github.com/openssl/openssl/pull/17455</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/arm64cpuid.pl                               |   8 +
+ crypto/arm_arch.h                                  |   1 +
+ crypto/armcap.c                                    |  10 +
+ crypto/evp/e_sm4.c                                 | 193 +++++--
+ crypto/sm4/asm/sm4-armv8.pl                        | 635 +++++++++++++++++++++
+ crypto/sm4/build.info                              |  32 +-
+ include/crypto/sm4_platform.h                      |  48 ++
+ providers/implementations/ciphers/cipher_sm4.h     |   1 +
+ .../implementations/ciphers/cipher_sm4_gcm_hw.c    |  20 +-
+ providers/implementations/ciphers/cipher_sm4_hw.c  |  57 +-
+ 10 files changed, 945 insertions(+), 60 deletions(-)
+ create mode 100755 crypto/sm4/asm/sm4-armv8.pl
+ create mode 100644 include/crypto/sm4_platform.h
+
+diff --git a/crypto/arm64cpuid.pl b/crypto/arm64cpuid.pl
+index b30f505339..1841c0cc04 100755
+--- a/crypto/arm64cpuid.pl
++++ b/crypto/arm64cpuid.pl
+@@ -80,6 +80,14 @@ _armv8_pmull_probe:
+ 	ret
+ .size	_armv8_pmull_probe,.-_armv8_pmull_probe
+ 
++.globl	_armv8_sm4_probe
++.type	_armv8_sm4_probe,%function
++_armv8_sm4_probe:
++	AARCH64_VALID_CALL_TARGET
++	.long	0xcec08400	// sm4e	v0.4s, v0.4s
++	ret
++.size	_armv8_sm4_probe,.-_armv8_sm4_probe
++
+ .globl	_armv8_sha512_probe
+ .type	_armv8_sha512_probe,%function
+ _armv8_sha512_probe:
+diff --git a/crypto/arm_arch.h b/crypto/arm_arch.h
+index 77173cae42..291620ebc9 100644
+--- a/crypto/arm_arch.h
++++ b/crypto/arm_arch.h
+@@ -80,6 +80,7 @@ extern unsigned int OPENSSL_armv8_rsa_neonized;
+ # define ARMV8_CPUID     (1&lt;&lt;7)
+ # define ARMV8_RNG       (1&lt;&lt;8)
+ # define ARMV8_SM3       (1&lt;&lt;9)
++# define ARMV8_SM4       (1&lt;&lt;10)
+ 
+ /*
+  * MIDR_EL1 system register
+diff --git a/crypto/armcap.c b/crypto/armcap.c
+index 93003c9121..5016987eeb 100644
+--- a/crypto/armcap.c
++++ b/crypto/armcap.c
+@@ -54,6 +54,7 @@ void _armv8_sha256_probe(void);
+ void _armv8_pmull_probe(void);
+ # ifdef __aarch64__
+ void _armv8_sm3_probe(void);
++void _armv8_sm4_probe(void);
+ void _armv8_sha512_probe(void);
+ unsigned int _armv8_cpuid_probe(void);
+ void _armv8_rng_probe(void);
+@@ -171,6 +172,7 @@ static unsigned long getauxval(unsigned long key)
+ #  define HWCAP_CE_SHA256        (1 &lt;&lt; 6)
+ #  define HWCAP_CPUID            (1 &lt;&lt; 11)
+ #  define HWCAP_CE_SM3           (1 &lt;&lt; 18)
++#  define HWCAP_CE_SM4           (1 &lt;&lt; 19)
+ #  define HWCAP_CE_SHA512        (1 &lt;&lt; 21)
+                                   /* AT_HWCAP2 */
+ #  define HWCAP2                 26
+@@ -242,6 +244,9 @@ void OPENSSL_cpuid_setup(void)
+             OPENSSL_armcap_P |= ARMV8_SHA256;
+ 
+ #  ifdef __aarch64__
++        if (hwcap &amp; HWCAP_CE_SM4)
++            OPENSSL_armcap_P |= ARMV8_SM4;
++
+         if (hwcap &amp; HWCAP_CE_SHA512)
+             OPENSSL_armcap_P |= ARMV8_SHA512;
+ 
+@@ -293,6 +298,11 @@ void OPENSSL_cpuid_setup(void)
+             OPENSSL_armcap_P |= ARMV8_SHA256;
+         }
+ #  if defined(__aarch64__) &amp;&amp; !defined(__APPLE__)
++        if (sigsetjmp(ill_jmp, 1) == 0) {
++            _armv8_sm4_probe();
++            OPENSSL_armcap_P |= ARMV8_SM4;
++        }
++
+         if (sigsetjmp(ill_jmp, 1) == 0) {
+             _armv8_sha512_probe();
+             OPENSSL_armcap_P |= ARMV8_SHA512;
+diff --git a/crypto/evp/e_sm4.c b/crypto/evp/e_sm4.c
+index abd603015c..bff79ff197 100644
+--- a/crypto/evp/e_sm4.c
++++ b/crypto/evp/e_sm4.c
+@@ -17,92 +17,187 @@
+ # include &lt;openssl/modes.h&gt;
+ # include &quot;crypto/sm4.h&quot;
+ # include &quot;crypto/evp.h&quot;
++# include &quot;crypto/sm4_platform.h&quot;
+ # include &quot;evp_local.h&quot;
+ 
+ typedef struct {
+-    SM4_KEY ks;
++    union {
++        OSSL_UNION_ALIGN;
++        SM4_KEY ks;
++    } ks;
++    block128_f block;
++    union {
++        ecb128_f ecb;
++        cbc128_f cbc;
++        ctr128_f ctr;
++    } stream;
+ } EVP_SM4_KEY;
+ 
++# define BLOCK_CIPHER_generic(nid,blocksize,ivlen,nmode,mode,MODE,flags) \
++static const EVP_CIPHER sm4_##mode = { \
++        nid##_##nmode,blocksize,128/8,ivlen, \
++        flags|EVP_CIPH_##MODE##_MODE,   \
++        EVP_ORIG_GLOBAL,                \
++        sm4_init_key,                   \
++        sm4_##mode##_cipher,            \
++        NULL,                           \
++        sizeof(EVP_SM4_KEY),            \
++        NULL,NULL,NULL,NULL }; \
++const EVP_CIPHER *EVP_sm4_##mode(void) \
++{ return &amp;sm4_##mode; }
++
++#define DEFINE_BLOCK_CIPHERS(nid,flags)             \
++        BLOCK_CIPHER_generic(nid,16,16,cbc,cbc,CBC,flags|EVP_CIPH_FLAG_DEFAULT_ASN1)     \
++        BLOCK_CIPHER_generic(nid,16,0,ecb,ecb,ECB,flags|EVP_CIPH_FLAG_DEFAULT_ASN1)      \
++        BLOCK_CIPHER_generic(nid,1,16,ofb128,ofb,OFB,flags|EVP_CIPH_FLAG_DEFAULT_ASN1)   \
++        BLOCK_CIPHER_generic(nid,1,16,cfb128,cfb,CFB,flags|EVP_CIPH_FLAG_DEFAULT_ASN1)   \
++        BLOCK_CIPHER_generic(nid,1,16,ctr,ctr,CTR,flags)
++
+ static int sm4_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+                         const unsigned char *iv, int enc)
+ {
+-    ossl_sm4_set_key(key, EVP_CIPHER_CTX_get_cipher_data(ctx));
++    int mode;
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
++
++    mode = EVP_CIPHER_CTX_get_mode(ctx);
++    if ((mode == EVP_CIPH_ECB_MODE || mode == EVP_CIPH_CBC_MODE)
++        &amp;&amp; !enc) {
++#ifdef HWSM4_CAPABLE
++        if (HWSM4_CAPABLE) {
++            HWSM4_set_decrypt_key(key, &amp;dat-&gt;ks.ks);
++            dat-&gt;block = (block128_f) HWSM4_decrypt;
++            dat-&gt;stream.cbc = NULL;
++# ifdef HWSM4_cbc_encrypt
++            if (mode == EVP_CIPH_CBC_MODE)
++                dat-&gt;stream.cbc = (cbc128_f) HWSM4_cbc_encrypt;
++# endif
++# ifdef HWSM4_ecb_encrypt
++            if (mode == EVP_CIPH_ECB_MODE)
++                dat-&gt;stream.ecb = (ecb128_f) HWSM4_ecb_encrypt;
++# endif
++        } else
++#endif
++        {
++            dat-&gt;block = (block128_f) ossl_sm4_decrypt;
++            ossl_sm4_set_key(key, EVP_CIPHER_CTX_get_cipher_data(ctx));
++        }
++    } else
++#ifdef HWSM4_CAPABLE
++    if (HWSM4_CAPABLE) {
++        HWSM4_set_encrypt_key(key, &amp;dat-&gt;ks.ks);
++        dat-&gt;block = (block128_f) HWSM4_encrypt;
++        dat-&gt;stream.cbc = NULL;
++# ifdef HWSM4_cbc_encrypt
++        if (mode == EVP_CIPH_CBC_MODE)
++            dat-&gt;stream.cbc = (cbc128_f) HWSM4_cbc_encrypt;
++        else
++# endif
++# ifdef HWSM4_ecb_encrypt
++        if (mode == EVP_CIPH_ECB_MODE)
++            dat-&gt;stream.ecb = (ecb128_f) HWSM4_ecb_encrypt;
++        else
++# endif
++# ifdef HWSM4_ctr32_encrypt_blocks
++        if (mode == EVP_CIPH_CTR_MODE)
++            dat-&gt;stream.ctr = (ctr128_f) HWSM4_ctr32_encrypt_blocks;
++        else
++# endif
++            (void)0;            /* terminate potentially open 'else' */
++    } else
++#endif
++    {
++        dat-&gt;block = (block128_f) ossl_sm4_encrypt;
++        ossl_sm4_set_key(key, EVP_CIPHER_CTX_get_cipher_data(ctx));
++    }
+     return 1;
+ }
+ 
+-static void sm4_cbc_encrypt(const unsigned char *in, unsigned char *out,
+-                            size_t len, const SM4_KEY *key,
+-                            unsigned char *ivec, const int enc)
++static int sm4_cbc_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                          const unsigned char *in, size_t len)
+ {
+-    if (enc)
+-        CRYPTO_cbc128_encrypt(in, out, len, key, ivec,
+-                              (block128_f)ossl_sm4_encrypt);
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
++
++    if (dat-&gt;stream.cbc)
++        (*dat-&gt;stream.cbc) (in, out, len, &amp;dat-&gt;ks.ks, ctx-&gt;iv,
++                            EVP_CIPHER_CTX_is_encrypting(ctx));
++    else if (EVP_CIPHER_CTX_is_encrypting(ctx))
++        CRYPTO_cbc128_encrypt(in, out, len, &amp;dat-&gt;ks, ctx-&gt;iv,
++                              dat-&gt;block);
+     else
+-        CRYPTO_cbc128_decrypt(in, out, len, key, ivec,
+-                              (block128_f)ossl_sm4_decrypt);
++        CRYPTO_cbc128_decrypt(in, out, len, &amp;dat-&gt;ks,
++                              ctx-&gt;iv, dat-&gt;block);
++    return 1;
+ }
+ 
+-static void sm4_cfb128_encrypt(const unsigned char *in, unsigned char *out,
+-                               size_t length, const SM4_KEY *key,
+-                               unsigned char *ivec, int *num, const int enc)
++static int sm4_cfb_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                          const unsigned char *in, size_t len)
+ {
+-    CRYPTO_cfb128_encrypt(in, out, length, key, ivec, num, enc,
+-                          (block128_f)ossl_sm4_encrypt);
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
++    int num = EVP_CIPHER_CTX_get_num(ctx);
++
++    CRYPTO_cfb128_encrypt(in, out, len, &amp;dat-&gt;ks,
++                          ctx-&gt;iv, &amp;num,
++                          EVP_CIPHER_CTX_is_encrypting(ctx), dat-&gt;block);
++    EVP_CIPHER_CTX_set_num(ctx, num);
++    return 1;
+ }
+ 
+-static void sm4_ecb_encrypt(const unsigned char *in, unsigned char *out,
+-                            const SM4_KEY *key, const int enc)
++static int sm4_ecb_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                          const unsigned char *in, size_t len)
+ {
+-    if (enc)
+-        ossl_sm4_encrypt(in, out, key);
++    size_t bl = EVP_CIPHER_CTX_get_block_size(ctx);
++    size_t i;
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
++
++    if (len &lt; bl)
++        return 1;
++
++    if (dat-&gt;stream.ecb != NULL)
++        (*dat-&gt;stream.ecb) (in, out, len, &amp;dat-&gt;ks.ks,
++                            EVP_CIPHER_CTX_is_encrypting(ctx));
+     else
+-        ossl_sm4_decrypt(in, out, key);
++        for (i = 0, len -= bl; i &lt;= len; i += bl)
++            (*dat-&gt;block) (in + i, out + i, &amp;dat-&gt;ks);
++
++    return 1;
+ }
+ 
+-static void sm4_ofb128_encrypt(const unsigned char *in, unsigned char *out,
+-                               size_t length, const SM4_KEY *key,
+-                               unsigned char *ivec, int *num)
++static int sm4_ofb_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                          const unsigned char *in, size_t len)
+ {
+-    CRYPTO_ofb128_encrypt(in, out, length, key, ivec, num,
+-                          (block128_f)ossl_sm4_encrypt);
+-}
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
++    int num = EVP_CIPHER_CTX_get_num(ctx);
+ 
+-IMPLEMENT_BLOCK_CIPHER(sm4, ks, sm4, EVP_SM4_KEY, NID_sm4,
+-                       16, 16, 16, 128, EVP_CIPH_FLAG_DEFAULT_ASN1,
+-                       sm4_init_key, 0, 0, 0, 0)
++    CRYPTO_ofb128_encrypt(in, out, len, &amp;dat-&gt;ks,
++                          ctx-&gt;iv, &amp;num, dat-&gt;block);
++    EVP_CIPHER_CTX_set_num(ctx, num);
++    return 1;
++}
+ 
+ static int sm4_ctr_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                           const unsigned char *in, size_t len)
+ {
+     int n = EVP_CIPHER_CTX_get_num(ctx);
+     unsigned int num;
+-    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY, ctx);
++    EVP_SM4_KEY *dat = EVP_C_DATA(EVP_SM4_KEY,ctx);
+ 
+     if (n &lt; 0)
+         return 0;
+     num = (unsigned int)n;
+ 
+-    CRYPTO_ctr128_encrypt(in, out, len, &amp;dat-&gt;ks, ctx-&gt;iv,
+-                          EVP_CIPHER_CTX_buf_noconst(ctx), &amp;num,
+-                          (block128_f)ossl_sm4_encrypt);
++    if (dat-&gt;stream.ctr)
++        CRYPTO_ctr128_encrypt_ctr32(in, out, len, &amp;dat-&gt;ks,
++                                    ctx-&gt;iv,
++                                    EVP_CIPHER_CTX_buf_noconst(ctx),
++                                    &amp;num, dat-&gt;stream.ctr);
++    else
++        CRYPTO_ctr128_encrypt(in, out, len, &amp;dat-&gt;ks,
++                              ctx-&gt;iv,
++                              EVP_CIPHER_CTX_buf_noconst(ctx), &amp;num,
++                              dat-&gt;block);
+     EVP_CIPHER_CTX_set_num(ctx, num);
+     return 1;
+ }
+ 
+-static const EVP_CIPHER sm4_ctr_mode = {
+-    NID_sm4_ctr, 1, 16, 16,
+-    EVP_CIPH_CTR_MODE,
+-    EVP_ORIG_GLOBAL,
+-    sm4_init_key,
+-    sm4_ctr_cipher,
+-    NULL,
+-    sizeof(EVP_SM4_KEY),
+-    NULL, NULL, NULL, NULL
+-};
+-
+-const EVP_CIPHER *EVP_sm4_ctr(void)
+-{
+-    return &amp;sm4_ctr_mode;
+-}
+-
++DEFINE_BLOCK_CIPHERS(NID_sm4, 0)
+ #endif
+diff --git a/crypto/sm4/asm/sm4-armv8.pl b/crypto/sm4/asm/sm4-armv8.pl
+new file mode 100755
+index 0000000000..7358a6e6a2
+--- /dev/null
++++ b/crypto/sm4/asm/sm4-armv8.pl
+@@ -0,0 +1,635 @@
++#! /usr/bin/env perl
++# Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++#
++# This module implements support for SM4 hw support on aarch64
++# Oct 2021
++#
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}arm-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/arm-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate arm-xlate.pl&quot;;
++
++open OUT,&quot;| \&quot;$^X\&quot; $xlate $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++*STDOUT=*OUT;
++
++$prefix=&quot;sm4_v8&quot;;
++my @rks=map(&quot;v$_&quot;,(0..7));
++
++sub rev32() {
++my $dst = shift;
++my $src = shift;
++$code.=&lt;&lt;___;
++#ifndef __ARMEB__
++	rev32	$dst.16b,$src.16b
++#endif
++___
++}
++
++sub enc_blk () {
++my $data = shift;
++$code.=&lt;&lt;___;
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[0].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[1].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[2].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[3].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[4].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[5].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[6].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data.4s, at rks</A>[7].4s
++	rev64	$data.4S,$data.4S
++	ext	$data.16b,$data.16b,$data.16b,#8
++___
++}
++
++sub enc_4blks () {
++my $data0 = shift;
++my $data1 = shift;
++my $data2 = shift;
++my $data3 = shift;
++$code.=&lt;&lt;___;
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[0].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[0].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[0].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[0].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[1].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[1].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[1].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[1].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[2].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[2].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[2].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[2].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[3].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[3].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[3].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[3].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[4].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[4].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[4].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[4].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[5].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[5].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[5].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[5].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[6].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[6].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[6].4s
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[6].4s
++
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data0.4s, at rks</A>[7].4s
++	rev64	$data0.4S,$data0.4S
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data1.4s, at rks</A>[7].4s
++	ext	$data0.16b,$data0.16b,$data0.16b,#8
++	rev64	$data1.4S,$data1.4S
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data2.4s, at rks</A>[7].4s
++	ext	$data1.16b,$data1.16b,$data1.16b,#8
++	rev64	$data2.4S,$data2.4S
++	sm4e	$<A HREF="../../../mailman/listinfo/openssl-commits.html">data3.4s, at rks</A>[7].4s
++	ext	$data2.16b,$data2.16b,$data2.16b,#8
++	rev64	$data3.4S,$data3.4S
++	ext	$data3.16b,$data3.16b,$data3.16b,#8
++___
++}
++
++$code=&lt;&lt;___;
++#include &quot;arm_arch.h&quot;
++.arch	armv8-a+crypto
++.text
++___
++
++{{{
++$code.=&lt;&lt;___;
++.align	6
++.Lck:
++	.long 0x00070E15, 0x1C232A31, 0x383F464D, 0x545B6269
++	.long 0x70777E85, 0x8C939AA1, 0xA8AFB6BD, 0xC4CBD2D9
++	.long 0xE0E7EEF5, 0xFC030A11, 0x181F262D, 0x343B4249
++	.long 0x50575E65, 0x6C737A81, 0x888F969D, 0xA4ABB2B9
++	.long 0xC0C7CED5, 0xDCE3EAF1, 0xF8FF060D, 0x141B2229
++	.long 0x30373E45, 0x4C535A61, 0x686F767D, 0x848B9299
++	.long 0xA0A7AEB5, 0xBCC3CAD1, 0xD8DFE6ED, 0xF4FB0209
++	.long 0x10171E25, 0x2C333A41, 0x484F565D, 0x646B7279
++.Lfk:
++	.long 0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc
++___
++}}}
++
++{{{
++my ($key,$keys)=(&quot;x0&quot;,&quot;x1&quot;);
++my ($tmp)=(&quot;x2&quot;);
++my ($key0,$key1,$key2,$key3,$key4,$key5,$key6,$key7)=map(&quot;v$_&quot;,(0..7));
++my ($const0,$const1,$const2,$const3,$const4,$const5,$const6,$const7)=map(&quot;v$_&quot;,(16..23));
++my ($fkconst) = (&quot;v24&quot;);
++$code.=&lt;&lt;___;
++.globl	${prefix}_set_encrypt_key
++.type	${prefix}_set_encrypt_key,%function
++.align	5
++${prefix}_set_encrypt_key:
++	AARCH64_VALID_CALL_TARGET
++	ld1	{$key0.4s},[$key]
++	adr	$tmp,.Lfk
++	ld1	{$fkconst.4s},[$tmp]
++	adr	$tmp,.Lck
++	ld1	{$const0.4s,$const1.4s,$const2.4s,$const3.4s},[$tmp],64
++___
++	&amp;rev32($key0, $key0);
++$code.=&lt;&lt;___;
++	ld1	{$const4.4s,$const5.4s,$const6.4s,$const7.4s},[$tmp]
++	eor	$key0.16b,$key0.16b,$fkconst.16b;
++	sm4ekey	$key0.4S,$key0.4S,$const0.4S
++	sm4ekey	$key1.4S,$key0.4S,$const1.4S
++	sm4ekey	$key2.4S,$key1.4S,$const2.4S
++	sm4ekey	$key3.4S,$key2.4S,$const3.4S
++	sm4ekey	$key4.4S,$key3.4S,$const4.4S
++	st1	{$key0.4s,$key1.4s,$key2.4s,$key3.4s},[$keys],64
++	sm4ekey	$key5.4S,$key4.4S,$const5.4S
++	sm4ekey	$key6.4S,$key5.4S,$const6.4S
++	sm4ekey	$key7.4S,$key6.4S,$const7.4S
++	st1	{$key4.4s,$key5.4s,$key6.4s,$key7.4s},[$keys]
++	ret
++.size	${prefix}_set_encrypt_key,.-${prefix}_set_encrypt_key
++___
++}}}
++
++{{{
++my ($key,$keys)=(&quot;x0&quot;,&quot;x1&quot;);
++my ($tmp)=(&quot;x2&quot;);
++my ($key7,$key6,$key5,$key4,$key3,$key2,$key1,$key0)=map(&quot;v$_&quot;,(0..7));
++my ($const0,$const1,$const2,$const3,$const4,$const5,$const6,$const7)=map(&quot;v$_&quot;,(16..23));
++my ($fkconst) = (&quot;v24&quot;);
++$code.=&lt;&lt;___;
++.globl	${prefix}_set_decrypt_key
++.type	${prefix}_set_decrypt_key,%function
++.align	5
++${prefix}_set_decrypt_key:
++	AARCH64_VALID_CALL_TARGET
++	ld1	{$key0.4s},[$key]
++	adr	$tmp,.Lfk
++	ld1	{$fkconst.4s},[$tmp]
++	adr	$tmp, .Lck
++	ld1	{$const0.4s,$const1.4s,$const2.4s,$const3.4s},[$tmp],64
++___
++	&amp;rev32($key0, $key0);
++$code.=&lt;&lt;___;
++	ld1	{$const4.4s,$const5.4s,$const6.4s,$const7.4s},[$tmp]
++	eor	$key0.16b, $key0.16b,$fkconst.16b;
++	sm4ekey	$key0.4S,$key0.4S,$const0.4S
++	sm4ekey	$key1.4S,$key0.4S,$const1.4S
++	sm4ekey	$key2.4S,$key1.4S,$const2.4S
++	rev64	$key0.4s,$key0.4s
++	rev64	$key1.4s,$key1.4s
++	ext	$key0.16b,$key0.16b,$key0.16b,#8
++	ext	$key1.16b,$key1.16b,$key1.16b,#8
++	sm4ekey	$key3.4S,$key2.4S,$const3.4S
++	sm4ekey	$key4.4S,$key3.4S,$const4.4S
++	rev64	$key2.4s,$key2.4s
++	rev64	$key3.4s,$key3.4s
++	ext	$key2.16b,$key2.16b,$key2.16b,#8
++	ext	$key3.16b,$key3.16b,$key3.16b,#8
++	sm4ekey	$key5.4S,$key4.4S,$const5.4S
++	sm4ekey	$key6.4S,$key5.4S,$const6.4S
++	rev64	$key4.4s,$key4.4s
++	rev64	$key5.4s,$key5.4s
++	ext	$key4.16b,$key4.16b,$key4.16b,#8
++	ext	$key5.16b,$key5.16b,$key5.16b,#8
++	sm4ekey	$key7.4S,$key6.4S,$const7.4S
++	rev64	$key6.4s, $key6.4s
++	rev64	$key7.4s, $key7.4s
++	ext	$key6.16b,$key6.16b,$key6.16b,#8
++	ext	$key7.16b,$key7.16b,$key7.16b,#8
++	st1	{$key7.4s,$key6.4s,$key5.4s,$key4.4s},[$keys],64
++	st1	{$key3.4s,$key2.4s,$key1.4s,$key0.4s},[$keys]
++	ret
++.size	${prefix}_set_decrypt_key,.-${prefix}_set_decrypt_key
++___
++}}}
++
++{{{
++sub gen_block () {
++my $dir = shift;
++my ($inp,$out,$rk)=map(&quot;x$_&quot;,(0..2));
++my ($data)=(&quot;v16&quot;);
++$code.=&lt;&lt;___;
++.globl	${prefix}_${dir}crypt
++.type	${prefix}_${dir}crypt,%function
++.align	5
++${prefix}_${dir}crypt:
++	AARCH64_VALID_CALL_TARGET
++	ld1	{$data.4s},[$inp]
++	ld1	{@rks[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[3].4s},[$rk],64
++	ld1	{@rks[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[7].4s},[$rk]
++___
++	&amp;rev32($data,$data);
++	&amp;enc_blk($data);
++	&amp;rev32($data,$data);
++$code.=&lt;&lt;___;
++	st1	{$data.4s},[$out]
++	ret
++.size	${prefix}_${dir}crypt,.-${prefix}_${dir}crypt
++___
++}
++
++&amp;gen_block(&quot;en&quot;);
++&amp;gen_block(&quot;de&quot;);
++}}}
++
++{{{
++my ($inp,$out,$len,$rk)=map(&quot;x$_&quot;,(0..3));
++my ($enc) = (&quot;w4&quot;);
++my @dat=map(&quot;v$_&quot;,(16..23));
++$code.=&lt;&lt;___;
++.globl	${prefix}_ecb_encrypt
++.type	${prefix}_ecb_encrypt,%function
++.align	5
++${prefix}_ecb_encrypt:
++	AARCH64_VALID_CALL_TARGET
++	ld1	{@rks[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[3].4s},[$rk],#64
++	ld1	{@rks[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[7].4s},[$rk]
++1:
++	cmp	$len,#64
++	b.lt	1f
++	ld1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$inp],#64
++	cmp	$len,#128
++	b.lt	2f
++	ld1	{@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[7].4s},[$inp],#64
++	// 8 blocks
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[4]);
++	&amp;rev32(@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]);
++	&amp;rev32(@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]);
++	&amp;rev32(@dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;enc_4blks(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[4]);
++	&amp;rev32(@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]);
++$code.=&lt;&lt;___;
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++___
++	&amp;rev32(@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]);
++	&amp;rev32(@dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++$code.=&lt;&lt;___;
++	st1	{@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[7].4s},[$out],#64
++	subs	$len,$len,#128
++	b.gt	1b
++	ret
++	// 4 blocks
++2:
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++$code.=&lt;&lt;___;
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	subs	$len,$len,#64
++	b.gt	1b
++1:
++	subs	$len,$len,#16
++	b.lt	1f
++	ld1	{@dat[0].4s},[$inp],#16
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;enc_blk(@dat[0]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++$code.=&lt;&lt;___;
++	st1	{@dat[0].4s},[$out],#16
++	b.ne	1b
++1:
++	ret
++.size	${prefix}_ecb_encrypt,.-${prefix}_ecb_encrypt
++___
++}}}
++
++{{{
++my ($inp,$out,$len,$rk,$ivp)=map(&quot;x$_&quot;,(0..4));
++my ($enc) = (&quot;w5&quot;);
++my @dat=map(&quot;v$_&quot;,(16..23));
++my @in=map(&quot;v$_&quot;,(24..31));
++my ($ivec) = (&quot;v8&quot;);
++$code.=&lt;&lt;___;
++.globl	${prefix}_cbc_encrypt
++.type	${prefix}_cbc_encrypt,%function
++.align	5
++${prefix}_cbc_encrypt:
++	AARCH64_VALID_CALL_TARGET
++	stp	d8,d9,[sp, #-16]!
++
++	ld1	{@rks[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[3].4s},[$rk],#64
++	ld1	{@rks[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[7].4s},[$rk]
++	ld1	{$ivec.4s},[$ivp]
++	cmp	$enc,#0
++	b.eq	.Ldec
++1:
++	cmp	$len, #64
++	b.lt	1f
++	ld1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$inp],#64
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b,$ivec.16b
++___
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;enc_blk(@dat[0]);
++$code.=&lt;&lt;___;
++	eor	@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b
++___
++	&amp;enc_blk(@dat[1]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++$code.=&lt;&lt;___;
++	eor	@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1].16b
++___
++	&amp;enc_blk(@dat[2]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++$code.=&lt;&lt;___;
++	eor	@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2].16b
++___
++	&amp;enc_blk(@dat[3]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++$code.=&lt;&lt;___;
++	mov	$<A HREF="../../../mailman/listinfo/openssl-commits.html">ivec.16b, at dat</A>[3].16b
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	subs	$len,$len,#64
++	b.ne	1b
++1:
++	subs	$len,$len,#16
++	b.lt	3f
++	ld1	{@dat[0].4s},[$inp],#16
++	eor	$ivec.16b,$<A HREF="../../../mailman/listinfo/openssl-commits.html">ivec.16b, at dat</A>[0].16b
++___
++	&amp;rev32($ivec,$ivec);
++	&amp;enc_blk($ivec);
++	&amp;rev32($ivec,$ivec);
++$code.=&lt;&lt;___;
++	st1	{$ivec.16b},[$out],#16
++	b.ne	1b
++	b	3f
++.Ldec:
++1:
++	cmp	$len, #64
++	b.lt	1f
++	ld1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$inp]
++	ld1	{@in[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[3].4s},[$inp],#64
++	cmp	$len,#128
++	b.lt	2f
++	// 8 blocks mode
++	ld1	{@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[7].4s},[$inp]
++	ld1	{@in[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[7].4s},[$inp],#64
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3],$dat[3]);
++	&amp;rev32(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[4]);
++	&amp;rev32(@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]);
++	&amp;rev32(@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]);
++	&amp;rev32(@dat[7],$dat[7]);
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;enc_4blks(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[4]);
++	&amp;rev32(@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]);
++	&amp;rev32(@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]);
++	&amp;rev32(@dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++$code.=&lt;&lt;___;
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b,$ivec.16b
++	eor	@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[0].16b
++	eor	@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[1].16b
++	mov	$<A HREF="../../../mailman/listinfo/openssl-commits.html">ivec.16b, at in</A>[7].16b
++	eor	@dat[3].16b,$dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[2].16b
++	eor	@dat[4].16b,$dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[3].16b
++	eor	@dat[5].16b,$dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[4].16b
++	eor	@dat[6].16b,$dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[5].16b
++	eor	@dat[7].16b,$dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[6].16b
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	st1	{@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[7].4s},[$out],#64
++	subs	$len,$len,128
++	b.gt	1b
++	b	3f
++	// 4 blocks mode
++2:
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3],$dat[3]);
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++$code.=&lt;&lt;___;
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b,$ivec.16b
++	eor	@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[0].16b
++	mov	$<A HREF="../../../mailman/listinfo/openssl-commits.html">ivec.16b, at in</A>[3].16b
++	eor	@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[1].16b
++	eor	@dat[3].16b,$dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[2].16b
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	subs	$len,$len,#64
++	b.gt	1b
++1:
++	subs	$len,$len,#16
++	b.lt	3f
++	ld1	{@dat[0].4s},[$inp],#16
++	mov	@in[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b
++___
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;enc_blk(@dat[0]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++$code.=&lt;&lt;___;
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0].16b,$ivec.16b
++	mov	$<A HREF="../../../mailman/listinfo/openssl-commits.html">ivec.16b, at in</A>[0].16b
++	st1	{@dat[0].16b},[$out],#16
++	b.ne	1b
++3:
++	// save back IV
++	st1	{$ivec.16b},[$ivp]
++	ldp	d8,d9,[sp],#16
++	ret
++.size	${prefix}_cbc_encrypt,.-${prefix}_cbc_encrypt
++___
++}}}
++
++{{{
++my ($inp,$out,$len,$rk,$ivp)=map(&quot;x$_&quot;,(0..4));
++my ($ctr)=(&quot;w5&quot;);
++my @dat=map(&quot;v$_&quot;,(16..23));
++my @in=map(&quot;v$_&quot;,(24..31));
++my ($ivec)=(&quot;v8&quot;);
++$code.=&lt;&lt;___;
++.globl	${prefix}_ctr32_encrypt_blocks
++.type	${prefix}_ctr32_encrypt_blocks,%function
++.align	5
++${prefix}_ctr32_encrypt_blocks:
++	AARCH64_VALID_CALL_TARGET
++	stp	d8,d9,[sp, #-16]!
++
++	ld1	{$ivec.4s},[$ivp]
++	ld1	{@rks[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[3].4s},[$rk],64
++	ld1	{@rks[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at rks</A>[7].4s},[$rk]
++___
++	&amp;rev32($ivec,$ivec);
++$code.=&lt;&lt;___;
++	mov	$ctr,$ivec.s[3]
++1:
++	cmp	$len,#4
++	b.lt	1f
++	ld1	{@in[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[3].4s},[$inp],#64
++	mov	@dat[0].16b,$ivec.16b
++	mov	@dat[1].16b,$ivec.16b
++	mov	@dat[2].16b,$ivec.16b
++	mov	@dat[3].16b,$ivec.16b
++	add	$ctr,$ctr,#1
++	mov	$dat[1].s[3],$ctr
++	add	$ctr,$ctr,#1
++	mov	@dat[2].s[3],$ctr
++	add	$ctr,$ctr,#1
++	mov	@dat[3].s[3],$ctr
++	cmp	$len,#8
++	b.lt	2f
++	ld1	{@in[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at in</A>[7].4s},[$inp],#64
++	mov	@dat[4].16b,$ivec.16b
++	mov	@dat[5].16b,$ivec.16b
++	mov	@dat[6].16b,$ivec.16b
++	mov	@dat[7].16b,$ivec.16b
++	add	$ctr,$ctr,#1
++	mov	$dat[4].s[3],$ctr
++	add	$ctr,$ctr,#1
++	mov	@dat[5].s[3],$ctr
++	add	$ctr,$ctr,#1
++	mov	@dat[6].s[3],$ctr
++	add	$ctr,$ctr,#1
++	mov	@dat[7].s[3],$ctr
++___
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;enc_4blks(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[4]);
++	&amp;rev32(@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[5]);
++	&amp;rev32(@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[6]);
++	&amp;rev32(@dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[7]);
++$code.=&lt;&lt;___;
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[0].16b
++	eor	@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[1].16b
++	eor	@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[2].16b
++	eor	@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[3].16b
++	eor	@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[4].16b
++	eor	@dat[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[5].16b
++	eor	@dat[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[6].16b
++	eor	@dat[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[7].16b
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	st1	{@dat[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[7].4s},[$out],#64
++	subs	$len,$len,#8
++	b.eq	3f
++	add	$ctr,$ctr,#1
++	mov	$ivec.s[3],$ctr
++	b	1b
++2:
++___
++	&amp;enc_4blks(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++	&amp;rev32(@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[1]);
++	&amp;rev32(@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[2]);
++	&amp;rev32(@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[3]);
++$code.=&lt;&lt;___;
++	eor	@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[0].16b
++	eor	@dat[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[1].16b
++	eor	@dat[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[2].16b
++	eor	@dat[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at dat</A>[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[3].16b
++	st1	{@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">.4s, at dat</A>[3].4s},[$out],#64
++	subs	$len,$len,#4
++	b.eq	3f
++	add	$ctr,$ctr,#1
++	mov	$ivec.s[3],$ctr
++	b	1b
++1:
++	subs	$len,$len,#1
++	b.lt	3f
++	mov	$dat[0].16b,$ivec.16b
++	ld1	{@in[0].4s},[$inp],#16
++___
++	&amp;enc_blk(@dat[0]);
++	&amp;rev32(@dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at dat</A>[0]);
++$code.=&lt;&lt;___;
++	eor	$dat[0].16b,$dat[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">.16b, at in</A>[0].16b
++	st1	{$dat[0].4s},[$out],#16
++	b.eq	3f
++	add	$ctr,$ctr,#1
++	mov	$ivec.s[3],$ctr
++	b	1b
++3:
++	ldp	d8,d9,[sp],#16
++	ret
++.size	${prefix}_ctr32_encrypt_blocks,.-${prefix}_ctr32_encrypt_blocks
++___
++}}}
++########################################
++{   my  %opcode = (
++        &quot;sm4e&quot;          =&gt; 0xcec08400,
++        &quot;sm4ekey&quot;       =&gt; 0xce60c800);
++
++    sub unsm4 {
++        my ($mnemonic,$arg)=@_;
++
++        $arg =~ m/[qv]([0-9]+)[^,]*,\s*[qv]([0-9]+)[^,]*(?:,\s*[qv]([0-9]+))?/o
++        &amp;&amp;
++        sprintf &quot;.inst\t0x%08x\t//%s %s&quot;,
++                        $opcode{$mnemonic}|$1|($2&lt;&lt;5)|($3&lt;&lt;16),
++                        $mnemonic,$arg;
++    }
++}
++
++open SELF,$0;
++while(&lt;SELF&gt;) {
++        next if (/^#!/);
++        last if (!s/^#/\/\// and !/^$/);
++        print;
++}
++close SELF;
++
++foreach(split(&quot;\n&quot;,$code)) {
++	s/\`([^\`]*)\`/eval($1)/ge;
++
++	s/\b(sm4\w+)\s+([qv].*)/unsm4($1,$2)/ge;
++	print $_,&quot;\n&quot;;
++}
++
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/sm4/build.info b/crypto/sm4/build.info
+index b65a7d149e..e27aa49e67 100644
+--- a/crypto/sm4/build.info
++++ b/crypto/sm4/build.info
+@@ -1,4 +1,32 @@
+ LIBS=../../libcrypto
+-SOURCE[../../libcrypto]=\
+-        sm4.c
+ 
++IF[{- !$disabled{asm} -}]
++  $SM4DEF_aarch64=SM4_ASM
++  $SM4ASM_aarch64=sm4-armv8.S
++
++  # Now that we have defined all the arch specific variables, use the
++  # appropriate one, and define the appropriate macros
++  IF[$SM4ASM_{- $target{asm_arch} -}]
++    $SM4ASM=$SM4ASM_{- $target{asm_arch} -}
++    $SM4DEF=$SM4DEF_{- $target{asm_arch} -}
++  ENDIF
++ENDIF
++
++SOURCE[../../libcrypto]= $SM4ASM sm4.c
++
++
++# Implementations are now spread across several libraries, so the defines
++# need to be applied to all affected libraries and modules.
++DEFINE[../../libcrypto]=$SM4DEF
++DEFINE[../../providers/libfips.a]=$SM4DEF
++DEFINE[../../providers/libdefault.a]=$SM4DEF
++# We only need to include the SM4DEF stuff in the legacy provider when it's a
++# separate module and it's dynamically linked with libcrypto.  Otherwise, it
++# already gets everything that the static libcrypto.a has, and doesn't need it
++# added again.
++IF[{- !$disabled{module} &amp;&amp; !$disabled{shared} -}]
++  DEFINE[../providers/liblegacy.a]=$SM4DEF
++ENDIF
++
++GENERATE[sm4-armv8.S]=asm/sm4-armv8.pl
++INCLUDE[sm4-armv8.o]=..
+diff --git a/include/crypto/sm4_platform.h b/include/crypto/sm4_platform.h
+new file mode 100644
+index 0000000000..42c8b44a43
+--- /dev/null
++++ b/include/crypto/sm4_platform.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#ifndef OSSL_SM4_PLATFORM_H
++# define OSSL_SM4_PLATFORM_H
++# pragma once
++
++# if defined(OPENSSL_CPUID_OBJ)
++#  if (defined(__arm__) || defined(__arm) || defined(__aarch64__))
++#   include &quot;arm_arch.h&quot;
++#   if __ARM_MAX_ARCH__&gt;=8
++#    define HWSM4_CAPABLE (OPENSSL_armcap_P &amp; ARMV8_SM4)
++#    define HWSM4_set_encrypt_key sm4_v8_set_encrypt_key
++#    define HWSM4_set_decrypt_key sm4_v8_set_decrypt_key
++#    define HWSM4_encrypt sm4_v8_encrypt
++#    define HWSM4_decrypt sm4_v8_decrypt
++#    define HWSM4_cbc_encrypt sm4_v8_cbc_encrypt
++#    define HWSM4_ecb_encrypt sm4_v8_ecb_encrypt
++#    define HWSM4_ctr32_encrypt_blocks sm4_v8_ctr32_encrypt_blocks
++#   endif
++#  endif
++# endif /* OPENSSL_CPUID_OBJ */
++
++# if defined(HWSM4_CAPABLE)
++int HWSM4_set_encrypt_key(const unsigned char *userKey, SM4_KEY *key);
++int HWSM4_set_decrypt_key(const unsigned char *userKey, SM4_KEY *key);
++void HWSM4_encrypt(const unsigned char *in, unsigned char *out,
++                   const SM4_KEY *key);
++void HWSM4_decrypt(const unsigned char *in, unsigned char *out,
++                   const SM4_KEY *key);
++void HWSM4_cbc_encrypt(const unsigned char *in, unsigned char *out,
++                       size_t length, const SM4_KEY *key,
++                       unsigned char *ivec, const int enc);
++void HWSM4_ecb_encrypt(const unsigned char *in, unsigned char *out,
++                       size_t length, const SM4_KEY *key,
++                       const int enc);
++void HWSM4_ctr32_encrypt_blocks(const unsigned char *in, unsigned char *out,
++                                size_t len, const void *key,
++                                const unsigned char ivec[16]);
++# endif /* HWSM4_CAPABLE */
++
++#endif /* OSSL_SM4_PLATFORM_H */
+diff --git a/providers/implementations/ciphers/cipher_sm4.h b/providers/implementations/ciphers/cipher_sm4.h
+index f7f833fcb4..01a031a74d 100644
+--- a/providers/implementations/ciphers/cipher_sm4.h
++++ b/providers/implementations/ciphers/cipher_sm4.h
+@@ -9,6 +9,7 @@
+ 
+ #include &quot;prov/ciphercommon.h&quot;
+ #include &quot;crypto/sm4.h&quot;
++#include &quot;crypto/sm4_platform.h&quot;
+ 
+ typedef struct prov_cast_ctx_st {
+     PROV_CIPHER_CTX base;      /* Must be first */
+diff --git a/providers/implementations/ciphers/cipher_sm4_gcm_hw.c b/providers/implementations/ciphers/cipher_sm4_gcm_hw.c
+index 6bcd1ec406..c0c9b22bd3 100644
+--- a/providers/implementations/ciphers/cipher_sm4_gcm_hw.c
++++ b/providers/implementations/ciphers/cipher_sm4_gcm_hw.c
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include &quot;cipher_sm4_gcm.h&quot;
++#include &quot;crypto/sm4_platform.h&quot;
+ 
+ static int sm4_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
+                            size_t keylen)
+@@ -20,9 +21,22 @@ static int sm4_gcm_initkey(PROV_GCM_CTX *ctx, const unsigned char *key,
+     SM4_KEY *ks = &amp;actx-&gt;ks.ks;
+ 
+     ctx-&gt;ks = ks;
+-    ossl_sm4_set_key(key, ks);
+-    CRYPTO_gcm128_init(&amp;ctx-&gt;gcm, ks, (block128_f)ossl_sm4_encrypt);
+-    ctx-&gt;ctr = (ctr128_f)NULL;
++# ifdef HWSM4_CAPABLE
++    if (HWSM4_CAPABLE) {
++        HWSM4_set_encrypt_key(key, ks);
++        CRYPTO_gcm128_init(&amp;ctx-&gt;gcm, ks, (block128_f) HWSM4_encrypt);
++#  ifdef HWSM4_ctr32_encrypt_blocks
++        ctx-&gt;ctr = (ctr128_f) HWSM4_ctr32_encrypt_blocks;
++#  else /* HWSM4_ctr32_encrypt_blocks */
++        ctx-&gt;ctr = (ctr128_f)NULL;
++#  endif
++    } else
++# endif /* HWSM4_CAPABLE */
++    {
++        ossl_sm4_set_key(key, ks);
++        CRYPTO_gcm128_init(&amp;ctx-&gt;gcm, ks, (block128_f)ossl_sm4_encrypt);
++        ctx-&gt;ctr = (ctr128_f)NULL;
++    }
+     ctx-&gt;key_set = 1;
+ 
+     return 1;
+diff --git a/providers/implementations/ciphers/cipher_sm4_hw.c b/providers/implementations/ciphers/cipher_sm4_hw.c
+index 0db04b1a74..4cd3d3d669 100644
+--- a/providers/implementations/ciphers/cipher_sm4_hw.c
++++ b/providers/implementations/ciphers/cipher_sm4_hw.c
+@@ -15,14 +15,59 @@ static int cipher_hw_sm4_initkey(PROV_CIPHER_CTX *ctx,
+     PROV_SM4_CTX *sctx =  (PROV_SM4_CTX *)ctx;
+     SM4_KEY *ks = &amp;sctx-&gt;ks.ks;
+ 
+-    ossl_sm4_set_key(key, ks);
+     ctx-&gt;ks = ks;
+     if (ctx-&gt;enc
+             || (ctx-&gt;mode != EVP_CIPH_ECB_MODE
+-                &amp;&amp; ctx-&gt;mode != EVP_CIPH_CBC_MODE))
+-        ctx-&gt;block = (block128_f)ossl_sm4_encrypt;
+-    else
+-        ctx-&gt;block = (block128_f)ossl_sm4_decrypt;
++                &amp;&amp; ctx-&gt;mode != EVP_CIPH_CBC_MODE)) {
++#ifdef HWSM4_CAPABLE
++        if (HWSM4_CAPABLE) {
++            HWSM4_set_encrypt_key(key, ks);
++            ctx-&gt;block = (block128_f)HWSM4_encrypt;
++            ctx-&gt;stream.cbc = NULL;
++#ifdef HWSM4_cbc_encrypt
++            if (ctx-&gt;mode == EVP_CIPH_CBC_MODE)
++                ctx-&gt;stream.cbc = (cbc128_f)HWSM4_cbc_encrypt;
++            else
++#endif
++#ifdef HWSM4_ecb_encrypt
++            if (ctx-&gt;mode == EVP_CIPH_ECB_MODE)
++                ctx-&gt;stream.ecb = (ecb128_f)HWSM4_ecb_encrypt;
++            else
++#endif
++#ifdef HWSM4_ctr32_encrypt_blocks
++            if (ctx-&gt;mode == EVP_CIPH_CTR_MODE)
++                ctx-&gt;stream.ctr = (ctr128_f)HWSM4_ctr32_encrypt_blocks;
++            else
++#endif
++            (void)0;            /* terminate potentially open 'else' */
++        } else
++#endif
++        {
++            ossl_sm4_set_key(key, ks);
++            ctx-&gt;block = (block128_f)ossl_sm4_encrypt;
++        }
++    } else {
++#ifdef HWSM4_CAPABLE
++        if (HWSM4_CAPABLE) {
++            HWSM4_set_decrypt_key(key, ks);
++            ctx-&gt;block = (block128_f)HWSM4_decrypt;
++            ctx-&gt;stream.cbc = NULL;
++#ifdef HWSM4_cbc_encrypt
++            if (ctx-&gt;mode == EVP_CIPH_CBC_MODE)
++                ctx-&gt;stream.cbc = (cbc128_f)HWSM4_cbc_encrypt;
++#endif
++#ifdef HWSM4_ecb_encrypt
++            if (ctx-&gt;mode == EVP_CIPH_ECB_MODE)
++                ctx-&gt;stream.ecb = (ecb128_f)HWSM4_ecb_encrypt;
++#endif
++        } else
++#endif
++        {
++            ossl_sm4_set_key(key, ks);
++            ctx-&gt;block = (block128_f)ossl_sm4_decrypt;
++        }
++    }
++
+     return 1;
+ }
+ 
+@@ -31,7 +76,7 @@ IMPLEMENT_CIPHER_HW_COPYCTX(cipher_hw_sm4_copyctx, PROV_SM4_CTX)
+ # define PROV_CIPHER_HW_sm4_mode(mode)                                         \
+ static const PROV_CIPHER_HW sm4_##mode = {                                     \
+     cipher_hw_sm4_initkey,                                                     \
+-    ossl_cipher_hw_chunked_##mode,                                             \
++    ossl_cipher_hw_generic_##mode,                                             \
+     cipher_hw_sm4_copyctx                                                      \
+ };                                                                             \
+ const PROV_CIPHER_HW *ossl_prov_cipher_hw_sm4_##mode(size_t keybits)           \
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="036099.html">[openssl]  master update
+</A></li>
+	<LI>Next message (by thread): <A HREF="036104.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36101">[ date ]</a>
+              <a href="thread.html#36101">[ thread ]</a>
+              <a href="subject.html#36101">[ subject ]</a>
+              <a href="author.html#36101">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

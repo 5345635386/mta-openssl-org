@@ -1,0 +1,279 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1572802426.799959.25444.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025958.html">
+   <LINK REL="Next"  HREF="025964.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1572802426.799959.25444.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sun Nov  3 17:33:46 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025958.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="025964.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25963">[ date ]</a>
+              <a href="thread.html#25963">[ thread ]</a>
+              <a href="subject.html#25963">[ subject ]</a>
+              <a href="author.html#25963">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3ee348b0dc5cd904fc2c022e6543f478c3d78732 (commit)
+       via  60653e5b25242555446f8acf0abd5ab9ff83010c (commit)
+      from  e774adb593e7bf9057775d85ecc7c24e9bacee12 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3ee348b0dc5cd904fc2c022e6543f478c3d78732
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Nov 1 16:56:31 2019 +0100
+
+    Change EVP_PKEY_CTX_new_provided() to take a library context too.
+    
+    With provided algorithms, the library context is ever present, so of
+    course it should be specified alongside the algorithm name and
+    property query string.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10308">https://github.com/openssl/openssl/pull/10308</A>)
+
+commit 60653e5b25242555446f8acf0abd5ab9ff83010c
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Oct 31 11:43:31 2019 +0100
+
+    Make EVP_PKEY_CTX initialization more precise
+    
+    There is a vagueness around how the provider data (algorithm name and
+    property query string) is initialized in the presence of an engine.
+    This change modifies this slightly so that the algorithm name for use
+    with providers is never set if the initilization was given an engine.
+    
+    This makes it easier for other functions to simply check ctx-&gt;algorithm
+    to see if the context is meant to be used for strictly legacy stuff or
+    not.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10308">https://github.com/openssl/openssl/pull/10308</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/pmeth_lib.c        | 42 ++++++++++++++++++++++++++++++++++++------
+ doc/man3/EVP_PKEY_CTX_new.pod | 13 +++++++------
+ include/crypto/evp.h          |  6 +++++-
+ include/openssl/evp.h         |  3 ++-
+ 4 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index 350d963086..d547e5a69d 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -111,7 +111,8 @@ const EVP_PKEY_METHOD *EVP_PKEY_meth_find(int type)
+     return (**ret)();
+ }
+ 
+-static EVP_PKEY_CTX *int_ctx_new(EVP_PKEY *pkey, ENGINE *e,
++static EVP_PKEY_CTX *int_ctx_new(OPENSSL_CTX *libctx,
++                                 EVP_PKEY *pkey, ENGINE *e,
+                                  const char *name, const char *propquery,
+                                  int id)
+ {
+@@ -132,8 +133,34 @@ static EVP_PKEY_CTX *int_ctx_new(EVP_PKEY *pkey, ENGINE *e,
+             return 0;
+         id = pkey-&gt;type;
+     }
+-    name = OBJ_nid2sn(id);
++
++    /*
++     * Here, we extract what information we can for the purpose of
++     * supporting usage with implementations from providers, to make
++     * for a smooth transition from legacy stuff to provider based stuff.
++     *
++     * If an engine is given, this is entirely legacy, and we should not
++     * pretend anything else, so we only set the name when no engine is
++     * given.  If both are already given, someone made a mistake, and
++     * since that can only happen internally, it's safe to make an
++     * assertion.
++     */
++    if (!ossl_assert(e == NULL || name == NULL))
++        return NULL;
++    if (e == NULL)
++        name = OBJ_nid2sn(id);
+     propquery = NULL;
++    /*
++     * We were called using legacy data, or an EVP_PKEY, but an EVP_PKEY
++     * isn't tied to a specific library context, so we fall back to the
++     * default library context.
++     * TODO(v3.0): an EVP_PKEY that doesn't originate from a leagacy key
++     * structure only has the pkeys[] cache, where the first element is
++     * considered the &quot;origin&quot;.  Investigate if that could be a suitable
++     * way to find a library context.
++     */
++    libctx = NULL;
++
+ #ifndef OPENSSL_NO_ENGINE
+     if (e == NULL &amp;&amp; pkey != NULL)
+         e = pkey-&gt;pmeth_engine != NULL ? pkey-&gt;pmeth_engine : pkey-&gt;engine;
+@@ -175,6 +202,7 @@ static EVP_PKEY_CTX *int_ctx_new(EVP_PKEY *pkey, ENGINE *e,
+         EVPerr(EVP_F_INT_CTX_NEW, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
++    ret-&gt;libctx = libctx;
+     ret-&gt;algorithm = name;
+     ret-&gt;propquery = propquery;
+     ret-&gt;engine = e;
+@@ -287,18 +315,19 @@ void EVP_PKEY_meth_free(EVP_PKEY_METHOD *pmeth)
+ 
+ EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e)
+ {
+-    return int_ctx_new(pkey, e, NULL, NULL, -1);
++    return int_ctx_new(NULL, pkey, e, NULL, NULL, -1);
+ }
+ 
+ EVP_PKEY_CTX *EVP_PKEY_CTX_new_id(int id, ENGINE *e)
+ {
+-    return int_ctx_new(NULL, e, NULL, NULL, id);
++    return int_ctx_new(NULL, NULL, e, NULL, NULL, id);
+ }
+ 
+-EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(const char *name,
++EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(OPENSSL_CTX *libctx,
++                                        const char *name,
+                                         const char *propquery)
+ {
+-    return int_ctx_new(NULL, NULL, name, propquery, -1);
++    return int_ctx_new(libctx, NULL, NULL, name, propquery, -1);
+ }
+ 
+ EVP_PKEY_CTX *EVP_PKEY_CTX_dup(const EVP_PKEY_CTX *pctx)
+@@ -328,6 +357,7 @@ EVP_PKEY_CTX *EVP_PKEY_CTX_dup(const EVP_PKEY_CTX *pctx)
+         EVP_PKEY_up_ref(pctx-&gt;pkey);
+     rctx-&gt;pkey = pctx-&gt;pkey;
+     rctx-&gt;operation = pctx-&gt;operation;
++    rctx-&gt;libctx = pctx-&gt;libctx;
+     rctx-&gt;algorithm = pctx-&gt;algorithm;
+     rctx-&gt;propquery = pctx-&gt;propquery;
+ 
+diff --git a/doc/man3/EVP_PKEY_CTX_new.pod b/doc/man3/EVP_PKEY_CTX_new.pod
+index de7f439da5..5d18a04344 100644
+--- a/doc/man3/EVP_PKEY_CTX_new.pod
++++ b/doc/man3/EVP_PKEY_CTX_new.pod
+@@ -12,7 +12,8 @@ EVP_PKEY_CTX_dup, EVP_PKEY_CTX_free
+ 
+  EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
+  EVP_PKEY_CTX *EVP_PKEY_CTX_new_id(int id, ENGINE *e);
+- EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(const char *name,
++ EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(OPENSSL_CTX *libctx,
++                                         const char *name,
+                                          const char *propquery);
+  EVP_PKEY_CTX *EVP_PKEY_CTX_dup(const EVP_PKEY_CTX *ctx);
+  void EVP_PKEY_CTX_free(EVP_PKEY_CTX *ctx);
+@@ -25,11 +26,11 @@ the algorithm specified in I&lt;pkey&gt; and ENGINE I&lt;e&gt;.
+ The EVP_PKEY_CTX_new_id() function allocates public key algorithm context
+ using the algorithm specified by I&lt;id&gt; and ENGINE I&lt;e&gt;.
+ 
+-The EVP_PKEY_CTX_new_provided() function allocates a public key
+-algorithm context using the algorithm specified by I&lt;name&gt; and the
+-property query I&lt;propquery&gt;.  The strings aren't duplicated, so they
+-must remain unchanged for the lifetime of the returned B&lt;EVP_PKEY_CTX&gt;
+-or of any of its duplicates.
++The EVP_PKEY_CTX_new_provided() function allocates a public key algorithm
++context using the library context I&lt;libctx&gt; (see L&lt;OPENSSL_CTX(3)&gt;), the
++algorithm specified by I&lt;name&gt; and the property query I&lt;propquery&gt;.  None
++of the arguments are duplicated, so they  must remain unchanged for the
++lifetime of the returned B&lt;EVP_PKEY_CTX&gt; or of any of its duplicates.
+ 
+ EVP_PKEY_CTX_new_id() and EVP_PKEY_CTX_new_provided() are normally
+ used when no B&lt;EVP_PKEY&gt; structure is associated with the operations,
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index dad7174bc5..32ae121eea 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -21,7 +21,11 @@ struct evp_pkey_ctx_st {
+     /* Actual operation */
+     int operation;
+ 
+-    /* Algorithm name and properties associated with this context */
++    /*
++     * Library context, Algorithm name and properties associated
++     * with this context
++     */
++    OPENSSL_CTX *libctx;
+     const char *algorithm;
+     const char *propquery;
+ 
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index a0190c8b08..baa1ce8c6c 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -1461,7 +1461,8 @@ void EVP_KEYMGMT_names_do_all(const EVP_KEYMGMT *keymgmt,
+ 
+ EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
+ EVP_PKEY_CTX *EVP_PKEY_CTX_new_id(int id, ENGINE *e);
+-EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(const char *name,
++EVP_PKEY_CTX *EVP_PKEY_CTX_new_provided(OPENSSL_CTX *libctx,
++                                        const char *name,
+                                         const char *propquery);
+ EVP_PKEY_CTX *EVP_PKEY_CTX_dup(const EVP_PKEY_CTX *ctx);
+ void EVP_PKEY_CTX_free(EVP_PKEY_CTX *ctx);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025958.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="025964.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25963">[ date ]</a>
+              <a href="thread.html#25963">[ thread ]</a>
+              <a href="subject.html#25963">[ subject ]</a>
+              <a href="author.html#25963">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

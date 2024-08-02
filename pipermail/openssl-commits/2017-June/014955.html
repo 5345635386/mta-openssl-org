@@ -1,0 +1,224 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1497028376.680347.2208.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014952.html">
+   <LINK REL="Next"  HREF="014956.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1497028376.680347.2208.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Fri Jun  9 17:12:56 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014952.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="014956.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14955">[ date ]</a>
+              <a href="thread.html#14955">[ thread ]</a>
+              <a href="subject.html#14955">[ subject ]</a>
+              <a href="author.html#14955">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f464f9c04bf3b26c22e9c386cb5d1700000c8e7e (commit)
+      from  9ae4e664da0692f27bfe0d1a34db29ed815203c8 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f464f9c04bf3b26c22e9c386cb5d1700000c8e7e
+Author: Pichulin Dmitrii &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">deem at deem.ru</A>&gt;
+Date:   Fri Jun 9 13:04:00 2017 -0400
+
+    fix check of broken implementations of GOST ciphersuites
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3642">https://github.com/openssl/openssl/pull/3642</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem_lib.c | 75 +++++++++++++++++++++++++------------------------
+ 1 file changed, 39 insertions(+), 36 deletions(-)
+
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index 29fb9dc..4f3eb5e 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -351,49 +351,52 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+         goto f_err;
+     }
+ 
++    if (SSL_USE_SIGALGS(s)) {
++        int rv;
++        unsigned int sigalg;
++
++        if (!PACKET_get_net_2(pkt, &amp;sigalg)) {
++            al = SSL_AD_DECODE_ERROR;
++            goto f_err;
++        }
++        rv = tls12_check_peer_sigalg(s, sigalg, pkey);
++        if (rv == -1) {
++            goto f_err;
++        } else if (rv == 0) {
++            al = SSL_AD_DECODE_ERROR;
++            goto f_err;
++        }
++#ifdef SSL_DEBUG
++        fprintf(stderr, &quot;USING TLSv1.2 HASH %s\n&quot;, EVP_MD_name(md));
++#endif
++    } else if (!tls1_set_peer_legacy_sigalg(s, pkey)) {
++            al = SSL_AD_INTERNAL_ERROR;
++            goto f_err;
++    }
++
++    md = ssl_md(s-&gt;s3-&gt;tmp.peer_sigalg-&gt;hash_idx);
++
+     /* Check for broken implementations of GOST ciphersuites */
+     /*
+-     * If key is GOST and n is exactly 64, it is bare signature without
+-     * length field (CryptoPro implementations at least till CSP 4.0)
++     * If key is GOST and len is exactly 64 or 128, it is signature without
++     * length field (CryptoPro implementations at least till TLS 1.2)
+      */
+ #ifndef OPENSSL_NO_GOST
+-    if (PACKET_remaining(pkt) == 64
+-        &amp;&amp; EVP_PKEY_id(pkey) == NID_id_GostR3410_2001) {
+-        len = 64;
++    if (!SSL_USE_SIGALGS(s)
++        &amp;&amp; ((PACKET_remaining(pkt) == 64
++             &amp;&amp; (EVP_PKEY_id(pkey) == NID_id_GostR3410_2001
++                 || EVP_PKEY_id(pkey) == NID_id_GostR3410_2012_256))
++            || (PACKET_remaining(pkt) == 128
++                &amp;&amp; EVP_PKEY_id(pkey) == NID_id_GostR3410_2012_512))) {
++        len = PACKET_remaining(pkt);
+     } else
+ #endif
+-    {
+-        if (SSL_USE_SIGALGS(s)) {
+-            int rv;
+-            unsigned int sigalg;
+-
+-            if (!PACKET_get_net_2(pkt, &amp;sigalg)) {
+-                al = SSL_AD_DECODE_ERROR;
+-                goto f_err;
+-            }
+-            rv = tls12_check_peer_sigalg(s, sigalg, pkey);
+-            if (rv == -1) {
+-                goto f_err;
+-            } else if (rv == 0) {
+-                al = SSL_AD_DECODE_ERROR;
+-                goto f_err;
+-            }
+-#ifdef SSL_DEBUG
+-            fprintf(stderr, &quot;USING TLSv1.2 HASH %s\n&quot;, EVP_MD_name(md));
+-#endif
+-        } else if (!tls1_set_peer_legacy_sigalg(s, pkey)) {
+-                al = SSL_AD_INTERNAL_ERROR;
+-                goto f_err;
+-        }
+-
+-        md = ssl_md(s-&gt;s3-&gt;tmp.peer_sigalg-&gt;hash_idx);
+-
+-        if (!PACKET_get_net_2(pkt, &amp;len)) {
+-            SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, SSL_R_LENGTH_MISMATCH);
+-            al = SSL_AD_DECODE_ERROR;
+-            goto f_err;
+-        }
++    if (!PACKET_get_net_2(pkt, &amp;len)) {
++        SSLerr(SSL_F_TLS_PROCESS_CERT_VERIFY, SSL_R_LENGTH_MISMATCH);
++        al = SSL_AD_DECODE_ERROR;
++        goto f_err;
+     }
++
+     j = EVP_PKEY_size(pkey);
+     if (((int)len &gt; j) || ((int)PACKET_remaining(pkt) &gt; j)
+         || (PACKET_remaining(pkt) == 0)) {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014952.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="014956.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14955">[ date ]</a>
+              <a href="thread.html#14955">[ thread ]</a>
+              <a href="subject.html#14955">[ subject ]</a>
+              <a href="author.html#14955">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

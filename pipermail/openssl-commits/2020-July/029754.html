@@ -1,0 +1,799 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595313080.084957.24728.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029749.html">
+   <LINK REL="Next"  HREF="029755.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595313080.084957.24728.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Tue Jul 21 06:31:20 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029749.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029755.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29754">[ date ]</a>
+              <a href="thread.html#29754">[ thread ]</a>
+              <a href="subject.html#29754">[ subject ]</a>
+              <a href="author.html#29754">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  9f7bdcf37f9541f7a1e4dc62ebdf97e8d8ccd307 (commit)
+      from  823a113574451ea2e050bee7ce35861948ad55ca (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 9f7bdcf37f9541f7a1e4dc62ebdf97e8d8ccd307
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Tue Jul 21 16:30:02 2020 +1000
+
+    Add ERR_raise() errors to fips OSSL_provider_init and self tests.
+    
+    As the ERR_raise() is setup at this point returng a range of negative values for errors is not required.
+    This will need to be revisited if the code ever moves to running from the DEP.
+    Added a -config option to the fips install so that it can test if a fips module is loadable from configuration.
+    (The -verify option only uses the generated config, whereas -config uses the normal way of including the generated data via another config file).
+    Added more failure tests for the raised errors.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12346">https://github.com/openssl/openssl/pull/12346</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/fipsinstall.c                                |  24 ++-
+ crypto/err/openssl.txt                            |   7 +
+ crypto/provider_core.c                            |   1 -
+ doc/man1/openssl-fipsinstall.pod.in               |  17 +++
+ doc/man5/fips_config.pod                          |   2 +-
+ providers/common/include/prov/providercommonerr.h |   7 +
+ providers/common/provider_err.c                   |  13 ++
+ providers/fips/fipsprov.c                         |  10 +-
+ providers/fips/self_test.c                        |  34 ++++-
+ test/recipes/03-test_fipsinstall.t                | 171 +++++++++++++++++++---
+ 10 files changed, 254 insertions(+), 32 deletions(-)
+
+diff --git a/apps/fipsinstall.c b/apps/fipsinstall.c
+index c8687bec8f..bd1cd68477 100644
+--- a/apps/fipsinstall.c
++++ b/apps/fipsinstall.c
+@@ -38,7 +38,7 @@ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+     OPT_IN, OPT_OUT, OPT_MODULE,
+     OPT_PROV_NAME, OPT_SECTION_NAME, OPT_MAC_NAME, OPT_MACOPT, OPT_VERIFY,
+-    OPT_NO_LOG, OPT_CORRUPT_DESC, OPT_CORRUPT_TYPE, OPT_QUIET
++    OPT_NO_LOG, OPT_CORRUPT_DESC, OPT_CORRUPT_TYPE, OPT_QUIET, OPT_CONFIG
+ } OPTION_CHOICE;
+ 
+ const OPTIONS fipsinstall_options[] = {
+@@ -62,6 +62,7 @@ const OPTIONS fipsinstall_options[] = {
+     {&quot;noout&quot;, OPT_NO_LOG, '-', &quot;Disable logging of self test events&quot;},
+     {&quot;corrupt_desc&quot;, OPT_CORRUPT_DESC, 's', &quot;Corrupt a self test by description&quot;},
+     {&quot;corrupt_type&quot;, OPT_CORRUPT_TYPE, 's', &quot;Corrupt a self test by type&quot;},
++    {&quot;config&quot;, OPT_CONFIG, '&lt;', &quot;The parent config to verify&quot;},
+     {&quot;quiet&quot;, OPT_QUIET, '-', &quot;No messages, just exit status&quot;},
+     {NULL}
+ };
+@@ -202,6 +203,11 @@ static void free_config_and_unload(CONF *conf)
+     }
+ }
+ 
++static int verify_module_load(const char *parent_config_file)
++{
++    return OPENSSL_CTX_load_config(NULL, parent_config_file);
++}
++
+ /*
+  * Returns 1 if the config file entries match the passed in module_mac and
+  * install_mac values, otherwise it returns 0.
+@@ -271,7 +277,7 @@ int fipsinstall_main(int argc, char **argv)
+     const char *prov_name = &quot;fips&quot;;
+     BIO *module_bio = NULL, *mem_bio = NULL, *fout = NULL;
+     char *in_fname = NULL, *out_fname = NULL, *prog;
+-    char *module_fname = NULL;
++    char *module_fname = NULL, *parent_config = NULL;
+     EVP_MAC_CTX *ctx = NULL, *ctx2 = NULL;
+     STACK_OF(OPENSSL_STRING) *opts = NULL;
+     OPTION_CHOICE o;
+@@ -328,6 +334,9 @@ opthelp:
+         case OPT_MAC_NAME:
+             mac_name = opt_arg();
+             break;
++        case OPT_CONFIG:
++            parent_config = opt_arg();
++            break;
+         case OPT_MACOPT:
+             if (!sk_OPENSSL_STRING_push(opts, opt_arg()))
+                 goto opthelp;
+@@ -342,6 +351,17 @@ opthelp:
+         }
+     }
+     argc = opt_num_rest();
++
++    if (parent_config != NULL) {
++        /* Test that a parent config can load the module */
++        if (verify_module_load(parent_config)) {
++            ret = OSSL_PROVIDER_available(NULL, prov_name) ? 0 : 1;
++            if (!quiet)
++                BIO_printf(bio_out, &quot;FIPS provider is %s\n&quot;,
++                           ret == 0 ? &quot;available&quot; : &quot; not available&quot;);
++        }
++        goto end;
++    }
+     if (module_fname == NULL
+         || (verify &amp;&amp; in_fname == NULL)
+         || (!verify &amp;&amp; out_fname == NULL)
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index fe937e6139..fcc4fb5c1c 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -2854,8 +2854,10 @@ PROV_R_GENERATE_ERROR:191:generate error
+ PROV_R_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE:165:\
+ 	illegal or unsupported padding mode
+ PROV_R_INAVLID_UKM_LENGTH:146:inavlid ukm length
++PROV_R_INDICATOR_INTEGRITY_FAILURE:210:indicator integrity failure
+ PROV_R_INSUFFICIENT_DRBG_STRENGTH:181:insufficient drbg strength
+ PROV_R_INVALID_AAD:108:invalid aad
++PROV_R_INVALID_CONFIG_DATA:211:invalid config data
+ PROV_R_INVALID_CONSTANT_LENGTH:157:invalid constant length
+ PROV_R_INVALID_CURVE:176:invalid curve
+ PROV_R_INVALID_CUSTOM_LENGTH:111:invalid custom length
+@@ -2878,6 +2880,7 @@ PROV_R_INVALID_PSS_SALTLEN:169:invalid pss saltlen
+ PROV_R_INVALID_SALT_LENGTH:112:invalid salt length
+ PROV_R_INVALID_SEED_LENGTH:154:invalid seed length
+ PROV_R_INVALID_SIGNATURE_SIZE:179:invalid signature size
++PROV_R_INVALID_STATE:212:invalid state
+ PROV_R_INVALID_TAG:110:invalid tag
+ PROV_R_INVALID_TAGLEN:118:invalid taglen
+ PROV_R_INVALID_X931_DIGEST:170:invalid x931 digest
+@@ -2885,6 +2888,7 @@ PROV_R_IN_ERROR_STATE:192:in error state
+ PROV_R_KEY_SIZE_TOO_SMALL:171:key size too small
+ PROV_R_MISSING_CEK_ALG:144:missing cek alg
+ PROV_R_MISSING_CIPHER:155:missing cipher
++PROV_R_MISSING_CONFIG_DATA:213:missing config data
+ PROV_R_MISSING_CONSTANT:156:missing constant
+ PROV_R_MISSING_KEY:128:missing key
+ PROV_R_MISSING_MAC:150:missing mac
+@@ -2897,6 +2901,7 @@ PROV_R_MISSING_SEED:140:missing seed
+ PROV_R_MISSING_SESSION_ID:133:missing session id
+ PROV_R_MISSING_TYPE:134:missing type
+ PROV_R_MISSING_XCGHASH:135:missing xcghash
++PROV_R_MODULE_INTEGRITY_FAILURE:214:module integrity failure
+ PROV_R_NOT_INSTANTIATED:193:not instantiated
+ PROV_R_NOT_SUPPORTED:136:not supported
+ PROV_R_NOT_XOF_OR_INVALID_LENGTH:113:not xof or invalid length
+@@ -2913,6 +2918,8 @@ PROV_R_READ_KEY:159:read key
+ PROV_R_REQUEST_TOO_LARGE_FOR_DRBG:196:request too large for drbg
+ PROV_R_REQUIRE_CTR_MODE_CIPHER:206:require ctr mode cipher
+ PROV_R_RESEED_ERROR:197:reseed error
++PROV_R_SELF_TEST_KAT_FAILURE:215:self test kat failure
++PROV_R_SELF_TEST_POST_FAILURE:216:self test post failure
+ PROV_R_TAG_NOTSET:119:tag notset
+ PROV_R_TAG_NOT_NEEDED:120:tag not needed
+ PROV_R_UNABLE_TO_FIND_CIPHERS:207:unable to find ciphers
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index f68fd8f0f9..b6586f904e 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -611,7 +611,6 @@ static int provider_activate(OSSL_PROVIDER *prov)
+ 
+     /* With this flag set, this provider has become fully &quot;loaded&quot;. */
+     prov-&gt;flag_initialized = 1;
+-
+     return 1;
+ }
+ 
+diff --git a/doc/man1/openssl-fipsinstall.pod.in b/doc/man1/openssl-fipsinstall.pod.in
+index 30df7bf3e9..ec83e0950f 100644
+--- a/doc/man1/openssl-fipsinstall.pod.in
++++ b/doc/man1/openssl-fipsinstall.pod.in
+@@ -21,6 +21,7 @@ B&lt;openssl fipsinstall&gt;
+ [B&lt;-quiet&gt;]
+ [B&lt;-corrupt_desc&gt; I&lt;selftest_description&gt;]
+ [B&lt;-corrupt_type&gt; I&lt;selftest_type&gt;]
++[B&lt;-config&gt; I&lt;parent_config&gt;]
+ 
+ =head1 DESCRIPTION
+ 
+@@ -143,6 +144,14 @@ Either option or both may be used to select the tests to corrupt.
+ Refer to the entries for B&lt;st-desc&gt; and B&lt;st-type&gt; in L&lt;OSSL_PROVIDER-FIPS(7)&gt; for
+ values that can be used.
+ 
++=item B&lt;-config&gt; I&lt;parent_config&gt;
++
++Test that a FIPS provider can be loaded from the specified configuration file.
++A previous call to this application needs to generate the extra configuration
++data that is included by the base C&lt;parent_config&gt; configuration file.
++See L&lt;config(5)&gt; for further information on how to set up a provider section.
++All other options are ignored if '-config' is used.
++
+ =back
+ 
+ =head1 EXAMPLES
+@@ -167,8 +176,16 @@ Corrupt any self tests which have the description C&lt;SHA1&gt;:
+          -macopt hexkey:000102030405060708090A0B0C0D0E0F10111213 \
+          -corrupt_desc 'SHA1'
+ 
++Validate that the fips module can be loaded from a base configuration file:
++
++ export OPENSSL_CONF_INCLUDE=&lt;path of configuration files&gt;
++ export OPENSSL_MODULES=&lt;provider_path&gt;
++ openssl fipsinstall -config' 'default.cnf'
++
++
+ =head1 SEE ALSO
+ 
++L&lt;config(5)&gt;,
+ L&lt;fips_config(5)&gt;,
+ L&lt;OSSL_PROVIDER-FIPS(7)&gt;,
+ L&lt;EVP_MAC(3)&gt;
+diff --git a/doc/man5/fips_config.pod b/doc/man5/fips_config.pod
+index 5077f30ecd..ebf6d685cc 100644
+--- a/doc/man5/fips_config.pod
++++ b/doc/man5/fips_config.pod
+@@ -59,7 +59,7 @@ It is written-to at the same time as B&lt;install-status&gt; is updated.
+ 
+ For example:
+ 
+- [fips_install]
++ [fips_sect]
+  install-version = 1
+  module-mac = 41:D0:FA:C2:5D:41:75:CD:7D:C3:90:55:6F:A4:DC
+  install-mac = FE:10:13:5A:D3:B4:C7:82:1B:1E:17:4C:AC:84:0C
+diff --git a/providers/common/include/prov/providercommonerr.h b/providers/common/include/prov/providercommonerr.h
+index c21537fd4f..f5fd37d9cc 100644
+--- a/providers/common/include/prov/providercommonerr.h
++++ b/providers/common/include/prov/providercommonerr.h
+@@ -78,8 +78,10 @@ int ERR_load_PROV_strings(void);
+ # define PROV_R_GENERATE_ERROR                            191
+ # define PROV_R_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE       165
+ # define PROV_R_INAVLID_UKM_LENGTH                        146
++# define PROV_R_INDICATOR_INTEGRITY_FAILURE               210
+ # define PROV_R_INSUFFICIENT_DRBG_STRENGTH                181
+ # define PROV_R_INVALID_AAD                               108
++# define PROV_R_INVALID_CONFIG_DATA                       211
+ # define PROV_R_INVALID_CONSTANT_LENGTH                   157
+ # define PROV_R_INVALID_CURVE                             176
+ # define PROV_R_INVALID_CUSTOM_LENGTH                     111
+@@ -102,6 +104,7 @@ int ERR_load_PROV_strings(void);
+ # define PROV_R_INVALID_SALT_LENGTH                       112
+ # define PROV_R_INVALID_SEED_LENGTH                       154
+ # define PROV_R_INVALID_SIGNATURE_SIZE                    179
++# define PROV_R_INVALID_STATE                             212
+ # define PROV_R_INVALID_TAG                               110
+ # define PROV_R_INVALID_TAGLEN                            118
+ # define PROV_R_INVALID_X931_DIGEST                       170
+@@ -109,6 +112,7 @@ int ERR_load_PROV_strings(void);
+ # define PROV_R_KEY_SIZE_TOO_SMALL                        171
+ # define PROV_R_MISSING_CEK_ALG                           144
+ # define PROV_R_MISSING_CIPHER                            155
++# define PROV_R_MISSING_CONFIG_DATA                       213
+ # define PROV_R_MISSING_CONSTANT                          156
+ # define PROV_R_MISSING_KEY                               128
+ # define PROV_R_MISSING_MAC                               150
+@@ -121,6 +125,7 @@ int ERR_load_PROV_strings(void);
+ # define PROV_R_MISSING_SESSION_ID                        133
+ # define PROV_R_MISSING_TYPE                              134
+ # define PROV_R_MISSING_XCGHASH                           135
++# define PROV_R_MODULE_INTEGRITY_FAILURE                  214
+ # define PROV_R_NOT_INSTANTIATED                          193
+ # define PROV_R_NOT_SUPPORTED                             136
+ # define PROV_R_NOT_XOF_OR_INVALID_LENGTH                 113
+@@ -136,6 +141,8 @@ int ERR_load_PROV_strings(void);
+ # define PROV_R_REQUEST_TOO_LARGE_FOR_DRBG                196
+ # define PROV_R_REQUIRE_CTR_MODE_CIPHER                   206
+ # define PROV_R_RESEED_ERROR                              197
++# define PROV_R_SELF_TEST_KAT_FAILURE                     215
++# define PROV_R_SELF_TEST_POST_FAILURE                    216
+ # define PROV_R_TAG_NOTSET                                119
+ # define PROV_R_TAG_NOT_NEEDED                            120
+ # define PROV_R_UNABLE_TO_FIND_CIPHERS                    207
+diff --git a/providers/common/provider_err.c b/providers/common/provider_err.c
+index 7a0e0c595d..7a5c41bfda 100644
+--- a/providers/common/provider_err.c
++++ b/providers/common/provider_err.c
+@@ -63,9 +63,13 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     &quot;illegal or unsupported padding mode&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INAVLID_UKM_LENGTH),
+     &quot;inavlid ukm length&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INDICATOR_INTEGRITY_FAILURE),
++    &quot;indicator integrity failure&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INSUFFICIENT_DRBG_STRENGTH),
+     &quot;insufficient drbg strength&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_AAD), &quot;invalid aad&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_CONFIG_DATA),
++    &quot;invalid config data&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_CONSTANT_LENGTH),
+     &quot;invalid constant length&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_CURVE), &quot;invalid curve&quot;},
+@@ -98,6 +102,7 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     &quot;invalid seed length&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_SIGNATURE_SIZE),
+     &quot;invalid signature size&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_STATE), &quot;invalid state&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_TAG), &quot;invalid tag&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_TAGLEN), &quot;invalid taglen&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_INVALID_X931_DIGEST),
+@@ -107,6 +112,8 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     &quot;key size too small&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_CEK_ALG), &quot;missing cek alg&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_CIPHER), &quot;missing cipher&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_CONFIG_DATA),
++    &quot;missing config data&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_CONSTANT), &quot;missing constant&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_KEY), &quot;missing key&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_MAC), &quot;missing mac&quot;},
+@@ -121,6 +128,8 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     &quot;missing session id&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_TYPE), &quot;missing type&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MISSING_XCGHASH), &quot;missing xcghash&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_MODULE_INTEGRITY_FAILURE),
++    &quot;module integrity failure&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_NOT_INSTANTIATED), &quot;not instantiated&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_NOT_SUPPORTED), &quot;not supported&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_NOT_XOF_OR_INVALID_LENGTH),
+@@ -145,6 +154,10 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_REQUIRE_CTR_MODE_CIPHER),
+     &quot;require ctr mode cipher&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_RESEED_ERROR), &quot;reseed error&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SELF_TEST_KAT_FAILURE),
++    &quot;self test kat failure&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SELF_TEST_POST_FAILURE),
++    &quot;self test post failure&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_TAG_NOTSET), &quot;tag notset&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_TAG_NOT_NEEDED), &quot;tag not needed&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_UNABLE_TO_FIND_CIPHERS),
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index a998e392d7..c91ad1c6d7 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -31,6 +31,7 @@
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/provider_ctx.h&quot;
+ #include &quot;prov/providercommon.h&quot;
++#include &quot;prov/providercommonerr.h&quot;
+ #include &quot;prov/provider_util.h&quot;
+ #include &quot;self_test.h&quot;
+ 
+@@ -700,8 +701,10 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+         selftest_params.cb_arg = NULL;
+     }
+ 
+-    if (!c_get_params(handle, core_params))
++    if (!c_get_params(handle, core_params)) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_GET_PARAMETER);
+         return 0;
++    }
+ 
+     /*  Create a context. */
+     if ((*provctx = PROV_CTX_new()) == NULL
+@@ -724,8 +727,10 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+     fgbl-&gt;handle = handle;
+ 
+     selftest_params.libctx = libctx;
+-    if (!SELF_TEST_post(&amp;selftest_params, 0))
++    if (!SELF_TEST_post(&amp;selftest_params, 0)) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_SELF_TEST_POST_FAILURE);
+         goto err;
++    }
+ 
+     /*
+      * TODO(3.0): Remove me. This is just a dummy call to demonstrate making
+@@ -735,7 +740,6 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+         goto err;
+ 
+     *out = fips_dispatch_table;
+-
+     return 1;
+  err:
+     fips_teardown(*provctx);
+diff --git a/providers/fips/self_test.c b/providers/fips/self_test.c
+index 58aa42eed8..8902510b44 100644
+--- a/providers/fips/self_test.c
++++ b/providers/fips/self_test.c
+@@ -12,7 +12,9 @@
+ #include &lt;openssl/params.h&gt;
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/fipskey.h&gt;
++#include &lt;openssl/err.h&gt;
+ #include &quot;e_os.h&quot;
++#include &quot;prov/providercommonerr.h&quot;
+ /*
+  * We're cheating here. Normally we don't allow RUN_ONCE usage inside the FIPS
+  * module because all such initialisation should be associated with an
+@@ -206,6 +208,7 @@ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test)
+         if (!on_demand_test)
+             return 1;
+     } else if (loclstate != FIPS_STATE_SELFTEST) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_STATE);
+         return 0;
+     }
+ 
+@@ -218,11 +221,14 @@ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test)
+         FIPS_state = FIPS_STATE_SELFTEST;
+     } else if (FIPS_state != FIPS_STATE_SELFTEST) {
+         CRYPTO_THREAD_unlock(self_test_lock);
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_STATE);
+         return 0;
+     }
+     if (st == NULL
+-            || st-&gt;module_checksum_data == NULL)
++            || st-&gt;module_checksum_data == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_CONFIG_DATA);
+         goto end;
++    }
+ 
+     ev = OSSL_SELF_TEST_new(st-&gt;cb, st-&gt;cb_arg);
+     if (ev == NULL)
+@@ -230,16 +236,20 @@ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test)
+ 
+     module_checksum = OPENSSL_hexstr2buf(st-&gt;module_checksum_data,
+                                          &amp;checksum_len);
+-    if (module_checksum == NULL)
++    if (module_checksum == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_CONFIG_DATA);
+         goto end;
++    }
+     bio_module = (*st-&gt;bio_new_file_cb)(st-&gt;module_filename, &quot;rb&quot;);
+ 
+     /* Always check the integrity of the fips module */
+     if (bio_module == NULL
+             || !verify_integrity(bio_module, st-&gt;bio_read_ex_cb,
+                                  module_checksum, checksum_len, st-&gt;libctx,
+-                                 ev, OSSL_SELF_TEST_TYPE_MODULE_INTEGRITY))
++                                 ev, OSSL_SELF_TEST_TYPE_MODULE_INTEGRITY)) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_MODULE_INTEGRITY_FAILURE);
+         goto end;
++    }
+ 
+     /* This will be NULL during installation - so the self test KATS will run */
+     if (st-&gt;indicator_data != NULL) {
+@@ -247,12 +257,16 @@ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test)
+          * If the kats have already passed indicator is set - then check the
+          * integrity of the indicator.
+          */
+-        if (st-&gt;indicator_checksum_data == NULL)
++        if (st-&gt;indicator_checksum_data == NULL) {
++            ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_CONFIG_DATA);
+             goto end;
++        }
+         indicator_checksum = OPENSSL_hexstr2buf(st-&gt;indicator_checksum_data,
+                                                 &amp;checksum_len);
+-        if (indicator_checksum == NULL)
++        if (indicator_checksum == NULL) {
++            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_CONFIG_DATA);
+             goto end;
++        }
+ 
+         bio_indicator =
+             (*st-&gt;bio_new_buffer_cb)(st-&gt;indicator_data,
+@@ -261,16 +275,20 @@ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test)
+                 || !verify_integrity(bio_indicator, st-&gt;bio_read_ex_cb,
+                                      indicator_checksum, checksum_len,
+                                      st-&gt;libctx, ev,
+-                                     OSSL_SELF_TEST_TYPE_INSTALL_INTEGRITY))
++                                     OSSL_SELF_TEST_TYPE_INSTALL_INTEGRITY)) {
++            ERR_raise(ERR_LIB_PROV, PROV_R_INDICATOR_INTEGRITY_FAILURE);
+             goto end;
+-        else
++        } else {
+             kats_already_passed = 1;
++        }
+     }
+ 
+     /* Only runs the KAT's during installation OR on_demand() */
+     if (on_demand_test || kats_already_passed == 0) {
+-        if (!SELF_TEST_kats(ev, st-&gt;libctx))
++        if (!SELF_TEST_kats(ev, st-&gt;libctx)) {
++            ERR_raise(ERR_LIB_PROV, PROV_R_SELF_TEST_KAT_FAILURE);
+             goto end;
++        }
+     }
+     ok = 1;
+ end:
+diff --git a/test/recipes/03-test_fipsinstall.t b/test/recipes/03-test_fipsinstall.t
+index 64970bea5a..1d7a1ff6ae 100644
+--- a/test/recipes/03-test_fipsinstall.t
++++ b/test/recipes/03-test_fipsinstall.t
+@@ -12,7 +12,7 @@ use warnings;
+ use File::Spec;
+ use File::Copy;
+ use OpenSSL::Glob;
+-use OpenSSL::Test qw/:DEFAULT srctop_dir bldtop_dir bldtop_file/;
++use OpenSSL::Test qw/:DEFAULT srctop_dir srctop_file bldtop_dir bldtop_file/;
+ use OpenSSL::Test::Utils;
+ 
+ BEGIN {
+@@ -24,23 +24,73 @@ use platform;
+ 
+ plan skip_all =&gt; &quot;Test only supported in a fips build&quot; if disabled(&quot;fips&quot;);
+ 
+-plan tests =&gt; 12;
++plan tests =&gt; 23;
+ 
+ my $infile = bldtop_file('providers', platform-&gt;dso('fips'));
+ my $fipskey = $ENV{FIPSKEY} // '00';
+ 
++# Read in a text $infile and replace the regular expression in $srch with the
++# value in $repl and output to a new file $outfile.
++sub replace_line_file_internal {
++
++    my ($infile, $srch, $repl, $outfile) = @_;
++    my $msg;
++
++    open(my $in, &quot;&lt;&quot;, $infile) or return 0;
++    read($in, $msg, 1024);
++    close $in;
++
++    $msg =~ s/$srch/$repl/;
++
++    open(my $fh, &quot;&gt;&quot;, $outfile) or return 0;
++    print $fh $msg;
++    close $fh;
++    return 1;
++}
++
++# Read in the text input file 'fips.cnf'
++# and replace a single Key = Value line with a new value in $value.
++# OR remove the Key = Value line if the passed in $value is empty.
++# and then output a new file $outfile.
++# $key is the Key to find
++sub replace_line_file {
++    my ($key, $value, $outfile) = @_;
++
++    my $srch = qr/$key\s*=\s*\S*\n/;
++    my $rep;
++    if ($value eq &quot;&quot;) {
++        $rep = &quot;&quot;;
++    } else {
++       $rep = &quot;$key = $value\n&quot;;
++    }
++    return replace_line_file_internal('fips.cnf', $srch, $rep, $outfile);
++}
++
++# Read in the text input file 'test/fips.cnf'
++# and replace the .cnf file used in
++# .include fipsmodule.cnf with a new value in $value.
++# and then output a new file $outfile.
++# $key is the Key to find
++sub replace_parent_line_file {
++    my ($value, $outfile) = @_;
++    my $srch = qr/fipsmodule.cnf/;
++    my $rep = &quot;$value&quot;;
++    return replace_line_file_internal(srctop_file(&quot;test&quot;, 'fips.cnf'),
++                                      $srch, $rep, $outfile);
++}
++
+ # fail if no module name
+ ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module',
+              '-provider_name', 'fips',
+              '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-             '-section_name', 'fips_install'])),
++             '-section_name', 'fips_sect'])),
+    &quot;fipsinstall fail&quot;);
+ 
+ # fail to verify if the configuration file is missing
+ ok(!run(app(['openssl', 'fipsinstall', '-in', 'dummy.tmp', '-module', $infile,
+              '-provider_name', 'fips', '-mac_name', 'HMAC',
+              '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-             '-section_name', 'fips_install', '-verify'])),
++             '-section_name', 'fips_sect', '-verify'])),
+    &quot;fipsinstall verify fail&quot;);
+ 
+ 
+@@ -48,56 +98,104 @@ ok(!run(app(['openssl', 'fipsinstall', '-in', 'dummy.tmp', '-module', $infile,
+ ok(run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install'])),
++            '-section_name', 'fips_sect'])),
+    &quot;fipsinstall&quot;);
+ 
+ # verify the fips.cnf file
+ ok(run(app(['openssl', 'fipsinstall', '-in', 'fips.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install', '-verify'])),
++            '-section_name', 'fips_sect', '-verify'])),
+    &quot;fipsinstall verify&quot;);
+ 
++ok(replace_line_file('module-mac', '', 'fips_no_module_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-in', 'fips_no_module_mac.cnf',
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
++                '-section_name', 'fips_sect', '-verify'])),
++   &quot;fipsinstall verify fail no module mac&quot;);
++
++ok(replace_line_file('install-mac', '', 'fips_no_install_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-in', 'fips_no_install_mac.cnf',
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
++                '-section_name', 'fips_sect', '-verify'])),
++   &quot;fipsinstall verify fail no install indicator mac&quot;);
++
++ok(replace_line_file('module-mac', '00:00:00:00:00:00',
++                     'fips_bad_module_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-in', 'fips_bad_module_mac.cnf',
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
++                '-section_name', 'fips_sect', '-verify'])),
++   &quot;fipsinstall verify fail if invalid module integrity value&quot;);
++
++ok(replace_line_file('install-mac', '00:00:00:00:00:00',
++                     'fips_bad_install_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-in', 'fips_bad_install_mac.cnf',
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
++                '-section_name', 'fips_sect', '-verify'])),
++   &quot;fipsinstall verify fail if invalid install indicator integrity value&quot;);
++
++ok(replace_line_file('install-status', 'INCORRECT_STATUS_STRING',
++                     'fips_bad_indicator.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-in', 'fips_bad_indicator.cnf',
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
++                '-section_name', 'fips_sect', '-verify'])),
++   &quot;fipsinstall verify fail if invalid install indicator status&quot;);
++
+ # fail to verify the fips.cnf file if a different key is used
+ ok(!run(app(['openssl', 'fipsinstall', '-in', 'fips.cnf', '-module', $infile,
+              '-provider_name', 'fips', '-mac_name', 'HMAC',
+              '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:01&quot;,
+-             '-section_name', 'fips_install', '-verify'])),
++             '-section_name', 'fips_sect', '-verify'])),
+    &quot;fipsinstall verify fail bad key&quot;);
+ 
+ # fail to verify the fips.cnf file if a different mac digest is used
+ ok(!run(app(['openssl', 'fipsinstall', '-in', 'fips.cnf', '-module', $infile,
+              '-provider_name', 'fips', '-mac_name', 'HMAC',
+              '-macopt', 'digest:SHA512', '-macopt', &quot;hexkey:$fipskey&quot;,
+-             '-section_name', 'fips_install', '-verify'])),
++             '-section_name', 'fips_sect', '-verify'])),
+    &quot;fipsinstall verify fail incorrect digest&quot;);
+ 
+ # corrupt the module hmac
+ ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install', '-corrupt_desc', 'HMAC'])),
++            '-section_name', 'fips_sect', '-corrupt_desc', 'HMAC'])),
+    &quot;fipsinstall fails when the module integrity is corrupted&quot;);
+ 
+ # corrupt the first digest
+-ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module', $infile,
++ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips_fail.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install', '-corrupt_desc', 'SHA1'])),
++            '-section_name', 'fips_sect', '-corrupt_desc', 'SHA1'])),
+    &quot;fipsinstall fails when the digest result is corrupted&quot;);
+ 
+ # corrupt another digest
+-ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module', $infile,
++ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips_fail.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install', '-corrupt_desc', 'SHA3'])),
++            '-section_name', 'fips_sect', '-corrupt_desc', 'SHA3'])),
+    &quot;fipsinstall fails when the digest result is corrupted&quot;);
+ 
+ # corrupt DRBG
+-ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.cnf', '-module', $infile,
++ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips_fail.cnf', '-module', $infile,
+             '-provider_name', 'fips', '-mac_name', 'HMAC',
+             '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-            '-section_name', 'fips_install', '-corrupt_desc', 'CTR'])),
++            '-section_name', 'fips_sect', '-corrupt_desc', 'CTR'])),
+    &quot;fipsinstall fails when the DRBG CTR result is corrupted&quot;);
+ 
+ # corrupt a KAS test
+@@ -108,7 +206,7 @@ SKIP: {
+     ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.conf', '-module', $infile,
+                 '-provider_name', 'fips', '-mac_name', 'HMAC',
+                 '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-                '-section_name', 'fips_install',
++                '-section_name', 'fips_sect',
+                 '-corrupt_desc', 'DH',
+                 '-corrupt_type', 'KAT_KA'])),
+        &quot;fipsinstall fails when the kas result is corrupted&quot;);
+@@ -121,8 +219,47 @@ SKIP: {
+     ok(!run(app(['openssl', 'fipsinstall', '-out', 'fips.conf', '-module', $infile,
+                 '-provider_name', 'fips', '-mac_name', 'HMAC',
+                 '-macopt', 'digest:SHA256', '-macopt', &quot;hexkey:$fipskey&quot;,
+-                '-section_name', 'fips_install',
++                '-section_name', 'fips_sect',
+                 '-corrupt_desc', 'DSA',
+                 '-corrupt_type', 'KAT_Signature'])),
+        &quot;fipsinstall fails when the signature result is corrupted&quot;);
+ }
++
++$ENV{OPENSSL_CONF_INCLUDE} = &quot;.&quot;;
++
++ok(replace_parent_line_file('fips.cnf', 'fips_parent.cnf')
++   &amp;&amp; run(app(['openssl', 'fipsinstall', '-config', 'fips_parent.cnf'])),
++   &quot;verify fips provider loads from a configuration file&quot;);
++
++ok(replace_parent_line_file('fips_no_module_mac.cnf',
++                            'fips_parent_no_module_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-config', 'fips_parent_no_module_mac.cnf'])),
++   &quot;verify load config fail no module mac&quot;);
++
++ok(replace_parent_line_file('fips_no_install_mac.cnf',
++                            'fips_parent_no_install_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-config', 'fips_parent_no_install_mac.cnf'])),
++   &quot;verify load config fail no install mac&quot;);
++
++ok(replace_parent_line_file('fips_bad_indicator.cnf',
++                            'fips_parent_bad_indicator.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-config', 'fips_parent_bad_indicator.cnf'])),
++   &quot;verify load config fail bad indicator&quot;);
++
++
++ok(replace_parent_line_file('fips_bad_install_mac.cnf',
++                            'fips_parent_bad_install_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-config', 'fips_parent_bad_install_mac.cnf'])),
++   &quot;verify load config fail bad install mac&quot;);
++
++ok(replace_parent_line_file('fips_bad_module_mac.cnf',
++                            'fips_parent_bad_module_mac.cnf')
++   &amp;&amp; !run(app(['openssl', 'fipsinstall',
++                '-config', 'fips_parent_bad_module_mac.cnf'])),
++   &quot;verify load config fail bad module mac&quot;);
++
++delete $ENV{OPENSSL_CONF_INCLUDE};
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029749.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029755.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29754">[ date ]</a>
+              <a href="thread.html#29754">[ thread ]</a>
+              <a href="subject.html#29754">[ subject ]</a>
+              <a href="author.html#29754">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1772 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1453215444.044006.16665.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003001.html">
+   <LINK REL="Next"  HREF="003006.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1453215444.044006.16665.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Tue Jan 19 14:57:24 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003001.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="003006.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3004">[ date ]</a>
+              <a href="thread.html#3004">[ thread ]</a>
+              <a href="subject.html#3004">[ subject ]</a>
+              <a href="author.html#3004">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6b01bed206156dbcb1ab150f618c8b24c01fb0d0 (commit)
+      from  6ada465fb258ae2c29668c59f3ec9b69dc38f8b3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6b01bed206156dbcb1ab150f618c8b24c01fb0d0
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Mon Jan 18 13:10:21 2016 -0500
+
+    Support disabling any or all TLS or DTLS versions
+    
+    Some users want to disable SSL 3.0/TLS 1.0/TLS 1.1, and enable just
+    TLS 1.2.  In the future they might want to disable TLS 1.2 and
+    enable just TLS 1.3, ...
+    
+    This commit makes it possible to disable any or all of the TLS or
+    DTLS protocols.  It also considerably simplifies the SSL/TLS tests,
+    by auto-generating the min/max version tests based on the set of
+    supported protocols (425 explicitly written out tests got replaced
+    by two loops that generate all 425 tests if all protocols are
+    enabled, fewer otherwise).
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Configure                  | 120 ++++++++-
+ apps/ciphers.c             |  18 +-
+ apps/openssl.c             |  21 ++
+ apps/s_client.c            |  45 ++--
+ apps/s_server.c            |  71 +++---
+ ssl/methods.c              |  61 ++++-
+ ssl/statem/statem_lib.c    |  22 ++
+ test/recipes/80-test_ssl.t | 616 ++++++++-------------------------------------
+ test/ssltest.c             |  70 ++++--
+ 9 files changed, 451 insertions(+), 593 deletions(-)
+
+diff --git a/Configure b/Configure
+index 908fe73..30e90b7 100755
+--- a/Configure
++++ b/Configure
+@@ -820,6 +820,10 @@ my $default_ranlib;
+ my $perl;
+ my $fips=0;
+ 
++# Known TLS and DTLS protocols
++my @tls = qw(ssl3 tls1 tls1_1 tls1_2);
++my @dtls = qw(dtls1 dtls1_2);
++
+ # Explicitelly known options that are possible to disable.  They can
+ # be regexps, and will be used like this: /^no-${option}$/
+ # For developers: keep it sorted alphabetically
+@@ -847,6 +851,8 @@ my @disablables = (
+     &quot;dynamic[-_]engine&quot;,
+     &quot;ec&quot;,
+     &quot;ec2m&quot;,
++    &quot;ecdh&quot;,
++    &quot;ecdsa&quot;,
+     &quot;ec_nistp_64_gcc_128&quot;,
+     &quot;engine&quot;,
+     &quot;err&quot;,			# Really???
+@@ -887,20 +893,22 @@ my @disablables = (
+     &quot;srtp&quot;,
+     &quot;sse2&quot;,
+     &quot;ssl&quot;,
+-    &quot;ssl3&quot;,
+-    &quot;ssl3-method&quot;,
+     &quot;ssl-trace&quot;,
+     &quot;static-engine&quot;,
+     &quot;stdio&quot;,
+     &quot;store&quot;,
+     &quot;threads&quot;,
+     &quot;tls&quot;,
+-    &quot;tls1&quot;,
+     &quot;unit-test&quot;,
+     &quot;whirlpool&quot;,
+     &quot;zlib&quot;,
+     &quot;zlib-dynamic&quot;,
+     );
++foreach my $proto ((@tls, @dtls))
++	{
++	push(@disablables, $proto);
++	push(@disablables, &quot;$proto-method&quot;);
++	}
+ 
+ # All of the following is disabled by default (RC5 was enabled before 0.9.8):
+ 
+@@ -1000,19 +1008,35 @@ PROCESS_ARGS:
+ 			{
+ 			if (!($disabled{$1} eq &quot;experimental&quot;))
+ 				{
+-				if ($1 eq &quot;ssl&quot;)
++				foreach my $proto ((@tls, @dtls))
+ 					{
+-					$disabled{&quot;ssl3&quot;} = &quot;option(ssl)&quot;;
++					if ($1 eq &quot;$proto-method&quot;)
++						{
++						$disabled{&quot;$proto&quot;} = &quot;option($proto-method)&quot;;
++						last;
++						}
+ 					}
+-				elsif ($1 eq &quot;tls&quot;)
++				if ($1 eq &quot;dtls&quot;)
+ 					{
+-					$disabled{&quot;tls1&quot;} = &quot;option(tls)&quot;
++                                        foreach my $proto (@dtls)
++						{
++						$disabled{$proto} = &quot;option(dtls)&quot;;
++						}
+ 					}
+-				elsif ($1 eq &quot;ssl3-method&quot;)
++				elsif ($1 eq &quot;ssl&quot;)
+ 					{
+-					$disabled{&quot;ssl3-method&quot;} = &quot;option(ssl)&quot;;
++					# Last one of its kind
+ 					$disabled{&quot;ssl3&quot;} = &quot;option(ssl)&quot;;
+ 					}
++				elsif ($1 eq &quot;tls&quot;)
++					{
++                                        # XXX: Tests will fail if all SSL/TLS
++                                        # protocols are disabled.
++                                        foreach my $proto (@tls)
++						{
++						$disabled{$proto} = &quot;option(tls)&quot;;
++						}
++					}
+ 				else
+ 					{
+ 					$disabled{$1} = &quot;option&quot;;
+@@ -1216,19 +1240,89 @@ if (defined($disabled{&quot;ec&quot;}))
+ 	$disabled{&quot;ecdh&quot;} = &quot;forced&quot;;
+ 	}
+ 
+-# SSL 3.0 and TLS requires MD5 and SHA and either RSA or DSA+DH
++# SSL 3.0 requires MD5 and SHA and either RSA or DSA+DH
+ if (defined($disabled{&quot;md5&quot;}) || defined($disabled{&quot;sha&quot;})
+     || (defined($disabled{&quot;rsa&quot;})
+-        &amp;&amp; (defined($disabled{&quot;dsa&quot;}) || defined($disabled{&quot;dh&quot;}))))
++	&amp;&amp; (defined($disabled{&quot;dsa&quot;}) || defined($disabled{&quot;dh&quot;}))))
+ 	{
+ 	$disabled{&quot;ssl3&quot;} = &quot;forced&quot;;
++	$disabled{&quot;ssl&quot;} = &quot;forced&quot;;
++	}
++
++# (D)TLS 1.0 and TLS 1.1 require MD5 and SHA and either RSA or DSA+DH
++# or ECDSA + ECDH.  (XXX: We don't support PSK-only builds).
++#
++if (defined($disabled{&quot;md5&quot;}) || defined($disabled{&quot;sha&quot;})
++    || (defined($disabled{&quot;rsa&quot;})
++	&amp;&amp; (defined($disabled{&quot;dsa&quot;}) || defined($disabled{&quot;dh&quot;}))
++	&amp;&amp; (defined($disabled{&quot;ecdsa&quot;}) || defined($disabled{&quot;ecdh&quot;}))))
++	{
+ 	$disabled{&quot;tls1&quot;} = &quot;forced&quot;;
++	$disabled{&quot;dtls1&quot;} = &quot;forced&quot;;
++	$disabled{&quot;tls1_1&quot;} = &quot;forced&quot;;
++	}
++
++# (D)TLS 1.2 requires either RSA or DSA+DH or ECDSA + ECDH
++# So if all are missing, we can't do either TLS or DTLS.
++# (XXX: We don't support PSK-only builds).
++#
++if (defined($disabled{&quot;rsa&quot;})
++    &amp;&amp; (defined($disabled{&quot;dsa&quot;}) || defined($disabled{&quot;dh&quot;}))
++    &amp;&amp; (defined($disabled{&quot;ecdsa&quot;}) || defined($disabled{&quot;ecdh&quot;})))
++	{
++	$disabled{&quot;tls&quot;} = &quot;forced&quot;;
++	$disabled{&quot;dtls&quot;} = &quot;forced&quot;;
++	foreach my $proto ((@tls, @dtls))
++		{
++		$disabled{&quot;$proto&quot;} = &quot;forced&quot;;
++		}
++	}
++
++
++# Avoid protocol support holes.  Also disable all versions below N, if version
++# N is disabled while N+1 is enabled.
++#
++my $prev_disabled = 1;
++my $force_disable = 0;
++foreach my $proto (reverse(@tls))
++	{
++	if ($force_disable)
++		{
++		$disabled{$proto} = 1;
++		}
++	elsif (! defined($disabled{$proto}))
++		{
++		$prev_disabled = 0;
++		}
++	elsif (! $prev_disabled)
++		{
++		$force_disable = 1;
++		}
++	}
++my $prev_disabled = 1;
++my $force_disable = 0;
++foreach my $proto (reverse(@dtls))
++	{
++	if ($force_disable)
++		{
++		$disabled{$proto} = 1;
++		}
++	elsif (! defined($disabled{$proto}))
++		{
++		$prev_disabled = 0;
++		}
++	elsif (! $prev_disabled)
++		{
++		$force_disable = 1;
++		}
+ 	}
+ 
+ if (defined($disabled{&quot;dgram&quot;}))
+ 	{
+-        $disabled{&quot;dtls&quot;} = &quot;forced&quot;;
+-        }
++	$disabled{&quot;dtls&quot;} = &quot;forced&quot;;
++	$disabled{&quot;dtls1&quot;} = &quot;forced&quot;;
++	$disabled{&quot;dtls1_2&quot;} = &quot;forced&quot;;
++	}
+ 
+ if (defined($disabled{&quot;ec&quot;}) || defined($disabled{&quot;dsa&quot;})
+     || defined($disabled{&quot;dh&quot;}) || defined($disabled{&quot;stdio&quot;}))
+diff --git a/apps/ciphers.c b/apps/ciphers.c
+index 086ad43..3e1ed95 100644
+--- a/apps/ciphers.c
++++ b/apps/ciphers.c
+@@ -78,15 +78,21 @@ OPTIONS ciphers_options[] = {
+     {&quot;v&quot;, OPT_V, '-', &quot;Verbose listing of the SSL/TLS ciphers&quot;},
+     {&quot;V&quot;, OPT_UPPER_V, '-', &quot;Even more verbose&quot;},
+     {&quot;s&quot;, OPT_S, '-', &quot;Only supported ciphers&quot;},
++#ifndef OPENSSL_NO_SSL3
++    {&quot;ssl3&quot;, OPT_SSL3, '-', &quot;SSL3 mode&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1
+     {&quot;tls1&quot;, OPT_TLS1, '-', &quot;TLS1 mode&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_1
+     {&quot;tls1_1&quot;, OPT_TLS1_1, '-', &quot;TLS1.1 mode&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_2
+     {&quot;tls1_2&quot;, OPT_TLS1_2, '-', &quot;TLS1.2 mode&quot;},
++#endif
+ #ifndef OPENSSL_NO_SSL_TRACE
+     {&quot;stdname&quot;, OPT_STDNAME, '-', &quot;Show standard cipher names&quot;},
+ #endif
+-#ifndef OPENSSL_NO_SSL3
+-    {&quot;ssl3&quot;, OPT_SSL3, '-', &quot;SSL3 mode&quot;},
+-#endif
+ #ifndef OPENSSL_NO_PSK
+     {&quot;psk&quot;, OPT_PSK, '-', &quot;include ciphersuites requiring PSK&quot;},
+ #endif
+@@ -153,13 +159,19 @@ int ciphers_main(int argc, char **argv)
+ #endif
+             break;
+         case OPT_TLS1:
++#ifndef OPENSSL_NO_TLS1
+             meth = TLSv1_client_method();
++#endif
+             break;
+         case OPT_TLS1_1:
++#ifndef OPENSSL_NO_TLS1_1
+             meth = TLSv1_1_client_method();
++#endif
+             break;
+         case OPT_TLS1_2:
++#ifndef OPENSSL_NO_TLS1_2
+             meth = TLSv1_2_client_method();
++#endif
+             break;
+         case OPT_PSK:
+ #ifndef OPENSSL_NO_PSK
+diff --git a/apps/openssl.c b/apps/openssl.c
+index 4f2ba8c..37f71a9 100644
+--- a/apps/openssl.c
++++ b/apps/openssl.c
+@@ -754,6 +754,12 @@ static void list_disabled(void)
+ #if defined(OPENSSL_NO_DTLS)
+     BIO_puts(bio_out, &quot;DTLS\n&quot;);
+ #endif
++#if defined(OPENSSL_NO_DTLS1)
++    BIO_puts(bio_out, &quot;DTLS1\n&quot;);
++#endif
++#if defined(OPENSSL_NO_DTLS1_2)
++    BIO_puts(bio_out, &quot;DTLS1_2\n&quot;);
++#endif
+ #ifdef OPENSSL_NO_EC
+     BIO_puts(bio_out, &quot;EC\n&quot;);
+ #endif
+@@ -835,9 +841,24 @@ static void list_disabled(void)
+ #ifdef OPENSSL_NO_SRTP
+     BIO_puts(bio_out, &quot;SRTP\n&quot;);
+ #endif
++#ifdef OPENSSL_NO_SSL
++    BIO_puts(bio_out, &quot;SSL\n&quot;);
++#endif
+ #ifdef OPENSSL_NO_SSL3
+     BIO_puts(bio_out, &quot;SSL3\n&quot;);
+ #endif
++#if defined(OPENSSL_NO_TLS)
++    BIO_puts(bio_out, &quot;TLS\n&quot;);
++#endif
++#ifdef OPENSSL_NO_TLS1
++    BIO_puts(bio_out, &quot;TLS1\n&quot;);
++#endif
++#ifdef OPENSSL_NO_TLS1_1
++    BIO_puts(bio_out, &quot;TLS1_1\n&quot;);
++#endif
++#ifdef OPENSSL_NO_TLS1_2
++    BIO_puts(bio_out, &quot;TLS1_2\n&quot;);
++#endif
+ #ifdef OPENSSL_NO_WHIRLPOOL
+     BIO_puts(bio_out, &quot;WHIRLPOOL\n&quot;);
+ #endif
+diff --git a/apps/s_client.c b/apps/s_client.c
+index 6d6ad691..4dea7c4 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -675,9 +675,6 @@ OPTIONS s_client_options[] = {
+     {&quot;quiet&quot;, OPT_QUIET, '-', &quot;No s_client output&quot;},
+     {&quot;ign_eof&quot;, OPT_IGN_EOF, '-', &quot;Ignore input eof (default when -quiet)&quot;},
+     {&quot;no_ign_eof&quot;, OPT_NO_IGN_EOF, '-', &quot;Don't ignore input eof&quot;},
+-    {&quot;tls1_2&quot;, OPT_TLS1_2, '-', &quot;Just use TLSv1.2&quot;},
+-    {&quot;tls1_1&quot;, OPT_TLS1_1, '-', &quot;Just use TLSv1.1&quot;},
+-    {&quot;tls1&quot;, OPT_TLS1, '-', &quot;Just use TLSv1&quot;},
+     {&quot;starttls&quot;, OPT_STARTTLS, 's',
+      &quot;Use the appropriate STARTTLS command before starting TLS&quot;},
+     {&quot;xmpphost&quot;, OPT_XMPPHOST, 's',
+@@ -727,13 +724,26 @@ OPTIONS s_client_options[] = {
+ #ifndef OPENSSL_NO_SSL3
+     {&quot;ssl3&quot;, OPT_SSL3, '-', &quot;Just use SSLv3&quot;},
+ #endif
++#ifndef OPENSSL_NO_TLS1
++    {&quot;tls1&quot;, OPT_TLS1, '-', &quot;Just use TLSv1&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_1
++    {&quot;tls1_1&quot;, OPT_TLS1_1, '-', &quot;Just use TLSv1.1&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_2
++    {&quot;tls1_2&quot;, OPT_TLS1_2, '-', &quot;Just use TLSv1.2&quot;},
++#endif
+ #ifndef OPENSSL_NO_DTLS
+     {&quot;dtls&quot;, OPT_DTLS, '-'},
+-    {&quot;dtls1&quot;, OPT_DTLS1, '-', &quot;Just use DTLSv1&quot;},
+-    {&quot;dtls1_2&quot;, OPT_DTLS1_2, '-'},
+     {&quot;timeout&quot;, OPT_TIMEOUT, '-'},
+     {&quot;mtu&quot;, OPT_MTU, 'p', &quot;Set the link layer MTU&quot;},
+ #endif
++#ifndef OPENSSL_NO_DTLS1
++    {&quot;dtls1&quot;, OPT_DTLS1, '-', &quot;Just use DTLSv1&quot;},
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
++    {&quot;dtls1_2&quot;, OPT_DTLS1_2, '-'},
++#endif
+ #ifndef OPENSSL_NO_SSL_TRACE
+     {&quot;trace&quot;, OPT_TRACE, '-'},
+ #endif
+@@ -1108,41 +1118,48 @@ int s_client_main(int argc, char **argv)
+ #endif
+             break;
+         case OPT_TLS1_2:
++#ifndef OPENSSL_NO_TLS1_2
+             meth = TLSv1_2_client_method();
++#endif
+             break;
+         case OPT_TLS1_1:
++#ifndef OPENSSL_NO_TLS1_1
+             meth = TLSv1_1_client_method();
++#endif
+             break;
+         case OPT_TLS1:
++#ifndef OPENSSL_NO_TLS1
+             meth = TLSv1_client_method();
++#endif
+             break;
+-#ifndef OPENSSL_NO_DTLS
+         case OPT_DTLS:
++#ifndef OPENSSL_NO_DTLS
+             meth = DTLS_client_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_DTLS1:
++#ifndef OPENSSL_NO_DTLS1
+             meth = DTLSv1_client_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_DTLS1_2:
++#ifndef OPENSSL_NO_DTLS1_2
+             meth = DTLSv1_2_client_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_TIMEOUT:
++#ifndef OPENSSL_NO_DTLS
+             enable_timeouts = 1;
++#endif
+             break;
+         case OPT_MTU:
++#ifndef OPENSSL_NO_DTLS
+             socket_mtu = atol(opt_arg());
+-            break;
+-#else
+-        case OPT_DTLS:
+-        case OPT_DTLS1:
+-        case OPT_DTLS1_2:
+-        case OPT_TIMEOUT:
+-        case OPT_MTU:
+-            break;
+ #endif
++            break;
+         case OPT_FALLBACKSCSV:
+             fallback_scsv = 1;
+             break;
+diff --git a/apps/s_server.c b/apps/s_server.c
+index 81ee385..93f6083 100644
+--- a/apps/s_server.c
++++ b/apps/s_server.c
+@@ -863,9 +863,6 @@ OPTIONS s_server_options[] = {
+      &quot;Do not load certificates from the default certificates directory&quot;},
+     {&quot;nocert&quot;, OPT_NOCERT, '-', &quot;Don't use any certificates (Anon-DH)&quot;},
+     {&quot;quiet&quot;, OPT_QUIET, '-', &quot;No server output&quot;},
+-    {&quot;tls1_2&quot;, OPT_TLS1_2, '-', &quot;just talk TLSv1.2&quot;},
+-    {&quot;tls1_1&quot;, OPT_TLS1_1, '-', &quot;Just talk TLSv1.1&quot;},
+-    {&quot;tls1&quot;, OPT_TLS1, '-', &quot;Just talk TLSv1&quot;},
+     {&quot;no_resume_ephemeral&quot;, OPT_NO_RESUME_EPHEMERAL, '-',
+      &quot;Disable caching and tickets if ephemeral (EC)DH is used&quot;},
+     {&quot;www&quot;, OPT_WWW, '-', &quot;Respond to a 'GET /' with a status page&quot;},
+@@ -937,16 +934,29 @@ OPTIONS s_server_options[] = {
+ #ifndef OPENSSL_NO_SSL3
+     {&quot;ssl3&quot;, OPT_SSL3, '-', &quot;Just talk SSLv3&quot;},
+ #endif
++#ifndef OPENSSL_NO_TLS1
++    {&quot;tls1&quot;, OPT_TLS1, '-', &quot;Just talk TLSv1&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_1
++    {&quot;tls1_1&quot;, OPT_TLS1_1, '-', &quot;Just talk TLSv1.1&quot;},
++#endif
++#ifndef OPENSSL_NO_TLS1_2
++    {&quot;tls1_2&quot;, OPT_TLS1_2, '-', &quot;just talk TLSv1.2&quot;},
++#endif
+ #ifndef OPENSSL_NO_DTLS
+     {&quot;dtls&quot;, OPT_DTLS, '-'},
+-    {&quot;dtls1&quot;, OPT_DTLS1, '-', &quot;Just talk DTLSv1&quot;},
+-    {&quot;dtls1_2&quot;, OPT_DTLS1_2, '-', &quot;Just talk DTLSv1.2&quot;},
+     {&quot;timeout&quot;, OPT_TIMEOUT, '-', &quot;Enable timeouts&quot;},
+     {&quot;mtu&quot;, OPT_MTU, 'p', &quot;Set link layer MTU&quot;},
+     {&quot;chain&quot;, OPT_CHAIN, '-', &quot;Read a certificate chain&quot;},
+     {&quot;listen&quot;, OPT_LISTEN, '-',
+      &quot;Listen for a DTLS ClientHello with a cookie and then connect&quot;},
+ #endif
++#ifndef OPENSSL_NO_DTLS1
++    {&quot;dtls1&quot;, OPT_DTLS1, '-', &quot;Just talk DTLSv1&quot;},
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
++    {&quot;dtls1_2&quot;, OPT_DTLS1_2, '-', &quot;Just talk DTLSv1.2&quot;},
++#endif
+ #ifndef OPENSSL_NO_DH
+     {&quot;no_dhe&quot;, OPT_NO_DHE, '-', &quot;Disable ephemeral DH&quot;},
+ #endif
+@@ -1039,19 +1049,6 @@ int s_server_main(int argc, char *argv[])
+     prog = opt_init(argc, argv, s_server_options);
+     while ((o = opt_next()) != OPT_EOF) {
+         switch (o) {
+-#ifdef OPENSSL_NO_PSK
+-        case OPT_PSK_HINT:
+-        case OPT_PSK:
+-#endif
+-#ifdef OPENSSL_NO_DTLS
+-        case OPT_DTLS:
+-        case OPT_DTLS1:
+-        case OPT_DTLS1_2:
+-        case OPT_TIMEOUT:
+-        case OPT_MTU:
+-        case OPT_CHAIN:
+-        case OPT_LISTEN:
+-#endif
+         case OPT_EOF:
+         case OPT_ERR:
+  opthelp:
+@@ -1299,33 +1296,33 @@ int s_server_main(int argc, char *argv[])
+         case OPT_NO_RESUME_EPHEMERAL:
+             no_resume_ephemeral = 1;
+             break;
+-#ifndef OPENSSL_NO_PSK
+         case OPT_PSK_HINT:
++#ifndef OPENSSL_NO_PSK
+             psk_identity_hint = opt_arg();
++#endif
+             break;
+         case OPT_PSK:
++#ifndef OPENSSL_NO_PSK
+             for (p = psk_key = opt_arg(); *p; p++) {
+                 if (isxdigit(*p))
+                     continue;
+                 BIO_printf(bio_err, &quot;Not a hex number '%s'\n&quot;, *argv);
+                 goto end;
+             }
+-            break;
+ #endif
+-#ifndef OPENSSL_NO_SRP
++            break;
+         case OPT_SRPVFILE:
++#ifndef OPENSSL_NO_SRP
+             srp_verifier_file = opt_arg();
+             meth = TLSv1_server_method();
++#endif
+             break;
+         case OPT_SRPUSERSEED:
++#ifndef OPENSSL_NO_SRP
+             srpuserseed = opt_arg();
+             meth = TLSv1_server_method();
+-            break;
+-#else
+-        case OPT_SRPVFILE:
+-        case OPT_SRPUSERSEED:
+-            break;
+ #endif
++            break;
+         case OPT_REV:
+             rev = 1;
+             break;
+@@ -1347,40 +1344,58 @@ int s_server_main(int argc, char *argv[])
+ #endif
+             break;
+         case OPT_TLS1_2:
++#ifndef OPENSSL_NO_TLS1_2
+             meth = TLSv1_2_server_method();
++#endif
+             break;
+         case OPT_TLS1_1:
++#ifndef OPENSSL_NO_TLS1_1
+             meth = TLSv1_1_server_method();
++#endif
+             break;
+         case OPT_TLS1:
++#ifndef OPENSSL_NO_TLS1
+             meth = TLSv1_server_method();
++#endif
+             break;
+-#ifndef OPENSSL_NO_DTLS
+         case OPT_DTLS:
++#ifndef OPENSSL_NO_DTLS
+             meth = DTLS_server_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_DTLS1:
++#ifndef OPENSSL_NO_DTLS1
+             meth = DTLSv1_server_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_DTLS1_2:
++#ifndef OPENSSL_NO_DTLS1_2
+             meth = DTLSv1_2_server_method();
+             socket_type = SOCK_DGRAM;
++#endif
+             break;
+         case OPT_TIMEOUT:
++#ifndef OPENSSL_NO_DTLS
+             enable_timeouts = 1;
++#endif
+             break;
+         case OPT_MTU:
++#ifndef OPENSSL_NO_DTLS
+             socket_mtu = atol(opt_arg());
++#endif
+             break;
+         case OPT_CHAIN:
++#ifndef OPENSSL_NO_DTLS
+             cert_chain = 1;
++#endif
+             break;
+         case OPT_LISTEN:
++#ifndef OPENSSL_NO_DTLS
+             dtlslisten = 1;
+-            break;
+ #endif
++            break;
+         case OPT_ID_PREFIX:
+             session_id_prefix = opt_arg();
+             break;
+diff --git a/ssl/methods.c b/ssl/methods.c
+index 7a8bb11..c0698ab 100644
+--- a/ssl/methods.c
++++ b/ssl/methods.c
+@@ -121,12 +121,18 @@ static const SSL_METHOD *tls1_get_method(int ver)
+ {
+     if (ver == TLS_ANY_VERSION)
+         return TLS_method();
++#ifndef OPENSSL_NO_TLS1_2
+     if (ver == TLS1_2_VERSION)
+         return TLSv1_2_method();
++#endif
++#ifndef OPENSSL_NO_TLS1_1
+     if (ver == TLS1_1_VERSION)
+         return TLSv1_1_method();
++#endif
++#ifndef OPENSSL_NO_TLS1
+     if (ver == TLS1_VERSION)
+         return TLSv1_method();
++#endif
+ #ifndef OPENSSL_NO_SSL3
+     if (ver == SSL3_VERSION)
+         return (SSLv3_method());
+@@ -140,20 +146,26 @@ IMPLEMENT_tls_meth_func(TLS_ANY_VERSION, 0, 0,
+                         ossl_statem_accept,
+                         ossl_statem_connect, tls1_get_method, TLSv1_2_enc_data)
+ 
++#ifndef OPENSSL_NO_TLS1_2_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_2_VERSION, 0, SSL_OP_NO_TLSv1_2,
+                         TLSv1_2_method,
+                         ossl_statem_accept,
+                         ossl_statem_connect, tls1_get_method, TLSv1_2_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1_1,
+                         TLSv1_1_method,
+                         ossl_statem_accept,
+                         ossl_statem_connect, tls1_get_method, TLSv1_1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1,
+                         TLSv1_method,
+                         ossl_statem_accept,
+                         ossl_statem_connect, tls1_get_method, TLSv1_enc_data)
++#endif
+ 
+ #ifndef OPENSSL_NO_SSL3_METHOD
+ IMPLEMENT_ssl3_meth_func(SSLv3_method, ossl_statem_accept, ossl_statem_connect,
+@@ -169,12 +181,18 @@ static const SSL_METHOD *tls1_get_server_method(int ver)
+ {
+     if (ver == TLS_ANY_VERSION)
+         return TLS_server_method();
++#ifndef OPENSSL_NO_TLS1_2
+     if (ver == TLS1_2_VERSION)
+         return TLSv1_2_server_method();
++#endif
++#ifndef OPENSSL_NO_TLS1_1
+     if (ver == TLS1_1_VERSION)
+         return TLSv1_1_server_method();
++#endif
++#ifndef OPENSSL_NO_TLS1
+     if (ver == TLS1_VERSION)
+         return TLSv1_server_method();
++#endif
+ #ifndef OPENSSL_NO_SSL3
+     if (ver == SSL3_VERSION)
+         return (SSLv3_server_method());
+@@ -188,23 +206,29 @@ IMPLEMENT_tls_meth_func(TLS_ANY_VERSION, 0, 0,
+                         ssl_undefined_function,
+                         tls1_get_server_method, TLSv1_2_enc_data)
+ 
++#ifndef OPENSSL_NO_TLS1_2_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_2_VERSION, 0, SSL_OP_NO_TLSv1_2,
+                         TLSv1_2_server_method,
+                         ossl_statem_accept,
+                         ssl_undefined_function,
+                         tls1_get_server_method, TLSv1_2_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1_1,
+                         TLSv1_1_server_method,
+                         ossl_statem_accept,
+                         ssl_undefined_function,
+                         tls1_get_server_method, TLSv1_1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1,
+                         TLSv1_server_method,
+                         ossl_statem_accept,
+                         ssl_undefined_function,
+                         tls1_get_server_method, TLSv1_enc_data)
++#endif
+ 
+ #ifndef OPENSSL_NO_SSL3_METHOD
+ IMPLEMENT_ssl3_meth_func(SSLv3_server_method,
+@@ -221,12 +245,18 @@ static const SSL_METHOD *tls1_get_client_method(int ver)
+ {
+     if (ver == TLS_ANY_VERSION)
+         return TLS_client_method();
++#ifndef OPENSSL_NO_TLS1_2
+     if (ver == TLS1_2_VERSION)
+         return TLSv1_2_client_method();
++#endif
++#ifndef OPENSSL_NO_TLS1_1
+     if (ver == TLS1_1_VERSION)
+         return TLSv1_1_client_method();
++#endif
++#ifndef OPENSSL_NO_TLS1
+     if (ver == TLS1_VERSION)
+         return TLSv1_client_method();
++#endif
+ #ifndef OPENSSL_NO_SSL3
+     if (ver == SSL3_VERSION)
+         return (SSLv3_client_method());
+@@ -240,23 +270,29 @@ IMPLEMENT_tls_meth_func(TLS_ANY_VERSION, 0, 0,
+                         ossl_statem_connect,
+                         tls1_get_client_method, TLSv1_2_enc_data)
+ 
++#ifndef OPENSSL_NO_TLS1_2_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_2_VERSION, 0, SSL_OP_NO_TLSv1_2,
+                         TLSv1_2_client_method,
+                         ssl_undefined_function,
+                         ossl_statem_connect,
+                         tls1_get_client_method, TLSv1_2_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1_1,
+                         TLSv1_1_client_method,
+                         ssl_undefined_function,
+                         ossl_statem_connect,
+                         tls1_get_client_method, TLSv1_1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_TLS1_METHOD
+ IMPLEMENT_tls_meth_func(TLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_TLSv1,
+                         TLSv1_client_method,
+                         ssl_undefined_function,
+                         ossl_statem_connect,
+                         tls1_get_client_method, TLSv1_enc_data)
++#endif
+ 
+ #ifndef OPENSSL_NO_SSL3_METHOD
+ IMPLEMENT_ssl3_meth_func(SSLv3_client_method,
+@@ -272,25 +308,33 @@ static const SSL_METHOD *dtls1_get_method(int ver)
+ {
+     if (ver == DTLS_ANY_VERSION)
+         return DTLS_method();
++#ifndef OPENSSL_NO_DTLS1
+     else if (ver == DTLS1_VERSION)
+         return DTLSv1_method();
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
+     else if (ver == DTLS1_2_VERSION)
+         return DTLSv1_2_method();
++#endif
+     else
+         return NULL;
+ }
+ 
++#ifndef OPENSSL_NO_DTLS1_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_DTLSv1,
+                           DTLSv1_method,
+                           ossl_statem_accept,
+                           ossl_statem_connect,
+                           dtls1_get_method, DTLSv1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_DTLS1_2_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_2_VERSION, 0, SSL_OP_NO_DTLSv1_2,
+                           DTLSv1_2_method,
+                           ossl_statem_accept,
+                           ossl_statem_connect,
+                           dtls1_get_method, DTLSv1_2_enc_data)
++#endif
+ 
+ IMPLEMENT_dtls1_meth_func(DTLS_ANY_VERSION, 0, 0,
+                           DTLS_method,
+@@ -298,7 +342,6 @@ IMPLEMENT_dtls1_meth_func(DTLS_ANY_VERSION, 0, 0,
+                           ossl_statem_connect,
+                           dtls1_get_method, DTLSv1_2_enc_data)
+ 
+-
+ /*
+  * DTLS server methods
+  */
+@@ -307,25 +350,33 @@ static const SSL_METHOD *dtls1_get_server_method(int ver)
+ {
+     if (ver == DTLS_ANY_VERSION)
+         return DTLS_server_method();
++#ifndef OPENSSL_NO_DTLS1
+     else if (ver == DTLS1_VERSION)
+         return DTLSv1_server_method();
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
+     else if (ver == DTLS1_2_VERSION)
+         return DTLSv1_2_server_method();
++#endif
+     else
+         return NULL;
+ }
+ 
++#ifndef OPENSSL_NO_DTLS1_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_DTLSv1,
+                           DTLSv1_server_method,
+                           ossl_statem_accept,
+                           ssl_undefined_function,
+                           dtls1_get_server_method, DTLSv1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_DTLS1_2_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_2_VERSION, 0, SSL_OP_NO_DTLSv1_2,
+                           DTLSv1_2_server_method,
+                           ossl_statem_accept,
+                           ssl_undefined_function,
+                           dtls1_get_server_method, DTLSv1_2_enc_data)
++#endif
+ 
+ IMPLEMENT_dtls1_meth_func(DTLS_ANY_VERSION, 0, 0,
+                           DTLS_server_method,
+@@ -342,25 +393,33 @@ static const SSL_METHOD *dtls1_get_client_method(int ver)
+ {
+     if (ver == DTLS_ANY_VERSION)
+         return DTLS_client_method();
++#ifndef OPENSSL_NO_DTLS1
+     else if (ver == DTLS1_VERSION || ver == DTLS1_BAD_VER)
+         return DTLSv1_client_method();
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
+     else if (ver == DTLS1_2_VERSION)
+         return DTLSv1_2_client_method();
++#endif
+     else
+         return NULL;
+ }
+ 
++#ifndef OPENSSL_NO_DTLS1_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_VERSION, SSL_METHOD_NO_SUITEB, SSL_OP_NO_DTLSv1,
+                           DTLSv1_client_method,
+                           ssl_undefined_function,
+                           ossl_statem_connect,
+                           dtls1_get_client_method, DTLSv1_enc_data)
++#endif
+ 
++#ifndef OPENSSL_NO_DTLS1_2_METHOD
+ IMPLEMENT_dtls1_meth_func(DTLS1_2_VERSION, 0, SSL_OP_NO_DTLSv1_2,
+                           DTLSv1_2_client_method,
+                           ssl_undefined_function,
+                           ossl_statem_connect,
+                           dtls1_get_client_method, DTLSv1_2_enc_data)
++#endif
+ 
+ IMPLEMENT_dtls1_meth_func(DTLS_ANY_VERSION, 0, 0,
+                           DTLS_client_method,
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index 7142128..984df19 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -727,11 +727,25 @@ typedef struct {
+ #endif
+ 
+ static const version_info tls_version_table[] = {
++#ifndef OPENSSL_NO_TLS1_2
+     { TLS1_2_VERSION, TLSv1_2_client_method, TLSv1_2_server_method },
++#else
++    { TLS1_2_VERSION, NULL, NULL },
++#endif
++#ifndef OPENSSL_NO_TLS1_1
+     { TLS1_1_VERSION, TLSv1_1_client_method, TLSv1_1_server_method },
++#else
++    { TLS1_1_VERSION, NULL, NULL },
++#endif
++#ifndef OPENSSL_NO_TLS1
+     { TLS1_VERSION, TLSv1_client_method, TLSv1_server_method },
++#else
++    { TLS1_VERSION, NULL, NULL },
++#endif
+ #ifndef OPENSSL_NO_SSL3
+     { SSL3_VERSION, SSLv3_client_method, SSLv3_server_method },
++#else
++    { SSL3_VERSION, NULL, NULL },
+ #endif
+     { 0, NULL, NULL },
+ };
+@@ -741,8 +755,16 @@ static const version_info tls_version_table[] = {
+ #endif
+ 
+ static const version_info dtls_version_table[] = {
++#ifndef OPENSSL_NO_DTLS1_2
+     { DTLS1_2_VERSION, DTLSv1_2_client_method, DTLSv1_2_server_method },
++#else
++    { DTLS1_2_VERSION, NULL, NULL },
++#endif
++#ifndef OPENSSL_NO_DTLS1
+     { DTLS1_VERSION, DTLSv1_client_method, DTLSv1_server_method },
++#else
++    { DTLS1_VERSION, NULL, NULL },
++#endif
+     { 0, NULL, NULL },
+ };
+ 
+diff --git a/test/recipes/80-test_ssl.t b/test/recipes/80-test_ssl.t
+index 0f96b5b..84cdf6c 100644
+--- a/test/recipes/80-test_ssl.t
++++ b/test/recipes/80-test_ssl.t
+@@ -11,8 +11,12 @@ use OpenSSL::Test::Utils;
+ 
+ setup(&quot;test_ssl&quot;);
+ 
+-my ($no_rsa, $no_dsa, $no_dh, $no_ec, $no_srp, $no_psk, $no_ssl3, $no_dtls) =
+-    disabled qw/rsa dsa dh ec srp psk ssl3 dtls/;
++my ($no_rsa, $no_dsa, $no_dh, $no_ec, $no_srp, $no_psk,
++    $no_ssl3, $no_tls1, $no_tls1_1, $no_tls1_2,
++    $no_dtls, $no_dtls1, $no_dtls1_2) =
++    disabled qw/rsa dsa dh ec srp psk
++                ssl3 tls1 tls1_1 tls1_2
++                dtls dtls1 dtls1_2/;
+ 
+ my $digest = &quot;-sha1&quot;;
+ my @reqcmd = (&quot;openssl&quot;, &quot;req&quot;);
+@@ -55,7 +59,7 @@ my $P2intermediate=&quot;tmp_intP2.ss&quot;;
+ plan tests =&gt;
+     1				# For testss
+     + 1				# For ssltest -test_cipherlist
+-    + 9				# For the first testssl
++    + 10			# For the first testssl
+     + 16			# For the first testsslproxy
+     + 16			# For the second testsslproxy
+     ;
+@@ -316,7 +320,7 @@ sub testssl {
+     }
+ 
+ 
+-    # plan tests =&gt; 9;
++    # plan tests =&gt; 10;
+ 
+     subtest 'standard SSL tests' =&gt; sub {
+ 	######################################################################
+@@ -407,7 +411,9 @@ sub testssl {
+             push @exkeys, &quot;-s_cert&quot;, &quot;certE.ss&quot;, &quot;-s_key&quot;, &quot;keyE.ss&quot;;
+         }
+ 
+-	my @protocols = (&quot;TLSv1.2&quot;, &quot;SSLv3&quot;);
++	my @protocols = ();
++        push(@protocols, &quot;TLSv1.2&quot;) unless $no_tls1_2;
++        push(@protocols, &quot;SSLv3&quot;) unless $no_ssl3;
+ 	my $protocolciphersuitcount = 0;
+ 	my %ciphersuites =
+ 	    map { my @c =
+@@ -568,514 +574,98 @@ sub testssl {
+ 	}
+     };
+ 
+-    subtest 'Version min/max tests' =&gt; sub {
+-
+-	plan tests =&gt; 425;
+-
+-	SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 76 if $no_ssl3;
+-
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        }
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 19 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
++    subtest 'TLS Version min/max tests' =&gt; sub {
++        my @protos;
++        push(@protos, &quot;ssl3&quot;) unless $no_ssl3;
++        push(@protos, &quot;tls1&quot;) unless $no_tls1;
++        push(@protos, &quot;tls1.1&quot;) unless $no_tls1_1;
++        push(@protos, &quot;tls1.2&quot;) unless $no_tls1_2;
++        my @minprotos = (undef, @protos);
++        my @maxprotos = (@protos, undef);
++        my @shdprotos = (@protos, $protos[$#protos]);
++        my $n = ((@protos+2) * (@protos+3))/2 - 2;
++        my $ntests = $n * $n;
++	plan tests =&gt; $ntests;
++        skip &quot;TLS disabled&quot;, 1 if $ntests == 1;
++
++        my $should;
++        for (my $smin = 0; $smin &lt; @minprotos; ++$smin) {
++        for (my $smax = $smin ? $smin - 1 : 0; $smax &lt; @maxprotos; ++$smax) {
++        for (my $cmin = 0; $cmin &lt; @minprotos; ++$cmin) {
++        for (my $cmax = $cmin ? $cmin - 1 : 0; $cmax &lt; @maxprotos; ++$cmax) {
++            if ($cmax &lt; $smin-1) {
++                $should = &quot;fail-server&quot;;
++            } elsif ($smax &lt; $cmin-1) {
++                $should = &quot;fail-client&quot;;
++            } elsif ($cmax &gt; $smax) {
++                $should = $shdprotos[$smax];
++            } else {
++                $should = $shdprotos[$cmax];
++            }
++
++            my @args = @ssltest;
++            push(@args, &quot;-should_negotiate&quot;, $should);
++            push(@args, &quot;-server_min_proto&quot;, $minprotos[$smin])
++                if (defined($minprotos[$smin]));
++            push(@args, &quot;-server_max_proto&quot;, $maxprotos[$smax])
++                if (defined($maxprotos[$smax]));
++            push(@args, &quot;-client_min_proto&quot;, $minprotos[$cmin])
++                if (defined($minprotos[$cmin]));
++            push(@args, &quot;-client_max_proto&quot;, $maxprotos[$cmax])
++                if (defined($maxprotos[$cmax]));
++            my $ok = run(test[@args]);
++            if (! $ok) {
++                print STDERR &quot;\nsmin=$smin, smax=$smax, cmin=$cmin, cmax=$cmax\n&quot;;
++                print STDERR &quot;\nFailed: @args\n&quot;;
++            }
++            ok($ok);
++        }}}}
++    };
+ 
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-server_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;ssl3 disabled&quot;, 6 if $no_ssl3;
+-            ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-            ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-            ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-client_max_proto&quot;, &quot;ssl3&quot;, &quot;-should_negotiate&quot;, &quot;ssl3&quot;])));
+-        }
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_min_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_max_proto&quot;, &quot;tls1&quot;, &quot;-should_negotiate&quot;, &quot;tls1&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_max_proto&quot;, &quot;tls1.1&quot;, &quot;-should_negotiate&quot;, &quot;tls1.1&quot;])));
+-        ok(run(test([@ssltest, &quot;-client_max_proto&quot;, &quot;tls1.2&quot;, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-        ok(run(test([@ssltest, &quot;-should_negotiate&quot;, &quot;tls1.2&quot;])));
+-
+-        SKIP : {
+-            skip &quot;dtls disabled&quot;, 64 if $no_dtls;
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;fail-client&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;fail-server&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-server_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_min_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_min_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_max_proto&quot;, &quot;dtls1&quot;, &quot;-should_negotiate&quot;, &quot;dtls1&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-client_max_proto&quot;, &quot;dtls1.2&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-            ok(run(test([@ssltest, &quot;-dtls&quot;, &quot;-should_negotiate&quot;, &quot;dtls1.2&quot;])));
+-        }
++    subtest 'DTLS Version min/max tests' =&gt; sub {
++        my @protos;
++        push(@protos, &quot;dtls1&quot;) unless ($no_dtls1 || $no_dtls);
++        push(@protos, &quot;dtls1.2&quot;) unless ($no_dtls1_2 || $no_dtls);
++        my @minprotos = (undef, @protos);
++        my @maxprotos = (@protos, undef);
++        my @shdprotos = (@protos, $protos[$#protos]);
++        my $n = ((@protos+2) * (@protos+3))/2 - 2;
++        my $ntests = $n * $n;
++	plan tests =&gt; $ntests;
++        skip &quot;DTLS disabled&quot;, 1 if $ntests == 1;
++
++        my $should;
++        for (my $smin = 0; $smin &lt; @minprotos; ++$smin) {
++        for (my $smax = $smin ? $smin - 1 : 0; $smax &lt; @maxprotos; ++$smax) {
++        for (my $cmin = 0; $cmin &lt; @minprotos; ++$cmin) {
++        for (my $cmax = $cmin ? $cmin - 1 : 0; $cmax &lt; @maxprotos; ++$cmax) {
++            if ($cmax &lt; $smin-1) {
++                $should = &quot;fail-server&quot;;
++            } elsif ($smax &lt; $cmin-1) {
++                $should = &quot;fail-client&quot;;
++            } elsif ($cmax &gt; $smax) {
++                $should = $shdprotos[$smax];
++            } else {
++                $should = $shdprotos[$cmax];
++            }
++
++            my @args = (@ssltest, &quot;-dtls&quot;);
++            push(@args, &quot;-should_negotiate&quot;, $should);
++            push(@args, &quot;-server_min_proto&quot;, $minprotos[$smin])
++                if (defined($minprotos[$smin]));
++            push(@args, &quot;-server_max_proto&quot;, $maxprotos[$smax])
++                if (defined($maxprotos[$smax]));
++            push(@args, &quot;-client_min_proto&quot;, $minprotos[$cmin])
++                if (defined($minprotos[$cmin]));
++            push(@args, &quot;-client_max_proto&quot;, $maxprotos[$cmax])
++                if (defined($maxprotos[$cmax]));
++            my $ok = run(test[@args]);
++            if (! $ok) {
++                print STDERR &quot;\nsmin=$smin, smax=$smax, cmin=$cmin, cmax=$cmax\n&quot;;
++                print STDERR &quot;\nFailed: @args\n&quot;;
++            }
++            ok($ok);
++        }}}}
+     };
+ }
+ 
+@@ -1140,7 +730,7 @@ sub testsslproxy {
+         my $auth = $_-&gt;[0]-&gt;[0];
+         my $cond = $_-&gt;[0]-&gt;[1];
+         my $res  = $_-&gt;[1];
+-	is(run(test([@ssltest, &quot;-ssl3&quot;, &quot;-server_auth&quot;, @CA,
++	is(run(test([@ssltest, &quot;-server_auth&quot;, @CA,
+                      &quot;-proxy&quot;, &quot;-proxy_auth&quot;, $auth,
+                      &quot;-proxy_cond&quot;, $cond])), $res,
+ 	   &quot;test tlsv1, server auth, proxy auth $auth and cond $cond (expect &quot;
+diff --git a/test/ssltest.c b/test/ssltest.c
+index d6b6618..cccab51 100644
+--- a/test/ssltest.c
++++ b/test/ssltest.c
+@@ -776,15 +776,21 @@ static void sv_usage(void)
+     fprintf(stderr, &quot; -srpuser user  - SRP username to use\n&quot;);
+     fprintf(stderr, &quot; -srppass arg   - password for 'user'\n&quot;);
+ #endif
+-#ifndef OPENSSL_NO_SSL3_METHOD
++#ifndef OPENSSL_NO_SSL3
+     fprintf(stderr, &quot; -ssl3         - use SSLv3\n&quot;);
+ #endif
++#ifndef OPENSSL_NO_TLS1
+     fprintf(stderr, &quot; -tls1         - use TLSv1\n&quot;);
++#endif
+ #ifndef OPENSSL_NO_DTLS
+     fprintf(stderr, &quot; -dtls        - use DTLS\n&quot;);
++#ifndef OPENSSL_NO_DTLS1
+     fprintf(stderr, &quot; -dtls1        - use DTLSv1\n&quot;);
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
+     fprintf(stderr, &quot; -dtls12       - use DTLSv1.2\n&quot;);
+ #endif
++#endif
+     fprintf(stderr, &quot; -CApath arg   - PEM format directory of CA's\n&quot;);
+     fprintf(stderr, &quot; -CAfile arg   - PEM format file of CA's\n&quot;);
+     fprintf(stderr, &quot; -cert arg     - Server certificate file\n&quot;);
+@@ -1046,7 +1052,7 @@ int main(int argc, char *argv[])
+ #ifdef OPENSSL_FIPS
+     int fips_mode = 0;
+ #endif
+-    int no_protocol = 0;
++    int no_protocol;
+ 
+     SSL_CONF_CTX *s_cctx = NULL, *c_cctx = NULL;
+     STACK_OF(OPENSSL_STRING) *conf_args = NULL;
+@@ -1173,24 +1179,12 @@ int main(int argc, char *argv[])
+         else if (strcmp(*argv, &quot;-tls1&quot;) == 0) {
+             tls1 = 1;
+         } else if (strcmp(*argv, &quot;-ssl3&quot;) == 0) {
+-#ifdef OPENSSL_NO_SSL3_METHOD
+-            no_protocol = 1;
+-#endif
+             ssl3 = 1;
+         } else if (strcmp(*argv, &quot;-dtls1&quot;) == 0) {
+-#ifdef OPENSSL_NO_DTLS
+-            no_protocol = 1;
+-#endif
+             dtls1 = 1;
+         } else if (strcmp(*argv, &quot;-dtls12&quot;) == 0) {
+-#ifdef OPENSSL_NO_DTLS
+-            no_protocol = 1;
+-#endif
+             dtls12 = 1;
+         } else if (strcmp(*argv, &quot;-dtls&quot;) == 0) {
+-#ifdef OPENSSL_NO_DTLS
+-            no_protocol = 1;
+-#endif
+             dtls = 1;
+         } else if (strncmp(*argv, &quot;-num&quot;, 4) == 0) {
+             if (--argc &lt; 1)
+@@ -1365,6 +1359,28 @@ int main(int argc, char *argv[])
+         EXIT(1);
+     }
+ 
++#ifdef OPENSSL_NO_SSL3
++    if (ssl3)
++        no_protocol = 1;
++    else
++#endif
++#ifdef OPENSSL_NO_TLS1
++    if (tls1)
++        no_protocol = 1;
++    else
++#endif
++#if defined(OPENSSL_NO_DTLS) || defined(OPENSSL_NO_DTLS1)
++    if (dtls1)
++        no_protocol = 1;
++    else
++#endif
++#if defined(OPENSSL_NO_DTLS) || defined(OPENSSL_NO_DTLS1_2)
++    if (dtls12)
++        no_protocol = 1;
++    else
++#endif
++        no_protocol = 0;
++
+     /*
+      * Testing was requested for a compiled-out protocol (e.g. SSLv3).
+      * Ideally, we would error out, but the generic test wrapper can't know
+@@ -1444,23 +1460,31 @@ int main(int argc, char *argv[])
+      * (Otherwise we exit early.) However the compiler doesn't know this, so
+      * we ifdef.
+      */
+-#ifndef OPENSSL_NO_SSL3
+-    if (ssl3)
+-        meth = SSLv3_method();
+-    else
+-#endif
+ #ifndef OPENSSL_NO_DTLS
++#ifndef OPENSSL_NO_DTLS1
+     if (dtls1)
+         meth = DTLSv1_method();
+-    else if (dtls12)
++    else
++#endif
++#ifndef OPENSSL_NO_DTLS1_2
++    if (dtls12)
+         meth = DTLSv1_2_method();
+-    else if (dtls)
++    else
++#endif
++    if (dtls)
+         meth = DTLS_method();
+     else
+ #endif
++#ifndef OPENSSL_NO_SSL3
++    if (ssl3)
++        meth = SSLv3_method();
++    else
++#endif
++#ifndef OPENSSL_NO_TLS1
+     if (tls1)
+         meth = TLSv1_method();
+     else
++#endif
+         meth = TLS_method();
+ 
+     c_ctx = SSL_CTX_new(meth);
+@@ -3163,9 +3187,11 @@ static unsigned int psk_server_callback(SSL *ssl, const char *identity,
+ 
+ static int do_test_cipherlist(void)
+ {
++#if !defined(OPENSSL_NO_SSL3) || !defined(OPENSSL_NO_TLS1)
+     int i = 0;
+     const SSL_METHOD *meth;
+     const SSL_CIPHER *ci, *tci = NULL;
++#endif
+ 
+ #ifndef OPENSSL_NO_SSL3
+     meth = SSLv3_method();
+@@ -3180,6 +3206,7 @@ static int do_test_cipherlist(void)
+         tci = ci;
+     }
+ #endif
++#ifndef OPENSSL_NO_TLS1
+     meth = TLSv1_method();
+     tci = NULL;
+     while ((ci = meth-&gt;get_cipher(i++)) != NULL) {
+@@ -3191,6 +3218,7 @@ static int do_test_cipherlist(void)
+             }
+         tci = ci;
+     }
++#endif
+ 
+     return 1;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003001.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="003006.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3004">[ date ]</a>
+              <a href="thread.html#3004">[ thread ]</a>
+              <a href="subject.html#3004">[ subject ]</a>
+              <a href="author.html#3004">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,313 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1573166276.993409.21781.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026030.html">
+   <LINK REL="Next"  HREF="026037.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1573166276.993409.21781.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Nov  7 22:37:56 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026030.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026037.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26032">[ date ]</a>
+              <a href="thread.html#26032">[ thread ]</a>
+              <a href="subject.html#26032">[ subject ]</a>
+              <a href="author.html#26032">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  1427d33cee59d6fe54efe1b5a322a1d7c8c03c20 (commit)
+      from  5388f9862d9aaf3c7cf7a70c1e36e7e983c26cfc (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1427d33cee59d6fe54efe1b5a322a1d7c8c03c20
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat Feb 25 23:38:46 2017 +0100
+
+    Refactor PEM_read_bio_{PrivateKey,Parameters,DHparams}
+    
+    They now go through internal STORE routines to do their job.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2746">https://github.com/openssl/openssl/pull/2746</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/pem/pem_pkey.c | 168 +++++++++++++++++++++-----------------------------
+ 1 file changed, 70 insertions(+), 98 deletions(-)
+
+diff --git a/crypto/pem/pem_pkey.c b/crypto/pem/pem_pkey.c
+index 7132a7ad80..a4c60a354d 100644
+--- a/crypto/pem/pem_pkey.c
++++ b/crypto/pem/pem_pkey.c
+@@ -17,6 +17,9 @@
+ #include &lt;openssl/pem.h&gt;
+ #include &lt;openssl/engine.h&gt;
+ #include &lt;openssl/dh.h&gt;
++#include &lt;openssl/store.h&gt;
++#include &lt;openssl/ui.h&gt;
++#include &quot;crypto/store.h&quot;
+ #include &quot;crypto/asn1.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ 
+@@ -25,70 +28,39 @@ int pem_check_suffix(const char *pem_str, const char *suffix);
+ EVP_PKEY *PEM_read_bio_PrivateKey(BIO *bp, EVP_PKEY **x, pem_password_cb *cb,
+                                   void *u)
+ {
+-    char *nm = NULL;
+-    const unsigned char *p = NULL;
+-    unsigned char *data = NULL;
+-    long len;
+-    int slen;
+     EVP_PKEY *ret = NULL;
++    OSSL_STORE_CTX *ctx = NULL;
++    OSSL_STORE_INFO *info = NULL;
++    UI_METHOD *ui_method = NULL;
+ 
+-    if (!PEM_bytes_read_bio_secmem(&amp;data, &amp;len, &amp;nm, PEM_STRING_EVP_PKEY, bp,
+-                                   cb, u))
++    if ((ui_method = UI_UTIL_wrap_read_pem_callback(cb, 0)) == NULL)
+         return NULL;
+-    p = data;
+-
+-    if (strcmp(nm, PEM_STRING_PKCS8INF) == 0) {
+-        PKCS8_PRIV_KEY_INFO *p8inf;
+-        p8inf = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;p, len);
+-        if (p8inf == NULL)
+-            goto p8err;
+-        ret = EVP_PKCS82PKEY(p8inf);
+-        if (x != NULL) {
+-            EVP_PKEY_free((EVP_PKEY *)*x);
+-            *x = ret;
+-        }
+-        PKCS8_PRIV_KEY_INFO_free(p8inf);
+-    } else if (strcmp(nm, PEM_STRING_PKCS8) == 0) {
+-        PKCS8_PRIV_KEY_INFO *p8inf;
+-        X509_SIG *p8;
+-        int klen;
+-        char psbuf[PEM_BUFSIZE];
+-        p8 = d2i_X509_SIG(NULL, &amp;p, len);
+-        if (p8 == NULL)
+-            goto p8err;
+-        if (cb)
+-            klen = cb(psbuf, PEM_BUFSIZE, 0, u);
+-        else
+-            klen = PEM_def_callback(psbuf, PEM_BUFSIZE, 0, u);
+-        if (klen &lt; 0) {
+-            PEMerr(PEM_F_PEM_READ_BIO_PRIVATEKEY, PEM_R_BAD_PASSWORD_READ);
+-            X509_SIG_free(p8);
++
++    if ((ctx = ossl_store_attach_pem_bio(bp, ui_method, u)) == NULL)
++        goto err;
++#ifndef OPENSSL_NO_SECURE_HEAP
++    {
++        int on = 1;
++        if (!OSSL_STORE_ctrl(ctx, OSSL_STORE_C_USE_SECMEM, &amp;on))
+             goto err;
++    }
++#endif
++
++    while (!OSSL_STORE_eof(ctx) &amp;&amp; (info = OSSL_STORE_load(ctx)) != NULL) {
++        if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_PKEY) {
++            ret = OSSL_STORE_INFO_get1_PKEY(info);
++            break;
+         }
+-        p8inf = PKCS8_decrypt(p8, psbuf, klen);
+-        X509_SIG_free(p8);
+-        OPENSSL_cleanse(psbuf, klen);
+-        if (p8inf == NULL)
+-            goto p8err;
+-        ret = EVP_PKCS82PKEY(p8inf);
+-        if (x) {
+-            EVP_PKEY_free((EVP_PKEY *)*x);
+-            *x = ret;
+-        }
+-        PKCS8_PRIV_KEY_INFO_free(p8inf);
+-    } else if ((slen = pem_check_suffix(nm, &quot;PRIVATE KEY&quot;)) &gt; 0) {
+-        const EVP_PKEY_ASN1_METHOD *ameth;
+-        ameth = EVP_PKEY_asn1_find_str(NULL, nm, slen);
+-        if (!ameth || !ameth-&gt;old_priv_decode)
+-            goto p8err;
+-        ret = d2i_PrivateKey(ameth-&gt;pkey_id, x, &amp;p, len);
++        OSSL_STORE_INFO_free(info);
+     }
+- p8err:
+-    if (ret == NULL)
+-        PEMerr(PEM_F_PEM_READ_BIO_PRIVATEKEY, ERR_R_ASN1_LIB);
++
++    if (ret != NULL &amp;&amp; x != NULL)
++        *x = ret;
++
+  err:
+-    OPENSSL_secure_free(nm);
+-    OPENSSL_secure_clear_free(data, len);
++    ossl_store_detach_pem_bio(ctx);
++    UI_destroy_method(ui_method);
++    OSSL_STORE_INFO_free(info);
+     return ret;
+ }
+ 
+@@ -115,39 +87,27 @@ int PEM_write_bio_PrivateKey_traditional(BIO *bp, EVP_PKEY *x,
+ 
+ EVP_PKEY *PEM_read_bio_Parameters(BIO *bp, EVP_PKEY **x)
+ {
+-    char *nm = NULL;
+-    const unsigned char *p = NULL;
+-    unsigned char *data = NULL;
+-    long len;
+-    int slen;
+     EVP_PKEY *ret = NULL;
++    OSSL_STORE_CTX *ctx = NULL;
++    OSSL_STORE_INFO *info = NULL;
+ 
+-    if (!PEM_bytes_read_bio(&amp;data, &amp;len, &amp;nm, PEM_STRING_PARAMETERS,
+-                            bp, 0, NULL))
+-        return NULL;
+-    p = data;
++    if ((ctx = ossl_store_attach_pem_bio(bp, UI_null(), NULL)) == NULL)
++        goto err;
+ 
+-    if ((slen = pem_check_suffix(nm, &quot;PARAMETERS&quot;)) &gt; 0) {
+-        ret = EVP_PKEY_new();
+-        if (ret == NULL)
+-            goto err;
+-        if (!EVP_PKEY_set_type_str(ret, nm, slen)
+-            || !ret-&gt;ameth-&gt;param_decode
+-            || !ret-&gt;ameth-&gt;param_decode(ret, &amp;p, len)) {
+-            EVP_PKEY_free(ret);
+-            ret = NULL;
+-            goto err;
+-        }
+-        if (x) {
+-            EVP_PKEY_free((EVP_PKEY *)*x);
+-            *x = ret;
++    while (!OSSL_STORE_eof(ctx) &amp;&amp; (info = OSSL_STORE_load(ctx)) != NULL) {
++        if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_PARAMS) {
++            ret = OSSL_STORE_INFO_get1_PARAMS(info);
++            break;
+         }
++        OSSL_STORE_INFO_free(info);
+     }
++
++    if (ret != NULL &amp;&amp; x != NULL)
++        *x = ret;
++
+  err:
+-    if (ret == NULL)
+-        PEMerr(PEM_F_PEM_READ_BIO_PARAMETERS, ERR_R_ASN1_LIB);
+-    OPENSSL_free(nm);
+-    OPENSSL_free(data);
++    ossl_store_detach_pem_bio(ctx);
++    OSSL_STORE_INFO_free(info);
+     return ret;
+ }
+ 
+@@ -203,25 +163,37 @@ int PEM_write_PrivateKey(FILE *fp, EVP_PKEY *x, const EVP_CIPHER *enc,
+ 
+ DH *PEM_read_bio_DHparams(BIO *bp, DH **x, pem_password_cb *cb, void *u)
+ {
+-    char *nm = NULL;
+-    const unsigned char *p = NULL;
+-    unsigned char *data = NULL;
+-    long len;
+     DH *ret = NULL;
++    EVP_PKEY *pkey = NULL;
++    OSSL_STORE_CTX *ctx = NULL;
++    OSSL_STORE_INFO *info = NULL;
++    UI_METHOD *ui_method = NULL;
+ 
+-    if (!PEM_bytes_read_bio(&amp;data, &amp;len, &amp;nm, PEM_STRING_DHPARAMS, bp, cb, u))
++    if ((ui_method = UI_UTIL_wrap_read_pem_callback(cb, 0)) == NULL)
+         return NULL;
+-    p = data;
+ 
+-    if (strcmp(nm, PEM_STRING_DHXPARAMS) == 0)
+-        ret = d2i_DHxparams(x, &amp;p, len);
+-    else
+-        ret = d2i_DHparams(x, &amp;p, len);
++    if ((ctx = ossl_store_attach_pem_bio(bp, ui_method, u)) == NULL)
++        goto err;
++
++    while (!OSSL_STORE_eof(ctx) &amp;&amp; (info = OSSL_STORE_load(ctx)) != NULL) {
++        if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_PARAMS) {
++            pkey = OSSL_STORE_INFO_get0_PARAMS(info);
++            if (EVP_PKEY_id(pkey) == EVP_PKEY_DHX
++                || EVP_PKEY_id(pkey) == EVP_PKEY_DH) {
++                ret = EVP_PKEY_get1_DH(pkey);
++                break;
++            }
++        }
++        OSSL_STORE_INFO_free(info);
++    }
+ 
+-    if (ret == NULL)
+-        PEMerr(PEM_F_PEM_READ_BIO_DHPARAMS, ERR_R_ASN1_LIB);
+-    OPENSSL_free(nm);
+-    OPENSSL_free(data);
++    if (ret != NULL &amp;&amp; x != NULL)
++        *x = ret;
++
++ err:
++    ossl_store_detach_pem_bio(ctx);
++    UI_destroy_method(ui_method);
++    OSSL_STORE_INFO_free(info);
+     return ret;
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026030.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026037.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26032">[ date ]</a>
+              <a href="thread.html#26032">[ thread ]</a>
+              <a href="subject.html#26032">[ subject ]</a>
+              <a href="author.html#26032">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

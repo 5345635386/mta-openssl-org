@@ -1,0 +1,626 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457471381.033543.4090.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005141.html">
+   <LINK REL="Next"  HREF="005156.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457471381.033543.4090.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Tue Mar  8 21:09:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005141.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005156.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5148">[ date ]</a>
+              <a href="thread.html#5148">[ thread ]</a>
+              <a href="subject.html#5148">[ subject ]</a>
+              <a href="author.html#5148">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  9471f7760dcc81fe6995f016fc7120db0c678818 (commit)
+      from  040d43b3ff8daca32dd0f72155f668249506b51b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 9471f7760dcc81fe6995f016fc7120db0c678818
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Mar 8 15:44:05 2016 +0000
+
+    Convert mem_dbg and mem_sec to the new Thread API
+    
+    Use new Thread API style locks, and thread local storage for mem_dbg
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem_dbg.c         | 199 ++++++++++++++++++++++++-----------------------
+ crypto/mem_sec.c         |  31 ++++----
+ include/openssl/crypto.h |   2 -
+ 3 files changed, 118 insertions(+), 114 deletions(-)
+
+diff --git a/crypto/mem_dbg.c b/crypto/mem_dbg.c
+index f2a1fd8..36efed8 100644
+--- a/crypto/mem_dbg.c
++++ b/crypto/mem_dbg.c
+@@ -112,6 +112,7 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;time.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
++#include &quot;internal/threads.h&quot;
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/buffer.h&gt;
+ #include &lt;openssl/bio.h&gt;
+@@ -147,7 +148,7 @@ static unsigned long order = 0; /* number of memory requests */
+  *   OPENSSL_mem_debug_pop()     to pop an entry,
+  */
+ struct app_mem_info_st {
+-    CRYPTO_THREADID threadid;
++    CRYPTO_THREAD_ID threadid;
+     const char *file;
+     int line;
+     const char *info;
+@@ -155,12 +156,10 @@ struct app_mem_info_st {
+     int references;
+ };
+ 
+-/*
+- * hash-table with those app_mem_info_st's that are at the
+- * top of their thread's stack (with `thread' as key); access requires
+- * MALLOC2 lock
+- */
+-static LHASH_OF(APP_INFO) *amih = NULL;
++static CRYPTO_ONCE memdbg_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_RWLOCK *malloc_lock = NULL;
++static CRYPTO_RWLOCK *long_malloc_lock = NULL;
++static CRYPTO_THREAD_LOCAL appinfokey;
+ 
+ /* memory-block description */
+ struct mem_st {
+@@ -168,7 +167,7 @@ struct mem_st {
+     int num;
+     const char *file;
+     int line;
+-    CRYPTO_THREADID threadid;
++    CRYPTO_THREAD_ID threadid;
+     unsigned long order;
+     time_t time;
+     APP_INFO *app_info;
+@@ -185,10 +184,17 @@ static LHASH_OF(MEM) *mh = NULL; /* hash-table of memory requests (address as
+ static unsigned int num_disable = 0;
+ 
+ /*
+- * Valid iff num_disable &gt; 0.  CRYPTO_LOCK_MALLOC2 is locked exactly in this
++ * Valid iff num_disable &gt; 0.  long_malloc_lock is locked exactly in this
+  * case (by the thread named in disabling_thread).
+  */
+-static CRYPTO_THREADID disabling_threadid;
++static CRYPTO_THREAD_ID disabling_threadid;
++
++static void do_memdbg_init(void)
++{
++    malloc_lock = CRYPTO_THREAD_lock_new();
++    long_malloc_lock = CRYPTO_THREAD_lock_new();
++    CRYPTO_THREAD_init_local(&amp;appinfokey, NULL);
++}
+ 
+ static void app_info_free(APP_INFO *inf)
+ {
+@@ -208,7 +214,9 @@ int CRYPTO_mem_ctrl(int mode)
+ #else
+     int ret = mh_mode;
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_MALLOC);
++    CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++
++    CRYPTO_THREAD_write_lock(malloc_lock);
+     switch (mode) {
+     default:
+         break;
+@@ -226,30 +234,29 @@ int CRYPTO_mem_ctrl(int mode)
+     /* switch off temporarily (for library-internal use): */
+     case CRYPTO_MEM_CHECK_DISABLE:
+         if (mh_mode &amp; CRYPTO_MEM_CHECK_ON) {
+-            CRYPTO_THREADID cur;
+-            CRYPTO_THREADID_current(&amp;cur);
+-            /* see if we don't have the MALLOC2 lock already */
++            CRYPTO_THREAD_ID cur = CRYPTO_THREAD_get_current_id();
++            /* see if we don't have long_malloc_lock already */
+             if (!num_disable
+-                || CRYPTO_THREADID_cmp(&amp;disabling_threadid, &amp;cur)) {
++                || !CRYPTO_THREAD_compare_id(disabling_threadid, cur)) {
+                 /*
+-                 * Long-time lock CRYPTO_LOCK_MALLOC2 must not be claimed
+-                 * while we're holding CRYPTO_LOCK_MALLOC, or we'll deadlock
+-                 * if somebody else holds CRYPTO_LOCK_MALLOC2 (and cannot
++                 * Long-time lock long_malloc_lock must not be claimed
++                 * while we're holding malloc_lock, or we'll deadlock
++                 * if somebody else holds long_malloc_lock (and cannot
+                  * release it because we block entry to this function). Give
+                  * them a chance, first, and then claim the locks in
+                  * appropriate order (long-time lock first).
+                  */
+-                CRYPTO_w_unlock(CRYPTO_LOCK_MALLOC);
++                CRYPTO_THREAD_unlock(malloc_lock);
+                 /*
+-                 * Note that after we have waited for CRYPTO_LOCK_MALLOC2 and
+-                 * CRYPTO_LOCK_MALLOC, we'll still be in the right &quot;case&quot; and
++                 * Note that after we have waited for long_malloc_lock and
++                 * malloc_lock, we'll still be in the right &quot;case&quot; and
+                  * &quot;if&quot; branch because MemCheck_start and MemCheck_stop may
+                  * never be used while there are multiple OpenSSL threads.
+                  */
+-                CRYPTO_w_lock(CRYPTO_LOCK_MALLOC2);
+-                CRYPTO_w_lock(CRYPTO_LOCK_MALLOC);
++                CRYPTO_THREAD_write_lock(long_malloc_lock);
++                CRYPTO_THREAD_write_lock(malloc_lock);
+                 mh_mode &amp;= ~CRYPTO_MEM_CHECK_ENABLE;
+-                CRYPTO_THREADID_cpy(&amp;disabling_threadid, &amp;cur);
++                disabling_threadid = cur;
+             }
+             num_disable++;
+         }
+@@ -261,13 +268,13 @@ int CRYPTO_mem_ctrl(int mode)
+                 num_disable--;
+                 if (num_disable == 0) {
+                     mh_mode |= CRYPTO_MEM_CHECK_ENABLE;
+-                    CRYPTO_w_unlock(CRYPTO_LOCK_MALLOC2);
++                    CRYPTO_THREAD_unlock(long_malloc_lock);
+                 }
+             }
+         }
+         break;
+     }
+-    CRYPTO_w_unlock(CRYPTO_LOCK_MALLOC);
++    CRYPTO_THREAD_unlock(malloc_lock);
+     return (ret);
+ #endif
+ }
+@@ -279,14 +286,15 @@ static int mem_check_on(void)
+     int ret = 0;
+ 
+     if (mh_mode &amp; CRYPTO_MEM_CHECK_ON) {
+-        CRYPTO_THREADID cur;
+-        CRYPTO_THREADID_current(&amp;cur);
+-        CRYPTO_r_lock(CRYPTO_LOCK_MALLOC);
++        CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++
++        CRYPTO_THREAD_ID cur = CRYPTO_THREAD_get_current_id();
++        CRYPTO_THREAD_read_lock(malloc_lock);
+ 
+         ret = (mh_mode &amp; CRYPTO_MEM_CHECK_ENABLE)
+-            || CRYPTO_THREADID_cmp(&amp;disabling_threadid, &amp;cur);
++            || !CRYPTO_THREAD_compare_id(disabling_threadid, cur);
+ 
+-        CRYPTO_r_unlock(CRYPTO_LOCK_MALLOC);
++        CRYPTO_THREAD_unlock(malloc_lock);
+     }
+     return (ret);
+ }
+@@ -316,44 +324,29 @@ static unsigned long mem_hash(const MEM *a)
+     return (ret);
+ }
+ 
+-static int app_info_cmp(const APP_INFO *a, const APP_INFO *b)
+-{
+-    return CRYPTO_THREADID_cmp(&amp;a-&gt;threadid, &amp;b-&gt;threadid);
+-}
+-
+-static unsigned long app_info_hash(const APP_INFO *a)
+-{
+-    unsigned long ret;
+-
+-    ret = CRYPTO_THREADID_hash(&amp;a-&gt;threadid);
+-    /* This is left in as a &quot;who am I to question legacy?&quot; measure */
+-    ret = ret * 17851 + (ret &gt;&gt; 14) * 7 + (ret &gt;&gt; 4) * 251;
+-    return (ret);
+-}
+-
+ /* returns 1 if there was an info to pop, 0 if the stack was empty. */
+ static int pop_info(void)
+ {
+-    APP_INFO tmp;
+     APP_INFO *current = NULL;
+ 
+-    if (amih != NULL) {
+-        CRYPTO_THREADID_current(&amp;tmp.threadid);
+-        if ((current = lh_APP_INFO_delete(amih, &amp;tmp)) != NULL) {
+-            APP_INFO *next = current-&gt;next;
++    CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++    current = (APP_INFO *)CRYPTO_THREAD_get_local(&amp;appinfokey);
++    if (current != NULL) {
++        APP_INFO *next = current-&gt;next;
+ 
+-            if (next != NULL) {
+-                next-&gt;references++;
+-                (void)lh_APP_INFO_insert(amih, next);
+-            }
+-            if (--(current-&gt;references) &lt;= 0) {
+-                current-&gt;next = NULL;
+-                if (next != NULL)
+-                    next-&gt;references--;
+-                OPENSSL_free(current);
+-            }
+-            return 1;
++        if (next != NULL) {
++            next-&gt;references++;
++            CRYPTO_THREAD_set_local(&amp;appinfokey, next);
++        } else {
++            CRYPTO_THREAD_set_local(&amp;appinfokey, NULL);
++        }
++        if (--(current-&gt;references) &lt;= 0) {
++            current-&gt;next = NULL;
++            if (next != NULL)
++                next-&gt;references--;
++            OPENSSL_free(current);
+         }
++        return 1;
+     }
+     return 0;
+ }
+@@ -366,23 +359,22 @@ int CRYPTO_mem_debug_push(const char *info, const char *file, int line)
+     if (mem_check_on()) {
+         CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
+ 
++        CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++
+         if ((ami = OPENSSL_malloc(sizeof(*ami))) == NULL)
+             goto err;
+-        if (amih == NULL) {
+-            if ((amih = lh_APP_INFO_new(app_info_hash, app_info_cmp)) == NULL) {
+-                OPENSSL_free(ami);
+-                goto err;
+-            }
+-        }
+ 
+-        CRYPTO_THREADID_current(&amp;ami-&gt;threadid);
++        ami-&gt;threadid = CRYPTO_THREAD_get_current_id();
+         ami-&gt;file = file;
+         ami-&gt;line = line;
+         ami-&gt;info = info;
+         ami-&gt;references = 1;
+         ami-&gt;next = NULL;
+ 
+-        if ((amim = lh_APP_INFO_insert(amih, ami)) != NULL)
++        amim = (APP_INFO *)CRYPTO_THREAD_get_local(&amp;appinfokey);
++        CRYPTO_THREAD_set_local(&amp;appinfokey, ami);
++
++        if (amim != NULL)
+             ami-&gt;next = amim;
+         ret = 1;
+  err:
+@@ -410,7 +402,7 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int before_p,
+                              const char *file, int line)
+ {
+     MEM *m, *mm;
+-    APP_INFO tmp, *amim;
++    APP_INFO *amim;
+ 
+     switch (before_p &amp; 127) {
+     case 0:
+@@ -421,6 +413,9 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int before_p,
+ 
+         if (mem_check_on()) {
+             CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
++
++            CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++
+             if ((m = OPENSSL_malloc(sizeof(*m))) == NULL) {
+                 OPENSSL_free(addr);
+                 CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
+@@ -439,7 +434,7 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int before_p,
+             m-&gt;file = file;
+             m-&gt;line = line;
+             m-&gt;num = num;
+-            CRYPTO_THREADID_current(&amp;m-&gt;threadid);
++            m-&gt;threadid = CRYPTO_THREAD_get_current_id();
+ 
+             if (order == break_order_num) {
+                 /* BREAK HERE */
+@@ -451,13 +446,10 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int before_p,
+ # endif
+             m-&gt;time = time(NULL);
+ 
+-            CRYPTO_THREADID_current(&amp;tmp.threadid);
+-            m-&gt;app_info = NULL;
+-            if (amih != NULL
+-                &amp;&amp; (amim = lh_APP_INFO_retrieve(amih, &amp;tmp)) != NULL) {
+-                m-&gt;app_info = amim;
++            amim = (APP_INFO *)CRYPTO_THREAD_get_local(&amp;appinfokey);
++            m-&gt;app_info = amim;
++            if (amim != NULL)
+                 amim-&gt;references++;
+-            }
+ 
+             if ((mm = lh_MEM_insert(mh, m)) != NULL) {
+                 /* Not good, but don't sweat it */
+@@ -554,7 +546,16 @@ static void print_leak(const MEM *m, MEM_LEAK *l)
+     APP_INFO *amip;
+     int ami_cnt;
+     struct tm *lcl = NULL;
+-    CRYPTO_THREADID ti;
++    /*
++     * Convert between CRYPTO_THREAD_ID (which could be anything at all) and
++     * a long. This may not be meaningful depending on what CRYPTO_THREAD_ID is
++     * but hopefully should give something sensible on most platforms
++     */
++    union {
++        CRYPTO_THREAD_ID tid;
++        unsigned long ltid;
++    } tid;
++    CRYPTO_THREAD_ID ti;
+ 
+ #define BUF_REMAIN (sizeof buf - (size_t)(bufp - buf))
+ 
+@@ -573,8 +574,9 @@ static void print_leak(const MEM *m, MEM_LEAK *l)
+                  m-&gt;order, m-&gt;file, m-&gt;line);
+     bufp += strlen(bufp);
+ 
+-    BIO_snprintf(bufp, BUF_REMAIN, &quot;thread=%lu, &quot;,
+-                 CRYPTO_THREADID_hash(&amp;m-&gt;threadid));
++    tid.ltid = 0;
++    tid.tid = m-&gt;threadid;
++    BIO_snprintf(bufp, BUF_REMAIN, &quot;thread=%lu, &quot;, tid.ltid);
+     bufp += strlen(bufp);
+ 
+     BIO_snprintf(bufp, BUF_REMAIN, &quot;number=%d, address=%p\n&quot;,
+@@ -590,7 +592,7 @@ static void print_leak(const MEM *m, MEM_LEAK *l)
+     ami_cnt = 0;
+ 
+     if (amip) {
+-        CRYPTO_THREADID_cpy(&amp;ti, &amp;amip-&gt;threadid);
++        ti = amip-&gt;threadid;
+ 
+         do {
+             int buf_len;
+@@ -598,9 +600,11 @@ static void print_leak(const MEM *m, MEM_LEAK *l)
+ 
+             ami_cnt++;
+             memset(buf, '&gt;', ami_cnt);
++            tid.ltid = 0;
++            tid.tid = amip-&gt;threadid;
+             BIO_snprintf(buf + ami_cnt, sizeof buf - ami_cnt,
+                          &quot; thread=%lu, file=%s, line=%d, info=\&quot;&quot;,
+-                         CRYPTO_THREADID_hash(&amp;amip-&gt;threadid), amip-&gt;file,
++                         tid.ltid, amip-&gt;file,
+                          amip-&gt;line);
+             buf_len = strlen(buf);
+             info_len = strlen(amip-&gt;info);
+@@ -617,7 +621,7 @@ static void print_leak(const MEM *m, MEM_LEAK *l)
+ 
+             amip = amip-&gt;next;
+         }
+-        while (amip &amp;&amp; !CRYPTO_THREADID_cmp(&amp;amip-&gt;threadid, &amp;ti));
++        while (amip &amp;&amp; CRYPTO_THREAD_compare_id(amip-&gt;threadid, ti));
+     }
+ 
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG_BACKTRACE
+@@ -638,12 +642,11 @@ int CRYPTO_mem_leaks(BIO *b)
+ {
+     MEM_LEAK ml;
+ 
+-    if (mh == NULL &amp;&amp; amih == NULL)
+-        return 1;
+-
+     /* Ensure all resources are released */
+     OPENSSL_cleanup();
+ 
++    CRYPTO_THREAD_run_once(&amp;memdbg_init, do_memdbg_init);
++
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
+ 
+     ml.bio = b;
+@@ -668,7 +671,7 @@ int CRYPTO_mem_leaks(BIO *b)
+          */
+         int old_mh_mode;
+ 
+-        CRYPTO_w_lock(CRYPTO_LOCK_MALLOC);
++        CRYPTO_THREAD_write_lock(malloc_lock);
+ 
+         /*
+          * avoid deadlock when lh_free() uses CRYPTO_mem_debug_free(), which uses
+@@ -679,17 +682,19 @@ int CRYPTO_mem_leaks(BIO *b)
+ 
+         lh_MEM_free(mh);
+         mh = NULL;
+-        if (amih != NULL) {
+-            if (lh_APP_INFO_num_items(amih) == 0) {
+-                lh_APP_INFO_free(amih);
+-                amih = NULL;
+-            }
+-        }
+ 
+         mh_mode = old_mh_mode;
+-        CRYPTO_w_unlock(CRYPTO_LOCK_MALLOC);
++        CRYPTO_THREAD_unlock(malloc_lock);
+     }
+-    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_OFF);
++
++    /* Clean up locks etc */
++    CRYPTO_THREAD_cleanup_local(&amp;appinfokey);
++    CRYPTO_THREAD_lock_free(malloc_lock);
++    CRYPTO_THREAD_lock_free(long_malloc_lock);
++    malloc_lock = NULL;
++    long_malloc_lock = NULL;
++
+     return ml.chunks == 0 ? 1 : 0;
+ }
+ 
+@@ -699,8 +704,6 @@ int CRYPTO_mem_leaks_fp(FILE *fp)
+     BIO *b;
+     int ret;
+ 
+-    if (mh == NULL &amp;&amp; amih == NULL)
+-        return 1;
+     /*
+      * Need to turn off memory checking when allocated BIOs ... especially as
+      * we're creating them at a time when we're trying to check we've not
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 7e41765..31c0525 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -25,10 +25,9 @@
+ # include &lt;sys/param.h&gt;
+ # include &lt;sys/stat.h&gt;
+ # include &lt;fcntl.h&gt;
++# include &quot;internal/threads.h&quot;
+ #endif
+ 
+-#define LOCK()      CRYPTO_w_lock(CRYPTO_LOCK_MALLOC)
+-#define UNLOCK()    CRYPTO_w_unlock(CRYPTO_LOCK_MALLOC)
+ #define CLEAR(p, s) OPENSSL_cleanse(p, s)
+ #ifndef PAGE_SIZE
+ # define PAGE_SIZE    4096
+@@ -40,6 +39,8 @@ static size_t secure_mem_used;
+ static int secure_mem_initialized;
+ static int too_late;
+ 
++static CRYPTO_RWLOCK *sec_malloc_lock = NULL;
++
+ /*
+  * These are the functions that must be implemented by a secure heap (sh).
+  */
+@@ -58,13 +59,16 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+ 
+     if (too_late)
+         return ret;
+-    LOCK();
++
+     OPENSSL_assert(!secure_mem_initialized);
+     if (!secure_mem_initialized) {
++        sec_malloc_lock = CRYPTO_THREAD_lock_new();
++        if (sec_malloc_lock == NULL)
++            return 0;
+         ret = sh_init(size, minsize);
+         secure_mem_initialized = 1;
+     }
+-    UNLOCK();
++
+     return ret;
+ #else
+     return 0;
+@@ -74,10 +78,9 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+ void CRYPTO_secure_malloc_done()
+ {
+ #ifdef IMPLEMENTED
+-    LOCK();
+     sh_done();
+     secure_mem_initialized = 0;
+-    UNLOCK();
++    CRYPTO_THREAD_lock_free(sec_malloc_lock);
+ #endif /* IMPLEMENTED */
+ }
+ 
+@@ -100,11 +103,11 @@ void *CRYPTO_secure_malloc(size_t num, const char *file, int line)
+         too_late = 1;
+         return CRYPTO_malloc(num, file, line);
+     }
+-    LOCK();
++    CRYPTO_THREAD_write_lock(sec_malloc_lock);
+     ret = sh_malloc(num);
+     actual_size = ret ? sh_actual_size(ret) : 0;
+     secure_mem_used += actual_size;
+-    UNLOCK();
++    CRYPTO_THREAD_unlock(sec_malloc_lock);
+     return ret;
+ #else
+     return CRYPTO_malloc(num, file, line);
+@@ -131,12 +134,12 @@ void CRYPTO_secure_free(void *ptr, const char *file, int line)
+         CRYPTO_free(ptr, file, line);
+         return;
+     }
+-    LOCK();
++    CRYPTO_THREAD_write_lock(sec_malloc_lock);
+     actual_size = sh_actual_size(ptr);
+     CLEAR(ptr, actual_size);
+     secure_mem_used -= actual_size;
+     sh_free(ptr);
+-    UNLOCK();
++    CRYPTO_THREAD_unlock(sec_malloc_lock);
+ #else
+     CRYPTO_free(ptr, file, line);
+ #endif /* IMPLEMENTED */
+@@ -149,9 +152,9 @@ int CRYPTO_secure_allocated(const void *ptr)
+ 
+     if (!secure_mem_initialized)
+         return 0;
+-    LOCK();
++    CRYPTO_THREAD_write_lock(sec_malloc_lock);
+     ret = sh_allocated(ptr);
+-    UNLOCK();
++    CRYPTO_THREAD_unlock(sec_malloc_lock);
+     return ret;
+ #else
+     return 0;
+@@ -172,9 +175,9 @@ size_t CRYPTO_secure_actual_size(void *ptr)
+ #ifdef IMPLEMENTED
+     size_t actual_size;
+ 
+-    LOCK();
++    CRYPTO_THREAD_write_lock(sec_malloc_lock);
+     actual_size = sh_actual_size(ptr);
+-    UNLOCK();
++    CRYPTO_THREAD_unlock(sec_malloc_lock);
+     return actual_size;
+ #else
+     return 0;
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 2969e2e..cfda8bb 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -174,10 +174,8 @@ extern &quot;C&quot; {
+ # define CRYPTO_LOCK_SSL_METHOD          17
+ # define CRYPTO_LOCK_RAND                18
+ # define CRYPTO_LOCK_RAND2               19
+-# define CRYPTO_LOCK_MALLOC              20
+ # define CRYPTO_LOCK_READDIR             24
+ # define CRYPTO_LOCK_RSA_BLINDING        25
+-# define CRYPTO_LOCK_MALLOC2             27
+ # define CRYPTO_LOCK_DYNLOCK             29
+ # define CRYPTO_LOCK_ENGINE              30
+ # define CRYPTO_LOCK_ECDSA               32
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005141.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005156.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5148">[ date ]</a>
+              <a href="thread.html#5148">[ thread ]</a>
+              <a href="subject.html#5148">[ subject ]</a>
+              <a href="author.html#5148">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

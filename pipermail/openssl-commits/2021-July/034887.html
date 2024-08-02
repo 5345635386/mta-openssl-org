@@ -1,0 +1,372 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1625738810.957226.3256.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034879.html">
+   <LINK REL="Next"  HREF="034889.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1625738810.957226.3256.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">tomas at openssl.org
+       </A><BR>
+    <I>Thu Jul  8 10:06:50 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034879.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="034889.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34887">[ date ]</a>
+              <a href="thread.html#34887">[ thread ]</a>
+              <a href="subject.html#34887">[ subject ]</a>
+              <a href="author.html#34887">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  ce50fd96dc542fe22a42265019e556272fd060ba (commit)
+      from  f8fc0e35e0b1813af15887d42e17b7d5537bb86c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ce50fd96dc542fe22a42265019e556272fd060ba
+Author: Oliver Mihatsch &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">oliver.mihatsch at virtual-solution.com</A>&gt;
+Date:   Mon Jul 5 16:23:03 2021 +0200
+
+    Fix memory leak in i2d_ASN1_bio_stream
+    
+    When creating a signed S/MIME message using SMIME_write_CMS()
+    if the reading from the bio fails, the state is therefore
+    still ASN1_STATE_START when BIO_flush() is called by i2d_ASN1_bio_stream().
+    This results in calling asn1_bio_flush_ex cleanup but will only
+    reset retry flags as the state is not ASN1_STATE_POST_COPY.
+    Therefore 48 bytes (Linux x86_64) leaked since the
+    ndef_prefix_free / ndef_suffix_free callbacks are not executed
+    and the ndef_aux structure is not freed.
+    
+    By always calling free function callback in asn1_bio_free() the
+    memory leak is fixed.
+    
+    (cherry picked from commit 3a1d2b59522163ebb83bb68e13c896188dc222c6)
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15999">https://github.com/openssl/openssl/pull/15999</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/bio_asn1.c  |  5 ++++
+ crypto/asn1/bio_ndef.c  |  3 ++
+ test/bio_memleak_test.c | 76 +++++++++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/crypto/asn1/bio_asn1.c b/crypto/asn1/bio_asn1.c
+index 86ee566323..7bb3c1fa16 100644
+--- a/crypto/asn1/bio_asn1.c
++++ b/crypto/asn1/bio_asn1.c
+@@ -138,6 +138,11 @@ static int asn1_bio_free(BIO *b)
+     if (ctx == NULL)
+         return 0;
+ 
++    if (ctx-&gt;prefix_free != NULL)
++        ctx-&gt;prefix_free(b, &amp;ctx-&gt;ex_buf, &amp;ctx-&gt;ex_len, &amp;ctx-&gt;ex_arg);
++    if (ctx-&gt;suffix_free != NULL)
++        ctx-&gt;suffix_free(b, &amp;ctx-&gt;ex_buf, &amp;ctx-&gt;ex_len, &amp;ctx-&gt;ex_arg);
++
+     OPENSSL_free(ctx-&gt;buf);
+     OPENSSL_free(ctx);
+     BIO_set_data(b, NULL);
+diff --git a/crypto/asn1/bio_ndef.c b/crypto/asn1/bio_ndef.c
+index d7d7d80eea..760e4846a4 100644
+--- a/crypto/asn1/bio_ndef.c
++++ b/crypto/asn1/bio_ndef.c
+@@ -142,6 +142,9 @@ static int ndef_prefix_free(BIO *b, unsigned char **pbuf, int *plen,
+ 
+     ndef_aux = *(NDEF_SUPPORT **)parg;
+ 
++    if (ndef_aux == NULL)
++        return 0;
++
+     OPENSSL_free(ndef_aux-&gt;derbuf);
+ 
+     ndef_aux-&gt;derbuf = NULL;
+diff --git a/test/bio_memleak_test.c b/test/bio_memleak_test.c
+index 383c82d156..23a6e7e5ce 100644
+--- a/test/bio_memleak_test.c
++++ b/test/bio_memleak_test.c
+@@ -10,6 +10,8 @@
+ #include &lt;string.h&gt;
+ #include &lt;openssl/buffer.h&gt;
+ #include &lt;openssl/bio.h&gt;
++#include &lt;openssl/pkcs7.h&gt;
++#include &lt;openssl/obj_mac.h&gt;
+ 
+ #include &quot;testutil.h&quot;
+ 
+@@ -35,7 +37,7 @@ static int test_bio_memleak(void)
+         goto finish;
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     return ok;
+ }
+@@ -62,7 +64,7 @@ static int test_bio_get_mem(void)
+         goto finish;
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     BUF_MEM_free(bufmem);
+     return ok;
+@@ -98,7 +100,7 @@ static int test_bio_new_mem_buf(void)
+         goto finish;
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     return ok;
+ }
+@@ -139,7 +141,7 @@ static int test_bio_rdonly_mem_buf(void)
+         goto finish;
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     BIO_free(bio2);
+     return ok;
+@@ -176,7 +178,7 @@ static int test_bio_rdwr_rdonly(void)
+ 
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     return ok;
+ }
+@@ -216,11 +218,72 @@ static int test_bio_nonclear_rst(void)
+ 
+     ok = 1;
+ 
+-finish:
++ finish:
+     BIO_free(bio);
+     return ok;
+ }
+ 
++static int error_callback_fired;
++static long BIO_error_callback(BIO *bio, int cmd, const char *argp,
++                               size_t len, int argi,
++                               long argl, int ret, size_t *processed)
++{
++    if ((cmd &amp; (BIO_CB_READ | BIO_CB_RETURN)) != 0) {
++        error_callback_fired = 1;
++        ret = 0;  /* fail for read operations to simulate error in input BIO */
++    }
++    return ret;
++}
++
++/* Checks i2d_ASN1_bio_stream() is freeing all memory when input BIO ends unexpectedly. */
++static int test_bio_i2d_ASN1_mime(void)
++{
++    int ok = 0;
++    BIO *bio = NULL, *out = NULL;
++    BUF_MEM bufmem;
++    static const char str[] = &quot;BIO mime test\n&quot;;
++    PKCS7 *p7 = NULL;
++
++    if (!TEST_ptr(bio = BIO_new(BIO_s_mem())))
++        goto finish;
++
++    bufmem.length = sizeof(str);
++    bufmem.data = (char *) str;
++    bufmem.max = bufmem.length;
++    BIO_set_mem_buf(bio, &amp;bufmem, BIO_NOCLOSE);
++    BIO_set_flags(bio, BIO_FLAGS_MEM_RDONLY);
++    BIO_set_callback_ex(bio, BIO_error_callback);
++
++    if (!TEST_ptr(out = BIO_new(BIO_s_mem())))
++        goto finish;
++    if (!TEST_ptr(p7 = PKCS7_new()))
++        goto finish;
++    if (!TEST_true(PKCS7_set_type(p7, NID_pkcs7_data)))
++        goto finish;
++
++    error_callback_fired = 0;
++
++    /*
++     * The call succeeds even if the input stream ends unexpectedly as
++     * there is no handling for this case in SMIME_crlf_copy().
++     */
++    if (!TEST_true(i2d_ASN1_bio_stream(out, (ASN1_VALUE*) p7, bio,
++                                       SMIME_STREAM | SMIME_BINARY,
++                                       ASN1_ITEM_rptr(PKCS7))))
++        goto finish;
++
++    if (!TEST_int_eq(error_callback_fired, 1))
++        goto finish;
++
++    ok = 1;
++
++ finish:
++    BIO_free(bio);
++    BIO_free(out);
++    PKCS7_free(p7);
++    return ok;
++}
++
+ int global_init(void)
+ {
+     CRYPTO_set_mem_debug(1);
+@@ -236,5 +299,6 @@ int setup_tests(void)
+     ADD_TEST(test_bio_rdonly_mem_buf);
+     ADD_TEST(test_bio_rdwr_rdonly);
+     ADD_TEST(test_bio_nonclear_rst);
++    ADD_TEST(test_bio_i2d_ASN1_mime);
+     return 1;
+ }
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034879.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="034889.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34887">[ date ]</a>
+              <a href="thread.html#34887">[ thread ]</a>
+              <a href="subject.html#34887">[ subject ]</a>
+              <a href="author.html#34887">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,259 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  openssl-3.0 update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1636372251.166250.29597.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035614.html">
+   <LINK REL="Next"  HREF="035618.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  openssl-3.0 update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1636372251.166250.29597.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  openssl-3.0 update">dev at ddvo.net
+       </A><BR>
+    <I>Mon Nov  8 11:50:51 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="035614.html">[openssl]  openssl-3.0 update
+</A></li>
+        <LI>Next message (by thread): <A HREF="035618.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35616">[ date ]</a>
+              <a href="thread.html#35616">[ thread ]</a>
+              <a href="subject.html#35616">[ subject ]</a>
+              <a href="author.html#35616">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch openssl-3.0 has been updated
+       via  f6d4ab9295a173c81e6fe4185ec62533d91b0c6d (commit)
+      from  a075c882641782a6ee94a9123c72b47891a8cf28 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f6d4ab9295a173c81e6fe4185ec62533d91b0c6d
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Fri Aug 27 11:34:23 2021 +0200
+
+    APPS/x509: Fix generation of AKID via v2i_AUTHORITY_KEYID()
+    
+    Fixes #16300
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16442">https://github.com/openssl/openssl/pull/16442</A>)
+    
+    (cherry picked from commit 9bf1061c44c81059102cd4749f6078b6ce71da9d)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/x509.c                |  7 ++++++-
+ crypto/x509/v3_akid.c      | 25 +++++++++++++++++++------
+ doc/man5/x509v3_config.pod | 11 +++++++----
+ test/recipes/25-test_req.t |  2 +-
+ 4 files changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/apps/x509.c b/apps/x509.c
+index 203ce919ba..2880ae792a 100644
+--- a/apps/x509.c
++++ b/apps/x509.c
+@@ -816,7 +816,12 @@ int x509_main(int argc, char **argv)
+             goto end;
+     }
+ 
+-    X509V3_set_ctx(&amp;ext_ctx, issuer_cert, x, req, NULL, X509V3_CTX_REPLACE);
++    X509V3_set_ctx(&amp;ext_ctx, issuer_cert, x, NULL, NULL, X509V3_CTX_REPLACE);
++    /* prepare fallback for AKID, but only if issuer cert equals subject cert */
++    if (CAfile == NULL) {
++        if (!X509V3_set_issuer_pkey(&amp;ext_ctx, privkey))
++            goto end;
++    }
+     if (extconf != NULL &amp;&amp; !x509toreq) {
+         X509V3_set_nconf(&amp;ext_ctx, extconf);
+         if (!X509V3_EXT_add_nconf(extconf, &amp;ext_ctx, extsect, x)) {
+diff --git a/crypto/x509/v3_akid.c b/crypto/x509/v3_akid.c
+index 5abd35d644..43b515f50c 100644
+--- a/crypto/x509/v3_akid.c
++++ b/crypto/x509/v3_akid.c
+@@ -107,6 +107,7 @@ static AUTHORITY_KEYID *v2i_AUTHORITY_KEYID(X509V3_EXT_METHOD *method,
+     ASN1_INTEGER *serial = NULL;
+     X509_EXTENSION *ext;
+     X509 *issuer_cert;
++    int same_issuer, ss;
+     AUTHORITY_KEYID *akeyid = AUTHORITY_KEYID_new();
+ 
+     if (akeyid == NULL)
+@@ -144,14 +145,26 @@ static AUTHORITY_KEYID *v2i_AUTHORITY_KEYID(X509V3_EXT_METHOD *method,
+         ERR_raise(ERR_LIB_X509V3, X509V3_R_NO_ISSUER_CERTIFICATE);
+         goto err;
+     }
+-
+-    if (keyid != 0) {
+-        /* prefer any pre-existing subject key identifier of the issuer cert */
++    same_issuer = ctx-&gt;subject_cert == ctx-&gt;issuer_cert;
++    ERR_set_mark();
++    if (ctx-&gt;issuer_pkey != NULL)
++        ss = X509_check_private_key(ctx-&gt;subject_cert, ctx-&gt;issuer_pkey);
++    else
++        ss = same_issuer;
++    ERR_pop_to_mark();
++
++    /* unless forced with &quot;always&quot;, AKID is suppressed for self-signed certs */
++    if (keyid == 2 || (keyid == 1 &amp;&amp; !ss)) {
++        /*
++         * prefer any pre-existing subject key identifier of the issuer cert
++         * except issuer cert is same as subject cert and is not self-signed
++         */
+         i = X509_get_ext_by_NID(issuer_cert, NID_subject_key_identifier, -1);
+-        if (i &gt;= 0 &amp;&amp; (ext = X509_get_ext(issuer_cert, i)) != NULL)
++        if (i &gt;= 0 &amp;&amp; (ext = X509_get_ext(issuer_cert, i)) != NULL
++            &amp;&amp; !(same_issuer &amp;&amp; !ss))
+             ikeyid = X509V3_EXT_d2i(ext);
+-        if (ikeyid == NULL &amp;&amp; ctx-&gt;issuer_pkey != NULL) { /* fallback */
+-            /* generate AKID from scratch, emulating s2i_skey_id(..., &quot;hash&quot;) */
++        if (ikeyid == NULL &amp;&amp; same_issuer &amp;&amp; ctx-&gt;issuer_pkey != NULL) {
++            /* generate fallback AKID, emulating s2i_skey_id(..., &quot;hash&quot;) */
+             X509_PUBKEY *pubkey = NULL;
+ 
+             if (X509_PUBKEY_set(&amp;pubkey, ctx-&gt;issuer_pkey))
+diff --git a/doc/man5/x509v3_config.pod b/doc/man5/x509v3_config.pod
+index 1d4c4dc3ae..2a3afee27f 100644
+--- a/doc/man5/x509v3_config.pod
++++ b/doc/man5/x509v3_config.pod
+@@ -194,13 +194,16 @@ Otherwise it may have the value B&lt;keyid&gt; or B&lt;issuer&gt;
+ or both of them, separated by C&lt;,&gt;.
+ Either or both can have the option B&lt;always&gt;,
+ indicated by putting a colon C&lt;:&gt; between the value and this option.
++For self-signed certificates the AKID is suppressed unless B&lt;always&gt; is present.
+ By default the B&lt;x509&gt;, B&lt;req&gt;, and B&lt;ca&gt; apps behave as if
+ &quot;none&quot; was given for self-signed certificates and &quot;keyid, issuer&quot; otherwise.
+ 
+-If B&lt;keyid&gt; is present, an attempt is made to compute the hash of the public key
+-corresponding to the signing key in case the certificate is self-signed,
+-or else to copy the subject key identifier (SKID) from the issuer certificate.
+-If this fails and the option B&lt;always&gt; is present, an error is returned.
++If B&lt;keyid&gt; is present, an attempt is made to
++copy the subject key identifier (SKID) from the issuer certificate except if
++the issuer certificate is the same as the current one and it is not self-signed.
++The hash of the public key related to the signing key is taken as fallback
++if the issuer certificate is the same as the current certificate.
++If B&lt;always&gt; is present but no value can be obtained, an error is returned.
+ 
+ If B&lt;issuer&gt; is present, and in addition it has the option B&lt;always&gt; specified
+ or B&lt;keyid&gt; is not present,
+diff --git a/test/recipes/25-test_req.t b/test/recipes/25-test_req.t
+index a405810ae2..235b53c61c 100644
+--- a/test/recipes/25-test_req.t
++++ b/test/recipes/25-test_req.t
+@@ -433,7 +433,7 @@ cert_ext_has_n_different_lines($cert, 0, $SKID_AKID); # no SKID and no AKID
+ 
+ $cert = &quot;self-signed_v3_CA_both_KIDs.pem&quot;;
+ generate_cert($cert, @v3_ca, &quot;-addext&quot;, &quot;subjectKeyIdentifier = hash&quot;,
+-            &quot;-addext&quot;, &quot;authorityKeyIdentifier = keyid&quot;);
++            &quot;-addext&quot;, &quot;authorityKeyIdentifier = keyid:always&quot;);
+ cert_ext_has_n_different_lines($cert, 3, $SKID_AKID); # SKID == AKID
+ strict_verify($cert, 1);
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="035614.html">[openssl]  openssl-3.0 update
+</A></li>
+	<LI>Next message (by thread): <A HREF="035618.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35616">[ date ]</a>
+              <a href="thread.html#35616">[ thread ]</a>
+              <a href="subject.html#35616">[ subject ]</a>
+              <a href="author.html#35616">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

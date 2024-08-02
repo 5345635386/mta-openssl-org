@@ -1,0 +1,504 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1462208317.476270.15133.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006831.html">
+   <LINK REL="Next"  HREF="006839.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1462208317.476270.15133.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Mon May  2 16:58:37 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006831.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="006839.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6837">[ date ]</a>
+              <a href="thread.html#6837">[ thread ]</a>
+              <a href="subject.html#6837">[ subject ]</a>
+              <a href="author.html#6837">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e8408681b3fff91b794a1a5c65fd190019d6e9ee (commit)
+      from  fbaf30d087a2db2b4e22279e819d481fca21ac5c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e8408681b3fff91b794a1a5c65fd190019d6e9ee
+Author: Todd Short &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tshort at akamai.com</A>&gt;
+Date:   Mon Apr 11 16:03:42 2016 -0400
+
+    Secure memory fixes
+    
+    Fix some of the variables to be (s)size_t, so that more than 1GB of
+    secure memory can be allocated. The arena has to be a power of 2, and
+    2GB fails because it ends up being a negative 32-bit signed number.
+    
+    The |too_late| flag is not strictly necessary; it is easy to figure
+    out if something is secure memory by looking at the arena. As before,
+    secure memory allocations will not fail, but now they can be freed
+    correctly. Once initialized, secure memory can still be used, even if
+    allocations occured before initialization.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem_sec.c                     | 70 +++++++++++++++++-----------------
+ doc/crypto/OPENSSL_secure_malloc.pod | 30 +++++++--------
+ include/openssl/crypto.h             |  2 +-
+ test/secmemtest.c                    | 73 +++++++++++++++++++++++++++++++++---
+ 4 files changed, 116 insertions(+), 59 deletions(-)
+
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 31c0525..d61d945 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -37,7 +37,6 @@
+ static size_t secure_mem_used;
+ 
+ static int secure_mem_initialized;
+-static int too_late;
+ 
+ static CRYPTO_RWLOCK *sec_malloc_lock = NULL;
+ 
+@@ -48,7 +47,7 @@ static int sh_init(size_t size, int minsize);
+ static char *sh_malloc(size_t size);
+ static void sh_free(char *ptr);
+ static void sh_done(void);
+-static int sh_actual_size(char *ptr);
++static size_t sh_actual_size(char *ptr);
+ static int sh_allocated(const char *ptr);
+ #endif
+ 
+@@ -57,10 +56,6 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+ #ifdef IMPLEMENTED
+     int ret = 0;
+ 
+-    if (too_late)
+-        return ret;
+-
+-    OPENSSL_assert(!secure_mem_initialized);
+     if (!secure_mem_initialized) {
+         sec_malloc_lock = CRYPTO_THREAD_lock_new();
+         if (sec_malloc_lock == NULL)
+@@ -75,13 +70,17 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+ #endif /* IMPLEMENTED */
+ }
+ 
+-void CRYPTO_secure_malloc_done()
++int CRYPTO_secure_malloc_done()
+ {
+ #ifdef IMPLEMENTED
+-    sh_done();
+-    secure_mem_initialized = 0;
+-    CRYPTO_THREAD_lock_free(sec_malloc_lock);
++    if (secure_mem_used == 0) {
++        sh_done();
++        secure_mem_initialized = 0;
++        CRYPTO_THREAD_lock_free(sec_malloc_lock);
++        return 1;
++    }
+ #endif /* IMPLEMENTED */
++    return 0;
+ }
+ 
+ int CRYPTO_secure_malloc_initialized()
+@@ -100,7 +99,6 @@ void *CRYPTO_secure_malloc(size_t num, const char *file, int line)
+     size_t actual_size;
+ 
+     if (!secure_mem_initialized) {
+-        too_late = 1;
+         return CRYPTO_malloc(num, file, line);
+     }
+     CRYPTO_THREAD_write_lock(sec_malloc_lock);
+@@ -130,7 +128,7 @@ void CRYPTO_secure_free(void *ptr, const char *file, int line)
+ 
+     if (ptr == NULL)
+         return;
+-    if (!secure_mem_initialized) {
++    if (!CRYPTO_secure_allocated(ptr)) {
+         CRYPTO_free(ptr, file, line);
+         return;
+     }
+@@ -208,9 +206,11 @@ size_t CRYPTO_secure_actual_size(void *ptr)
+  * place.
+  */
+ 
+-# define TESTBIT(t, b)  (t[(b) &gt;&gt; 3] &amp;  (1 &lt;&lt; ((b) &amp; 7)))
+-# define SETBIT(t, b)   (t[(b) &gt;&gt; 3] |= (1 &lt;&lt; ((b) &amp; 7)))
+-# define CLEARBIT(t, b) (t[(b) &gt;&gt; 3] &amp;= (0xFF &amp; ~(1 &lt;&lt; ((b) &amp; 7))))
++#define ONE ((size_t)1)
++
++# define TESTBIT(t, b)  (t[(b) &gt;&gt; 3] &amp;  (ONE &lt;&lt; ((b) &amp; 7)))
++# define SETBIT(t, b)   (t[(b) &gt;&gt; 3] |= (ONE &lt;&lt; ((b) &amp; 7)))
++# define CLEARBIT(t, b) (t[(b) &gt;&gt; 3] &amp;= (0xFF &amp; ~(ONE &lt;&lt; ((b) &amp; 7))))
+ 
+ #define WITHIN_ARENA(p) \
+     ((char*)(p) &gt;= sh.arena &amp;&amp; (char*)(p) &lt; &amp;sh.arena[sh.arena_size])
+@@ -229,21 +229,21 @@ typedef struct sh_st
+     char* map_result;
+     size_t map_size;
+     char *arena;
+-    int arena_size;
++    size_t arena_size;
+     char **freelist;
+-    int freelist_size;
+-    int minsize;
++    ossl_ssize_t freelist_size;
++    size_t minsize;
+     unsigned char *bittable;
+     unsigned char *bitmalloc;
+-    int bittable_size; /* size in bits */
++    size_t bittable_size; /* size in bits */
+ } SH;
+ 
+ static SH sh;
+ 
+-static int sh_getlist(char *ptr)
++static size_t sh_getlist(char *ptr)
+ {
+-    int list = sh.freelist_size - 1;
+-    int bit = (sh.arena_size + ptr - sh.arena) / sh.minsize;
++    ossl_ssize_t list = sh.freelist_size - 1;
++    size_t bit = (sh.arena_size + ptr - sh.arena) / sh.minsize;
+ 
+     for (; bit; bit &gt;&gt;= 1, list--) {
+         if (TESTBIT(sh.bittable, bit))
+@@ -257,22 +257,22 @@ static int sh_getlist(char *ptr)
+ 
+ static int sh_testbit(char *ptr, int list, unsigned char *table)
+ {
+-    int bit;
++    size_t bit;
+ 
+     OPENSSL_assert(list &gt;= 0 &amp;&amp; list &lt; sh.freelist_size);
+     OPENSSL_assert(((ptr - sh.arena) &amp; ((sh.arena_size &gt;&gt; list) - 1)) == 0);
+-    bit = (1 &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
++    bit = (ONE &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
+     OPENSSL_assert(bit &gt; 0 &amp;&amp; bit &lt; sh.bittable_size);
+     return TESTBIT(table, bit);
+ }
+ 
+ static void sh_clearbit(char *ptr, int list, unsigned char *table)
+ {
+-    int bit;
++    size_t bit;
+ 
+     OPENSSL_assert(list &gt;= 0 &amp;&amp; list &lt; sh.freelist_size);
+     OPENSSL_assert(((ptr - sh.arena) &amp; ((sh.arena_size &gt;&gt; list) - 1)) == 0);
+-    bit = (1 &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
++    bit = (ONE &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
+     OPENSSL_assert(bit &gt; 0 &amp;&amp; bit &lt; sh.bittable_size);
+     OPENSSL_assert(TESTBIT(table, bit));
+     CLEARBIT(table, bit);
+@@ -280,11 +280,11 @@ static void sh_clearbit(char *ptr, int list, unsigned char *table)
+ 
+ static void sh_setbit(char *ptr, int list, unsigned char *table)
+ {
+-    int bit;
++    size_t bit;
+ 
+     OPENSSL_assert(list &gt;= 0 &amp;&amp; list &lt; sh.freelist_size);
+     OPENSSL_assert(((ptr - sh.arena) &amp; ((sh.arena_size &gt;&gt; list) - 1)) == 0);
+-    bit = (1 &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
++    bit = (ONE &lt;&lt; list) + ((ptr - sh.arena) / (sh.arena_size &gt;&gt; list));
+     OPENSSL_assert(bit &gt; 0 &amp;&amp; bit &lt; sh.bittable_size);
+     OPENSSL_assert(!TESTBIT(table, bit));
+     SETBIT(table, bit);
+@@ -449,21 +449,21 @@ static int sh_allocated(const char *ptr)
+ 
+ static char *sh_find_my_buddy(char *ptr, int list)
+ {
+-    int bit;
++    size_t bit;
+     char *chunk = NULL;
+ 
+-    bit = (1 &lt;&lt; list) + (ptr - sh.arena) / (sh.arena_size &gt;&gt; list);
++    bit = (ONE &lt;&lt; list) + (ptr - sh.arena) / (sh.arena_size &gt;&gt; list);
+     bit ^= 1;
+ 
+     if (TESTBIT(sh.bittable, bit) &amp;&amp; !TESTBIT(sh.bitmalloc, bit))
+-        chunk = sh.arena + ((bit &amp; ((1 &lt;&lt; list) - 1)) * (sh.arena_size &gt;&gt; list));
++        chunk = sh.arena + ((bit &amp; ((ONE &lt;&lt; list) - 1)) * (sh.arena_size &gt;&gt; list));
+ 
+     return chunk;
+ }
+ 
+ static char *sh_malloc(size_t size)
+ {
+-    int list, slist;
++    ossl_ssize_t list, slist;
+     size_t i;
+     char *chunk;
+ 
+@@ -522,7 +522,7 @@ static char *sh_malloc(size_t size)
+ 
+ static void sh_free(char *ptr)
+ {
+-    int list;
++    size_t list;
+     char *buddy;
+ 
+     if (ptr == NULL)
+@@ -559,7 +559,7 @@ static void sh_free(char *ptr)
+     }
+ }
+ 
+-static int sh_actual_size(char *ptr)
++static size_t sh_actual_size(char *ptr)
+ {
+     int list;
+ 
+@@ -568,6 +568,6 @@ static int sh_actual_size(char *ptr)
+         return 0;
+     list = sh_getlist(ptr);
+     OPENSSL_assert(sh_testbit(ptr, list, sh.bittable));
+-    return sh.arena_size / (1 &lt;&lt; list);
++    return sh.arena_size / (ONE &lt;&lt; list);
+ }
+ #endif /* IMPLEMENTED */
+diff --git a/doc/crypto/OPENSSL_secure_malloc.pod b/doc/crypto/OPENSSL_secure_malloc.pod
+index 2a04931..8e62658 100644
+--- a/doc/crypto/OPENSSL_secure_malloc.pod
++++ b/doc/crypto/OPENSSL_secure_malloc.pod
+@@ -16,13 +16,13 @@ CYRPTO_secure_malloc_used - secure heap storage
+ 
+  int CRYPTO_secure_malloc_initialized();
+ 
+- void CRYPTO_secure_malloc_done();
++ int CRYPTO_secure_malloc_done();
+ 
+- void *OPENSSL_secure_malloc(int num);
+- void *CRYPTO_secure_malloc(int num, const char *file, int line);
++ void *OPENSSL_secure_malloc(size_t num);
++ void *CRYPTO_secure_malloc(size_t num, const char *file, int line);
+ 
+- void *OPENSSL_secure_zalloc(int num);
+- void *CRYPTO_secure_zalloc(int num, const char *file, int line);
++ void *OPENSSL_secure_zalloc(size_t num);
++ void *CRYPTO_secure_zalloc(size_t num, const char *file, int line);
+ 
+  void OPENSSL_secure_free(void* ptr);
+  void CRYPTO_secure_free(void *ptr, const char *, int);
+@@ -30,7 +30,7 @@ CYRPTO_secure_malloc_used - secure heap storage
+  size_t OPENSSL_secure_actual_size(const void *ptr);
+  int OPENSSL_secure_allocated(const void *ptr);
+ 
+- size_t CYRPTO_secure_malloc_used();
++ size_t CYRPTO_secure_used();
+ 
+ =head1 DESCRIPTION
+ 
+@@ -49,14 +49,14 @@ put all intermediate values and computations there.
+ CRYPTO_secure_malloc_init() creates the secure heap, with the specified
+ C&lt;size&gt; in bytes. The C&lt;minsize&gt; parameter is the minimum size to
+ allocate from the heap. Both C&lt;size&gt; and C&lt;minsize&gt; must be a power
+-of two.  It is an error to call this after any OPENSSL_secure_malloc()
+-calls have been made.
++of two.
+ 
+ CRYPTO_secure_malloc_initialized() indicates whether or not the secure
+ heap as been initialized and is available.
+ 
+ CRYPTO_secure_malloc_done() releases the heap and makes the memory unavailable
+-to the process. It can take noticeably long to complete.
++to the process if all secure memory has been freed.
++It can take noticeably long to complete. 
+ 
+ OPENSSL_secure_malloc() allocates C&lt;num&gt; bytes from the heap.
+ If CRYPTO_secure_malloc_init() is not called, this is equivalent to
+@@ -83,7 +83,7 @@ OPENSSL_secure_actual_size() tells the actual size allocated to the
+ pointer; implementations may allocate more space than initially
+ requested, in order to &quot;round up&quot; and reduce secure heap fragmentation.
+ 
+-CRYPTO_secure_malloc_used() returns the number of bytes allocated in the
++CRYPTO_secure_used() returns the number of bytes allocated in the
+ secure heap.
+ 
+ =head1 RETURN VALUES
+@@ -94,7 +94,7 @@ mapping.
+ 
+ CRYPTO_secure_malloc_initialized() returns 1 if the secure heap is
+ available (that is, if CRYPTO_secure_malloc_init() has been called,
+-but CRYPTO_secure_malloc_done() has not) or 0 if not.
++but CRYPTO_secure_malloc_done() has not been called or failed) or 0 if not.
+ 
+ OPENSSL_secure_malloc() and OPENSSL_secure_zalloc() return a pointer into
+ the secure heap of the requested size, or C&lt;NULL&gt; if memory could not be
+@@ -102,13 +102,9 @@ allocated.
+ 
+ CRYPTO_secure_allocated() returns 1 if the pointer is in the secure heap, or 0 if not.
+ 
+-CRYPTO_secure_malloc_done() and OPENSSL_secure_free()
+-return no values.
++CRYPTO_secure_malloc_done() returns 1 if the secure memory area is released, or 0 if not.
+ 
+-=head1 BUGS
+-
+-The size parameters should be B&lt;size_t&gt; not B&lt;int&gt; and will be changed
+-in a future release.
++OPENSSL_secure_free() returns no values.
+ 
+ =head1 SEE ALSO
+ 
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 0eaf6b1..5e16318 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -371,7 +371,7 @@ void *CRYPTO_clear_realloc(void *addr, size_t old_num, size_t num,
+                            const char *file, int line);
+ 
+ int CRYPTO_secure_malloc_init(size_t sz, int minsize);
+-void CRYPTO_secure_malloc_done(void);
++int CRYPTO_secure_malloc_done(void);
+ void *CRYPTO_secure_malloc(size_t num, const char *file, int line);
+ void *CRYPTO_secure_zalloc(size_t num, const char *file, int line);
+ void CRYPTO_secure_free(void *ptr, const char *file, int line);
+diff --git a/test/secmemtest.c b/test/secmemtest.c
+index 7a77291..523dffa 100644
+--- a/test/secmemtest.c
++++ b/test/secmemtest.c
+@@ -1,32 +1,93 @@
+ 
+ #include &lt;openssl/crypto.h&gt;
+ 
++#define perror_line()    perror_line1(__LINE__)
++#define perror_line1(l)  perror_line2(l)
++#define perror_line2(l)  perror(&quot;failed &quot; #l)
++
+ int main(int argc, char **argv)
+ {
+ #if defined(OPENSSL_SYS_LINUX) || defined(OPENSSL_SYS_UNIX)
+-    char *p = NULL, *q = NULL;
++    char *p = NULL, *q = NULL, *r = NULL, *s = NULL;
+ 
++    r = OPENSSL_secure_malloc(20);
++    /* r = non-secure 20 */
++    if (r == NULL) {
++        perror_line();
++        return 1;
++    }
+     if (!CRYPTO_secure_malloc_init(4096, 32)) {
+-        perror(&quot;failed&quot;);
++        perror_line();
++        return 1;
++    }
++    if (CRYPTO_secure_allocated(r)) {
++        perror_line();
+         return 1;
+     }
+     p = OPENSSL_secure_malloc(20);
++    /* r = non-secure 20, p = secure 20 */
+     if (!CRYPTO_secure_allocated(p)) {
+-        perror(&quot;failed 1&quot;);
++        perror_line();
++        return 1;
++    }
++    /* 20 secure -&gt; 32-byte minimum allocaton unit */
++    if (CRYPTO_secure_used() != 32) {
++        perror_line();
+         return 1;
+     }
+     q = OPENSSL_malloc(20);
++    /* r = non-secure 20, p = secure 20, q = non-secure 20 */
+     if (CRYPTO_secure_allocated(q)) {
+-        perror(&quot;failed 1&quot;);
++        perror_line();
++        return 1;
++    }
++    s = OPENSSL_secure_malloc(20);
++    /* r = non-secure 20, p = secure 20, q = non-secure 20, s = secure 20 */
++    if (!CRYPTO_secure_allocated(s)) {
++        perror_line();
++        return 1;
++    }
++    /* 2 * 20 secure -&gt; 64 bytes allocated */
++    if (CRYPTO_secure_used() != 64) {
++        perror_line();
+         return 1;
+     }
+     OPENSSL_secure_free(p);
++    /* 20 secure -&gt; 32 bytes allocated */
++    if (CRYPTO_secure_used() != 32) {
++        perror_line();
++        return 1;
++    }
+     OPENSSL_free(q);
+-    CRYPTO_secure_malloc_done();
++    /* should not complete, as secure memory is still allocated */
++    if (CRYPTO_secure_malloc_done()) {
++        perror_line();
++        return 1;
++    }
++    if (!CRYPTO_secure_malloc_initialized()) {
++        perror_line();
++        return 1;
++    }
++    OPENSSL_secure_free(s);
++    /* secure memory should now be 0, so done should complete */
++    if (CRYPTO_secure_used() != 0) {
++        perror_line();
++        return 1;
++    }
++    if (!CRYPTO_secure_malloc_done()) {
++        perror_line();
++        return 1;
++    }
++    if (CRYPTO_secure_malloc_initialized()) {
++        perror_line();
++        return 1;
++    }
++    /* this can complete - it was not really secure */
++    OPENSSL_secure_free(r);
+ #else
+     /* Should fail. */
+     if (CRYPTO_secure_malloc_init(4096, 32)) {
+-        perror(&quot;failed&quot;);
++        perror_line();
+         return 1;
+     }
+ #endif
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006831.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="006839.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6837">[ date ]</a>
+              <a href="thread.html#6837">[ thread ]</a>
+              <a href="subject.html#6837">[ subject ]</a>
+              <a href="author.html#6837">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

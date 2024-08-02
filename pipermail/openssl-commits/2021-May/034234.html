@@ -1,0 +1,440 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1620915065.556905.17839.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034171.html">
+   <LINK REL="Next"  HREF="034250.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>beldmit at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1620915065.556905.17839.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">beldmit at gmail.com
+       </A><BR>
+    <I>Thu May 13 14:11:05 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034171.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="034250.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34234">[ date ]</a>
+              <a href="thread.html#34234">[ thread ]</a>
+              <a href="subject.html#34234">[ subject ]</a>
+              <a href="author.html#34234">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  9a48d4a4fec6827d387ee63756504892e3656299 (commit)
+       via  fffb067b468f8e6ffd003b346d7aba558f205c23 (commit)
+      from  207b8693b0821aab356ce9dccb7f2fe86e5e035a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 9a48d4a4fec6827d387ee63756504892e3656299
+Author: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+Date:   Fri Apr 30 18:13:14 2021 +0200
+
+    Testing private keys with extra attributes
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15075">https://github.com/openssl/openssl/pull/15075</A>)
+
+commit fffb067b468f8e6ffd003b346d7aba558f205c23
+Author: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+Date:   Wed Apr 28 21:43:35 2021 +0300
+
+    Try to parse private key as PKCS#8 first, fallback afterwards
+    
+    Fixes #15022
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15075">https://github.com/openssl/openssl/pull/15075</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/d2i_pr.c       |  71 +++++++++++++++++++++++++++++++--------------
+ test/recipes/25-test_req.t |  27 +++++++++++++++--
+ test/testrsa_withattrs.der | Bin 0 -&gt; 1277 bytes
+ test/testrsa_withattrs.pem |  29 ++++++++++++++++++
+ 4 files changed, 103 insertions(+), 24 deletions(-)
+ create mode 100644 test/testrsa_withattrs.der
+ create mode 100644 test/testrsa_withattrs.pem
+
+diff --git a/crypto/asn1/d2i_pr.c b/crypto/asn1/d2i_pr.c
+index 7b127d2092..091b6e7216 100644
+--- a/crypto/asn1/d2i_pr.c
++++ b/crypto/asn1/d2i_pr.c
+@@ -78,13 +78,53 @@ EVP_PKEY *d2i_PrivateKey(int type, EVP_PKEY **a, const unsigned char **pp,
+  * type
+  */
+ 
++static EVP_PKEY *key_as_pkcs8(const unsigned char **pp, long length, int *carry_on)
++{
++    const unsigned char *p = *pp;
++    PKCS8_PRIV_KEY_INFO *p8 = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;p, length);
++    EVP_PKEY *ret;
++
++    if (p8 == NULL)
++        return NULL;
++
++    ret = EVP_PKCS82PKEY(p8);
++    if (ret == NULL)
++        *carry_on = 0;
++
++    PKCS8_PRIV_KEY_INFO_free(p8);
++
++    if (ret != NULL)
++        *pp = p;
++
++    return ret;
++}
++
+ EVP_PKEY *d2i_AutoPrivateKey(EVP_PKEY **a, const unsigned char **pp,
+                              long length)
+ {
+     STACK_OF(ASN1_TYPE) *inkey;
+     const unsigned char *p;
+     int keytype;
++    EVP_PKEY *ret = NULL;
++    int carry_on = 1;
++
++    ERR_set_mark();
++    ret = key_as_pkcs8(pp, length, &amp;carry_on);
++    if (ret != NULL) {
++        ERR_clear_last_mark();
++        if (a != NULL)
++            *a = ret;
++        return ret;
++    }
++
++    if (carry_on == 0) {
++        ERR_clear_last_mark();
++        ASN1err(ASN1_F_D2I_AUTOPRIVATEKEY,
++                ASN1_R_UNSUPPORTED_PUBLIC_KEY_TYPE);
++        return NULL;
++    }
+     p = *pp;
++
+     /*
+      * Dirty trick: read in the ASN1 data into a STACK_OF(ASN1_TYPE): by
+      * analyzing it we can determine the passed structure: this assumes the
+@@ -100,28 +140,15 @@ EVP_PKEY *d2i_AutoPrivateKey(EVP_PKEY **a, const unsigned char **pp,
+         keytype = EVP_PKEY_DSA;
+     else if (sk_ASN1_TYPE_num(inkey) == 4)
+         keytype = EVP_PKEY_EC;
+-    else if (sk_ASN1_TYPE_num(inkey) == 3) { /* This seems to be PKCS8, not
+-                                              * traditional format */
+-        PKCS8_PRIV_KEY_INFO *p8 = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;p, length);
+-        EVP_PKEY *ret;
+-
+-        sk_ASN1_TYPE_pop_free(inkey, ASN1_TYPE_free);
+-        if (!p8) {
+-            ASN1err(ASN1_F_D2I_AUTOPRIVATEKEY,
+-                    ASN1_R_UNSUPPORTED_PUBLIC_KEY_TYPE);
+-            return NULL;
+-        }
+-        ret = EVP_PKCS82PKEY(p8);
+-        PKCS8_PRIV_KEY_INFO_free(p8);
+-        if (ret == NULL)
+-            return NULL;
+-        *pp = p;
+-        if (a) {
+-            *a = ret;
+-        }
+-        return ret;
+-    } else
++    else
+         keytype = EVP_PKEY_RSA;
+     sk_ASN1_TYPE_pop_free(inkey, ASN1_TYPE_free);
+-    return d2i_PrivateKey(keytype, a, pp, length);
++
++    ret = d2i_PrivateKey(keytype, a, pp, length);
++    if (ret != NULL)
++        ERR_pop_to_mark();
++    else
++        ERR_clear_last_mark();
++
++    return ret;
+ }
+diff --git a/test/recipes/25-test_req.t b/test/recipes/25-test_req.t
+index 5e1ea308a2..be4cdb1626 100644
+--- a/test/recipes/25-test_req.t
++++ b/test/recipes/25-test_req.t
+@@ -47,7 +47,7 @@ ok(!run(app([@addext_args, &quot;-addext&quot;, $val, &quot;-addext&quot;, $val3])));
+ ok(!run(app([@addext_args, &quot;-addext&quot;, $val2, &quot;-addext&quot;, $val3])));
+ 
+ subtest &quot;generating certificate requests with RSA&quot; =&gt; sub {
+-    plan tests =&gt; 2;
++    plan tests =&gt; 6;
+ 
+     SKIP: {
+         skip &quot;RSA is not supported by this OpenSSL build&quot;, 2
+@@ -63,6 +63,29 @@ subtest &quot;generating certificate requests with RSA&quot; =&gt; sub {
+                     &quot;-config&quot;, srctop_file(&quot;test&quot;, &quot;test.cnf&quot;),
+                     &quot;-verify&quot;, &quot;-in&quot;, &quot;testreq.pem&quot;, &quot;-noout&quot;])),
+            &quot;Verifying signature on request&quot;);
++
++        ok(run(app([&quot;openssl&quot;, &quot;req&quot;,
++                    &quot;-config&quot;, srctop_file(&quot;test&quot;, &quot;test.cnf&quot;),
++                    &quot;-new&quot;, &quot;-out&quot;, &quot;testreq_withattrs_pem.pem&quot;, &quot;-utf8&quot;,
++                    &quot;-key&quot;, srctop_file(&quot;test&quot;, &quot;testrsa_withattrs.pem&quot;)])),
++           &quot;Generating request from a key with extra attributes - PEM&quot;);
++
++        ok(run(app([&quot;openssl&quot;, &quot;req&quot;,
++                    &quot;-config&quot;, srctop_file(&quot;test&quot;, &quot;test.cnf&quot;),
++                    &quot;-verify&quot;, &quot;-in&quot;, &quot;testreq_withattrs_pem.pem&quot;, &quot;-noout&quot;])),
++           &quot;Verifying signature on request from a key with extra attributes - PEM&quot;);
++
++        ok(run(app([&quot;openssl&quot;, &quot;req&quot;,
++                    &quot;-config&quot;, srctop_file(&quot;test&quot;, &quot;test.cnf&quot;),
++                    &quot;-new&quot;, &quot;-out&quot;, &quot;testreq_withattrs_der.pem&quot;, &quot;-utf8&quot;,
++                    &quot;-key&quot;, srctop_file(&quot;test&quot;, &quot;testrsa_withattrs.der&quot;),
++	            &quot;-keyform&quot;, &quot;DER&quot;])),
++           &quot;Generating request from a key with extra attributes - PEM&quot;);
++
++        ok(run(app([&quot;openssl&quot;, &quot;req&quot;,
++                    &quot;-config&quot;, srctop_file(&quot;test&quot;, &quot;test.cnf&quot;),
++                    &quot;-verify&quot;, &quot;-in&quot;, &quot;testreq_withattrs_der.pem&quot;, &quot;-noout&quot;])),
++           &quot;Verifying signature on request from a key with extra attributes - PEM&quot;);
+     }
+ };
+ 
+@@ -165,7 +188,7 @@ run_conversion('req conversions',
+ run_conversion('req conversions -- testreq2',
+                srctop_file(&quot;test&quot;, &quot;testreq2.pem&quot;));
+ 
+-unlink &quot;testkey.pem&quot;, &quot;testreq.pem&quot;;
++unlink &quot;testkey.pem&quot;, &quot;testreq.pem&quot;, &quot;testreq_withattrs_pem.pem&quot;, &quot;testreq_withattrs_der.pem&quot;;
+ 
+ sub run_conversion {
+     my $title = shift;
+diff --git a/test/testrsa_withattrs.der b/test/testrsa_withattrs.der
+new file mode 100644
+index 0000000000..811e1e0bcb
+Binary files /dev/null and b/test/testrsa_withattrs.der differ
+diff --git a/test/testrsa_withattrs.pem b/test/testrsa_withattrs.pem
+new file mode 100644
+index 0000000000..42d0a3c51c
+--- /dev/null
++++ b/test/testrsa_withattrs.pem
+@@ -0,0 +1,29 @@
++-----BEGIN PRIVATE KEY-----
++MIIE+QIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDsh7QWxhftrqng
++RC3Ms+HxH2NFCX1sRoiIV4cYK2z0DQdEiNpFdpHlcs3weTuudcpr8XursodVFMTB
++eHjROhgwO/LT9xReEUiaoHJgfv6KcKcxEvntCjQkzGhkw03OH5VYdtTRAbwpwcYt
++groPiZ2STINpQOmFabzai+K+3rddwTGkkca3C5kY7KOMlnt9IuvmycksRqH6MPKz
++P5QbztlgY95rtra+OEzKLYQ1ux6hkaUlpxT5eGKfzYdccwKJWa0dUXyT/8F6rpTm
++Zbz3BxdKGAWMywaTfh5ywhNmVNTeIumxIRc3+PInn0rqKTaDrWylxiBdb3t27HxQ
++InDZmPwdAgMBAAECggEBAMTRrzN8JxEq1ES/tvStgodoPOyHlwxwLNB3NP0RtZnm
++9XM8BZTjs0egnmlKGDV14riruuMGrcJIg+kR3EcN9m68k7V51kLoUugINuTBCAIe
++96DIT5vFb9pnFT8znRy1/0obp787mF2O1t+r9jNTqgDBFmCRGUBg2jtpR4bYQPEL
++ZjXMDPcsmOlmbBdsyQvjlOHqXjCoUWwOCBEZdtaLzxaOPrBW5Jh2h3Xz1pV3NdZ/
++xufAYRhpJamPNiSipRehBZAeQP2ZAyHj/5x3tgEcA+C04Ki8NvuwJx/6T/lGKD+1
++x3DKsniNi6fEbGlpST/Zp1GY4WyVPcrLa8JxyO+UagECgYEA+gvBBI+LSK5enPXu
++WooEQP17fKzdZG7Cic8TfTPbtBIcXjNQFLHjFoBNk+TBFCjZma7L+fEcKcDm+Bg1
++qa4xihOP6BoQqHXZZNZ+9ZU96MPmI9Zb60CMG9lM1VVhSqrm2n3Q+tefod/a2bQk
++oz8QsdpsUFqVFCF5l+Tb6lp2QN0CgYEA8imPEml6LG35snBY1H6t0ASCHT1oFdHP
++o01WKQas/tuLO+pMfZrA0zLZBExxZuUJloC6COsTcOrlK+hGM60Ab6TgSPbUvYqH
++8yMV7SYLvheEngqIiFExmHg79mxnys3Rgv9KMxAV2Ip2wBrBMwUOaURU9pUKXlIN
++xiaUuevSVEECgYEA0Dbrcs3JUSuKM7AC3DfjlO6/XrFf5hrpOfJKq058m/Uc1EBs
++Zd8/V2RdtVKeiRf/Ix9QUYA6UHaGnn8iaHpaXD0v7zmNN4pzDaojrIKrO+GtCZid
++kEd+pE4N0fO4AYJQnA567/aPwi7zQaflfl6smz1kRoE3dLzvUNHNYtgTcq0CgYAm
++Op1VgMVCwlHK86VyVlVGI5AO4aTO3QJ0ez8A1wb0bOA8Iy7UHVwXe017Oj4kyj+L
++POMhiUrWZp6rIc4DVmpdNaAapKzNB1OS9JT/jSQJbFkJQgxvyLGVqlV8/3wbLgbH
++MVobWYy5VJKOnSqmzUOLJrhq/PhYD4gRIgIUn7/igQKBgQCptqrREOq9fXDEpozC
++39TL4vDrKJWpB1uK6pBEjgEVD/+tcfziVN40j5hnNFDUu/8kxxp9/4w8mPjdJ0CF
++hWIvrXasjnnFehy6IewWCljNH5CfOM64rDoXaF+ESIM4rLBHbQ8KYvaKkMjOcdNB
++JG1sRWVU01AwEhnvxS1zbyBtiqA4MDYGCCqFAwIJAwgBMSoEKBqiSOXm8r5I7hEA
+++gglN/s0bbRCnzopEhuEorpcnDXrktVtjQrmMi0=
++-----END PRIVATE KEY-----
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034171.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="034250.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34234">[ date ]</a>
+              <a href="thread.html#34234">[ thread ]</a>
+              <a href="subject.html#34234">[ subject ]</a>
+              <a href="author.html#34234">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

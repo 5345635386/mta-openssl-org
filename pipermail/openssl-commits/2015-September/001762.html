@@ -1,0 +1,577 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441539364.602906.21559.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001761.html">
+   <LINK REL="Next"  HREF="001763.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441539364.602906.21559.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sun Sep  6 11:36:04 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001761.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001763.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1762">[ date ]</a>
+              <a href="thread.html#1762">[ thread ]</a>
+              <a href="subject.html#1762">[ subject ]</a>
+              <a href="author.html#1762">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a60994df34fe6a694441471c7f8dcf9661fb091d (commit)
+       via  a412b8919821efd00121d28cf2441c5445bee602 (commit)
+      from  297172294c5bf2b94976ac6911d4d01176fb1921 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a60994df34fe6a694441471c7f8dcf9661fb091d
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sun Sep 6 12:20:12 2015 +0200
+
+    Change the treatment of stdin and stdout to allow binary data
+    
+    If the output to stdout or the input from stdin is meant to be binary,
+    it's deeply unsetting to get the occasional LF converted to CRLF or
+    the other way around.  If someone happens to forget to redirect stdin
+    or stdout, they will get gibberish anyway, line ending conversion will
+    not change that.
+    
+    Therefore, let's not have dup_bio_* decide unilaterally what mode the
+    BIO derived from stdin and stdout, and rather let the app decide by
+    declaring the intended format.
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+
+commit a412b8919821efd00121d28cf2441c5445bee602
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sun Sep 6 10:51:04 2015 +0200
+
+    dup_bio_* and bio_open_* are utility functions and belong in apps.c
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/apps.c     | 175 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ apps/apps.h     |   4 +-
+ apps/enc.c      |   2 +-
+ apps/engine.c   |   2 +-
+ apps/openssl.c  | 154 +------------------------------------------------
+ apps/s_client.c |   4 +-
+ apps/s_server.c |   4 +-
+ 7 files changed, 180 insertions(+), 165 deletions(-)
+
+diff --git a/apps/apps.c b/apps/apps.c
+index f3b2d48..d4af862 100644
+--- a/apps/apps.c
++++ b/apps/apps.c
+@@ -121,7 +121,13 @@
+ #if !defined(OPENSSL_SYS_WIN32) &amp;&amp; !defined(OPENSSL_SYS_WINCE) &amp;&amp; !defined(NETWARE_CLIB)
+ # include &lt;strings.h&gt;
+ #endif
+-#include &lt;sys/types.h&gt;
++#ifndef NO_SYS_TYPES_H
++# include &lt;sys/types.h&gt;
++#endif
++#ifndef OPENSSL_NO_POSIX_IO
++# include &lt;sys/stat.h&gt;
++# include &lt;fcntl.h&gt;
++#endif
+ #include &lt;ctype.h&gt;
+ #include &lt;errno.h&gt;
+ #include &lt;openssl/err.h&gt;
+@@ -464,7 +470,7 @@ static char *app_get_pass(char *arg, int keepbio)
+             pwdbio = BIO_push(btmp, pwdbio);
+ #endif
+         } else if (strcmp(arg, &quot;stdin&quot;) == 0) {
+-            pwdbio = dup_bio_in();
++            pwdbio = dup_bio_in(FORMAT_TEXT);
+             if (!pwdbio) {
+                 BIO_printf(bio_err, &quot;Can't open BIO for stdin\n&quot;);
+                 return NULL;
+@@ -681,7 +687,7 @@ X509 *load_cert(const char *file, int format,
+ 
+     if (file == NULL) {
+         unbuffer(stdin);
+-        cert = dup_bio_in();
++        cert = dup_bio_in(format);
+     } else
+         cert = bio_open_default(file, 'r', format);
+     if (cert == NULL)
+@@ -770,7 +776,7 @@ EVP_PKEY *load_key(const char *file, int format, int maybe_stdin,
+ #endif
+     if (file == NULL &amp;&amp; maybe_stdin) {
+         unbuffer(stdin);
+-        key = dup_bio_in();
++        key = dup_bio_in(format);
+     } else
+         key = bio_open_default(file, 'r', format);
+     if (key == NULL)
+@@ -833,7 +839,7 @@ EVP_PKEY *load_pubkey(const char *file, int format, int maybe_stdin,
+ #endif
+     if (file == NULL &amp;&amp; maybe_stdin) {
+         unbuffer(stdin);
+-        key = dup_bio_in();
++        key = dup_bio_in(format);
+     } else
+         key = bio_open_default(file, 'r', format);
+     if (key == NULL)
+@@ -2707,3 +2713,162 @@ int raw_write_stdout(const void *buf, int siz)
+     return write(fileno(stdout), buf, siz);
+ }
+ #endif
++
++/*
++ * Centralized handling if input and output files with format specification
++ * The format is meant to show what the input and output is supposed to be,
++ * and is therefore a show of intent more than anything else.  However, it
++ * does impact behavior on some platform, such as differentiating between
++ * text and binary input/output on non-Unix platforms
++ */
++inline int istext(int format)
++{
++    return (format &amp; B_FORMAT_TEXT) == B_FORMAT_TEXT;
++}
++
++BIO *dup_bio_in(int format)
++{
++    return BIO_new_fp(stdin,
++                      BIO_NOCLOSE | (istext(format) ? BIO_FP_TEXT : 0));
++}
++
++BIO *dup_bio_out(int format)
++{
++    BIO *b = BIO_new_fp(stdout,
++                        BIO_NOCLOSE | (istext(format) ? BIO_FP_TEXT : 0));
++#ifdef OPENSSL_SYS_VMS
++    if (istext(format))
++        b = BIO_push(BIO_new(BIO_f_linebuffer()), b);
++#endif
++    return b;
++}
++
++void unbuffer(FILE *fp)
++{
++    setbuf(fp, NULL);
++}
++
++static const char *modestr(char mode, int format)
++{
++    OPENSSL_assert(mode == 'a' || mode == 'r' || mode == 'w');
++
++    switch (mode) {
++    case 'a':
++        return istext(format) ? &quot;a&quot; : &quot;ab&quot;;
++    case 'r':
++        return istext(format) ? &quot;r&quot; : &quot;rb&quot;;
++    case 'w':
++        return istext(format) ? &quot;w&quot; : &quot;wb&quot;;
++    }
++    /* The assert above should make sure we never reach this point */
++    return NULL;
++}
++
++static const char *modeverb(char mode)
++{
++    switch (mode) {
++    case 'a':
++        return &quot;appending&quot;;
++    case 'r':
++        return &quot;reading&quot;;
++    case 'w':
++        return &quot;writing&quot;;
++    }
++    return &quot;(doing something)&quot;;
++}
++
++/*
++ * Open a file for writing, owner-read-only.
++ */
++BIO *bio_open_owner(const char *filename, int format, int private)
++{
++    FILE *fp = NULL;
++    BIO *b = NULL;
++    int fd = -1, bflags, mode, binmode;
++
++    if (!private || filename == NULL || strcmp(filename, &quot;-&quot;) == 0)
++        return bio_open_default(filename, 'w', format);
++
++    mode = O_WRONLY;
++#ifdef O_CREAT
++    mode |= O_CREAT;
++#endif
++#ifdef O_TRUNC
++    mode |= O_TRUNC;
++#endif
++    binmode = istext(format);
++    if (binmode) {
++#ifdef O_BINARY
++        mode |= O_BINARY;
++#elif defined(_O_BINARY)
++        mode |= _O_BINARY;
++#endif
++    }
++
++    fd = open(filename, mode, 0600);
++    if (fd &lt; 0)
++        goto err;
++    fp = fdopen(fd, modestr('w', format));
++    if (fp == NULL)
++        goto err;
++    bflags = BIO_CLOSE;
++    if (!binmode)
++        bflags |= BIO_FP_TEXT;
++    b = BIO_new_fp(fp, bflags);
++    if (b)
++        return b;
++
++ err:
++    BIO_printf(bio_err, &quot;%s: Can't open \&quot;%s\&quot; for writing, %s\n&quot;,
++               opt_getprog(), filename, strerror(errno));
++    ERR_print_errors(bio_err);
++    /* If we have fp, then fdopen took over fd, so don't close both. */
++    if (fp)
++        fclose(fp);
++    else if (fd &gt;= 0)
++        close(fd);
++    return NULL;
++}
++
++static BIO *bio_open_default_(const char *filename, char mode, int format,
++                              int quiet)
++{
++    BIO *ret;
++
++    if (filename == NULL || strcmp(filename, &quot;-&quot;) == 0) {
++        ret = mode == 'r' ? dup_bio_in(format) : dup_bio_out(format);
++        if (quiet) {
++            ERR_clear_error();
++            return ret;
++        }
++        if (ret != NULL)
++            return ret;
++        BIO_printf(bio_err,
++                   &quot;Can't open %s, %s\n&quot;,
++                   mode == 'r' ? &quot;stdin&quot; : &quot;stdout&quot;, strerror(errno));
++    } else {
++        ret = BIO_new_file(filename, modestr(mode, format));
++        if (quiet) {
++            ERR_clear_error();
++            return ret;
++        }
++        if (ret != NULL)
++            return ret;
++        BIO_printf(bio_err,
++                   &quot;Can't open %s for %s, %s\n&quot;,
++                   filename, modeverb(mode), strerror(errno));
++    }
++    ERR_print_errors(bio_err);
++    return NULL;
++}
++
++BIO *bio_open_default(const char *filename, char mode, int format)
++{
++    return bio_open_default_(filename, mode, format, 0);
++}
++
++BIO *bio_open_default_quiet(const char *filename, char mode, int format)
++{
++    return bio_open_default_(filename, mode, format, 1);
++}
++
+diff --git a/apps/apps.h b/apps/apps.h
+index c34d22e..0901c7d 100644
+--- a/apps/apps.h
++++ b/apps/apps.h
+@@ -152,8 +152,8 @@ extern char *default_config_file;
+ extern BIO *bio_in;
+ extern BIO *bio_out;
+ extern BIO *bio_err;
+-BIO *dup_bio_in(void);
+-BIO *dup_bio_out(void);
++BIO *dup_bio_in(int format);
++BIO *dup_bio_out(int format);
+ BIO *bio_open_owner(const char *filename, int format, int private);
+ BIO *bio_open_default(const char *filename, char mode, int format);
+ BIO *bio_open_default_quiet(const char *filename, char mode, int format);
+diff --git a/apps/enc.c b/apps/enc.c
+index 0bdba38..fc7e14c 100644
+--- a/apps/enc.c
++++ b/apps/enc.c
+@@ -328,7 +328,7 @@ int enc_main(int argc, char **argv)
+ 
+     if (infile == NULL) {
+         unbuffer(stdin);
+-        in = dup_bio_in();
++        in = dup_bio_in(format);
+     } else
+         in = bio_open_default(infile, 'r', format);
+     if (in == NULL)
+diff --git a/apps/engine.c b/apps/engine.c
+index 91af7bf..b1c1371 100644
+--- a/apps/engine.c
++++ b/apps/engine.c
+@@ -319,7 +319,7 @@ int engine_main(int argc, char **argv)
+     OPTION_CHOICE o;
+     char *prog;
+ 
+-    out = dup_bio_out();
++    out = dup_bio_out(FORMAT_TEXT);
+     prog = opt_init(argc, argv, engine_options);
+     if (!engines || !pre_cmds || !post_cmds)
+         goto end;
+diff --git a/apps/openssl.c b/apps/openssl.c
+index bfd77a5..39ae64d 100644
+--- a/apps/openssl.c
++++ b/apps/openssl.c
+@@ -132,13 +132,6 @@
+ #ifdef OPENSSL_SYS_VMS
+ # include &lt;unixio.h&gt;
+ #endif
+-#ifndef NO_SYS_TYPES_H
+-# include &lt;sys/types.h&gt;
+-#endif
+-#ifndef OPENSSL_NO_POSIX_IO
+-# include &lt;sys/stat.h&gt;
+-# include &lt;fcntl.h&gt;
+-#endif
+ #define INCLUDE_FUNCTION_TABLE
+ #include &quot;apps.h&quot;
+ 
+@@ -280,149 +273,6 @@ static void lock_dbg_cb(int mode, int type, const char *file, int line)
+     }
+ }
+ 
+-BIO *dup_bio_in(void)
+-{
+-    return BIO_new_fp(stdin, BIO_NOCLOSE | BIO_FP_TEXT);
+-}
+-
+-BIO *dup_bio_out(void)
+-{
+-    BIO *b = BIO_new_fp(stdout, BIO_NOCLOSE | BIO_FP_TEXT);
+-#ifdef OPENSSL_SYS_VMS
+-    b = BIO_push(BIO_new(BIO_f_linebuffer()), b);
+-#endif
+-    return b;
+-}
+-
+-void unbuffer(FILE *fp)
+-{
+-    setbuf(fp, NULL);
+-}
+-
+-static const char *modestr(char mode, int format)
+-{
+-    OPENSSL_assert(mode == 'a' || mode == 'r' || mode == 'w');
+-
+-    switch (mode) {
+-    case 'a':
+-        return (format &amp; B_FORMAT_TEXT) ? &quot;a&quot; : &quot;ab&quot;;
+-    case 'r':
+-        return (format &amp; B_FORMAT_TEXT) ? &quot;r&quot; : &quot;rb&quot;;
+-    case 'w':
+-        return (format &amp; B_FORMAT_TEXT) ? &quot;w&quot; : &quot;wb&quot;;
+-    }
+-    /* The assert above should make sure we never reach this point */
+-    return NULL;
+-}
+-
+-static const char *modeverb(char mode)
+-{
+-    switch (mode) {
+-    case 'a':
+-        return &quot;appending&quot;;
+-    case 'r':
+-        return &quot;reading&quot;;
+-    case 'w':
+-        return &quot;writing&quot;;
+-    }
+-    return &quot;(doing something)&quot;;
+-}
+-
+-/*
+- * Open a file for writing, owner-read-only.
+- */
+-BIO *bio_open_owner(const char *filename, int format, int private)
+-{
+-    FILE *fp = NULL;
+-    BIO *b = NULL;
+-    int fd = -1, bflags, mode, binmode;
+-
+-    if (!private || filename == NULL || strcmp(filename, &quot;-&quot;) == 0)
+-        return bio_open_default(filename, 'w', format);
+-
+-    mode = O_WRONLY;
+-#ifdef O_CREAT
+-    mode |= O_CREAT;
+-#endif
+-#ifdef O_TRUNC
+-    mode |= O_TRUNC;
+-#endif
+-    binmode = !(format &amp; B_FORMAT_TEXT);
+-    if (binmode) {
+-#ifdef O_BINARY
+-        mode |= O_BINARY;
+-#elif defined(_O_BINARY)
+-        mode |= _O_BINARY;
+-#endif
+-    }
+-
+-    fd = open(filename, mode, 0600);
+-    if (fd &lt; 0)
+-        goto err;
+-    fp = fdopen(fd, modestr('w', format));
+-    if (fp == NULL)
+-        goto err;
+-    bflags = BIO_CLOSE;
+-    if (!binmode)
+-        bflags |= BIO_FP_TEXT;
+-    b = BIO_new_fp(fp, bflags);
+-    if (b)
+-        return b;
+-
+- err:
+-    BIO_printf(bio_err, &quot;%s: Can't open \&quot;%s\&quot; for writing, %s\n&quot;,
+-               opt_getprog(), filename, strerror(errno));
+-    ERR_print_errors(bio_err);
+-    /* If we have fp, then fdopen took over fd, so don't close both. */
+-    if (fp)
+-        fclose(fp);
+-    else if (fd &gt;= 0)
+-        close(fd);
+-    return NULL;
+-}
+-
+-static BIO *bio_open_default_(const char *filename, char mode, int format,
+-                              int quiet)
+-{
+-    BIO *ret;
+-
+-    if (filename == NULL || strcmp(filename, &quot;-&quot;) == 0) {
+-        ret = mode == 'r' ? dup_bio_in() : dup_bio_out();
+-        if (quiet) {
+-            ERR_clear_error();
+-            return ret;
+-        }
+-        if (ret != NULL)
+-            return ret;
+-        BIO_printf(bio_err,
+-                   &quot;Can't open %s, %s\n&quot;,
+-                   mode == 'r' ? &quot;stdin&quot; : &quot;stdout&quot;, strerror(errno));
+-    } else {
+-        ret = BIO_new_file(filename, modestr(mode, format));
+-        if (quiet) {
+-            ERR_clear_error();
+-            return ret;
+-        }
+-        if (ret != NULL)
+-            return ret;
+-        BIO_printf(bio_err,
+-                   &quot;Can't open %s for %s, %s\n&quot;,
+-                   filename, modeverb(mode), strerror(errno));
+-    }
+-    ERR_print_errors(bio_err);
+-    return NULL;
+-}
+-
+-BIO *bio_open_default(const char *filename, char mode, int format)
+-{
+-    return bio_open_default_(filename, mode, format, 0);
+-}
+-
+-BIO *bio_open_default_quiet(const char *filename, char mode, int format)
+-{
+-    return bio_open_default_(filename, mode, format, 1);
+-}
+-
+ #if defined( OPENSSL_SYS_VMS)
+ extern char **copy_argv(int *argc, char **argv);
+ #endif
+@@ -443,8 +293,8 @@ int main(int argc, char *argv[])
+ 
+     /* Set up some of the environment. */
+     default_config_file = make_config_name();
+-    bio_in = dup_bio_in();
+-    bio_out = dup_bio_out();
++    bio_in = dup_bio_in(FORMAT_TEXT);
++    bio_out = dup_bio_out(FORMAT_TEXT);
+     bio_err = BIO_new_fp(stderr, BIO_NOCLOSE | BIO_FP_TEXT);
+ 
+ #if defined( OPENSSL_SYS_VMS)
+diff --git a/apps/s_client.c b/apps/s_client.c
+index 819cff3..3eb495a 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -1162,9 +1162,9 @@ int s_client_main(int argc, char **argv)
+         if (c_quiet &amp;&amp; !c_debug) {
+             bio_c_out = BIO_new(BIO_s_null());
+             if (c_msg &amp;&amp; !bio_c_msg)
+-                bio_c_msg = dup_bio_out();
++                bio_c_msg = dup_bio_out(FORMAT_TEXT);
+         } else if (bio_c_out == NULL)
+-            bio_c_out = dup_bio_out();
++            bio_c_out = dup_bio_out(FORMAT_TEXT);
+     }
+ #ifndef OPENSSL_NO_SRP
+     if (!app_passwd(srppass, NULL, &amp;srp_arg.srppassin, NULL)) {
+diff --git a/apps/s_server.c b/apps/s_server.c
+index e7c794c..8fe1ebe 100644
+--- a/apps/s_server.c
++++ b/apps/s_server.c
+@@ -1575,10 +1575,10 @@ int s_server_main(int argc, char *argv[])
+         if (s_quiet &amp;&amp; !s_debug) {
+             bio_s_out = BIO_new(BIO_s_null());
+             if (s_msg &amp;&amp; !bio_s_msg)
+-                bio_s_msg = dup_bio_out();
++                bio_s_msg = dup_bio_out(FORMAT_TEXT);
+         } else {
+             if (bio_s_out == NULL)
+-                bio_s_out = dup_bio_out();
++                bio_s_out = dup_bio_out(FORMAT_TEXT);
+         }
+     }
+ #if !defined(OPENSSL_NO_RSA) || !defined(OPENSSL_NO_DSA) || !defined(OPENSSL_NO_EC)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001761.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001763.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1762">[ date ]</a>
+              <a href="thread.html#1762">[ thread ]</a>
+              <a href="subject.html#1762">[ subject ]</a>
+              <a href="author.html#1762">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,244 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1464041417.479425.7850.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007509.html">
+   <LINK REL="Next"  HREF="007512.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1464041417.479425.7850.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon May 23 22:10:17 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007509.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007512.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7511">[ date ]</a>
+              <a href="thread.html#7511">[ thread ]</a>
+              <a href="subject.html#7511">[ subject ]</a>
+              <a href="author.html#7511">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a93e0e78db78e03bdcd29acf9bbc8a812ee50cb6 (commit)
+      from  1c7bfec5982210b2666a91771777c56338cf4d8d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a93e0e78db78e03bdcd29acf9bbc8a812ee50cb6
+Author: J Mohan Rao Arisankala &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">mohan at barracuda.com</A>&gt;
+Date:   Mon May 23 23:37:47 2016 +0530
+
+    #4342: few missing malloc return checks and free in error paths
+    
+    ossl_hmac_cleanup, pkey_hmac_cleanup:
+     - allow to invoke with NULL data
+     - using EVP_PKEY_CTX_[get|set]_data
+    
+    EVP_DigestInit_ex:
+     - remove additional check for &#8216;type&#8217; and doing clear free instead of
+    free
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/engine/eng_openssl.c | 25 ++++++++++++++++++++-----
+ crypto/evp/digest.c         |  8 +++-----
+ crypto/hmac/hm_pmeth.c      | 24 ++++++++++++++++++------
+ 3 files changed, 41 insertions(+), 16 deletions(-)
+
+diff --git a/crypto/engine/eng_openssl.c b/crypto/engine/eng_openssl.c
+index 75fd23d..7e28604 100644
+--- a/crypto/engine/eng_openssl.c
++++ b/crypto/engine/eng_openssl.c
+@@ -441,6 +441,10 @@ static int ossl_hmac_init(EVP_PKEY_CTX *ctx)
+         return 0;
+     hctx-&gt;ktmp.type = V_ASN1_OCTET_STRING;
+     hctx-&gt;ctx = HMAC_CTX_new();
++    if (hctx-&gt;ctx == NULL) {
++        OPENSSL_free(hctx);
++        return 0;
++    }
+     EVP_PKEY_CTX_set_data(ctx, hctx);
+     EVP_PKEY_CTX_set0_keygen_info(ctx, NULL, 0);
+ # ifdef TEST_ENG_OPENSSL_HMAC_INIT
+@@ -449,31 +453,42 @@ static int ossl_hmac_init(EVP_PKEY_CTX *ctx)
+     return 1;
+ }
+ 
++static void ossl_hmac_cleanup(EVP_PKEY_CTX *ctx);
++
+ static int ossl_hmac_copy(EVP_PKEY_CTX *dst, EVP_PKEY_CTX *src)
+ {
+     OSSL_HMAC_PKEY_CTX *sctx, *dctx;
++
++    /* allocate memory for dst-&gt;data and a new HMAC_CTX in dst-&gt;data-&gt;ctx */
+     if (!ossl_hmac_init(dst))
+         return 0;
+     sctx = EVP_PKEY_CTX_get_data(src);
+     dctx = EVP_PKEY_CTX_get_data(dst);
+     dctx-&gt;md = sctx-&gt;md;
+     if (!HMAC_CTX_copy(dctx-&gt;ctx, sctx-&gt;ctx))
+-        return 0;
++        goto err;
+     if (sctx-&gt;ktmp.data) {
+         if (!ASN1_OCTET_STRING_set(&amp;dctx-&gt;ktmp,
+                                    sctx-&gt;ktmp.data, sctx-&gt;ktmp.length))
+-            return 0;
++            goto err;
+     }
+     return 1;
++err:
++    /* release HMAC_CTX in dst-&gt;data-&gt;ctx and memory allocated for dst-&gt;data */
++    ossl_hmac_cleanup(dst);
++    return 0;
+ }
+ 
+ static void ossl_hmac_cleanup(EVP_PKEY_CTX *ctx)
+ {
+     OSSL_HMAC_PKEY_CTX *hctx = EVP_PKEY_CTX_get_data(ctx);
+ 
+-    HMAC_CTX_free(hctx-&gt;ctx);
+-    OPENSSL_clear_free(hctx-&gt;ktmp.data, hctx-&gt;ktmp.length);
+-    OPENSSL_free(hctx);
++    if (hctx) {
++        HMAC_CTX_free(hctx-&gt;ctx);
++        OPENSSL_clear_free(hctx-&gt;ktmp.data, hctx-&gt;ktmp.length);
++        OPENSSL_free(hctx);
++        EVP_PKEY_CTX_set_data(ctx, NULL);
++    }
+ }
+ 
+ static int ossl_hmac_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY *pkey)
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index 051fc7b..c594a0a 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -68,10 +68,8 @@ int EVP_DigestInit_ex(EVP_MD_CTX *ctx, const EVP_MD *type, ENGINE *impl)
+      * previous handle, re-querying for an ENGINE, and having a
+      * reinitialisation, when it may all be unnecessary.
+      */
+-    if (ctx-&gt;engine &amp;&amp; ctx-&gt;digest &amp;&amp; (!type ||
+-                                       (type
+-                                        &amp;&amp; (type-&gt;type ==
+-                                            ctx-&gt;digest-&gt;type))))
++    if (ctx-&gt;engine &amp;&amp; ctx-&gt;digest &amp;&amp;
++        (type == NULL || (type-&gt;type == ctx-&gt;digest-&gt;type)))
+         goto skip_to_init;
+     if (type) {
+         /*
+@@ -117,7 +115,7 @@ int EVP_DigestInit_ex(EVP_MD_CTX *ctx, const EVP_MD *type, ENGINE *impl)
+ #endif
+     if (ctx-&gt;digest != type) {
+         if (ctx-&gt;digest &amp;&amp; ctx-&gt;digest-&gt;ctx_size) {
+-            OPENSSL_free(ctx-&gt;md_data);
++            OPENSSL_clear_free(ctx-&gt;md_data, ctx-&gt;digest-&gt;ctx_size);
+             ctx-&gt;md_data = NULL;
+         }
+         ctx-&gt;digest = type;
+diff --git a/crypto/hmac/hm_pmeth.c b/crypto/hmac/hm_pmeth.c
+index 55493be..5b98477 100644
+--- a/crypto/hmac/hm_pmeth.c
++++ b/crypto/hmac/hm_pmeth.c
+@@ -32,6 +32,10 @@ static int pkey_hmac_init(EVP_PKEY_CTX *ctx)
+         return 0;
+     hctx-&gt;ktmp.type = V_ASN1_OCTET_STRING;
+     hctx-&gt;ctx = HMAC_CTX_new();
++    if (hctx-&gt;ctx == NULL) {
++        OPENSSL_free(hctx);
++        return 0;
++    }
+ 
+     ctx-&gt;data = hctx;
+     ctx-&gt;keygen_info_count = 0;
+@@ -39,33 +43,41 @@ static int pkey_hmac_init(EVP_PKEY_CTX *ctx)
+     return 1;
+ }
+ 
++static void pkey_hmac_cleanup(EVP_PKEY_CTX *ctx);
++
+ static int pkey_hmac_copy(EVP_PKEY_CTX *dst, EVP_PKEY_CTX *src)
+ {
+     HMAC_PKEY_CTX *sctx, *dctx;
++
++    /* allocate memory for dst-&gt;data and a new HMAC_CTX in dst-&gt;data-&gt;ctx */
+     if (!pkey_hmac_init(dst))
+         return 0;
+-    sctx = src-&gt;data;
+-    dctx = dst-&gt;data;
++    sctx = EVP_PKEY_CTX_get_data(src);
++    dctx = EVP_PKEY_CTX_get_data(dst);
+     dctx-&gt;md = sctx-&gt;md;
+     if (!HMAC_CTX_copy(dctx-&gt;ctx, sctx-&gt;ctx))
+-        return 0;
++        goto err;
+     if (sctx-&gt;ktmp.data) {
+         if (!ASN1_OCTET_STRING_set(&amp;dctx-&gt;ktmp,
+                                    sctx-&gt;ktmp.data, sctx-&gt;ktmp.length))
+-            return 0;
++            goto err;
+     }
+     return 1;
++err:
++    /* release HMAC_CTX in dst-&gt;data-&gt;ctx and memory allocated for dst-&gt;data */
++    pkey_hmac_cleanup (dst);
++    return 0;
+ }
+ 
+ static void pkey_hmac_cleanup(EVP_PKEY_CTX *ctx)
+ {
+-    HMAC_PKEY_CTX *hctx = ctx-&gt;data;
++    HMAC_PKEY_CTX *hctx = EVP_PKEY_CTX_get_data(ctx);
+ 
+     if (hctx != NULL) {
+         HMAC_CTX_free(hctx-&gt;ctx);
+         OPENSSL_clear_free(hctx-&gt;ktmp.data, hctx-&gt;ktmp.length);
+         OPENSSL_free(hctx);
+-        ctx-&gt;data = NULL;
++        EVP_PKEY_CTX_set_data(ctx, NULL);
+     }
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007509.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007512.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7511">[ date ]</a>
+              <a href="thread.html#7511">[ thread ]</a>
+              <a href="subject.html#7511">[ subject ]</a>
+              <a href="author.html#7511">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

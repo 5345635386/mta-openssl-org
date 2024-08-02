@@ -1,0 +1,540 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2022-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1642156842.698759.995115.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="036075.html">
+   <LINK REL="Next"  HREF="036078.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1642156842.698759.995115.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Fri Jan 14 10:40:42 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="036075.html">[openssl]  master update
+</A></li>
+        <LI>Next message (by thread): <A HREF="036078.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36077">[ date ]</a>
+              <a href="thread.html#36077">[ thread ]</a>
+              <a href="subject.html#36077">[ subject ]</a>
+              <a href="author.html#36077">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  71396cd048072b69559b46d98cfebfd4474cd712 (commit)
+      from  79704a88eb5aa70fa506e3e59a29fcda21f428af (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 71396cd048072b69559b46d98cfebfd4474cd712
+Author: fangming.fang &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">fangming.fang at arm.com</A>&gt;
+Date:   Fri Dec 24 08:29:04 2021 +0000
+
+    SM3 acceleration with SM3 hardware instruction on aarch64
+    
+    SM3 hardware instruction is optional feature of crypto extension for
+    aarch64. This implementation accelerates SM3 via SM3 instructions. For
+    the platform not supporting SM3 instruction, the original C
+    implementation still works. Thanks to AliBaba for testing and reporting
+    the following perf numbers for Yitian710:
+    
+    Benchmark on T-Head Yitian-710 2.75GHz:
+    
+    Before:
+    type  16 bytes     64 bytes    256 bytes    1024 bytes   8192 bytes   16384 bytes
+    sm3   49297.82k   121062.63k   223106.05k   283371.52k   307574.10k   309400.92k
+    
+    After (33% - 74% faster):
+    type  16 bytes     64 bytes    256 bytes    1024 bytes   8192 bytes   16384 bytes
+    sm3   65640.01k   179121.79k   359854.59k   481448.96k   534055.59k   538274.47k
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/17454">https://github.com/openssl/openssl/pull/17454</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/arm64cpuid.pl        |   8 ++
+ crypto/arm_arch.h           |   1 +
+ crypto/armcap.c             |  10 ++
+ crypto/sm3/asm/sm3-armv8.pl | 282 ++++++++++++++++++++++++++++++++++++++++++++
+ crypto/sm3/build.info       |  21 +++-
+ crypto/sm3/sm3_local.h      |  16 ++-
+ 6 files changed, 335 insertions(+), 3 deletions(-)
+ create mode 100644 crypto/sm3/asm/sm3-armv8.pl
+
+diff --git a/crypto/arm64cpuid.pl b/crypto/arm64cpuid.pl
+index a86fa6073a..b30f505339 100755
+--- a/crypto/arm64cpuid.pl
++++ b/crypto/arm64cpuid.pl
+@@ -96,6 +96,14 @@ _armv8_cpuid_probe:
+ 	ret
+ .size	_armv8_cpuid_probe,.-_armv8_cpuid_probe
+ 
++.globl	_armv8_sm3_probe
++.type	_armv8_sm3_probe,%function
++_armv8_sm3_probe:
++	AARCH64_VALID_CALL_TARGET
++	.long	0xce63c004	// sm3partw1 v4.4s, v0.4s, v3.4s
++	ret
++.size	_armv8_sm3_probe,.-_armv8_sm3_probe
++
+ .globl	OPENSSL_cleanse
+ .type	OPENSSL_cleanse,%function
+ .align	5
+diff --git a/crypto/arm_arch.h b/crypto/arm_arch.h
+index 848f06542c..77173cae42 100644
+--- a/crypto/arm_arch.h
++++ b/crypto/arm_arch.h
+@@ -79,6 +79,7 @@ extern unsigned int OPENSSL_armv8_rsa_neonized;
+ # define ARMV8_SHA512    (1&lt;&lt;6)
+ # define ARMV8_CPUID     (1&lt;&lt;7)
+ # define ARMV8_RNG       (1&lt;&lt;8)
++# define ARMV8_SM3       (1&lt;&lt;9)
+ 
+ /*
+  * MIDR_EL1 system register
+diff --git a/crypto/armcap.c b/crypto/armcap.c
+index 72ed0a024a..93003c9121 100644
+--- a/crypto/armcap.c
++++ b/crypto/armcap.c
+@@ -53,6 +53,7 @@ void _armv8_sha1_probe(void);
+ void _armv8_sha256_probe(void);
+ void _armv8_pmull_probe(void);
+ # ifdef __aarch64__
++void _armv8_sm3_probe(void);
+ void _armv8_sha512_probe(void);
+ unsigned int _armv8_cpuid_probe(void);
+ void _armv8_rng_probe(void);
+@@ -169,6 +170,7 @@ static unsigned long getauxval(unsigned long key)
+ #  define HWCAP_CE_SHA1          (1 &lt;&lt; 5)
+ #  define HWCAP_CE_SHA256        (1 &lt;&lt; 6)
+ #  define HWCAP_CPUID            (1 &lt;&lt; 11)
++#  define HWCAP_CE_SM3           (1 &lt;&lt; 18)
+ #  define HWCAP_CE_SHA512        (1 &lt;&lt; 21)
+                                   /* AT_HWCAP2 */
+ #  define HWCAP2                 26
+@@ -245,6 +247,9 @@ void OPENSSL_cpuid_setup(void)
+ 
+         if (hwcap &amp; HWCAP_CPUID)
+             OPENSSL_armcap_P |= ARMV8_CPUID;
++
++        if (hwcap &amp; HWCAP_CE_SM3)
++            OPENSSL_armcap_P |= ARMV8_SM3;
+ #  endif
+     }
+ #  ifdef __aarch64__
+@@ -292,6 +297,11 @@ void OPENSSL_cpuid_setup(void)
+             _armv8_sha512_probe();
+             OPENSSL_armcap_P |= ARMV8_SHA512;
+         }
++
++        if (sigsetjmp(ill_jmp, 1) == 0) {
++            _armv8_sm3_probe();
++            OPENSSL_armcap_P |= ARMV8_SM3;
++        }
+ #  endif
+     }
+ #  ifdef __aarch64__
+diff --git a/crypto/sm3/asm/sm3-armv8.pl b/crypto/sm3/asm/sm3-armv8.pl
+new file mode 100644
+index 0000000000..bb71b2eade
+--- /dev/null
++++ b/crypto/sm3/asm/sm3-armv8.pl
+@@ -0,0 +1,282 @@
++#! /usr/bin/env perl
++# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++#
++# This module implements support for Armv8 SM3 instructions
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}arm-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/arm-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate arm-xlate.pl&quot;;
++
++open OUT,&quot;| \&quot;$^X\&quot; $xlate $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++*STDOUT=*OUT;
++
++# Message expanding:
++#	Wj &lt;- P1(W[j-16]^W[j-9]^(W[j-3]&lt;&lt;&lt;15))^(W[j-13]&lt;&lt;&lt;7)^W[j-6]
++# Input: s0, s1, s2, s3
++#	s0 = w0  | w1  | w2  | w3
++#	s1 = w4  | w5  | w6  | w7
++#	s2 = w8  | w9  | w10 | w11
++#	s3 = w12 | w13 | w14 | w15
++# Output: s4
++sub msg_exp () {
++my $s0 = shift;
++my $s1 = shift;
++my $s2 = shift;
++my $s3 = shift;
++my $s4 = shift;
++my $vtmp1 = shift;
++my $vtmp2 = shift;
++$code.=&lt;&lt;___;
++	// s4 = w7  | w8  | w9  | w10
++	ext     $s4.16b, $s1.16b, $s2.16b, #12
++	// vtmp1 = w3  | w4  | w5  | w6
++	ext	$vtmp1.16b, $s0.16b, $s1.16b, #12
++	// vtmp2 = w10 | w11 | w12 | w13
++	ext     $vtmp2.16b, $s2.16b, $s3.16b, #8
++	sm3partw1       $s4.4s, $s0.4s, $s3.4s
++	sm3partw2       $s4.4s, $vtmp2.4s, $vtmp1.4s
++___
++}
++
++# A round of compresson function
++# Input:
++# 	ab - choose instruction among sm3tt1a, sm3tt1b, sm3tt2a, sm3tt2b
++# 	vstate0 - vstate1, store digest status(A - H)
++# 	vconst0 - vconst1, interleaved used to store Tj &lt;&lt;&lt; j
++# 	vtmp - temporary register
++# 	vw - for sm3tt1ab, vw = s0 eor s1
++# 	s0 - for sm3tt2ab, just be s0
++# 	i, choose wj' or wj from vw
++sub round () {
++my $ab = shift;
++my $vstate0 = shift;
++my $vstate1 = shift;
++my $vconst0 = shift;
++my $vconst1 = shift;
++my $vtmp = shift;
++my $vw = shift;
++my $s0 = shift;
++my $i = shift;
++$code.=&lt;&lt;___;
++	sm3ss1  $vtmp.4s, $vstate0.4s, $vconst0.4s, $vstate1.4s
++	shl     $vconst1.4s, $vconst0.4s, #1
++	sri     $vconst1.4s, $vconst0.4s, #31
++	sm3tt1$ab       $vstate0.4s, $vtmp.4s, $vw.4s[$i]
++	sm3tt2$ab       $vstate1.4s, $vtmp.4s, $s0.4s[$i]
++___
++}
++
++sub qround () {
++my $ab = shift;
++my $vstate0 = shift;
++my $vstate1 = shift;
++my $vconst0 = shift;
++my $vconst1 = shift;
++my $vtmp1 = shift;
++my $vtmp2 = shift;
++my $s0 = shift;
++my $s1 = shift;
++my $s2 = shift;
++my $s3 = shift;
++my $s4 = shift;
++	if($s4) {
++		&amp;msg_exp($s0, $s1, $s2, $s3, $s4, $vtmp1, $vtmp2);
++	}
++$code.=&lt;&lt;___;
++	eor     $vtmp1.16b, $s0.16b, $s1.16b
++___
++	&amp;round($ab, $vstate0, $vstate1, $vconst0, $vconst1, $vtmp2,
++               $vtmp1, $s0, 0);
++	&amp;round($ab, $vstate0, $vstate1, $vconst1, $vconst0, $vtmp2,
++               $vtmp1, $s0, 1);
++	&amp;round($ab, $vstate0, $vstate1, $vconst0, $vconst1, $vtmp2,
++               $vtmp1, $s0, 2);
++	&amp;round($ab, $vstate0, $vstate1, $vconst1, $vconst0, $vtmp2,
++               $vtmp1, $s0, 3);
++}
++
++$code=&lt;&lt;___;
++#include &quot;arm_arch.h&quot;
++.arch	armv8.2-a+sm4
++.text
++___
++
++{{{
++my ($pstate,$pdata,$num)=(&quot;x0&quot;,&quot;x1&quot;,&quot;w2&quot;);
++my ($state1,$state2)=(&quot;v5&quot;,&quot;v6&quot;);
++my ($sconst1, $sconst2)=(&quot;s16&quot;,&quot;s17&quot;);
++my ($vconst1, $vconst2)=(&quot;v16&quot;,&quot;v17&quot;);
++my ($s0,$s1,$s2,$s3,$s4)=map(&quot;v$_&quot;,(0..4));
++my ($bkstate1,$bkstate2)=(&quot;v18&quot;,&quot;v19&quot;);
++my ($vconst_tmp1,$vconst_tmp2)=(&quot;v20&quot;,&quot;v21&quot;);
++my ($vtmp1,$vtmp2)=(&quot;v22&quot;,&quot;v23&quot;);
++my $constaddr=&quot;x8&quot;;
++# void ossl_hwsm3_block_data_order(SM3_CTX *c, const void *p, size_t num)
++$code.=&lt;&lt;___;
++.globl	ossl_hwsm3_block_data_order
++.type	ossl_hwsm3_block_data_order,%function
++.align	5
++ossl_hwsm3_block_data_order:
++	AARCH64_VALID_CALL_TARGET
++	// load state
++	ld1     {$state1.4s-$state2.4s}, [$pstate]
++	rev64   $state1.4s, $state1.4s
++	rev64   $state2.4s, $state2.4s
++	ext     $state1.16b, $state1.16b, $state1.16b, #8
++	ext     $state2.16b, $state2.16b, $state2.16b, #8
++
++	adr     $constaddr, .Tj
++	ldp     $sconst1, $sconst2, [$constaddr]
++
++.Loop:
++	// load input
++	ld1     {$s0.16b-$s3.16b}, [$pdata], #64
++	sub     $num, $num, #1
++
++	mov     $bkstate1.16b, $state1.16b
++	mov     $bkstate2.16b, $state2.16b
++
++#ifndef __ARMEB__
++	rev32   $s0.16b, $s0.16b
++	rev32   $s1.16b, $s1.16b
++	rev32   $s2.16b, $s2.16b
++	rev32   $s3.16b, $s3.16b
++#endif
++
++	ext     $vconst_tmp1.16b, $vconst1.16b, $vconst1.16b, #4
++___
++	&amp;qround(&quot;a&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s0,$s1,$s2,$s3,$s4);
++	&amp;qround(&quot;a&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s1,$s2,$s3,$s4,$s0);
++	&amp;qround(&quot;a&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s2,$s3,$s4,$s0,$s1);
++	&amp;qround(&quot;a&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s3,$s4,$s0,$s1,$s2);
++
++$code.=&lt;&lt;___;
++	ext     $vconst_tmp1.16b, $vconst2.16b, $vconst2.16b, #4
++___
++
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s4,$s0,$s1,$s2,$s3);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s0,$s1,$s2,$s3,$s4);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s1,$s2,$s3,$s4,$s0);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s2,$s3,$s4,$s0,$s1);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s3,$s4,$s0,$s1,$s2);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s4,$s0,$s1,$s2,$s3);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s0,$s1,$s2,$s3,$s4);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s1,$s2,$s3,$s4,$s0);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s2,$s3,$s4,$s0,$s1);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s3,$s4);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s4,$s0);
++	&amp;qround(&quot;b&quot;,$state1,$state2,$vconst_tmp1,$vconst_tmp2,$vtmp1,$vtmp2,
++                $s0,$s1);
++
++$code.=&lt;&lt;___;
++	eor     $state1.16b, $state1.16b, $bkstate1.16b
++	eor     $state2.16b, $state2.16b, $bkstate2.16b
++
++	// any remained blocks?
++	cbnz    $num, .Loop
++
++	// save state
++	rev64   $state1.4s, $state1.4s
++	rev64   $state2.4s, $state2.4s
++	ext     $state1.16b, $state1.16b, $state1.16b, #8
++	ext     $state2.16b, $state2.16b, $state2.16b, #8
++	st1     {$state1.4s-$state2.4s}, [$pstate]
++	ret
++.size	ossl_hwsm3_block_data_order,.-ossl_hwsm3_block_data_order
++
++.align	3
++.Tj:
++.word	0x79cc4519, 0x9d8a7a87
++___
++}}}
++
++#########################################
++my %sm3partopcode = (
++	&quot;sm3partw1&quot;         =&gt;   0xce60C000,
++        &quot;sm3partw2&quot;         =&gt;   0xce60C400);
++
++my %sm3sslopcode = (
++	&quot;sm3ssl&quot;            =&gt;   0xce400000);
++
++my %sm3ttopcode = (
++	&quot;sm3tt1a&quot;           =&gt;   0xce408000,
++	&quot;sm3tt1b&quot;           =&gt;   0xce408400,
++	&quot;sm3tt2a&quot;           =&gt;   0xce408800,
++	&quot;sm3tt2b&quot;           =&gt;   0xce408C00);
++
++sub unsm3part {
++	my ($mnemonic,$arg)=@_;
++
++	$arg=~ m/[qv](\d+)[^,]*,\s*[qv](\d+)[^,]*,\s*[qv](\d+)/o
++	&amp;&amp;
++	sprintf &quot;.inst\t0x%08x\t//%s %s&quot;,
++			$sm3partopcode{$mnemonic}|$1|($2&lt;&lt;5)|($3&lt;&lt;16),
++			$mnemonic,$arg;
++}
++
++sub unsm3ssl {
++	my ($mnemonic,$arg)=@_;
++
++	$arg=~ m/[qv](\d+)[^,]*,\s*[qv](\d+)[^,]*,\s*[qv](\d+)[^,]*,
++                \s*[qv](\d+)/o
++	&amp;&amp;
++	sprintf &quot;.inst\t0x%08x\t//%s %s&quot;,
++			$sm3sslopcode{$mnemonic}|$1|($2&lt;&lt;5)|($3&lt;&lt;16)|($4&lt;&lt;10),
++			$mnemonic,$arg;
++}
++
++sub unsm3tt {
++	my ($mnemonic,$arg)=@_;
++
++	$arg=~ m/[qv](\d+)[^,]*,\s*[qv](\d+)[^,]*,\s*[qv](\d+)[^,]*\[([0-3])\]/o
++	&amp;&amp;
++	sprintf &quot;.inst\t0x%08x\t//%s %s&quot;,
++			$sm3ttopcode{$mnemonic}|$1|($2&lt;&lt;5)|($3&lt;&lt;16)|($4&lt;&lt;12),
++			$mnemonic,$arg;
++}
++
++open SELF,$0;
++while(&lt;SELF&gt;) {
++        next if (/^#!/);
++        last if (!s/^#/\/\// and !/^$/);
++        print;
++}
++close SELF;
++
++foreach(split(&quot;\n&quot;,$code)) {
++	s/\`([^\`]*)\`/eval($1)/ge;
++
++	s/\b(sm3partw[1-2])\s+([qv].*)/unsm3part($1,$2)/ge;
++	s/\b(sm3ssl)\s+([qv].*)/unsm3ssl($1,$2)/ge;
++	s/\b(sm3tt[1-2][a-b])\s+([qv].*)/unsm3tt($1,$2)/ge;
++	print $_,&quot;\n&quot;;
++}
++
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/sm3/build.info b/crypto/sm3/build.info
+index eca68216f2..2fa54a4a8b 100644
+--- a/crypto/sm3/build.info
++++ b/crypto/sm3/build.info
+@@ -1,5 +1,22 @@
+ LIBS=../../libcrypto
+ 
+ IF[{- !$disabled{sm3} -}]
+-  SOURCE[../../libcrypto]=sm3.c legacy_sm3.c
+-ENDIF
+\ No newline at end of file
++  IF[{- !$disabled{asm} -}]
++    $SM3ASM_aarch64=sm3-armv8.S
++    $SM3DEF_aarch64=OPENSSL_SM3_ASM
++
++    # Now that we have defined all the arch specific variables, use the
++    # appropriate ones, and define the appropriate macros
++    IF[$SM3ASM_{- $target{asm_arch} -}]
++      $SM3ASM=$SM3ASM_{- $target{asm_arch} -}
++      $SM3DEF=$SM3DEF_{- $target{asm_arch} -}
++    ENDIF
++  ENDIF
++
++  SOURCE[../../libcrypto]=sm3.c legacy_sm3.c $SM3ASM
++  DEFINE[../../libcrypto]=$SM3DEF
++
++  GENERATE[sm3-armv8.S]=asm/sm3-armv8.pl
++  INCLUDE[sm3-armv8.o]=..
++ENDIF
++
+diff --git a/crypto/sm3/sm3_local.h b/crypto/sm3/sm3_local.h
+index 6daeb878a8..ac8a2bf768 100644
+--- a/crypto/sm3/sm3_local.h
++++ b/crypto/sm3/sm3_local.h
+@@ -32,7 +32,21 @@
+         ll=(c)-&gt;G; (void)HOST_l2c(ll, (s)); \
+         ll=(c)-&gt;H; (void)HOST_l2c(ll, (s)); \
+       } while (0)
+-#define HASH_BLOCK_DATA_ORDER   ossl_sm3_block_data_order
++
++#if defined(OPENSSL_SM3_ASM)
++# if defined(__aarch64__)
++#  include &quot;crypto/arm_arch.h&quot;
++#  define HWSM3_CAPABLE (OPENSSL_armcap_P &amp; ARMV8_SM3)
++void ossl_hwsm3_block_data_order(SM3_CTX *c, const void *p, size_t num);
++# endif
++#endif
++
++#if defined(HWSM3_CAPABLE)
++# define HASH_BLOCK_DATA_ORDER (HWSM3_CAPABLE ? ossl_hwsm3_block_data_order \
++                                              : ossl_sm3_block_data_order)
++#else
++# define HASH_BLOCK_DATA_ORDER   ossl_sm3_block_data_order
++#endif
+ 
+ void ossl_sm3_block_data_order(SM3_CTX *c, const void *p, size_t num);
+ void ossl_sm3_transform(SM3_CTX *c, const unsigned char *data);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="036075.html">[openssl]  master update
+</A></li>
+	<LI>Next message (by thread): <A HREF="036078.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36077">[ date ]</a>
+              <a href="thread.html#36077">[ thread ]</a>
+              <a href="subject.html#36077">[ subject ]</a>
+              <a href="author.html#36077">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

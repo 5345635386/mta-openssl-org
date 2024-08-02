@@ -1,0 +1,231 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522786211.066053.4759.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018881.html">
+   <LINK REL="Next"  HREF="018888.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>davidben at google.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522786211.066053.4759.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">davidben at google.com
+       </A><BR>
+    <I>Tue Apr  3 20:10:11 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018881.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018888.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18884">[ date ]</a>
+              <a href="thread.html#18884">[ thread ]</a>
+              <a href="subject.html#18884">[ subject ]</a>
+              <a href="author.html#18884">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dc55e4f70f401c5869410d6a0c068c18c3fd53ec (commit)
+      from  b2b4dfcca6cf2230107a711f7af1cd8ee3f74229 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dc55e4f70f401c5869410d6a0c068c18c3fd53ec
+Author: David Benjamin &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">davidben at google.com</A>&gt;
+Date:   Wed Mar 28 12:21:45 2018 -0400
+
+    Fix a bug in ecp_nistp224.c.
+    
+    felem_neg does not produce an output within the tight bounds suitable
+    for felem_contract. This affects build configurations which set
+    enable-ec_nistp_64_gcc_128.
+    
+    point_double and point_add, in the non-z*_is_zero cases, tolerate and
+    fix up the wider bounds, so this only affects point_add calls where the
+    other point is infinity. Thus it only affects the final addition in
+    arbitrary-point multiplication, giving the wrong y-coordinate. This is a
+    no-op for ECDH and ECDSA, which only use the x-coordinate of
+    arbitrary-point operations.
+    
+    Note: ecp_nistp521.c has the same issue in that the documented
+    preconditions are violated by the test case. I have not addressed this
+    in this PR. ecp_nistp521.c does not immediately produce the wrong
+    answer; felem_contract there appears to be a bit more tolerant than its
+    documented preconditions. However, I haven't checked the point_add
+    property above holds. ecp_nistp521.c should either get this same fix, to
+    be conservative, or have the bounds analysis and comments reworked for
+    the wider bounds.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5779">https://github.com/openssl/openssl/pull/5779</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ecp_nistp224.c | 28 ++++++++++++----------------
+ test/ectest.c            |  9 +++++++++
+ 2 files changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/crypto/ec/ecp_nistp224.c b/crypto/ec/ecp_nistp224.c
+index 4ece15c..346f84d 100644
+--- a/crypto/ec/ecp_nistp224.c
++++ b/crypto/ec/ecp_nistp224.c
+@@ -395,22 +395,6 @@ static void felem_sum(felem out, const felem in)
+     out[3] += in[3];
+ }
+ 
+-/* Get negative value: out = -in */
+-/* Assumes in[i] &lt; 2^57 */
+-static void felem_neg(felem out, const felem in)
+-{
+-    static const limb two58p2 = (((limb) 1) &lt;&lt; 58) + (((limb) 1) &lt;&lt; 2);
+-    static const limb two58m2 = (((limb) 1) &lt;&lt; 58) - (((limb) 1) &lt;&lt; 2);
+-    static const limb two58m42m2 = (((limb) 1) &lt;&lt; 58) -
+-        (((limb) 1) &lt;&lt; 42) - (((limb) 1) &lt;&lt; 2);
+-
+-    /* Set to 0 mod 2^224-2^96+1 to ensure out &gt; in */
+-    out[0] = two58p2 - in[0];
+-    out[1] = two58m42m2 - in[1];
+-    out[2] = two58m2 - in[2];
+-    out[3] = two58m2 - in[3];
+-}
+-
+ /* Subtract field elements: out -= in */
+ /* Assumes in[i] &lt; 2^57 */
+ static void felem_diff(felem out, const felem in)
+@@ -680,6 +664,18 @@ static void felem_contract(felem out, const felem in)
+ }
+ 
+ /*
++ * Get negative value: out = -in
++ * Requires in[i] &lt; 2^63,
++ * ensures out[0] &lt; 2^56, out[1] &lt; 2^56, out[2] &lt; 2^56, out[3] &lt;= 2^56 + 2^16
++ */
++static void felem_neg(felem out, const felem in)
++{
++    widefelem tmp = {0};
++    felem_diff_128_64(tmp, in);
++    felem_reduce(out, tmp);
++}
++
++/*
+  * Zero-check: returns 1 if input is 0, and 0 otherwise. We know that field
+  * elements are reduced to in &lt; 2^225, so we only need to check three cases:
+  * 0, 2^224 - 2^96 + 1, and 2^225 - 2^97 + 2
+diff --git a/test/ectest.c b/test/ectest.c
+index 66d84a7..1c31cce 100644
+--- a/test/ectest.c
++++ b/test/ectest.c
+@@ -1377,6 +1377,15 @@ static int nistp_single_test(int idx)
+     if (!TEST_int_eq(0, EC_POINT_cmp(NISTP, Q, Q_CHECK, ctx)))
+         goto err;
+ 
++    /* regression test for felem_neg bug */
++    if (!TEST_true(BN_set_word(m, 32))
++        || !TEST_true(BN_set_word(n, 31))
++        || !TEST_true(EC_POINT_copy(P, G))
++        || !TEST_true(EC_POINT_invert(NISTP, P, ctx))
++        || !TEST_true(EC_POINT_mul(NISTP, Q, m, P, n, ctx))
++        || !TEST_int_eq(0, EC_POINT_cmp(NISTP, Q, G, ctx)))
++      goto err;
++
+     r = group_order_tests(NISTP);
+ err:
+     EC_GROUP_free(NISTP);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018881.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018888.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18884">[ date ]</a>
+              <a href="thread.html#18884">[ thread ]</a>
+              <a href="subject.html#18884">[ subject ]</a>
+              <a href="author.html#18884">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,197 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599545724.363520.19087.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030509.html">
+   <LINK REL="Next"  HREF="030514.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>beldmit at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599545724.363520.19087.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">beldmit at gmail.com
+       </A><BR>
+    <I>Tue Sep  8 06:15:24 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030509.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030514.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30510">[ date ]</a>
+              <a href="thread.html#30510">[ thread ]</a>
+              <a href="subject.html#30510">[ subject ]</a>
+              <a href="author.html#30510">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ea0add4a822749d620714a4660eedd86a91e8e1b (commit)
+      from  08497fc64f688a91d421de74a8498aff33573485 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ea0add4a822749d620714a4660eedd86a91e8e1b
+Author: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+Date:   Thu Sep 3 16:47:19 2020 +0300
+
+    New GOST PKCS12 standard support
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12780">https://github.com/openssl/openssl/pull/12780</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/pkcs12/p12_decr.c | 50 +++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/crypto/pkcs12/p12_decr.c b/crypto/pkcs12/p12_decr.c
+index b9d13d9cf5..32e5597e06 100644
+--- a/crypto/pkcs12/p12_decr.c
++++ b/crypto/pkcs12/p12_decr.c
+@@ -24,13 +24,14 @@ unsigned char *PKCS12_pbe_crypt(const X509_ALGOR *algor,
+     unsigned char *out = NULL;
+     int outlen, i;
+     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++    int max_out_len, mac_len = 0;
+ 
+     if (ctx == NULL) {
+         PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT, ERR_R_MALLOC_FAILURE);
+         goto err;
+     }
+ 
+-    /* Decrypt data */
++    /* Process data */
+     if (!EVP_PBE_CipherInit(algor-&gt;algorithm, pass, passlen,
+                             algor-&gt;parameter, ctx, en_de)) {
+         PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT,
+@@ -38,8 +39,37 @@ unsigned char *PKCS12_pbe_crypt(const X509_ALGOR *algor,
+         goto err;
+     }
+ 
+-    if ((out = OPENSSL_malloc(inlen + EVP_CIPHER_CTX_block_size(ctx)))
+-            == NULL) {
++    /*
++     * GOST algorithm specifics:
++     * OMAC algorithm calculate and encrypt MAC of the encrypted objects
++     * It's appended to encrypted text on encrypting
++     * MAC should be processed on decrypting separately from plain text
++     */
++    max_out_len = inlen + EVP_CIPHER_CTX_block_size(ctx);
++    if (EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(ctx)) &amp; EVP_CIPH_FLAG_CIPHER_WITH_MAC) {
++        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_TLS1_AAD, 0, &amp;mac_len) &lt; 0) {
++            PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++
++        if (EVP_CIPHER_CTX_encrypting(ctx)) {
++            max_out_len += mac_len;
++        } else {
++            if (inlen &lt; mac_len) {
++                PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT,
++                          PKCS12_R_UNSUPPORTED_PKCS12_MODE);
++                goto err;
++            }
++            inlen -= mac_len;
++            if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
++                                    (int)mac_len, (unsigned char *)in+inlen) &lt; 0) {
++                PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT, ERR_R_INTERNAL_ERROR);
++                goto err;
++            }
++        }
++    }
++
++    if ((out = OPENSSL_malloc(max_out_len)) == NULL) {
+         PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT, ERR_R_MALLOC_FAILURE);
+         goto err;
+     }
+@@ -60,6 +90,16 @@ unsigned char *PKCS12_pbe_crypt(const X509_ALGOR *algor,
+         goto err;
+     }
+     outlen += i;
++    if (EVP_CIPHER_flags(EVP_CIPHER_CTX_cipher(ctx)) &amp; EVP_CIPH_FLAG_CIPHER_WITH_MAC) {
++        if (EVP_CIPHER_CTX_encrypting(ctx)) {
++            if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
++                (int)mac_len, out+outlen) &lt; 0) {
++                PKCS12err(PKCS12_F_PKCS12_PBE_CRYPT, ERR_R_INTERNAL_ERROR);
++                goto err;
++            }
++            outlen += mac_len;
++        }
++    }
+     if (datalen)
+         *datalen = outlen;
+     if (data)
+@@ -79,10 +119,10 @@ void *PKCS12_item_decrypt_d2i(const X509_ALGOR *algor, const ASN1_ITEM *it,
+                               const char *pass, int passlen,
+                               const ASN1_OCTET_STRING *oct, int zbuf)
+ {
+-    unsigned char *out;
++    unsigned char *out = NULL;
+     const unsigned char *p;
+     void *ret;
+-    int outlen;
++    int outlen = 0;
+ 
+     if (!PKCS12_pbe_crypt(algor, pass, passlen, oct-&gt;data, oct-&gt;length,
+                           &amp;out, &amp;outlen, 0)) {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030509.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030514.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30510">[ date ]</a>
+              <a href="thread.html#30510">[ thread ]</a>
+              <a href="subject.html#30510">[ subject ]</a>
+              <a href="author.html#30510">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

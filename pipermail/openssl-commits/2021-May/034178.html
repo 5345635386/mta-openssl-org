@@ -1,0 +1,163 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620617216.933492.32020.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034176.html">
+   <LINK REL="Next"  HREF="034186.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620617216.933492.32020.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Mon May 10 03:26:56 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034176.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034186.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34178">[ date ]</a>
+              <a href="thread.html#34178">[ thread ]</a>
+              <a href="subject.html#34178">[ subject ]</a>
+              <a href="author.html#34178">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  d29d7a7ff22e8e3be1c8bbdb8edd3ab9c72ed021 (commit)
+      from  333b31e3000ff009cdc48bf45d9af687031f7688 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit d29d7a7ff22e8e3be1c8bbdb8edd3ab9c72ed021
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Wed May 5 16:58:37 2021 +1000
+
+    Fix i2d_PKCS8PrivateKey_nid_bio() regression.
+    
+    This method ignores the nid and could end up saving out the private key unencrypted
+    
+    In earlier alpha releases OSSL_num_encoders() returned 0 for this test
+    case, which then meant that the legacy path was run, and the key was
+    then correctly encrypted.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15152">https://github.com/openssl/openssl/pull/15152</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/pem/pem_pk8.c   |  8 +++++++-
+ test/evp_extra_test2.c | 37 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/crypto/pem/pem_pk8.c b/crypto/pem/pem_pk8.c
+index 86a66b586c..5e28907be3 100644
+--- a/crypto/pem/pem_pk8.c
++++ b/crypto/pem/pem_pk8.c
+@@ -93,7 +93,13 @@ static int do_pk8pkey(BIO *bp, const EVP_PKEY *x, int isder, int nid,
+         }
+     }
+ 
+-    if (OSSL_ENCODER_CTX_get_num_encoders(ctx) != 0) {
++    /*
++     * NOTE: There is no attempt to do a EVP_CIPHER_fetch() using the nid,
++     * since the nid is a PBE algorithm which can't be fetched currently.
++     * (e.g. NID_pbe_WithSHA1And2_Key_TripleDES_CBC). Just use the legacy
++     * path if the NID is passed.
++     */
++    if (nid == -1 &amp;&amp; OSSL_ENCODER_CTX_get_num_encoders(ctx) != 0) {
+         ret = 1;
+         if (enc != NULL) {
+             ret = 0;
+diff --git a/test/evp_extra_test2.c b/test/evp_extra_test2.c
+index 6d5303ab9d..2e5861c77f 100644
+--- a/test/evp_extra_test2.c
++++ b/test/evp_extra_test2.c
+@@ -290,6 +290,40 @@ done:
+     return ret;
+ }
+ 
++#ifndef OPENSSL_NO_DES
++static int test_pkcs8key_nid_bio(void)
++{
++    int ret;
++    const int nid = NID_pbe_WithSHA1And3_Key_TripleDES_CBC;
++    static const char pwd[] = &quot;PASSWORD&quot;;
++    EVP_PKEY *pkey = NULL, *pkey_dec = NULL;
++    BIO *in = NULL, *enc_bio = NULL;
++    char *enc_data = NULL;
++    long enc_datalen = 0;
++    OSSL_PROVIDER *provider = NULL;
++
++    ret = TEST_ptr(provider = OSSL_PROVIDER_load(NULL, &quot;default&quot;))
++          &amp;&amp; TEST_ptr(enc_bio = BIO_new(BIO_s_mem()))
++          &amp;&amp; TEST_ptr(in = BIO_new_mem_buf(kExampleRSAKeyPKCS8,
++                                           sizeof(kExampleRSAKeyPKCS8)))
++          &amp;&amp; TEST_ptr(pkey = d2i_PrivateKey_ex_bio(in, NULL, NULL, NULL))
++          &amp;&amp; TEST_int_eq(i2d_PKCS8PrivateKey_nid_bio(enc_bio, pkey, nid,
++                                                     pwd, sizeof(pwd) - 1,
++                                                     NULL, NULL), 1)
++          &amp;&amp; TEST_int_gt(enc_datalen = BIO_get_mem_data(enc_bio, &amp;enc_data), 0)
++          &amp;&amp; TEST_ptr(pkey_dec = d2i_PKCS8PrivateKey_bio(enc_bio, NULL, NULL,
++                                                         (void *)pwd))
++          &amp;&amp; TEST_true(EVP_PKEY_eq(pkey, pkey_dec));
++
++    EVP_PKEY_free(pkey_dec);
++    EVP_PKEY_free(pkey);
++    BIO_free(in);
++    BIO_free(enc_bio);
++    OSSL_PROVIDER_unload(provider);
++    return ret;
++}
++#endif /* OPENSSL_NO_DES */
++
+ static int test_alternative_default(void)
+ {
+     OSSL_LIB_CTX *oldctx;
+@@ -727,6 +761,9 @@ int setup_tests(void)
+     ADD_TEST(test_pkey_todata_null);
+     ADD_TEST(test_pkey_export_null);
+     ADD_TEST(test_pkey_export);
++#ifndef OPENSSL_NO_DES
++    ADD_TEST(test_pkcs8key_nid_bio);
++#endif
+     return 1;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034176.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034186.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34178">[ date ]</a>
+              <a href="thread.html#34178">[ thread ]</a>
+              <a href="subject.html#34178">[ subject ]</a>
+              <a href="author.html#34178">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,304 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1554992294.488806.18075.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022783.html">
+   <LINK REL="Next"  HREF="022796.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>nic.tuv at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1554992294.488806.18075.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">nic.tuv at gmail.com
+       </A><BR>
+    <I>Thu Apr 11 14:18:14 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022783.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="022796.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22788">[ date ]</a>
+              <a href="thread.html#22788">[ thread ]</a>
+              <a href="subject.html#22788">[ subject ]</a>
+              <a href="author.html#22788">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5173cdde7d758824e6a07f2a6c6808b254602e11 (commit)
+      from  37f03b9881a4ffa52b0059ae444be3c416cf2a5f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5173cdde7d758824e6a07f2a6c6808b254602e11
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Sat Mar 23 13:12:08 2019 +1000
+
+    ec key validation checks updated
+    
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8564">https://github.com/openssl/openssl/pull/8564</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_key.c | 89 ++++++++++++++++++++++++++++++++++++++++++++++--------
+ test/ectest.c      | 57 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 132 insertions(+), 14 deletions(-)
+
+diff --git a/crypto/ec/ec_key.c b/crypto/ec/ec_key.c
+index 416c0e0..76aea4f 100644
+--- a/crypto/ec/ec_key.c
++++ b/crypto/ec/ec_key.c
+@@ -298,6 +298,58 @@ int EC_KEY_check_key(const EC_KEY *eckey)
+     return eckey-&gt;group-&gt;meth-&gt;keycheck(eckey);
+ }
+ 
++/*
++ * Check the range of the EC public key.
++ * See SP800-56A R3 Section 5.6.2.3.3 (Part 2)
++ * i.e.
++ *  - If q = odd prime p: Verify that xQ and yQ are integers in the
++ *    interval[0, p &#8722; 1], OR
++ *  - If q = 2m: Verify that xQ and yQ are bit strings of length m bits.
++ * Returns 1 if the public key has a valid range, otherwise it returns 0.
++ */
++static int ec_key_public_range_check(BN_CTX *ctx, const EC_KEY *key)
++{
++    int ret = 0;
++    BIGNUM *x, *y;
++
++    BN_CTX_start(ctx);
++    x = BN_CTX_get(ctx);
++    y = BN_CTX_get(ctx);
++    if (y == NULL)
++        goto err;
++
++    if (!EC_POINT_get_affine_coordinates(key-&gt;group, key-&gt;pub_key, x, y, ctx))
++        goto err;
++
++    if (EC_METHOD_get_field_type(key-&gt;group-&gt;meth) == NID_X9_62_prime_field) {
++        if (BN_is_negative(x)
++            || BN_cmp(x, key-&gt;group-&gt;field) &gt;= 0
++            || BN_is_negative(y)
++            || BN_cmp(y, key-&gt;group-&gt;field) &gt;= 0) {
++            goto err;
++        }
++    } else {
++        int m = EC_GROUP_get_degree(key-&gt;group);
++        if (BN_num_bits(x) &gt; m || BN_num_bits(y) &gt; m) {
++            goto err;
++        }
++    }
++    ret = 1;
++err:
++    BN_CTX_end(ctx);
++    return ret;
++}
++
++/*
++ * ECC Key validation as specified in SP800-56A R3.
++ *    Section 5.6.2.3.3 ECC Full Public-Key Validation
++ *    Section 5.6.2.1.2 Owner Assurance of Private-Key Validity
++ *    Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency
++ * NOTES:
++ *    Before calling this method in fips mode, there should be an assurance that
++ *    an approved elliptic-curve group is used.
++ * Returns 1 if the key is valid, otherwise it returns 0.
++ */
+ int ec_key_simple_check_key(const EC_KEY *eckey)
+ {
+     int ok = 0;
+@@ -310,6 +362,7 @@ int ec_key_simple_check_key(const EC_KEY *eckey)
+         return 0;
+     }
+ 
++    /* 5.6.2.3.3 (Step 1): Q != infinity */
+     if (EC_POINT_is_at_infinity(eckey-&gt;group, eckey-&gt;pub_key)) {
+         ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_POINT_AT_INFINITY);
+         goto err;
+@@ -317,20 +370,28 @@ int ec_key_simple_check_key(const EC_KEY *eckey)
+ 
+     if ((ctx = BN_CTX_new()) == NULL)
+         goto err;
++
+     if ((point = EC_POINT_new(eckey-&gt;group)) == NULL)
+         goto err;
+ 
+-    /* testing whether the pub_key is on the elliptic curve */
++    /* 5.6.2.3.3 (Step 2) Test if the public key is in range */
++    if (!ec_key_public_range_check(ctx, eckey)) {
++        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_COORDINATES_OUT_OF_RANGE);
++        goto err;
++    }
++
++    /* 5.6.2.3.3 (Step 3) is the pub_key on the elliptic curve */
+     if (EC_POINT_is_on_curve(eckey-&gt;group, eckey-&gt;pub_key, ctx) &lt;= 0) {
+         ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_POINT_IS_NOT_ON_CURVE);
+         goto err;
+     }
+-    /* testing whether pub_key * order is the point at infinity */
++
+     order = eckey-&gt;group-&gt;order;
+     if (BN_is_zero(order)) {
+         ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_INVALID_GROUP_ORDER);
+         goto err;
+     }
++    /* 5.6.2.3.3 (Step 4) : pub_key * order is the point at infinity. */
+     if (!EC_POINT_mul(eckey-&gt;group, point, NULL, eckey-&gt;pub_key, order, ctx)) {
+         ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, ERR_R_EC_LIB);
+         goto err;
+@@ -339,15 +400,21 @@ int ec_key_simple_check_key(const EC_KEY *eckey)
+         ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_WRONG_ORDER);
+         goto err;
+     }
+-    /*
+-     * in case the priv_key is present : check if generator * priv_key ==
+-     * pub_key
+-     */
++
+     if (eckey-&gt;priv_key != NULL) {
+-        if (BN_cmp(eckey-&gt;priv_key, order) &gt;= 0) {
++        /*
++         * 5.6.2.1.2 Owner Assurance of Private-Key Validity
++         * The private key is in the range [1, order-1]
++         */
++        if (BN_cmp(eckey-&gt;priv_key, BN_value_one()) &lt; 0
++                || BN_cmp(eckey-&gt;priv_key, order) &gt;= 0) {
+             ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_WRONG_ORDER);
+             goto err;
+         }
++        /*
++         * Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency (b)
++         * Check if generator * priv_key = pub_key
++         */
+         if (!EC_POINT_mul(eckey-&gt;group, point, eckey-&gt;priv_key,
+                           NULL, NULL, ctx)) {
+             ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, ERR_R_EC_LIB);
+@@ -399,12 +466,10 @@ int EC_KEY_set_public_key_affine_coordinates(EC_KEY *key, BIGNUM *x,
+         goto err;
+ 
+     /*
+-     * Check if retrieved coordinates match originals and are less than field
+-     * order: if not values are out of range.
++     * Check if retrieved coordinates match originals. The range check is done
++     * inside EC_KEY_check_key().
+      */
+-    if (BN_cmp(x, tx) || BN_cmp(y, ty)
+-        || (BN_cmp(x, key-&gt;group-&gt;field) &gt;= 0)
+-        || (BN_cmp(y, key-&gt;group-&gt;field) &gt;= 0)) {
++    if (BN_cmp(x, tx) || BN_cmp(y, ty)) {
+         ECerr(EC_F_EC_KEY_SET_PUBLIC_KEY_AFFINE_COORDINATES,
+               EC_R_COORDINATES_OUT_OF_RANGE);
+         goto err;
+diff --git a/test/ectest.c b/test/ectest.c
+index 7236b43..ab75ace 100644
+--- a/test/ectest.c
++++ b/test/ectest.c
+@@ -1855,7 +1855,59 @@ err:
+     OPENSSL_free(buf);
+     return r;
+ }
+-#endif
++
++static int check_ec_key_field_public_range_test(int id)
++{
++    int ret = 0, type = 0;
++    const EC_POINT *pub = NULL;
++    const EC_GROUP *group = NULL;
++    const EC_METHOD *meth = NULL;
++    const BIGNUM *field = NULL;
++    BIGNUM *x = NULL, *y = NULL;
++    EC_KEY *key = NULL;
++
++    if (!(TEST_ptr(x = BN_new())
++          &amp;&amp; TEST_ptr(y = BN_new())
++          &amp;&amp; TEST_ptr(key = EC_KEY_new_by_curve_name(curves[id].nid))
++          &amp;&amp; TEST_ptr(group = EC_KEY_get0_group(key))
++          &amp;&amp; TEST_ptr(meth = EC_GROUP_method_of(group))
++          &amp;&amp; TEST_ptr(field = EC_GROUP_get0_field(group))
++          &amp;&amp; TEST_int_gt(EC_KEY_generate_key(key), 0)
++          &amp;&amp; TEST_int_gt(EC_KEY_check_key(key), 0)
++          &amp;&amp; TEST_ptr(pub = EC_KEY_get0_public_key(key))
++          &amp;&amp; TEST_int_gt(EC_POINT_get_affine_coordinates(group, pub, x, y,
++                                                         NULL), 0)))
++        goto err;
++
++    /*
++     * Make the public point out of range by adding the field (which will still
++     * be the same point on the curve). The add is different for char2 fields.
++     */
++    type = EC_METHOD_get_field_type(meth);
++    if (type == NID_X9_62_characteristic_two_field) {
++        /* test for binary curves */
++        if (!TEST_true(BN_GF2m_add(x, x, field)))
++            goto err;
++    } else if (type == NID_X9_62_prime_field) {
++        /* test for prime curves */
++        if (!TEST_true(BN_add(x, x, field)))
++            goto err;
++    } else {
++        /* this should never happen */
++        TEST_error(&quot;Unsupported EC_METHOD field_type&quot;);
++        goto err;
++    }
++    if (!TEST_int_le(EC_KEY_set_public_key_affine_coordinates(key, x, y), 0))
++        goto err;
++
++    ret = 1;
++err:
++    BN_free(x);
++    BN_free(y);
++    EC_KEY_free(key);
++    return ret;
++}
++#endif /* OPENSSL_NO_EC */
+ 
+ int setup_tests(void)
+ {
+@@ -1880,7 +1932,8 @@ int setup_tests(void)
+     ADD_TEST(group_field_test);
+     ADD_ALL_TESTS(check_named_curve_test, crv_len);
+     ADD_ALL_TESTS(check_named_curve_lookup_test, crv_len);
+-#endif
++    ADD_ALL_TESTS(check_ec_key_field_public_range_test, crv_len);
++#endif /* OPENSSL_NO_EC */
+     return 1;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022783.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="022796.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22788">[ date ]</a>
+              <a href="thread.html#22788">[ thread ]</a>
+              <a href="subject.html#22788">[ subject ]</a>
+              <a href="author.html#22788">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

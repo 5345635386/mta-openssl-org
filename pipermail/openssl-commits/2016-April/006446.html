@@ -1,0 +1,211 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1460668716.188561.3154.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006444.html">
+   <LINK REL="Next"  HREF="006447.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1460668716.188561.3154.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Apr 14 21:18:36 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006444.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="006447.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6446">[ date ]</a>
+              <a href="thread.html#6446">[ thread ]</a>
+              <a href="subject.html#6446">[ subject ]</a>
+              <a href="author.html#6446">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  1ee7b8b97c90e8e59627bfcbda3714f18368a9e1 (commit)
+      from  6e08e9e7ccf00aba847351adc3b46b9dae1f114d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1ee7b8b97c90e8e59627bfcbda3714f18368a9e1
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Apr 14 21:28:54 2016 +0100
+
+    Fix ex_data locks issue
+    
+    Travis identified a problem with freeing the ex_data locks which wasn't
+    quite right in ff2344052. Trying to fix it identified a further problem:
+    the ex_data locks are cleaned up by OPENSSL_cleanup(), which is called
+    explicitly by CRYPTO_mem_leaks(), but then later the BIO passed to
+    CRYPTO_mem_leaks() is freed. An attempt is then made to use the ex_data
+    lock already freed.
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bio_lib.c                   |  4 ++++
+ crypto/ex_data.c                       | 24 +++++++++++++++++-------
+ crypto/include/internal/cryptlib_int.h |  1 -
+ crypto/mem_dbg.c                       |  8 +++++++-
+ include/internal/bio.h                 |  1 +
+ 5 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/bio/bio_lib.c b/crypto/bio/bio_lib.c
+index 0258694..94c97da 100644
+--- a/crypto/bio/bio_lib.c
++++ b/crypto/bio/bio_lib.c
+@@ -645,6 +645,10 @@ uint64_t BIO_number_written(BIO *bio)
+     return 0;
+ }
+ 
++void bio_free_ex_data(BIO *bio)
++{
++    CRYPTO_free_ex_data(CRYPTO_EX_INDEX_BIO, bio, &amp;bio-&gt;ex_data);
++}
+ 
+ void bio_cleanup(void)
+ {
+diff --git a/crypto/ex_data.c b/crypto/ex_data.c
+index c607f87..ca1c204 100644
+--- a/crypto/ex_data.c
++++ b/crypto/ex_data.c
+@@ -134,7 +134,7 @@ typedef struct ex_callbacks_st {
+ 
+ static EX_CALLBACKS ex_data[CRYPTO_EX_INDEX__COUNT];
+ 
+-static CRYPTO_RWLOCK *ex_data_lock;
++static CRYPTO_RWLOCK *ex_data_lock = NULL;
+ static CRYPTO_ONCE ex_data_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ static void do_ex_data_init(void)
+@@ -142,12 +142,6 @@ static void do_ex_data_init(void)
+     ex_data_lock = CRYPTO_THREAD_lock_new();
+ }
+ 
+-void ex_data_cleanup(void)
+-{
+-    CRYPTO_THREAD_lock_free(ex_data_lock);
+-    ex_data_lock = NULL;
+-}
+-
+ /*
+  * Return the EX_CALLBACKS from the |ex_data| array that corresponds to
+  * a given class.  On success, *holds the lock.*
+@@ -163,6 +157,19 @@ static EX_CALLBACKS *get_and_lock(int class_index)
+ 
+     CRYPTO_THREAD_run_once(&amp;ex_data_init, do_ex_data_init);
+ 
++    if (ex_data_lock == NULL) {
++        /*
++         * This can happen in normal operation when using CRYPTO_mem_leaks().
++         * The CRYPTO_mem_leaks() function calls OPENSSL_cleanup() which cleans
++         * up the locks. Subsequently the BIO that CRYPTO_mem_leaks() uses gets
++         * freed, which also attempts to free the ex_data. However
++         * CRYPTO_mem_leaks() ensures that the ex_data is freed early (i.e.
++         * before OPENSSL_cleanup() is called), so if we get here we can safely
++         * ignore this operation. We just treat it as an error.
++         */
++         return NULL;
++    }
++
+     ip = &amp;ex_data[class_index];
+     CRYPTO_THREAD_write_lock(ex_data_lock);
+     return ip;
+@@ -189,6 +196,9 @@ void crypto_cleanup_all_ex_data_int(void)
+         sk_EX_CALLBACK_pop_free(ip-&gt;meth, cleanup_cb);
+         ip-&gt;meth = NULL;
+     }
++
++    CRYPTO_THREAD_lock_free(ex_data_lock);
++    ex_data_lock = NULL;
+ }
+ 
+ 
+diff --git a/crypto/include/internal/cryptlib_int.h b/crypto/include/internal/cryptlib_int.h
+index fd68522..a38ac18 100644
+--- a/crypto/include/internal/cryptlib_int.h
++++ b/crypto/include/internal/cryptlib_int.h
+@@ -65,7 +65,6 @@ struct thread_local_inits_st {
+ };
+ 
+ int ossl_init_thread_start(uint64_t opts);
+-void ex_data_cleanup(void);
+ 
+ /*
+  * OPENSSL_INIT flags. The primary list of these is in crypto.h. Flags below
+diff --git a/crypto/mem_dbg.c b/crypto/mem_dbg.c
+index d4d72f2..2b8cf73 100644
+--- a/crypto/mem_dbg.c
++++ b/crypto/mem_dbg.c
+@@ -115,7 +115,7 @@
+ #include &quot;internal/threads.h&quot;
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/buffer.h&gt;
+-#include &lt;openssl/bio.h&gt;
++#include &quot;internal/bio.h&quot;
+ #include &lt;openssl/lhash.h&gt;
+ 
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG_BACKTRACE
+@@ -636,6 +636,12 @@ int CRYPTO_mem_leaks(BIO *b)
+ {
+     MEM_LEAK ml;
+ 
++    /*
++     * OPENSSL_cleanup() will free the ex_data locks so we can't have any
++     * ex_data hanging around
++     */
++    bio_free_ex_data(b);
++
+     /* Ensure all resources are released */
+     OPENSSL_cleanup();
+ 
+diff --git a/include/internal/bio.h b/include/internal/bio.h
+index ec9dff6..31fe1aa 100644
+--- a/include/internal/bio.h
++++ b/include/internal/bio.h
+@@ -67,4 +67,5 @@ struct bio_method_st {
+     long (*callback_ctrl) (BIO *, int, bio_info_cb *);
+ };
+ 
++void bio_free_ex_data(BIO *bio);
+ void bio_cleanup(void);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006444.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="006447.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6446">[ date ]</a>
+              <a href="thread.html#6446">[ thread ]</a>
+              <a href="subject.html#6446">[ subject ]</a>
+              <a href="author.html#6446">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

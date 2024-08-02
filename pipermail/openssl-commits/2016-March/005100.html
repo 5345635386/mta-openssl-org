@@ -1,0 +1,707 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457446541.740605.2829.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005094.html">
+   <LINK REL="Next"  HREF="005102.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457446541.740605.2829.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Tue Mar  8 14:15:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005094.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005102.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5100">[ date ]</a>
+              <a href="thread.html#5100">[ thread ]</a>
+              <a href="subject.html#5100">[ subject ]</a>
+              <a href="author.html#5100">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7b8e12d24eea68017ce96b0faf79d12f3c3ba9f1 (commit)
+       via  8509dcc9f319190c565ab6baad7c88d37a951d1c (commit)
+      from  f75200115d1a778c39c8a8850823928d8be1f8ac (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7b8e12d24eea68017ce96b0faf79d12f3c3ba9f1
+Author: Alessandro Ghedini &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alessandro at ghedini.me</A>&gt;
+Date:   Sat Mar 5 21:31:43 2016 +0000
+
+    Convert ERR_STRING_DATA to new multi-threading API
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit 8509dcc9f319190c565ab6baad7c88d37a951d1c
+Author: Alessandro Ghedini &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alessandro at ghedini.me</A>&gt;
+Date:   Wed Mar 2 17:36:17 2016 +0000
+
+    Convert ERR_STATE to new multi-threading API
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/err/err.c                | 259 +++++++++++-----------------------------
+ crypto/err/err_lcl.h            |   2 -
+ crypto/init.c                   |   4 +-
+ doc/crypto/ERR_remove_state.pod |  14 +--
+ doc/crypto/err.pod              |  11 +-
+ include/openssl/crypto.h        |   1 -
+ include/openssl/err.h           |   5 +-
+ util/libcrypto.num              |   4 +-
+ 8 files changed, 87 insertions(+), 213 deletions(-)
+ delete mode 100644 crypto/err/err_lcl.h
+
+diff --git a/crypto/err/err.c b/crypto/err/err.c
+index 181882d..da6d3ee 100644
+--- a/crypto/err/err.c
++++ b/crypto/err/err.c
+@@ -112,13 +112,13 @@
+ #include &lt;stdarg.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;internal/cryptlib_int.h&gt;
++#include &lt;internal/threads.h&gt;
+ #include &lt;openssl/lhash.h&gt;
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/buffer.h&gt;
+ #include &lt;openssl/bio.h&gt;
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/opensslconf.h&gt;
+-#include &quot;err_lcl.h&quot;
+ 
+ static void err_load_strings(int lib, ERR_STRING_DATA *str);
+ 
+@@ -231,25 +231,21 @@ static ERR_STRING_DATA ERR_str_reasons[] = {
+ };
+ #endif
+ 
++static CRYPTO_ONCE err_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_THREAD_LOCAL err_thread_local;
++
++static CRYPTO_ONCE err_string_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_RWLOCK *err_string_lock;
++
+ /* Predeclarations of the &quot;err_defaults&quot; functions */
+ static LHASH_OF(ERR_STRING_DATA) *get_hash(int create, int lockit);
+ static ERR_STRING_DATA *int_err_get_item(const ERR_STRING_DATA *);
+-static LHASH_OF(ERR_STATE) *int_thread_get(int create, int lockit);
+-static void int_thread_release(LHASH_OF(ERR_STATE) **hash);
+-static ERR_STATE *int_thread_get_item(const ERR_STATE *);
+-static ERR_STATE *int_thread_set_item(ERR_STATE *);
+-static void int_thread_del_item(const ERR_STATE *);
+ 
+ /*
+  * The internal state
+  */
+ 
+-/* This is a struct so that REF_PRINT_COUNT works. */
+-static struct refcount {
+-    int references;
+-} refcount = { 0 };
+ static LHASH_OF(ERR_STRING_DATA) *int_error_hash = NULL;
+-static LHASH_OF(ERR_STATE) *int_thread_hash = NULL;
+ static int int_err_library_number = ERR_LIB_USER;
+ 
+ static unsigned long get_error_values(int inc, int top, const char **file,
+@@ -276,7 +272,7 @@ static LHASH_OF(ERR_STRING_DATA) *get_hash(int create, int lockit)
+     LHASH_OF(ERR_STRING_DATA) *ret = NULL;
+ 
+     if (lockit)
+-        CRYPTO_w_lock(CRYPTO_LOCK_ERR);
++        CRYPTO_THREAD_write_lock(err_string_lock);
+     if (!int_error_hash &amp;&amp; create) {
+         int_error_hash = lh_ERR_STRING_DATA_new(err_string_data_hash,
+                                                 err_string_data_cmp);
+@@ -284,7 +280,7 @@ static LHASH_OF(ERR_STRING_DATA) *get_hash(int create, int lockit)
+     if (int_error_hash != NULL)
+         ret = int_error_hash;
+     if (lockit)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++        CRYPTO_THREAD_unlock(err_string_lock);
+ 
+     return ret;
+ }
+@@ -294,115 +290,15 @@ static ERR_STRING_DATA *int_err_get_item(const ERR_STRING_DATA *d)
+     ERR_STRING_DATA *p = NULL;
+     LHASH_OF(ERR_STRING_DATA) *hash;
+ 
+-    CRYPTO_r_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_read_lock(err_string_lock);
+     hash = get_hash(0, 0);
+     if (hash)
+         p = lh_ERR_STRING_DATA_retrieve(hash, d);
+-    CRYPTO_r_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+ 
+     return p;
+ }
+ 
+-static unsigned long err_state_hash(const ERR_STATE *a)
+-{
+-    return CRYPTO_THREADID_hash(&amp;a-&gt;tid) * 13;
+-}
+-
+-static int err_state_cmp(const ERR_STATE *a, const ERR_STATE *b)
+-{
+-    return CRYPTO_THREADID_cmp(&amp;a-&gt;tid, &amp;b-&gt;tid);
+-}
+-
+-static LHASH_OF(ERR_STATE) *int_thread_get(int create, int lockit)
+-{
+-    LHASH_OF(ERR_STATE) *ret = NULL;
+-
+-    if (lockit)
+-        CRYPTO_w_lock(CRYPTO_LOCK_ERR);
+-    if (!int_thread_hash &amp;&amp; create) {
+-        int_thread_hash = lh_ERR_STATE_new(err_state_hash, err_state_cmp);
+-    }
+-    if (int_thread_hash != NULL) {
+-        refcount.references++;
+-        ret = int_thread_hash;
+-    }
+-    if (lockit)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
+-    return ret;
+-}
+-
+-static void int_thread_release(LHASH_OF(ERR_STATE) **hash)
+-{
+-    int i;
+-
+-    if (hash == NULL || *hash == NULL)
+-        return;
+-
+-    i = CRYPTO_add(&amp;refcount.references, -1, CRYPTO_LOCK_ERR);
+-
+-    REF_PRINT_COUNT(&amp;refcount, &quot;ERR&quot;);
+-    if (i &gt; 0)
+-        return;
+-    REF_ASSERT_ISNT(i &lt; 0);
+-    *hash = NULL;
+-}
+-
+-static ERR_STATE *int_thread_get_item(const ERR_STATE *d)
+-{
+-    ERR_STATE *p = NULL;
+-    LHASH_OF(ERR_STATE) *hash;
+-
+-    CRYPTO_r_lock(CRYPTO_LOCK_ERR);
+-    hash = int_thread_get(0, 0);
+-    if (hash)
+-        p = lh_ERR_STATE_retrieve(hash, d);
+-    CRYPTO_r_unlock(CRYPTO_LOCK_ERR);
+-
+-    int_thread_release(&amp;hash);
+-    return p;
+-}
+-
+-static ERR_STATE *int_thread_set_item(ERR_STATE *d)
+-{
+-    ERR_STATE *p = NULL;
+-    LHASH_OF(ERR_STATE) *hash;
+-
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
+-    hash = int_thread_get(1, 0);
+-    if (hash)
+-        p = lh_ERR_STATE_insert(hash, d);
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
+-
+-    int_thread_release(&amp;hash);
+-    return p;
+-}
+-
+-static void int_thread_del_item(const ERR_STATE *d)
+-{
+-    ERR_STATE *p = NULL;
+-    LHASH_OF(ERR_STATE) *hash;
+-
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
+-    hash = int_thread_get(0, 0);
+-    if (hash) {
+-        p = lh_ERR_STATE_delete(hash, d);
+-        /* If there are no other references, and we just removed the
+-         * last item, delete the int_thread_hash */
+-        if (refcount.references == 1
+-            &amp;&amp; int_thread_hash
+-            &amp;&amp; lh_ERR_STATE_num_items(int_thread_hash) == 0) {
+-            refcount.references = 0;
+-            lh_ERR_STATE_free(int_thread_hash);
+-            int_thread_hash = NULL;
+-            hash = NULL;
+-        }
+-    }
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
+-
+-    int_thread_release(&amp;hash);
+-    ERR_STATE_free(p);
+-}
+-
+ #ifndef OPENSSL_NO_ERR
+ # define NUM_SYS_STR_REASONS 127
+ # define LEN_SYS_STR_REASON 32
+@@ -425,16 +321,9 @@ static void build_SYS_str_reasons(void)
+     static int init = 1;
+     int i;
+ 
+-    CRYPTO_r_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_write_lock(err_string_lock);
+     if (!init) {
+-        CRYPTO_r_unlock(CRYPTO_LOCK_ERR);
+-        return;
+-    }
+-
+-    CRYPTO_r_unlock(CRYPTO_LOCK_ERR);
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
+-    if (!init) {
+-        CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++        CRYPTO_THREAD_unlock(err_string_lock);
+         return;
+     }
+ 
+@@ -462,7 +351,7 @@ static void build_SYS_str_reasons(void)
+ 
+     init = 0;
+ 
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+ }
+ #endif
+ 
+@@ -498,9 +387,18 @@ static void ERR_STATE_free(ERR_STATE *s)
+     OPENSSL_free(s);
+ }
+ 
++static void do_err_strings_init(void)
++{
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
++    err_string_lock = CRYPTO_THREAD_lock_new();
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
++}
++
+ void ERR_load_ERR_strings(void)
+ {
+ #ifndef OPENSSL_NO_ERR
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
+     err_load_strings(0, ERR_str_libraries);
+     err_load_strings(0, ERR_str_reasons);
+     err_load_strings(ERR_LIB_SYS, ERR_str_functs);
+@@ -513,7 +411,7 @@ static void err_load_strings(int lib, ERR_STRING_DATA *str)
+ {
+     LHASH_OF(ERR_STRING_DATA) *hash;
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_write_lock(err_string_lock);
+     hash = get_hash(1, 0);
+     if (hash) {
+         for (; str-&gt;error; str++) {
+@@ -522,7 +420,7 @@ static void err_load_strings(int lib, ERR_STRING_DATA *str)
+             (void)lh_ERR_STRING_DATA_insert(hash, str);
+         }
+     }
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+ }
+ 
+ void ERR_load_strings(int lib, ERR_STRING_DATA *str)
+@@ -535,7 +433,9 @@ void ERR_unload_strings(int lib, ERR_STRING_DATA *str)
+ {
+     LHASH_OF(ERR_STRING_DATA) *hash;
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
++    CRYPTO_THREAD_write_lock(err_string_lock);
+     hash = get_hash(0, 0);
+     if (hash) {
+         for (; str-&gt;error; str++) {
+@@ -544,15 +444,17 @@ void ERR_unload_strings(int lib, ERR_STRING_DATA *str)
+             (void)lh_ERR_STRING_DATA_delete(hash, str);
+         }
+     }
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+ }
+ 
+ void ERR_free_strings(void)
+ {
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
++    CRYPTO_THREAD_write_lock(err_string_lock);
+     lh_ERR_STRING_DATA_free(int_error_hash);
+     int_error_hash = NULL;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+ }
+ 
+ /********************************************************/
+@@ -768,7 +670,6 @@ void ERR_error_string_n(unsigned long e, char *buf, size_t len)
+     }
+ }
+ 
+-/* BAD for multi-threading: uses a local buffer if ret == NULL */
+ /*
+  * ERR_error_string_n should be used instead for ret != NULL as
+  * ERR_error_string cannot know how large the buffer is
+@@ -789,21 +690,13 @@ LHASH_OF(ERR_STRING_DATA) *ERR_get_string_table(void)
+     return get_hash(0, 1);
+ }
+ 
+-LHASH_OF(ERR_STATE) *ERR_get_err_state_table(void)
+-{
+-    return int_thread_get(0, 1);
+-}
+-
+-void ERR_release_err_state_table(LHASH_OF(ERR_STATE) **hash)
+-{
+-    int_thread_release(hash);
+-}
+-
+ const char *ERR_lib_error_string(unsigned long e)
+ {
+     ERR_STRING_DATA d, *p;
+     unsigned long l;
+ 
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
+     l = ERR_GET_LIB(e);
+     d.error = ERR_PACK(l, 0, 0);
+     p = int_err_get_item(&amp;d);
+@@ -815,6 +708,8 @@ const char *ERR_func_error_string(unsigned long e)
+     ERR_STRING_DATA d, *p;
+     unsigned long l, f;
+ 
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
+     l = ERR_GET_LIB(e);
+     f = ERR_GET_FUNC(e);
+     d.error = ERR_PACK(l, f, 0);
+@@ -827,6 +722,8 @@ const char *ERR_reason_error_string(unsigned long e)
+     ERR_STRING_DATA d, *p = NULL;
+     unsigned long l, r;
+ 
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
+     l = ERR_GET_LIB(e);
+     r = ERR_GET_REASON(e);
+     d.error = ERR_PACK(l, 0, r);
+@@ -838,77 +735,63 @@ const char *ERR_reason_error_string(unsigned long e)
+     return ((p == NULL) ? NULL : p-&gt;string);
+ }
+ 
+-void ERR_remove_thread_state(const CRYPTO_THREADID *id)
++void ERR_remove_thread_state(void)
+ {
+-    ERR_STATE tmp;
++    ERR_STATE *state = ERR_get_state();
++    if (state == NULL)
++        return;
+ 
+-    if (id)
+-        CRYPTO_THREADID_cpy(&amp;tmp.tid, id);
+-    else
+-        CRYPTO_THREADID_current(&amp;tmp.tid);
+-    /*
+-     * thread_del_item automatically destroys the LHASH if the number of
+-     * items reaches zero.
+-     */
+-    int_thread_del_item(&amp;tmp);
++    CRYPTO_THREAD_set_local(&amp;err_thread_local, NULL);
++    ERR_STATE_free(state);
+ }
+ 
+ #if OPENSSL_API_COMPAT &lt; 0x10000000L
+ void ERR_remove_state(unsigned long pid)
+ {
+-    ERR_remove_thread_state(NULL);
++    ERR_remove_thread_state();
+ }
+ #endif
+ 
++static void err_do_init(void)
++{
++    CRYPTO_THREAD_init_local(&amp;err_thread_local, NULL);
++}
++
+ ERR_STATE *ERR_get_state(void)
+ {
+-    static ERR_STATE fallback;
+-    ERR_STATE *ret, tmp, *tmpp = NULL;
+-    int i;
+-    CRYPTO_THREADID tid;
+-
+-    CRYPTO_THREADID_current(&amp;tid);
+-    CRYPTO_THREADID_cpy(&amp;tmp.tid, &amp;tid);
+-    ret = int_thread_get_item(&amp;tmp);
+-
+-    /* ret == the error state, if NULL, make a new one */
+-    if (ret == NULL) {
+-        ret = OPENSSL_malloc(sizeof(*ret));
+-        if (ret == NULL)
+-            return (&amp;fallback);
+-        CRYPTO_THREADID_cpy(&amp;ret-&gt;tid, &amp;tid);
+-        ret-&gt;top = 0;
+-        ret-&gt;bottom = 0;
+-        for (i = 0; i &lt; ERR_NUM_ERRORS; i++) {
+-            ret-&gt;err_data[i] = NULL;
+-            ret-&gt;err_data_flags[i] = 0;
+-        }
+-        tmpp = int_thread_set_item(ret);
+-        /* To check if insertion failed, do a get. */
+-        if (int_thread_get_item(ret) != ret) {
+-            ERR_STATE_free(ret); /* could not insert it */
+-            return (&amp;fallback);
++    ERR_STATE *state = NULL;
++
++    CRYPTO_THREAD_run_once(&amp;err_init, err_do_init);
++
++    state = CRYPTO_THREAD_get_local(&amp;err_thread_local);
++
++    if (state == NULL) {
++        state = OPENSSL_zalloc(sizeof(*state));
++        if (state == NULL)
++            return NULL;
++
++        if (!CRYPTO_THREAD_set_local(&amp;err_thread_local, state)) {
++            ERR_STATE_free(state);
++            return NULL;
+         }
+-        /*
+-         * If a race occurred in this function and we came second, tmpp is
+-         * the first one that we just replaced.
+-         */
+-        ERR_STATE_free(tmpp);
+ 
+         /* Ignore failures from these */
+         OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+         ossl_init_thread_start(OPENSSL_INIT_THREAD_ERR_STATE);
+     }
+-    return ret;
++
++    return state;
+ }
+ 
+ int ERR_get_next_error_library(void)
+ {
+     int ret;
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_run_once(&amp;err_string_init, do_err_strings_init);
++
++    CRYPTO_THREAD_write_lock(err_string_lock);
+     ret = int_err_library_number++;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_ERR);
++    CRYPTO_THREAD_unlock(err_string_lock);
+     return ret;
+ }
+ 
+diff --git a/crypto/err/err_lcl.h b/crypto/err/err_lcl.h
+deleted file mode 100644
+index c9d24f1..0000000
+--- a/crypto/err/err_lcl.h
++++ /dev/null
+@@ -1,2 +0,0 @@
+-
+-DEFINE_LHASH_OF(ERR_STATE);
+diff --git a/crypto/init.c b/crypto/init.c
+index 44acd4f..b0826ee 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -360,9 +360,9 @@ static void ossl_init_thread_stop(struct thread_local_inits_st *locals)
+     if (locals-&gt;err_state) {
+ #ifdef OPENSSL_INIT_DEBUG
+         fprintf(stderr, &quot;OPENSSL_INIT: ossl_init_thread_stop: &quot;
+-                        &quot;ERR_remove_thread_state(NULL)\n&quot;);
++                        &quot;ERR_remove_thread_state()\n&quot;);
+ #endif
+-        ERR_remove_thread_state(NULL);
++        ERR_remove_thread_state();
+     }
+ 
+     OPENSSL_free(locals);
+diff --git a/doc/crypto/ERR_remove_state.pod b/doc/crypto/ERR_remove_state.pod
+index 55ded84..b011182 100644
+--- a/doc/crypto/ERR_remove_state.pod
++++ b/doc/crypto/ERR_remove_state.pod
+@@ -8,7 +8,7 @@ ERR_remove_thread_state, ERR_remove_state - free a thread's error queue
+ 
+  #include &lt;openssl/err.h&gt;
+ 
+- void ERR_remove_thread_state(const CRYPTO_THREADID *tid);
++ void ERR_remove_thread_state(void);
+ 
+ Deprecated:
+ 
+@@ -18,17 +18,16 @@ Deprecated:
+ 
+ =head1 DESCRIPTION
+ 
+-ERR_remove_thread_state() frees the error queue associated with thread B&lt;tid&gt;.
+-If B&lt;tid&gt; == B&lt;NULL&gt;, the current thread will have its error queue removed.
++ERR_remove_thread_state() frees the error queue associated with the current
++thread.
+ 
+ Since error queue data structures are allocated automatically for new
+ threads, they must be freed when threads are terminated in order to
+ avoid memory leaks.
+ 
+ ERR_remove_state is deprecated and has been replaced by
+-ERR_remove_thread_state. Since threads in OpenSSL are no longer identified
+-by unsigned long values any argument to this function is ignored. Calling
+-ERR_remove_state is equivalent to B&lt;ERR_remove_thread_state(NULL)&gt;.
++ERR_remove_thread_state. Any argument to this function is ignored and
++calling ERR_remove_state is equivalent to B&lt;ERR_remove_thread_state()&gt;.
+ 
+ =head1 RETURN VALUE
+ 
+@@ -41,7 +40,6 @@ L&lt;err(3)&gt;
+ =head1 HISTORY
+ 
+ ERR_remove_state()
+-was deprecated in OpenSSL 1.0.0 when ERR_remove_thread_state() was introduced
+-and thread IDs were introduced to identify threads instead of 'unsigned long'. 
++was deprecated in OpenSSL 1.0.0 when ERR_remove_thread_state() was introduced.
+ 
+ =cut
+diff --git a/doc/crypto/err.pod b/doc/crypto/err.pod
+index 5fafbc5..6847f21 100644
+--- a/doc/crypto/err.pod
++++ b/doc/crypto/err.pod
+@@ -22,7 +22,7 @@ err - error codes
+  int ERR_GET_REASON(unsigned long e);
+ 
+  void ERR_clear_error(void);
+- void ERR_remove_thread_state(const CRYPTO_THREADID *tid);
++ void ERR_remove_thread_state(void);
+ 
+  char *ERR_error_string(unsigned long e, char *buf);
+  const char *ERR_lib_error_string(unsigned long e);
+@@ -164,15 +164,14 @@ TBA more details
+ 
+ =head1 INTERNALS
+ 
+-The error queues are stored in a hash table with one B&lt;ERR_STATE&gt;
+-entry for each pid. ERR_get_state() returns the current thread's
++The error queues are stored in a thread-local storage with one B&lt;ERR_STATE&gt;
++entry for each thread. ERR_get_state() returns the current thread's
+ B&lt;ERR_STATE&gt;. An B&lt;ERR_STATE&gt; can hold up to B&lt;ERR_NUM_ERRORS&gt; error
+ codes. When more error codes are added, the old ones are overwritten,
+ on the assumption that the most recent errors are most important.
+ 
+-Error strings are also stored in hash table. The hash tables can
+-be obtained by calling ERR_get_err_state_table(void) and
+-ERR_get_string_table(void) respectively.
++Error strings are also stored in a hash table that can be obtained
++by calling ERR_get_string_table(void).
+ 
+ =head1 SEE ALSO
+ 
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 0f09197..53c26b9 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -165,7 +165,6 @@ extern &quot;C&quot; {
+  * names in cryptlib.c
+  */
+ 
+-# define CRYPTO_LOCK_ERR                 1
+ # define CRYPTO_LOCK_X509                3
+ # define CRYPTO_LOCK_X509_INFO           4
+ # define CRYPTO_LOCK_X509_PKEY           5
+diff --git a/include/openssl/err.h b/include/openssl/err.h
+index 0b12d92..4b6c663 100644
+--- a/include/openssl/err.h
++++ b/include/openssl/err.h
+@@ -141,7 +141,6 @@ extern &quot;C&quot; {
+ 
+ # define ERR_NUM_ERRORS  16
+ typedef struct err_state_st {
+-    CRYPTO_THREADID tid;
+     int err_flags[ERR_NUM_ERRORS];
+     unsigned long err_buffer[ERR_NUM_ERRORS];
+     char *err_data[ERR_NUM_ERRORS];
+@@ -366,14 +365,12 @@ void ERR_load_ERR_strings(void);
+ 
+ void ERR_free_strings(void);
+ 
+-void ERR_remove_thread_state(const CRYPTO_THREADID *tid);
++void ERR_remove_thread_state(void);
+ DEPRECATEDIN_1_0_0(void ERR_remove_state(unsigned long pid)) /* if zero we
+                                                               * look it up */
+ ERR_STATE *ERR_get_state(void);
+ 
+ LHASH_OF(ERR_STRING_DATA) *ERR_get_string_table(void);
+-LHASH_OF(ERR_STATE) *ERR_get_err_state_table(void);
+-void ERR_release_err_state_table(LHASH_OF(ERR_STATE) **hash);
+ 
+ int ERR_get_next_error_library(void);
+ 
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 28e78e4..3ae4500 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -1047,7 +1047,7 @@ X509at_get_attr_by_OBJ                  1015	1_1_0	EXIST::FUNCTION:
+ EVP_MD_CTX_copy_ex                      1016	1_1_0	EXIST::FUNCTION:
+ UI_dup_error_string                     1017	1_1_0	EXIST::FUNCTION:
+ lh_num_items                            1018	1_1_0	EXIST::FUNCTION:
+-ERR_get_err_state_table                 1019	1_1_0	EXIST::FUNCTION:
++ERR_get_err_state_table                 1019	1_1_0	NOEXIST::FUNCTION:
+ ASN1_INTEGER_cmp                        1020	1_1_0	EXIST::FUNCTION:
+ X509_NAME_entry_count                   1021	1_1_0	EXIST::FUNCTION:
+ UI_method_set_closer                    1022	1_1_0	EXIST::FUNCTION:
+@@ -3507,7 +3507,7 @@ i2d_PBE2PARAM                           3389	1_1_0	EXIST::FUNCTION:
+ EC_POINT_make_affine                    3390	1_1_0	EXIST::FUNCTION:EC
+ DSA_generate_parameters                 3391	1_1_0	EXIST::FUNCTION:DEPRECATEDIN_0_9_8,DSA
+ ASN1_BIT_STRING_num_asc                 3392	1_1_0	EXIST::FUNCTION:
+-ERR_release_err_state_table             3393	1_1_0	EXIST::FUNCTION:
++ERR_release_err_state_table             3393	1_1_0	NOEXIST::FUNCTION:
+ X509_INFO_free                          3394	1_1_0	EXIST::FUNCTION:
+ d2i_PKCS8_PRIV_KEY_INFO_fp              3395	1_1_0	EXIST::FUNCTION:STDIO
+ X509_OBJECT_retrieve_match              3396	1_1_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005094.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005102.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5100">[ date ]</a>
+              <a href="thread.html#5100">[ thread ]</a>
+              <a href="subject.html#5100">[ subject ]</a>
+              <a href="author.html#5100">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

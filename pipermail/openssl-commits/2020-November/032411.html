@@ -1,0 +1,675 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1606645985.903266.26646.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032407.html">
+   <LINK REL="Next"  HREF="032425.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1606645985.903266.26646.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Sun Nov 29 10:33:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032407.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032425.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32411">[ date ]</a>
+              <a href="thread.html#32411">[ thread ]</a>
+              <a href="subject.html#32411">[ subject ]</a>
+              <a href="author.html#32411">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5658470ce7b4fabfd1fa2cdc69bee8d3a5e826f9 (commit)
+      from  6568d7a93127d097122e2ce10491d06a363929e9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5658470ce7b4fabfd1fa2cdc69bee8d3a5e826f9
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Fri Nov 27 22:03:29 2020 +0100
+
+    endecode_test.c: Significant speedup in generating DH and DHX keys
+    
+    Fixes #13495
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13552">https://github.com/openssl/openssl/pull/13552</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/build.info                                    |   4 +-
+ test/endecode_test.c                               |  19 ++-
+ test/predefined_dhparams.c                         | 172 +++++++++++++++++++++
+ crypto/des/cbc_enc.c =&gt; test/predefined_dhparams.h |  15 +-
+ test/recipes/80-test_ssl_old.t                     |  28 +++-
+ test/ssltest_old.c                                 | 171 ++------------------
+ 6 files changed, 232 insertions(+), 177 deletions(-)
+ create mode 100644 test/predefined_dhparams.c
+ copy crypto/des/cbc_enc.c =&gt; test/predefined_dhparams.h (59%)
+
+diff --git a/test/build.info b/test/build.info
+index 7f9e44b591..d781b10393 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -700,7 +700,7 @@ IF[{- !$disabled{tests} -}]
+     INCLUDE[mdc2_internal_test]=.. ../include ../apps/include
+     DEPEND[mdc2_internal_test]=../libcrypto.a libtestutil.a
+ 
+-    SOURCE[ssltest_old]=ssltest_old.c
++    SOURCE[ssltest_old]=ssltest_old.c predefined_dhparams.c
+     INCLUDE[ssltest_old]=.. ../include ../apps/include
+     DEPEND[ssltest_old]=../libcrypto.a ../libssl.a
+   ENDIF
+@@ -789,7 +789,7 @@ IF[{- !$disabled{tests} -}]
+   DEPEND[hexstr_test]=../libcrypto.a libtestutil.a
+ 
+   PROGRAMS{noinst}=endecode_test
+-  SOURCE[endecode_test]=endecode_test.c
++  SOURCE[endecode_test]=endecode_test.c predefined_dhparams.c
+   INCLUDE[endecode_test]=.. ../include ../apps/include
+   DEPEND[endecode_test]=../libcrypto.a libtestutil.a
+ 
+diff --git a/test/endecode_test.c b/test/endecode_test.c
+index 4a86e71b76..e01cc4ddff 100644
+--- a/test/endecode_test.c
++++ b/test/endecode_test.c
+@@ -22,6 +22,7 @@
+ #include &quot;internal/cryptlib.h&quot;   /* ossl_assert */
+ #include &quot;crypto/pem.h&quot;          /* For PVK and &quot;blob&quot; PEM headers */
+ 
++#include &quot;predefined_dhparams.h&quot;
+ #include &quot;testutil.h&quot;
+ 
+ #ifndef OPENSSL_NO_EC
+@@ -42,13 +43,21 @@ static OSSL_PARAM *ec_explicit_tri_params_explicit = NULL;
+ static EVP_PKEY *make_template(const char *type, OSSL_PARAM *genparams)
+ {
+     EVP_PKEY *pkey = NULL;
+-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, type, NULL);
++    EVP_PKEY_CTX *ctx = NULL;
++
++#ifndef OPENSSL_NO_DH
++    /* use DH(X) keys with predetermined parameters for efficiency */
++    if (strcmp(type, &quot;DH&quot;) == 0)
++        return get_dh512(NULL);
++    if (strcmp(type, &quot;X9.42 DH&quot;) == 0)
++        return get_dhx512(NULL);
++#endif
+ 
+     /*
+      * No real need to check the errors other than for the cascade
+      * effect.  |pkey| will simply remain NULL if something goes wrong.
+      */
+-    (void)(ctx != NULL
++    (void)((ctx = EVP_PKEY_CTX_new_from_name(NULL, type, NULL)) != NULL
+            &amp;&amp; EVP_PKEY_paramgen_init(ctx) &gt; 0
+            &amp;&amp; (genparams == NULL
+                || EVP_PKEY_CTX_set_params(ctx, genparams) &gt; 0)
+@@ -1193,9 +1202,11 @@ int setup_tests(void)
+ #ifndef OPENSSL_NO_DH
+     MAKE_DOMAIN_KEYS(DH, &quot;DH&quot;, NULL);
+     MAKE_DOMAIN_KEYS(DHX, &quot;X9.42 DH&quot;, NULL);
++    TEST_info(&quot;Generating keys...DH done&quot;);
+ #endif
+ #ifndef OPENSSL_NO_DSA
+     MAKE_DOMAIN_KEYS(DSA, &quot;DSA&quot;, DSA_params);
++    TEST_info(&quot;Generating keys...DSA done&quot;);
+ #endif
+ #ifndef OPENSSL_NO_EC
+     MAKE_DOMAIN_KEYS(EC, &quot;EC&quot;, EC_params);
+@@ -1209,10 +1220,12 @@ int setup_tests(void)
+     MAKE_KEYS(ED448, &quot;ED448&quot;, NULL);
+     MAKE_KEYS(X25519, &quot;X25519&quot;, NULL);
+     MAKE_KEYS(X448, &quot;X448&quot;, NULL);
++    TEST_info(&quot;Generating keys...EC done&quot;);
+ #endif
+     MAKE_KEYS(RSA, &quot;RSA&quot;, NULL);
++    TEST_info(&quot;Generating keys...RSA done&quot;);
+     MAKE_KEYS(RSA_PSS, &quot;RSA-PSS&quot;, RSA_PSS_params);
+-    TEST_info(&quot;Generating key... done&quot;);
++    TEST_info(&quot;Generating keys...RSA_PSS done&quot;);
+ 
+     if (ok) {
+ #ifndef OPENSSL_NO_DH
+diff --git a/test/predefined_dhparams.c b/test/predefined_dhparams.c
+new file mode 100644
+index 0000000000..18fb096216
+--- /dev/null
++++ b/test/predefined_dhparams.c
+@@ -0,0 +1,172 @@
++/*
++ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/evp.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/param_build.h&gt;
++
++#include &quot;predefined_dhparams.h&quot;
++
++#ifndef OPENSSL_NO_DH
++
++static EVP_PKEY *get_dh_from_pg_bn(OSSL_LIB_CTX *libctx, const char *type,
++                                   BIGNUM *p, BIGNUM *g, BIGNUM *q)
++{
++    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(libctx, type, NULL);
++    OSSL_PARAM_BLD *tmpl = NULL;
++    OSSL_PARAM *params = NULL;
++    EVP_PKEY *dhpkey = NULL;
++
++    if (pctx == NULL || !EVP_PKEY_key_fromdata_init(pctx))
++        goto err;
++
++    if ((tmpl = OSSL_PARAM_BLD_new()) == NULL
++            || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_P, p)
++            || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_G, g)
++            || (q != NULL
++                &amp;&amp; !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_Q, q)))
++        goto err;
++
++    params = OSSL_PARAM_BLD_to_param(tmpl);
++    if (params == NULL || !EVP_PKEY_fromdata(pctx, &amp;dhpkey, params))
++        goto err;
++
++ err:
++    EVP_PKEY_CTX_free(pctx);
++    OSSL_PARAM_BLD_free_params(params);
++    OSSL_PARAM_BLD_free(tmpl);
++    return dhpkey;
++}
++
++static EVP_PKEY *get_dh_from_pg(OSSL_LIB_CTX *libctx, const char *type,
++                                unsigned char *pdata, size_t plen,
++                                unsigned char *gdata, size_t glen,
++                                unsigned char *qdata, size_t qlen)
++{
++    EVP_PKEY *dhpkey = NULL;
++    BIGNUM *p = NULL, *g = NULL, *q = NULL;
++
++    p = BN_bin2bn(pdata, plen, NULL);
++    g = BN_bin2bn(gdata, glen, NULL);
++    if (p == NULL || g == NULL)
++        goto err;
++    if (qdata != NULL &amp;&amp; (q = BN_bin2bn(qdata, qlen, NULL)) == NULL)
++        goto err;
++
++    dhpkey = get_dh_from_pg_bn(libctx, type, p, g, q);
++
++ err:
++    BN_free(p);
++    BN_free(g);
++    BN_free(q);
++    return dhpkey;
++}
++
++EVP_PKEY *get_dh512(OSSL_LIB_CTX *libctx)
++{
++    static unsigned char dh512_p[] = {
++        0xCB, 0xC8, 0xE1, 0x86, 0xD0, 0x1F, 0x94, 0x17, 0xA6, 0x99, 0xF0, 0xC6,
++        0x1F, 0x0D, 0xAC, 0xB6, 0x25, 0x3E, 0x06, 0x39, 0xCA, 0x72, 0x04, 0xB0,
++        0x6E, 0xDA, 0xC0, 0x61, 0xE6, 0x7A, 0x77, 0x25, 0xE8, 0x3B, 0xB9, 0x5F,
++        0x9A, 0xB6, 0xB5, 0xFE, 0x99, 0x0B, 0xA1, 0x93, 0x4E, 0x35, 0x33, 0xB8,
++        0xE1, 0xF1, 0x13, 0x4F, 0x59, 0x1A, 0xD2, 0x57, 0xC0, 0x26, 0x21, 0x33,
++        0x02, 0xC5, 0xAE, 0x23,
++    };
++    static unsigned char dh512_g[] = {
++        0x02,
++    };
++
++    return get_dh_from_pg(libctx, &quot;DH&quot;, dh512_p, sizeof(dh512_p),
++                          dh512_g, sizeof(dh512_g), NULL, 0);
++}
++
++EVP_PKEY *get_dhx512(OSSL_LIB_CTX *libctx)
++{
++    static unsigned char dhx512_p[] = {
++        0x00, 0xe8, 0x1a, 0xb7, 0x9a, 0x02, 0x65, 0x64, 0x94, 0x7b, 0xba, 0x09,
++        0x1c, 0x12, 0x27, 0x1e, 0xea, 0x89, 0x32, 0x64, 0x78, 0xf8, 0x1c, 0x78,
++        0x8e, 0x96, 0xc3, 0xc6, 0x9f, 0x41, 0x05, 0x41, 0x65, 0xae, 0xe3, 0x05,
++        0xea, 0x66, 0x21, 0xf7, 0x38, 0xb7, 0x2b, 0x32, 0x40, 0x5a, 0x14, 0x86,
++        0x51, 0x94, 0xb1, 0xcf, 0x01, 0xe3, 0x27, 0x28, 0xf6, 0x75, 0xa3, 0x15,
++        0xbb, 0x12, 0x4d, 0x99, 0xe7,
++    };
++    static unsigned char dhx512_g[] = {
++        0x00, 0x91, 0xc1, 0x43, 0x6d, 0x0d, 0xb0, 0xa4, 0xde, 0x41, 0xb7, 0x93,
++        0xad, 0x51, 0x94, 0x1b, 0x43, 0xd8, 0x42, 0xf1, 0x5e, 0x46, 0x83, 0x5d,
++        0xf1, 0xd1, 0xf0, 0x41, 0x10, 0xd1, 0x1c, 0x5e, 0xad, 0x9b, 0x68, 0xb1,
++        0x6f, 0xf5, 0x8e, 0xaa, 0x6d, 0x71, 0x88, 0x37, 0xdf, 0x05, 0xf7, 0x6e,
++        0x7a, 0xb4, 0x25, 0x10, 0x6c, 0x7f, 0x38, 0xb4, 0xc8, 0xfc, 0xcc, 0x0c,
++        0x6a, 0x02, 0x08, 0x61, 0xf6,
++    };
++    static unsigned char dhx512_q[] = {
++        0x00, 0xdd, 0xf6, 0x35, 0xad, 0xfa, 0x70, 0xc7, 0xe7, 0xa8, 0xf0, 0xe3,
++        0xda, 0x79, 0x34, 0x3f, 0x5b, 0xcf, 0x73, 0x82, 0x91,
++    };
++
++    return get_dh_from_pg(libctx, &quot;X9.42 DH&quot;,
++                          dhx512_p, sizeof(dhx512_p),
++                          dhx512_g, sizeof(dhx512_g),
++                          dhx512_q, sizeof(dhx512_q));
++}
++
++EVP_PKEY *get_dh1024dsa(OSSL_LIB_CTX *libctx)
++{
++    static unsigned char dh1024_p[] = {
++        0xC8, 0x00, 0xF7, 0x08, 0x07, 0x89, 0x4D, 0x90, 0x53, 0xF3, 0xD5, 0x00,
++        0x21, 0x1B, 0xF7, 0x31, 0xA6, 0xA2, 0xDA, 0x23, 0x9A, 0xC7, 0x87, 0x19,
++        0x3B, 0x47, 0xB6, 0x8C, 0x04, 0x6F, 0xFF, 0xC6, 0x9B, 0xB8, 0x65, 0xD2,
++        0xC2, 0x5F, 0x31, 0x83, 0x4A, 0xA7, 0x5F, 0x2F, 0x88, 0x38, 0xB6, 0x55,
++        0xCF, 0xD9, 0x87, 0x6D, 0x6F, 0x9F, 0xDA, 0xAC, 0xA6, 0x48, 0xAF, 0xFC,
++        0x33, 0x84, 0x37, 0x5B, 0x82, 0x4A, 0x31, 0x5D, 0xE7, 0xBD, 0x52, 0x97,
++        0xA1, 0x77, 0xBF, 0x10, 0x9E, 0x37, 0xEA, 0x64, 0xFA, 0xCA, 0x28, 0x8D,
++        0x9D, 0x3B, 0xD2, 0x6E, 0x09, 0x5C, 0x68, 0xC7, 0x45, 0x90, 0xFD, 0xBB,
++        0x70, 0xC9, 0x3A, 0xBB, 0xDF, 0xD4, 0x21, 0x0F, 0xC4, 0x6A, 0x3C, 0xF6,
++        0x61, 0xCF, 0x3F, 0xD6, 0x13, 0xF1, 0x5F, 0xBC, 0xCF, 0xBC, 0x26, 0x9E,
++        0xBC, 0x0B, 0xBD, 0xAB, 0x5D, 0xC9, 0x54, 0x39,
++    };
++    static unsigned char dh1024_g[] = {
++        0x3B, 0x40, 0x86, 0xE7, 0xF3, 0x6C, 0xDE, 0x67, 0x1C, 0xCC, 0x80, 0x05,
++        0x5A, 0xDF, 0xFE, 0xBD, 0x20, 0x27, 0x74, 0x6C, 0x24, 0xC9, 0x03, 0xF3,
++        0xE1, 0x8D, 0xC3, 0x7D, 0x98, 0x27, 0x40, 0x08, 0xB8, 0x8C, 0x6A, 0xE9,
++        0xBB, 0x1A, 0x3A, 0xD6, 0x86, 0x83, 0x5E, 0x72, 0x41, 0xCE, 0x85, 0x3C,
++        0xD2, 0xB3, 0xFC, 0x13, 0xCE, 0x37, 0x81, 0x9E, 0x4C, 0x1C, 0x7B, 0x65,
++        0xD3, 0xE6, 0xA6, 0x00, 0xF5, 0x5A, 0x95, 0x43, 0x5E, 0x81, 0xCF, 0x60,
++        0xA2, 0x23, 0xFC, 0x36, 0xA7, 0x5D, 0x7A, 0x4C, 0x06, 0x91, 0x6E, 0xF6,
++        0x57, 0xEE, 0x36, 0xCB, 0x06, 0xEA, 0xF5, 0x3D, 0x95, 0x49, 0xCB, 0xA7,
++        0xDD, 0x81, 0xDF, 0x80, 0x09, 0x4A, 0x97, 0x4D, 0xA8, 0x22, 0x72, 0xA1,
++        0x7F, 0xC4, 0x70, 0x56, 0x70, 0xE8, 0x20, 0x10, 0x18, 0x8F, 0x2E, 0x60,
++        0x07, 0xE7, 0x68, 0x1A, 0x82, 0x5D, 0x32, 0xA2,
++    };
++
++    return get_dh_from_pg(libctx, &quot;DH&quot;, dh1024_p, sizeof(dh1024_p),
++                          dh1024_g, sizeof(dh1024_g), NULL, 0);
++}
++
++EVP_PKEY *get_dh2048(OSSL_LIB_CTX *libctx)
++{
++    BIGNUM *p = NULL, *g = NULL;
++    EVP_PKEY *dhpkey = NULL;
++
++    g = BN_new();
++    if (g == NULL || !BN_set_word(g, 2))
++        goto err;
++
++    p = BN_get_rfc3526_prime_2048(NULL);
++    if (p == NULL)
++        goto err;
++
++    dhpkey = get_dh_from_pg_bn(libctx, &quot;DH&quot;, p, g, NULL);
++
++ err:
++    BN_free(p);
++    BN_free(g);
++    return dhpkey;
++}
++
++#endif
+diff --git a/crypto/des/cbc_enc.c b/test/predefined_dhparams.h
+similarity index 59%
+copy from crypto/des/cbc_enc.c
+copy to test/predefined_dhparams.h
+index aa8ac1a5c3..29d33ce1eb 100644
+--- a/crypto/des/cbc_enc.c
++++ b/test/predefined_dhparams.h
+@@ -7,12 +7,11 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/*
+- * DES low level APIs are deprecated for public use, but still ok for internal
+- * use.
+- */
+-#include &quot;internal/deprecated.h&quot;
+-
+-#define CBC_ENC_C__DONT_UPDATE_IV
++#include &lt;openssl/evp.h&gt;
+ 
+-#include &quot;ncbc_enc.c&quot;           /* des_cbc_encrypt */
++#ifndef OPENSSL_NO_DH
++EVP_PKEY *get_dh512(OSSL_LIB_CTX *libctx);
++EVP_PKEY *get_dhx512(OSSL_LIB_CTX *libctx);
++EVP_PKEY *get_dh1024dsa(OSSL_LIB_CTX *libct);
++EVP_PKEY *get_dh2048(OSSL_LIB_CTX *libctx);
++#endif
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index 26df2bdb3a..aa2428559f 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -391,8 +391,14 @@ sub testssl {
+ 	       'test sslv2/sslv3 w/o (EC)DHE via BIO pair');
+ 	  }
+ 
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-dhe1024dsa&quot;, &quot;-v&quot;])),
+-	     'test sslv2/sslv3 with 1024bit DHE via BIO pair');
++	SKIP: {
++	    skip &quot;skipping dhe1024dsa test&quot;, 1
++                if ($no_dh);
++
++            ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-dhe1024dsa&quot;, &quot;-v&quot;])),
++               'test sslv2/sslv3 with 1024bit DHE via BIO pair');
++          }
++
+ 	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-server_auth&quot;, @CA])),
+ 	     'test sslv2/sslv3 with server authentication');
+ 	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-client_auth&quot;, @CA])),
+@@ -499,12 +505,18 @@ sub testssl {
+                 }
+             }
+             next if $protocol eq &quot;-tls1_3&quot;;
+-            is(run(test([@ssltest,
+-                         &quot;-s_cipher&quot;, &quot;EDH&quot;,
+-                         &quot;-c_cipher&quot;, 'EDH:@SECLEVEL=1',
+-                         &quot;-dhe512&quot;,
+-                         $protocol])), 0,
+-               &quot;testing connection with weak DH, expecting failure&quot;);
++
++          SKIP: {
++              skip &quot;skipping dhe512 test&quot;, 1
++                  if ($no_dh);
++
++              is(run(test([@ssltest,
++                           &quot;-s_cipher&quot;, &quot;EDH&quot;,
++                           &quot;-c_cipher&quot;, 'EDH:@SECLEVEL=1',
++                           &quot;-dhe512&quot;,
++                           $protocol])), 0,
++                 &quot;testing connection with weak DH, expecting failure&quot;);
++            }
+         }
+     };
+ 
+diff --git a/test/ssltest_old.c b/test/ssltest_old.c
+index cd5d1b3f4d..794d878675 100644
+--- a/test/ssltest_old.c
++++ b/test/ssltest_old.c
+@@ -57,8 +57,6 @@
+ # include &lt;openssl/ct.h&gt;
+ #endif
+ #include &lt;openssl/provider.h&gt;
+-#include &lt;openssl/core_names.h&gt;
+-#include &lt;openssl/param_build.h&gt;
+ 
+ /*
+  * Or gethostname won't be declared properly
+@@ -74,6 +72,8 @@
+ # include &lt;unistd.h&gt;
+ #endif
+ 
++#include &quot;predefined_dhparams.h&quot;
++
+ static SSL_CTX *s_ctx = NULL;
+ static SSL_CTX *s_ctx2 = NULL;
+ 
+@@ -91,10 +91,6 @@ struct app_verify_arg {
+     int app_verify;
+ };
+ 
+-static EVP_PKEY *get_dh512(OSSL_LIB_CTX *libctx);
+-static EVP_PKEY *get_dh1024dsa(OSSL_LIB_CTX *libctx);
+-static EVP_PKEY *get_dh2048(OSSL_LIB_CTX *libctx);
+-
+ static char *psk_key = NULL;    /* by default PSK is not used */
+ #ifndef OPENSSL_NO_PSK
+ static unsigned int psk_client_callback(SSL *ssl, const char *hint,
+@@ -632,12 +628,14 @@ static void sv_usage(void)
+     fprintf(stderr, &quot; -num &lt;val&gt;    - number of connections to perform\n&quot;);
+     fprintf(stderr,
+             &quot; -bytes &lt;val&gt;  - number of bytes to swap between client/server\n&quot;);
++#ifndef OPENSSL_NO_DH
+     fprintf(stderr,
+             &quot; -dhe512       - use 512 bit key for DHE (to test failure)\n&quot;);
+     fprintf(stderr,
+             &quot; -dhe1024      - use 1024 bit key (safe prime) for DHE (default, no-op)\n&quot;);
+     fprintf(stderr,
+             &quot; -dhe1024dsa   - use 1024 bit key (with 160-bit subprime) for DHE\n&quot;);
++#endif
+     fprintf(stderr, &quot; -no_dhe       - disable DHE\n&quot;);
+ #ifndef OPENSSL_NO_EC
+     fprintf(stderr, &quot; -no_ecdhe     - disable ECDHE\nTODO(openssl-team): no_ecdhe was broken by auto ecdh. Make this work again.\n&quot;);
+@@ -888,12 +886,10 @@ int main(int argc, char *argv[])
+     int should_reuse = -1;
+     int no_ticket = 0;
+     long bytes = 256L;
++#ifndef OPENSSL_NO_DH
+     EVP_PKEY *dhpkey;
+     int dhe512 = 0, dhe1024dsa = 0;
+-#ifndef OPENSSL_NO_DH
+     int no_dhe = 0;
+-#else
+-    int no_dhe = 1;
+ #endif
+     int no_psk = 0;
+     int print_time = 0;
+@@ -978,12 +974,16 @@ int main(int argc, char *argv[])
+             debug = 1;
+         else if (strcmp(*argv, &quot;-reuse&quot;) == 0)
+             reuse = 1;
+-        else if (strcmp(*argv, &quot;-dhe512&quot;) == 0) {
++        else if (strcmp(*argv, &quot;-no_dhe&quot;) == 0)
++#ifdef OPENSSL_NO_DH
++            /* unused in this case */;
++#else
++            no_dhe = 1;
++        else if (strcmp(*argv, &quot;-dhe512&quot;) == 0)
+             dhe512 = 1;
+-        } else if (strcmp(*argv, &quot;-dhe1024dsa&quot;) == 0) {
++        else if (strcmp(*argv, &quot;-dhe1024dsa&quot;) == 0)
+             dhe1024dsa = 1;
+-        } else if (strcmp(*argv, &quot;-no_dhe&quot;) == 0)
+-            no_dhe = 1;
++#endif
+         else if (strcmp(*argv, &quot;-no_ecdhe&quot;) == 0)
+             /* obsolete */;
+         else if (strcmp(*argv, &quot;-psk&quot;) == 0) {
+@@ -1486,6 +1486,7 @@ int main(int argc, char *argv[])
+         ERR_print_errors(bio_err);
+         goto end;
+     }
++#ifndef OPENSSL_NO_DH
+     if (!no_dhe) {
+         if (dhe1024dsa)
+             dhpkey = get_dh1024dsa(libctx);
+@@ -1503,6 +1504,7 @@ int main(int argc, char *argv[])
+         SSL_CTX_set0_tmp_dh_pkey(s_ctx, dhpkey);
+         SSL_CTX_set0_tmp_dh_pkey(s_ctx2, dhpkey);
+     }
++#endif
+ 
+     if (!(SSL_CTX_load_verify_file(s_ctx, CAfile)
+           || SSL_CTX_load_verify_dir(s_ctx, CApath))
+@@ -2884,149 +2886,6 @@ static int app_verify_callback(X509_STORE_CTX *ctx, void *arg)
+     return ok;
+ }
+ 
+-static EVP_PKEY *get_dh_from_pg_bn(OSSL_LIB_CTX *libctx, BIGNUM *p, BIGNUM *g)
+-{
+-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(libctx, &quot;DH&quot;, NULL);
+-    OSSL_PARAM_BLD *tmpl = NULL;
+-    OSSL_PARAM *params = NULL;
+-    EVP_PKEY *dhpkey = NULL;
+-
+-    if (pctx == NULL || !EVP_PKEY_key_fromdata_init(pctx))
+-        goto err;
+-
+-    tmpl = OSSL_PARAM_BLD_new();
+-    if (tmpl == NULL
+-            || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_P, p)
+-            || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_G, g))
+-        goto err;
+-
+-    params = OSSL_PARAM_BLD_to_param(tmpl);
+-    if (params == NULL || !EVP_PKEY_fromdata(pctx, &amp;dhpkey, params))
+-        goto err;
+-
+- err:
+-    EVP_PKEY_CTX_free(pctx);
+-    OSSL_PARAM_BLD_free_params(params);
+-    OSSL_PARAM_BLD_free(tmpl);
+-    return dhpkey;
+-}
+-static EVP_PKEY *get_dh_from_pg(OSSL_LIB_CTX *libctx, unsigned char *pdata,
+-                                size_t plen, unsigned char *gdata, size_t glen)
+-{
+-    EVP_PKEY *dhpkey = NULL;
+-    BIGNUM *p = NULL, *g = NULL;
+-
+-    p = BN_bin2bn(pdata, plen, NULL);
+-    g = BN_bin2bn(gdata, glen, NULL);
+-    if (p == NULL || g == NULL)
+-        goto err;
+-
+-    dhpkey = get_dh_from_pg_bn(libctx, p, g);
+-
+- err:
+-    BN_free(p);
+-    BN_free(g);
+-    return dhpkey;
+-}
+-
+-/* These DH parameters were generated using the dhparam command line app */
+-static EVP_PKEY *get_dh512(OSSL_LIB_CTX *libctx)
+-{
+-    static unsigned char dh512_p[] = {
+-        0xCB, 0xC8, 0xE1, 0x86, 0xD0, 0x1F, 0x94, 0x17, 0xA6, 0x99, 0xF0,
+-        0xC6,
+-        0x1F, 0x0D, 0xAC, 0xB6, 0x25, 0x3E, 0x06, 0x39, 0xCA, 0x72, 0x04,
+-        0xB0,
+-        0x6E, 0xDA, 0xC0, 0x61, 0xE6, 0x7A, 0x77, 0x25, 0xE8, 0x3B, 0xB9,
+-        0x5F,
+-        0x9A, 0xB6, 0xB5, 0xFE, 0x99, 0x0B, 0xA1, 0x93, 0x4E, 0x35, 0x33,
+-        0xB8,
+-        0xE1, 0xF1, 0x13, 0x4F, 0x59, 0x1A, 0xD2, 0x57, 0xC0, 0x26, 0x21,
+-        0x33,
+-        0x02, 0xC5, 0xAE, 0x23,
+-    };
+-    static unsigned char dh512_g[] = {
+-        0x02,
+-    };
+-
+-    return get_dh_from_pg(libctx, dh512_p, sizeof(dh512_p), dh512_g,
+-                          sizeof(dh512_g));
+-}
+-
+-static EVP_PKEY *get_dh1024dsa(OSSL_LIB_CTX *libctx)
+-{
+-    static unsigned char dh1024_p[] = {
+-        0xC8, 0x00, 0xF7, 0x08, 0x07, 0x89, 0x4D, 0x90, 0x53, 0xF3, 0xD5,
+-        0x00,
+-        0x21, 0x1B, 0xF7, 0x31, 0xA6, 0xA2, 0xDA, 0x23, 0x9A, 0xC7, 0x87,
+-        0x19,
+-        0x3B, 0x47, 0xB6, 0x8C, 0x04, 0x6F, 0xFF, 0xC6, 0x9B, 0xB8, 0x65,
+-        0xD2,
+-        0xC2, 0x5F, 0x31, 0x83, 0x4A, 0xA7, 0x5F, 0x2F, 0x88, 0x38, 0xB6,
+-        0x55,
+-        0xCF, 0xD9, 0x87, 0x6D, 0x6F, 0x9F, 0xDA, 0xAC, 0xA6, 0x48, 0xAF,
+-        0xFC,
+-        0x33, 0x84, 0x37, 0x5B, 0x82, 0x4A, 0x31, 0x5D, 0xE7, 0xBD, 0x52,
+-        0x97,
+-        0xA1, 0x77, 0xBF, 0x10, 0x9E, 0x37, 0xEA, 0x64, 0xFA, 0xCA, 0x28,
+-        0x8D,
+-        0x9D, 0x3B, 0xD2, 0x6E, 0x09, 0x5C, 0x68, 0xC7, 0x45, 0x90, 0xFD,
+-        0xBB,
+-        0x70, 0xC9, 0x3A, 0xBB, 0xDF, 0xD4, 0x21, 0x0F, 0xC4, 0x6A, 0x3C,
+-        0xF6,
+-        0x61, 0xCF, 0x3F, 0xD6, 0x13, 0xF1, 0x5F, 0xBC, 0xCF, 0xBC, 0x26,
+-        0x9E,
+-        0xBC, 0x0B, 0xBD, 0xAB, 0x5D, 0xC9, 0x54, 0x39,
+-    };
+-    static unsigned char dh1024_g[] = {
+-        0x3B, 0x40, 0x86, 0xE7, 0xF3, 0x6C, 0xDE, 0x67, 0x1C, 0xCC, 0x80,
+-        0x05,
+-        0x5A, 0xDF, 0xFE, 0xBD, 0x20, 0x27, 0x74, 0x6C, 0x24, 0xC9, 0x03,
+-        0xF3,
+-        0xE1, 0x8D, 0xC3, 0x7D, 0x98, 0x27, 0x40, 0x08, 0xB8, 0x8C, 0x6A,
+-        0xE9,
+-        0xBB, 0x1A, 0x3A, 0xD6, 0x86, 0x83, 0x5E, 0x72, 0x41, 0xCE, 0x85,
+-        0x3C,
+-        0xD2, 0xB3, 0xFC, 0x13, 0xCE, 0x37, 0x81, 0x9E, 0x4C, 0x1C, 0x7B,
+-        0x65,
+-        0xD3, 0xE6, 0xA6, 0x00, 0xF5, 0x5A, 0x95, 0x43, 0x5E, 0x81, 0xCF,
+-        0x60,
+-        0xA2, 0x23, 0xFC, 0x36, 0xA7, 0x5D, 0x7A, 0x4C, 0x06, 0x91, 0x6E,
+-        0xF6,
+-        0x57, 0xEE, 0x36, 0xCB, 0x06, 0xEA, 0xF5, 0x3D, 0x95, 0x49, 0xCB,
+-        0xA7,
+-        0xDD, 0x81, 0xDF, 0x80, 0x09, 0x4A, 0x97, 0x4D, 0xA8, 0x22, 0x72,
+-        0xA1,
+-        0x7F, 0xC4, 0x70, 0x56, 0x70, 0xE8, 0x20, 0x10, 0x18, 0x8F, 0x2E,
+-        0x60,
+-        0x07, 0xE7, 0x68, 0x1A, 0x82, 0x5D, 0x32, 0xA2,
+-    };
+-
+-    return get_dh_from_pg(libctx, dh1024_p, sizeof(dh1024_p), dh1024_g,
+-                          sizeof(dh1024_g));
+-}
+-
+-static EVP_PKEY *get_dh2048(OSSL_LIB_CTX *libctx)
+-{
+-    BIGNUM *p = NULL, *g = NULL;
+-    EVP_PKEY *dhpkey = NULL;
+-
+-    g = BN_new();
+-    if (g == NULL || !BN_set_word(g, 2))
+-        goto err;
+-
+-    p = BN_get_rfc3526_prime_2048(NULL);
+-    if (p == NULL)
+-        goto err;
+-
+-    dhpkey = get_dh_from_pg_bn(libctx, p, g);
+-
+- err:
+-    BN_free(p);
+-    BN_free(g);
+-    return dhpkey;
+-}
+-
+ #ifndef OPENSSL_NO_PSK
+ /* convert the PSK key (psk_key) in ascii to binary (psk) */
+ static int psk_key2bn(const char *pskkey, unsigned char *psk,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032407.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032425.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32411">[ date ]</a>
+              <a href="thread.html#32411">[ thread ]</a>
+              <a href="subject.html#32411">[ subject ]</a>
+              <a href="author.html#32411">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

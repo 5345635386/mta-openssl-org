@@ -1,0 +1,852 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1549969696.652026.15578.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="021834.html">
+   <LINK REL="Next"  HREF="021852.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1549969696.652026.15578.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Tue Feb 12 11:08:16 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="021834.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="021852.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21847">[ date ]</a>
+              <a href="thread.html#21847">[ thread ]</a>
+              <a href="subject.html#21847">[ subject ]</a>
+              <a href="author.html#21847">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a40f0f6475711f01d32c4cdc39e54311b7e9c876 (commit)
+      from  dff298135b9b8bbaac1f452a219bb446e50728d1 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a40f0f6475711f01d32c4cdc39e54311b7e9c876
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Thu Jan 24 12:15:54 2019 +1000
+
+    Add sparse array data type.
+    
+    This commit adds a space and time efficient sparse array data structure.
+    The structure's raw API is wrapped by inline functions which provide type
+    safety.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8197">https://github.com/openssl/openssl/pull/8197</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/README.sparse_array                         | 155 +++++++++++++++
+ crypto/build.info                                  |   4 +-
+ crypto/include/internal/sparse_array.h             |  78 ++++++++
+ crypto/sparse_array.c                              | 213 +++++++++++++++++++++
+ doc/internal/man3/DEFINE_SPARSE_ARRAY_OF.pod       | 112 +++++++++++
+ test/build.info                                    |   6 +-
+ .../{02-test_lhash.t =&gt; 02-test_sparse_array.t}    |   6 +-
+ test/sparse_array_test.c                           | 103 ++++++++++
+ 8 files changed, 671 insertions(+), 6 deletions(-)
+ create mode 100644 crypto/README.sparse_array
+ create mode 100644 crypto/include/internal/sparse_array.h
+ create mode 100644 crypto/sparse_array.c
+ create mode 100644 doc/internal/man3/DEFINE_SPARSE_ARRAY_OF.pod
+ copy test/recipes/{02-test_lhash.t =&gt; 02-test_sparse_array.t} (63%)
+ create mode 100644 test/sparse_array_test.c
+
+diff --git a/crypto/README.sparse_array b/crypto/README.sparse_array
+new file mode 100644
+index 0000000..947c34d
+--- /dev/null
++++ b/crypto/README.sparse_array
+@@ -0,0 +1,155 @@
++The sparse_array.c file contains an implementation of a sparse array that
++attempts to be both space and time efficient.
++
++The sparse array is represented using a tree structure.  Each node in the
++tree contains a block of pointers to either the user supplied leaf values or
++to another node.
++
++There are a number of parameters used to define the block size:
++
++    OPENSSL_SA_BLOCK_BITS   Specifies the number of bits covered by each block
++    SA_BLOCK_MAX            Specifies the number of pointers in each block
++    SA_BLOCK_MASK           Specifies a bit mask to perform modulo block size
++    SA_BLOCK_MAX_LEVELS     Indicates the maximum possible height of the tree
++
++These constants are inter-related:
++    SA_BLOCK_MAX        = 2 ^ OPENSSL_SA_BLOCK_BITS
++    SA_BLOCK_MASK       = SA_BLOCK_MAX - 1
++    SA_BLOCK_MAX_LEVELS = number of bits in size_t divided by
++                          OPENSSL_SA_BLOCK_BITS rounded up to the next multiple
++                          of OPENSSL_SA_BLOCK_BITS
++
++OPENSSL_SA_BLOCK_BITS can be defined at compile time and this overrides the
++built in setting.
++
++As a space and performance optimisation, the height of the tree is usually
++less than the maximum possible height.  Only sufficient height is allocated to
++accommodate the largest index added to the data structure.
++
++The largest index used to add a value to the array determines the tree height:
++
++        +----------------------+---------------------+
++        | Largest Added Index  |   Height of Tree    |
++        +----------------------+---------------------+
++        | SA_BLOCK_MAX     - 1 |          1          |
++        | SA_BLOCK_MAX ^ 2 - 1 |          2          |
++        | SA_BLOCK_MAX ^ 3 - 1 |          3          |
++        | ...                  |          ...        |
++        | size_t max           | SA_BLOCK_MAX_LEVELS |
++        +----------------------+---------------------+
++
++The tree height is dynamically increased as needed based on additions.
++
++An empty tree is represented by a NULL root pointer.  Inserting a value at
++index 0 results in the allocation of a top level node full of null pointers
++except for the single pointer to the user's data (N = SA_BLOCK_MAX for
++breviety):
++
++        +----+
++        |Root|
++        |Node|
++        +-+--+
++          |
++          |
++          |
++          v
++        +-+-+---+---+---+---+
++        | 0 | 1 | 2 |...|N-1|
++        |   |nil|nil|...|nil|
++        +-+-+---+---+---+---+
++          |
++          |
++          |
++          v
++        +-+--+
++        |User|
++        |Data|
++        +----+
++    Index 0
++
++
++Inserting at element 2N+1 creates a new root node and pushes down the old root
++node.  It then creates a second second level node to hold the pointer to the
++user's new data:
++
++        +----+
++        |Root|
++        |Node|
++        +-+--+
++          |
++          |
++          |
++          v
++        +-+-+---+---+---+---+
++        | 0 | 1 | 2 |...|N-1|
++        |   |nil|   |...|nil|
++        +-+-+---+-+-+---+---+
++          |       |
++          |       +------------------+
++          |                          |
++          v                          v
++        +-+-+---+---+---+---+      +-+-+---+---+---+---+
++        | 0 | 1 | 2 |...|N-1|      | 0 | 1 | 2 |...|N-1|
++        |nil|   |nil|...|nil|      |nil|   |nil|...|nil|
++        +-+-+---+---+---+---+      +---+-+-+---+---+---+
++          |                              |
++          |                              |
++          |                              |
++          v                              v
++        +-+--+                         +-+--+
++        |User|                         |User|
++        |Data|                         |Data|
++        +----+                         +----+
++    Index 0                       Index 2N+1
++
++
++The nodes themselves are allocated in a sparse manner.  Only nodes which exist
++along a path from the root of the tree to an added leaf will be allocated.
++The complexity is hidden and nodes are allocated on an as needed basis.
++Because the data is expected to be sparse this doesn't result in a large waste
++of space.
++
++Values can be removed from the sparse array by setting their index position to
++NULL.  The data structure does not attempt to reclaim nodes or reduce the
++height of the tree on removal.  For example, now setting index 0 to NULL would
++result in:
++
++        +----+
++        |Root|
++        |Node|
++        +-+--+
++          |
++          |
++          |
++          v
++        +-+-+---+---+---+---+
++        | 0 | 1 | 2 |...|N-1|
++        |   |nil|   |...|nil|
++        +-+-+---+-+-+---+---+
++          |       |
++          |       +------------------+
++          |                          |
++          v                          v
++        +-+-+---+---+---+---+      +-+-+---+---+---+---+
++        | 0 | 1 | 2 |...|N-1|      | 0 | 1 | 2 |...|N-1|
++        |nil|nil|nil|...|nil|      |nil|   |nil|...|nil|
++        +---+---+---+---+---+      +---+-+-+---+---+---+
++                                         |
++                                         |
++                                         |
++                                         v
++                                       +-+--+
++                                       |User|
++                                       |Data|
++                                       +----+
++                                  Index 2N+1
++
++
++Accesses to elements in the sparse array take O(log n) time where n is the
++largest element.  The base of the logarithm is SA_BLOCK_MAX, so for moderately
++small indices (e.g. NIDs), single level (constant time) access is achievable.
++Space usage is O(minimum(m, n log(n)) where m is the number of elements in the
++array.
++
++Note: sparse arrays only include pointers to types.  Thus, SPARSE_ARRAY_OF(char)
++can be used to store a string.
+diff --git a/crypto/build.info b/crypto/build.info
+index 5e879ea..3b67315 100644
+--- a/crypto/build.info
++++ b/crypto/build.info
+@@ -12,8 +12,8 @@ SOURCE[../libcrypto]=\
+         cryptlib.c mem.c mem_dbg.c cversion.c ex_data.c cpt_err.c \
+         ebcdic.c uid.c o_time.c o_str.c o_dir.c o_fopen.c ctype.c \
+         threads_pthread.c threads_win.c threads_none.c getenv.c \
+-        o_init.c o_fips.c mem_sec.c init.c {- $target{cpuid_asm_src} -} \
+-        {- $target{uplink_aux_src} -}
++        o_init.c o_fips.c mem_sec.c init.c sparse_array.c \
++        {- $target{cpuid_asm_src} -} {- $target{uplink_aux_src} -}
+ 
+ DEPEND[cversion.o]=buildinf.h
+ GENERATE[buildinf.h]=../util/mkbuildinf.pl &quot;$(CC) $(LIB_CFLAGS) $(CPPFLAGS_Q)&quot; &quot;$(PLATFORM)&quot;
+diff --git a/crypto/include/internal/sparse_array.h b/crypto/include/internal/sparse_array.h
+new file mode 100644
+index 0000000..bf0a996
+--- /dev/null
++++ b/crypto/include/internal/sparse_array.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#ifndef HEADER_SPARSE_ARRAY_H
++# define HEADER_SPARSE_ARRAY_H
++
++# ifdef __cplusplus
++extern &quot;C&quot; {
++# endif
++
++# define SPARSE_ARRAY_OF(type) struct sparse_array_st_ ## type
++
++# define DEFINE_SPARSE_ARRAY_OF(type) \
++    SPARSE_ARRAY_OF(type); \
++    static ossl_inline SPARSE_ARRAY_OF(type) * \
++        ossl_sa_##type##_new(void) \
++    { \
++        return (SPARSE_ARRAY_OF(type) *)OPENSSL_SA_new(); \
++    } \
++    static ossl_inline void ossl_sa_##type##_free(SPARSE_ARRAY_OF(type) *sa) \
++    { \
++        OPENSSL_SA_free((OPENSSL_SA *)sa); \
++    } \
++    static ossl_inline void ossl_sa_##type##_free_leaves(SPARSE_ARRAY_OF(type) *sa) \
++    { \
++        OPENSSL_SA_free_leaves((OPENSSL_SA *)sa); \
++    } \
++    static ossl_inline size_t ossl_sa_##type##_num(const SPARSE_ARRAY_OF(type) *sa) \
++    { \
++        return OPENSSL_SA_num((OPENSSL_SA *)sa); \
++    } \
++    static ossl_inline void ossl_sa_##type##_doall(const SPARSE_ARRAY_OF(type) *sa, \
++                                                   void (*leaf)(type *)) \
++    { \
++        OPENSSL_SA_doall((OPENSSL_SA *)sa, (void (*)(void *))leaf); \
++    } \
++    static ossl_inline void ossl_sa_##type##_doall_arg(const SPARSE_ARRAY_OF(type) *sa, \
++                                                       void (*leaf)(type *, \
++						                    void *),\
++                                                       void *arg) \
++    { \
++        OPENSSL_SA_doall_arg((OPENSSL_SA *)sa, (void (*)(void *, void *))leaf, \
++                             arg); \
++    } \
++    static ossl_inline type *ossl_sa_##type##_get(const SPARSE_ARRAY_OF(type) *sa, \
++                                                  size_t n) \
++    { \
++        return (type *)OPENSSL_SA_get((OPENSSL_SA *)sa, n); \
++    } \
++    static ossl_inline int ossl_sa_##type##_set(SPARSE_ARRAY_OF(type) *sa, \
++                                                size_t n, type *val) \
++    { \
++        return OPENSSL_SA_set((OPENSSL_SA *)sa, n, (void *)val); \
++    } \
++    SPARSE_ARRAY_OF(type)
++
++typedef struct sparse_array_st OPENSSL_SA;
++OPENSSL_SA *OPENSSL_SA_new(void);
++void OPENSSL_SA_free(OPENSSL_SA *sa);
++void OPENSSL_SA_free_leaves(OPENSSL_SA *sa);
++size_t OPENSSL_SA_num(const OPENSSL_SA *sa);
++void OPENSSL_SA_doall(const OPENSSL_SA *sa, void (*leaf)(void *));
++void OPENSSL_SA_doall_arg(const OPENSSL_SA *sa, void (*leaf)(void *, void *),
++                          void *);
++void *OPENSSL_SA_get(const OPENSSL_SA *sa, size_t n);
++int OPENSSL_SA_set(OPENSSL_SA *sa, size_t n, void *val);
++
++# ifdef  __cplusplus
++}
++# endif
++#endif
+diff --git a/crypto/sparse_array.c b/crypto/sparse_array.c
+new file mode 100644
+index 0000000..8b56b25
+--- /dev/null
++++ b/crypto/sparse_array.c
+@@ -0,0 +1,213 @@
++/*
++ * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/crypto.h&gt;
++#include &quot;internal/sparse_array.h&quot;
++
++/*
++ * How many bits are used to index each level in the tree structre?
++ * This setting determines the number of pointers stored in each node of the
++ * tree used to represent the sparse array.  Having more pointers reduces the
++ * depth of the tree but potentially wastes more memory.  That is, this is a
++ * direct space versus time tradeoff.
++ *
++ * The large memory model uses twelve bits which means that the are 4096
++ * pointers in each tree node.  This is more than sufficient to hold the
++ * largest defined NID (as of Feb 2019).  This means that using a NID to
++ * index a sparse array becomes a constant time single array look up.
++ *
++ * The small memory model uses four bits which means the tree nodes contain
++ * sixteen pointers.  This reduces the amount of unused space significantly
++ * at a cost in time.
++ *
++ * The library builder is also permitted to define other sizes in the closed
++ * interval [2, sizeof(size_t) * 8].
++ */
++#ifndef OPENSSL_SA_BLOCK_BITS
++# ifdef OPENSSL_SMALL_FOOTPRINT
++#  define OPENSSL_SA_BLOCK_BITS           4
++# else
++#  define OPENSSL_SA_BLOCK_BITS           12
++# endif
++#elif OPENSSL_SA_BLOCK_BITS &lt; 2 || OPENSSL_SA_BLOCK_BITS &gt; BN_BITS2
++# error OPENSSL_SA_BLOCK_BITS is out of range
++#endif
++
++/*
++ * From the number of bits, work out:
++ *    the number of pointers in a tree node;
++ *    a bit mask to quickly extra an index and
++ *    the maximum depth of the tree structure.
++  */
++#define SA_BLOCK_MAX            (1 &lt;&lt; OPENSSL_SA_BLOCK_BITS)
++#define SA_BLOCK_MASK           (SA_BLOCK_MAX - 1)
++#define SA_BLOCK_MAX_LEVELS     (((int)sizeof(size_t) * 8 \
++                                  + OPENSSL_SA_BLOCK_BITS - 1) \
++                                 / OPENSSL_SA_BLOCK_BITS)
++
++struct sparse_array_st {
++    int levels;
++    size_t top;
++    size_t nelem;
++    void **nodes;
++};
++
++OPENSSL_SA *OPENSSL_SA_new(void)
++{
++    OPENSSL_SA *res = OPENSSL_zalloc(sizeof(*res));
++
++    return res;
++}
++
++static void sa_doall(const OPENSSL_SA *sa, void (*node)(void **),
++                     void (*leaf)(void *, void *), void *arg)
++{
++    int i[SA_BLOCK_MAX_LEVELS];
++    void *nodes[SA_BLOCK_MAX_LEVELS];
++    int l = 0;
++
++    i[0] = 0;
++    nodes[0] = sa-&gt;nodes;
++    while (l &gt;= 0) {
++        const int n = i[l];
++        void ** const p = nodes[l];
++
++        if (n &gt;= SA_BLOCK_MAX) {
++            if (p != NULL &amp;&amp; node != NULL)
++                (*node)(p);
++            l--;
++        } else {
++            i[l] = n + 1;
++            if (p != NULL &amp;&amp; p[n] != NULL) {
++                if (l &lt; sa-&gt;levels - 1) {
++                    i[++l] = 0;
++                    nodes[l] = p[n];
++                } else if (leaf != NULL) {
++                    (*leaf)(p[n], arg);
++                }
++            }
++        }
++    }
++}
++
++static void sa_free_node(void **p)
++{
++    OPENSSL_free(p);
++}
++
++static void sa_free_leaf(void *p, void *arg)
++{
++    OPENSSL_free(p);
++}
++
++void OPENSSL_SA_free(OPENSSL_SA *sa)
++{
++    sa_doall(sa, &amp;sa_free_node, NULL, NULL);
++    OPENSSL_free(sa);
++}
++
++void OPENSSL_SA_free_leaves(OPENSSL_SA *sa)
++{
++    sa_doall(sa, &amp;sa_free_node, &amp;sa_free_leaf, NULL);
++    OPENSSL_free(sa);
++}
++
++/* Wrap this in a structure to avoid compiler warnings */
++struct trampoline_st {
++    void (*func)(void *);
++};
++
++static void trampoline(void *l, void *arg)
++{
++    ((const struct trampoline_st *)arg)-&gt;func(l);
++}
++
++void OPENSSL_SA_doall(const OPENSSL_SA *sa, void (*leaf)(void *))
++{
++    struct trampoline_st tramp;
++
++    tramp.func = leaf;
++    if (sa != NULL)
++        sa_doall(sa, NULL, &amp;trampoline, &amp;tramp);
++}
++
++void OPENSSL_SA_doall_arg(const OPENSSL_SA *sa, void (*leaf)(void *, void *),
++                          void *arg)
++{
++    if (sa != NULL)
++        sa_doall(sa, NULL, leaf, arg);
++}
++
++size_t OPENSSL_SA_num(const OPENSSL_SA *sa)
++{
++    return sa == NULL ? 0 : sa-&gt;nelem;
++}
++
++void *OPENSSL_SA_get(const OPENSSL_SA *sa, size_t n)
++{
++    int level;
++    void **p, *r = NULL;
++
++    if (sa == NULL)
++        return NULL;
++
++    if (n &lt;= sa-&gt;top) {
++        p = sa-&gt;nodes;
++        for (level = sa-&gt;levels - 1; p != NULL &amp;&amp; level &gt; 0; level--)
++            p = (void **)p[(n &gt;&gt; (OPENSSL_SA_BLOCK_BITS * level))
++                           &amp; SA_BLOCK_MASK];
++        r = p == NULL ? NULL : p[n &amp; SA_BLOCK_MASK];
++    }
++    return r;
++}
++
++static ossl_inline void **alloc_node(void)
++{
++    return OPENSSL_zalloc(SA_BLOCK_MAX * sizeof(void *));
++}
++
++int OPENSSL_SA_set(OPENSSL_SA *sa, size_t posn, void *val)
++{
++    int i, level = 1;
++    size_t n = posn;
++    void **p;
++
++    if (sa == NULL)
++        return 0;
++
++    for (level = 1; level &lt;= SA_BLOCK_MAX_LEVELS; level++)
++        if ((n &gt;&gt;= OPENSSL_SA_BLOCK_BITS) == 0)
++            break;
++
++    for (;sa-&gt;levels &lt; level; sa-&gt;levels++) {
++        p = alloc_node();
++        if (p == NULL)
++            return 0;
++        p[0] = sa-&gt;nodes;
++        sa-&gt;nodes = p;
++    }
++    if (sa-&gt;top &lt; posn)
++        sa-&gt;top = posn;
++
++    p = sa-&gt;nodes;
++    for (level = sa-&gt;levels - 1; level &gt; 0; level--) {
++        i = (posn &gt;&gt; (OPENSSL_SA_BLOCK_BITS * level)) &amp; SA_BLOCK_MASK;
++        if (p[i] == NULL &amp;&amp; (p[i] = alloc_node()) == NULL)
++            return 0;
++        p = p[i];
++    }
++    p += posn &amp; SA_BLOCK_MASK;
++    if (val == NULL &amp;&amp; *p != NULL)
++        sa-&gt;nelem--;
++    else if (val != NULL &amp;&amp; *p == NULL)
++        sa-&gt;nelem++;
++    *p = val;
++    return 1;
++}
+diff --git a/doc/internal/man3/DEFINE_SPARSE_ARRAY_OF.pod b/doc/internal/man3/DEFINE_SPARSE_ARRAY_OF.pod
+new file mode 100644
+index 0000000..146f02d
+--- /dev/null
++++ b/doc/internal/man3/DEFINE_SPARSE_ARRAY_OF.pod
+@@ -0,0 +1,112 @@
++=pod
++
++=head1 NAME
++
++DEFINE_SPARSE_ARRAY_OF, ossl_sa_TYPE_new, ossl_sa_TYPE_free,
++ossl_sa_TYPE_free_leaves, ossl_sa_TYPE_num, ossl_sa_TYPE_doall,
++ossl_sa_TYPE_doall_arg, ossl_sa_TYPE_get, ossl_sa_TYPE_set
++- sparse array container
++
++=head1 SYNOPSIS
++
++ #include &quot;internal/sparse_array.h&quot;
++
++ typedef struct sparse_array_st OPENSSL_SA;
++
++ SPARSE_ARRAY_OF(TYPE)
++ DEFINE_SPARSE_ARRAY_OF(TYPE)
++
++ SPARSE_ARRAY_OF(TYPE) *ossl_sa_TYPE_new(void);
++ void ossl_sa_TYPE_free(const SPARSE_ARRAY_OF(TYPE) *sa);
++ void ossl_sa_TYPE_free_leaves(const SPARSE_ARRAY_OF(TYPE) *sa);
++ int ossl_sa_TYPE_num(const SPARSE_ARRAY_OF(TYPE) *sa);
++ void ossl_sa_TYPE_doall(const OPENSSL_SA *sa, void (*leaf)(void *));
++ void ossl_sa_TYPE_doall_arg(const OPENSSL_SA *sa, void (*leaf)(void *), void *arg);
++ TYPE *ossl_sa_TYPE_get(const SPARSE_ARRAY_OF(TYPE) *sa, size_t idx);
++ int ossl_sa_TYPE_set(SPARSE_ARRAY_OF(TYPE) *sa, size_t idx, TYPE *value);
++
++=head1 DESCRIPTION
++
++SPARSE_ARRAY_OF() returns the name for a sparse array of the specified
++B&lt;TYPE&gt;.  DEFINE_STACK_OF() creates set of functions for a sparse array of
++B&lt;TYPE&gt;. This will mean that a pointer to type B&lt;TYPE&gt; is stored in each
++element of a sparse array, the type is referenced by SPARSE_ARRAY_OF(TYPE) and
++each function name begins with I&lt;ossl_sa_TYPE_&gt;. For example:
++
++ TYPE *ossl_sa_TYPE_get(SPARSE_ARRAY_OF(TYPE) *sa, size_t idx);
++
++ossl_sa_TYPE_num() returns the number of elements in B&lt;sa&gt; or 0 if B&lt;sa&gt; is
++B&lt;NULL&gt;.
++
++ossl_sa_TYPE_get() returns element B&lt;idx&gt; in B&lt;sa&gt;, where B&lt;idx&gt; starts at
++zero. If B&lt;idx&gt; refers to a value that has not been set then B&lt;NULL&gt; is
++returned.
++
++ossl_sa_TYPE_set() sets element B&lt;idx&gt; in B&lt;sa&gt; to B&lt;value&gt;, where B&lt;idx&gt;
++starts at zero. The sparse array will be resized as required.
++
++ossl_sa_TYPE_new() allocates a new empty sparse array.
++
++ossl_sa_TYPE_free() frees up the B&lt;sa&gt; structure. It does B&lt;not&gt; free up any
++elements of B&lt;sa&gt;. After this call B&lt;sa&gt; is no longer valid.
++
++ossl_sa_TYPE_free_leaves() frees up the B&lt;sa&gt; structure and all of its
++elements.  After this call B&lt;sa&gt; is no longer valid.
++
++ossl_sa_TYPE_doall() calls the function B&lt;leaf&gt; for each element in B&lt;sa&gt; in
++ascending index order.
++
++ossl_sa_TYPE_doall_arg() calls the function B&lt;leaf&gt; for each element in B&lt;sa&gt;
++in ascending index order. The argument B&lt;arg&gt; is passed to each call of
++B&lt;leaf&gt;.
++
++=head1 NOTES
++
++Sparse arrays are an internal data structure and should B&lt;not&gt; be used by user
++applications.
++
++Care should be taken when accessing sparse arrays in multi-threaded
++environments.  The ossl_sa_TYPE_set operation can cause the internal structure
++of the sparse array to change which causes race conditions if the sparse array
++is accessed in a different thread.
++
++SPARSE_ARRAY_OF() and DEFINE_SPARSE_ARRAY_OF() are implemented as macros.
++
++The underlying utility B&lt;OPENSSL_SA_&gt; API should not be used directly.  It
++defines these functions: OPENSSL_SA_doall, OPENSSL_SA_doall_arg,
++OPENSSL_SA_free, OPENSSL_SA_free_leaves, OPENSSL_SA_get, OPENSSL_SA_new,
++OPENSSL_SA_num and OPENSSL_SA_set.
++
++=head1 RETURN VALUES
++
++ossl_sa_TYPE_num() returns the number of elements in the sparse array or B&lt;0&gt;
++if the passed sparse array is B&lt;NULL&gt;.
++
++ossl_sa_TYPE_get() returns a pointer to a sparse array element or B&lt;NULL&gt; if
++the element has not be set.
++
++ossl_sa_TYPE_set() return B&lt;1&gt; on success and B&lt;0&gt; on error. In the latter
++case, the elements of the sparse array remain unchanged, although the internal
++structures might have.
++
++ossl_sa_TYPE_new() returns an empty sparse array or B&lt;NULL&gt; if an error
++occurs.
++
++ossl_sa_TYPE_doall, ossl_sa_TYPE_doall_arg, ossl_sa_TYPE_free() and
++ossl_sa_TYPE_free_leaves() do not return values.
++
++=head1 HISTORY
++
++This functionality was added to OpenSSL 3.0.0.
++
++=head1 COPYRIGHT
++
++Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.  Copyright
++(c) 2019, Oracle and/or its affiliates.  All rights reserved.
++
++Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use this
++file except in compliance with the License.  You can obtain a copy in the file
++LICENSE in the source distribution or at
++L&lt;<A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>&gt;.
++
++=cut
+diff --git a/test/build.info b/test/build.info
+index 4c29beb..b2b7375 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -30,7 +30,7 @@ IF[{- !$disabled{tests} -}]
+           dhtest enginetest casttest \
+           bftest ssltest_old dsatest dsa_no_digest_size_test exptest rsa_test \
+           evp_test evp_extra_test igetest v3nametest v3ext \
+-          crltest danetest bad_dtls_test lhash_test \
++          crltest danetest bad_dtls_test lhash_test sparse_array_test \
+           conf_include_test \
+           constant_time_test verify_extra_test clienthellotest \
+           packettest asynctest secmemtest srptest memleaktest stack_test \
+@@ -488,6 +488,10 @@ IF[{- !$disabled{tests} -}]
+     INCLUDE[ctype_internal_test]=.. ../crypto/include ../include
+     DEPEND[ctype_internal_test]=../libcrypto.a libtestutil.a
+ 
++    SOURCE[sparse_array_test]=sparse_array_test.c
++    INCLUDE[sparse_array_test]=../crypto/include ../include
++    DEPEND[sparse_array_test]=../libcrypto.a libtestutil.a
++
+     SOURCE[siphash_internal_test]=siphash_internal_test.c
+     INCLUDE[siphash_internal_test]=.. ../include ../crypto/include
+     DEPEND[siphash_internal_test]=../libcrypto.a libtestutil.a
+diff --git a/test/recipes/02-test_lhash.t b/test/recipes/02-test_sparse_array.t
+similarity index 63%
+copy from test/recipes/02-test_lhash.t
+copy to test/recipes/02-test_sparse_array.t
+index 5f1f1b6..ee4a63e 100644
+--- a/test/recipes/02-test_lhash.t
++++ b/test/recipes/02-test_sparse_array.t
+@@ -1,6 +1,6 @@
+ #! /usr/bin/env perl
+-# Copyright 2017 The OpenSSL Project Authors. All Rights Reserved.
+-# Copyright (c) 2017, Oracle and/or its affiliates.  All rights reserved.
++# Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
+ #
+ # Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -9,4 +9,4 @@
+ 
+ use OpenSSL::Test::Simple;
+ 
+-simple_test(&quot;test_lhash&quot;, &quot;lhash_test&quot;);
++simple_test(&quot;test_sparse_array&quot;, &quot;sparse_array_test&quot;);
+diff --git a/test/sparse_array_test.c b/test/sparse_array_test.c
+new file mode 100644
+index 0000000..295ccb0
+--- /dev/null
++++ b/test/sparse_array_test.c
+@@ -0,0 +1,103 @@
++/*
++ * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;limits.h&gt;
++
++#include &lt;openssl/crypto.h&gt;
++#include &lt;internal/nelem.h&gt;
++
++#include &quot;internal/sparse_array.h&quot;
++#include &quot;testutil.h&quot;
++
++/* The macros below generate unused functions which error out one of the clang
++ * builds.  We disable this check here.
++ */
++#ifdef __clang__
++#pragma clang diagnostic ignored &quot;-Wunused-function&quot;
++#endif
++
++DEFINE_SPARSE_ARRAY_OF(char);
++
++static int test_sparse_array(void)
++{
++    static const struct {
++        size_t n;
++        char *v;
++    } cases[] = {
++        { 22, &quot;a&quot; }, { 0, &quot;z&quot; }, { 1, &quot;b&quot; }, { 290, &quot;c&quot; },
++        { INT_MAX, &quot;m&quot; }, { 6666666, &quot;d&quot; }, { (size_t)-1, &quot;H&quot; },
++        { 99, &quot;e&quot; }
++    };
++    SPARSE_ARRAY_OF(char) *sa;
++    size_t i, j;
++    int res = 0;
++
++    if (!TEST_ptr(sa = ossl_sa_char_new())
++            || !TEST_ptr_null(ossl_sa_char_get(sa, 3))
++            || !TEST_ptr_null(ossl_sa_char_get(sa, 0))
++            || !TEST_ptr_null(ossl_sa_char_get(sa, UINT_MAX)))
++        goto err;
++
++    for (i = 0; i &lt; OSSL_NELEM(cases); i++) {
++        if (!TEST_true(ossl_sa_char_set(sa, cases[i].n, cases[i].v))) {
++            TEST_note(&quot;iteration %zu&quot;, i + 1);
++            goto err;
++        }
++        for (j = 0; j &lt;= i; j++)
++            if (!TEST_str_eq(ossl_sa_char_get(sa, cases[j].n), cases[j].v)) {
++                TEST_note(&quot;iteration %zu / %zu&quot;, i + 1, j + 1);
++                goto err;
++            }
++    }
++
++    res = 1;
++err:
++    ossl_sa_char_free(sa);
++    return res;
++}
++
++static int test_sparse_array_num(void)
++{
++    static const struct {
++        size_t num;
++        size_t n;
++        char *v;
++    } cases[] = {
++        { 1, 22, &quot;a&quot; }, { 2, 1021, &quot;b&quot; }, { 3, 3, &quot;c&quot; }, { 2, 22, NULL },
++        { 2, 3, &quot;d&quot; }, { 3, 22, &quot;e&quot; }, { 3, 666, NULL }, { 4, 666, &quot;f&quot; },
++        { 3, 3, NULL }, { 2, 22, NULL }, { 1, 666, NULL }, { 2, 64000, &quot;g&quot; },
++        { 1, 1021, NULL }, { 0, 64000, NULL }, { 1, 23, &quot;h&quot; }, { 0, 23, NULL }
++    };
++    SPARSE_ARRAY_OF(char) *sa = NULL;
++    size_t i;
++    int res = 0;
++
++    if (!TEST_size_t_eq(ossl_sa_char_num(NULL), 0)
++            || !TEST_ptr(sa = ossl_sa_char_new())
++            || !TEST_size_t_eq(ossl_sa_char_num(sa), 0))
++        goto err;
++    for (i = 0; i &lt; OSSL_NELEM(cases); i++)
++        if (!TEST_true(ossl_sa_char_set(sa, cases[i].n, cases[i].v))
++                || !TEST_size_t_eq(ossl_sa_char_num(sa), cases[i].num))
++            goto err;
++    res = 1;
++err:
++    ossl_sa_char_free(sa);
++    return res;
++}
++
++int setup_tests(void)
++{
++    ADD_TEST(test_sparse_array);
++    ADD_TEST(test_sparse_array_num);
++    return 1;
++}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="021834.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="021852.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21847">[ date ]</a>
+              <a href="thread.html#21847">[ thread ]</a>
+              <a href="subject.html#21847">[ subject ]</a>
+              <a href="author.html#21847">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,480 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  openssl-3.0 update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1636731720.561926.238434.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035642.html">
+   <LINK REL="Next"  HREF="035644.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  openssl-3.0 update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1636731720.561926.238434.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  openssl-3.0 update">tomas at openssl.org
+       </A><BR>
+    <I>Fri Nov 12 15:42:00 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="035642.html">[openssl]  openssl-3.0 update
+</A></li>
+        <LI>Next message (by thread): <A HREF="035644.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35643">[ date ]</a>
+              <a href="thread.html#35643">[ thread ]</a>
+              <a href="subject.html#35643">[ subject ]</a>
+              <a href="author.html#35643">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch openssl-3.0 has been updated
+       via  433c6cab4b4bc187f8120dc2ca0505f81d7b56e6 (commit)
+      from  2e11cb796e1b46159615625c1df34800a1ebae94 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 433c6cab4b4bc187f8120dc2ca0505f81d7b56e6
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Thu Nov 4 15:38:51 2021 +0100
+
+    providers: Allow possible reinitialization in all signature algorithms
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16964">https://github.com/openssl/openssl/pull/16964</A>)
+    
+    (cherry picked from commit 3ffd23e9529d725903bc97fd45489a77b831876f)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/implementations/signature/dsa_sig.c      | 40 ++++++++++++++--------
+ providers/implementations/signature/ecdsa_sig.c    | 36 +++++++++++++------
+ providers/implementations/signature/eddsa_sig.c    |  9 +++++
+ .../implementations/signature/mac_legacy_sig.c     |  9 +++--
+ providers/implementations/signature/rsa_sig.c      | 31 ++++++++++-------
+ providers/implementations/signature/sm2_sig.c      | 33 +++++++++++++-----
+ 6 files changed, 108 insertions(+), 50 deletions(-)
+
+diff --git a/providers/implementations/signature/dsa_sig.c b/providers/implementations/signature/dsa_sig.c
+index 2acab0b481..28fd7c498e 100644
+--- a/providers/implementations/signature/dsa_sig.c
++++ b/providers/implementations/signature/dsa_sig.c
+@@ -189,22 +189,31 @@ static int dsa_signverify_init(void *vpdsactx, void *vdsa,
+     PROV_DSA_CTX *pdsactx = (PROV_DSA_CTX *)vpdsactx;
+ 
+     if (!ossl_prov_is_running()
+-            || pdsactx == NULL
+-            || vdsa == NULL
+-            || !DSA_up_ref(vdsa))
++            || pdsactx == NULL)
+         return 0;
+-    DSA_free(pdsactx-&gt;dsa);
+-    pdsactx-&gt;dsa = vdsa;
++
++    if (vdsa == NULL &amp;&amp; pdsactx-&gt;dsa == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
++        return 0;
++    }
++
++    if (vdsa != NULL) {
++        if (!ossl_dsa_check_key(pdsactx-&gt;libctx, vdsa,
++                                operation == EVP_PKEY_OP_SIGN)) {
++            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY_LENGTH);
++            return 0;
++        }
++        if (!DSA_up_ref(vdsa))
++            return 0;
++        DSA_free(pdsactx-&gt;dsa);
++        pdsactx-&gt;dsa = vdsa;
++    }
++
+     pdsactx-&gt;operation = operation;
+ 
+     if (!dsa_set_ctx_params(pdsactx, params))
+         return 0;
+ 
+-    if (!ossl_dsa_check_key(pdsactx-&gt;libctx, vdsa,
+-                            operation == EVP_PKEY_OP_SIGN)) {
+-        ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY_LENGTH);
+-        return 0;
+-    }
+     return 1;
+ }
+ 
+@@ -278,9 +287,12 @@ static int dsa_digest_signverify_init(void *vpdsactx, const char *mdname,
+         return 0;
+ 
+     pdsactx-&gt;flag_allow_md = 0;
+-    pdsactx-&gt;mdctx = EVP_MD_CTX_new();
+-    if (pdsactx-&gt;mdctx == NULL)
+-        goto error;
++
++    if (pdsactx-&gt;mdctx == NULL) {
++        pdsactx-&gt;mdctx = EVP_MD_CTX_new();
++        if (pdsactx-&gt;mdctx == NULL)
++            goto error;
++    }
+ 
+     if (!EVP_DigestInit_ex2(pdsactx-&gt;mdctx, pdsactx-&gt;md, params))
+         goto error;
+@@ -289,9 +301,7 @@ static int dsa_digest_signverify_init(void *vpdsactx, const char *mdname,
+ 
+  error:
+     EVP_MD_CTX_free(pdsactx-&gt;mdctx);
+-    EVP_MD_free(pdsactx-&gt;md);
+     pdsactx-&gt;mdctx = NULL;
+-    pdsactx-&gt;md = NULL;
+     return 0;
+ }
+ 
+diff --git a/providers/implementations/signature/ecdsa_sig.c b/providers/implementations/signature/ecdsa_sig.c
+index 64be0657c3..865d49d100 100644
+--- a/providers/implementations/signature/ecdsa_sig.c
++++ b/providers/implementations/signature/ecdsa_sig.c
+@@ -131,16 +131,29 @@ static int ecdsa_signverify_init(void *vctx, void *ec,
+     PROV_ECDSA_CTX *ctx = (PROV_ECDSA_CTX *)vctx;
+ 
+     if (!ossl_prov_is_running()
+-            || ctx == NULL
+-            || ec == NULL
+-            || !EC_KEY_up_ref(ec))
++            || ctx == NULL)
+         return 0;
+-    EC_KEY_free(ctx-&gt;ec);
+-    ctx-&gt;ec = ec;
++
++    if (ec == NULL &amp;&amp; ctx-&gt;ec == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
++        return 0;
++    }
++
++    if (ec != NULL) {
++        if (!ossl_ec_check_key(ctx-&gt;libctx, ec, operation == EVP_PKEY_OP_SIGN))
++            return 0;
++        if (!EC_KEY_up_ref(ec))
++            return 0;
++        EC_KEY_free(ctx-&gt;ec);
++        ctx-&gt;ec = ec;
++    }
++
+     ctx-&gt;operation = operation;
++
+     if (!ecdsa_set_ctx_params(ctx, params))
+         return 0;
+-    return ossl_ec_check_key(ctx-&gt;libctx, ec, operation == EVP_PKEY_OP_SIGN);
++
++    return 1;
+ }
+ 
+ static int ecdsa_sign_init(void *vctx, void *ec, const OSSL_PARAM params[])
+@@ -279,18 +292,19 @@ static int ecdsa_digest_signverify_init(void *vctx, const char *mdname,
+         return 0;
+ 
+     ctx-&gt;flag_allow_md = 0;
+-    ctx-&gt;mdctx = EVP_MD_CTX_new();
+-    if (ctx-&gt;mdctx == NULL)
+-        goto error;
++
++    if (ctx-&gt;mdctx == NULL) {
++        ctx-&gt;mdctx = EVP_MD_CTX_new();
++        if (ctx-&gt;mdctx == NULL)
++            goto error;
++    }
+ 
+     if (!EVP_DigestInit_ex2(ctx-&gt;mdctx, ctx-&gt;md, params))
+         goto error;
+     return 1;
+ error:
+     EVP_MD_CTX_free(ctx-&gt;mdctx);
+-    EVP_MD_free(ctx-&gt;md);
+     ctx-&gt;mdctx = NULL;
+-    ctx-&gt;md = NULL;
+     return 0;
+ }
+ 
+diff --git a/providers/implementations/signature/eddsa_sig.c b/providers/implementations/signature/eddsa_sig.c
+index 148c143cc0..eb1a769128 100644
+--- a/providers/implementations/signature/eddsa_sig.c
++++ b/providers/implementations/signature/eddsa_sig.c
+@@ -100,6 +100,14 @@ static int eddsa_digest_signverify_init(void *vpeddsactx, const char *mdname,
+         return 0;
+     }
+ 
++    if (edkey == NULL) {
++        if (peddsactx-&gt;key != NULL)
++            /* there is nothing to do on reinit */
++            return 1;
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
++        return 0;
++    }
++
+     if (!ossl_ecx_key_up_ref(edkey)) {
+         ERR_raise(ERR_LIB_PROV, ERR_R_INTERNAL_ERROR);
+         return 0;
+@@ -124,6 +132,7 @@ static int eddsa_digest_signverify_init(void *vpeddsactx, const char *mdname,
+     default:
+         /* Should never happen */
+         ERR_raise(ERR_LIB_PROV, ERR_R_INTERNAL_ERROR);
++        ossl_ecx_key_free(edkey);
+         return 0;
+     }
+     if (ret &amp;&amp; WPACKET_finish(&amp;pkt)) {
+diff --git a/providers/implementations/signature/mac_legacy_sig.c b/providers/implementations/signature/mac_legacy_sig.c
+index 0866e68d9b..6be605c8c6 100644
+--- a/providers/implementations/signature/mac_legacy_sig.c
++++ b/providers/implementations/signature/mac_legacy_sig.c
+@@ -16,6 +16,7 @@
+ #include &lt;openssl/core_names.h&gt;
+ #include &lt;openssl/params.h&gt;
+ #include &lt;openssl/err.h&gt;
++#include &lt;openssl/proverr.h&gt;
+ #ifndef FIPS_MODULE
+ # include &lt;openssl/engine.h&gt;
+ #endif
+@@ -101,10 +102,14 @@ static int mac_digest_sign_init(void *vpmacctx, const char *mdname, void *vkey,
+     const char *ciphername = NULL, *engine = NULL;
+ 
+     if (!ossl_prov_is_running()
+-        || pmacctx == NULL
+-        || (pmacctx-&gt;key == NULL &amp;&amp; vkey == NULL))
++        || pmacctx == NULL)
+         return 0;
+ 
++    if (pmacctx-&gt;key == NULL &amp;&amp; vkey == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
++        return 0;
++    }
++
+     if (vkey != NULL) {
+         if (!ossl_mac_key_up_ref(vkey))
+             return 0;
+diff --git a/providers/implementations/signature/rsa_sig.c b/providers/implementations/signature/rsa_sig.c
+index 298d789b74..7dcdf952a3 100644
+--- a/providers/implementations/signature/rsa_sig.c
++++ b/providers/implementations/signature/rsa_sig.c
+@@ -386,19 +386,24 @@ static int rsa_signverify_init(void *vprsactx, void *vrsa,
+ {
+     PROV_RSA_CTX *prsactx = (PROV_RSA_CTX *)vprsactx;
+ 
+-    if (!ossl_prov_is_running())
++    if (!ossl_prov_is_running() || prsactx == NULL)
+         return 0;
+ 
+-    if (prsactx == NULL || vrsa == NULL)
++    if (vrsa == NULL &amp;&amp; prsactx-&gt;rsa == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
+         return 0;
++    }
+ 
+-    if (!ossl_rsa_check_key(prsactx-&gt;libctx, vrsa, operation))
+-        return 0;
++    if (vrsa != NULL) {
++        if (!ossl_rsa_check_key(prsactx-&gt;libctx, vrsa, operation))
++            return 0;
++
++        if (!RSA_up_ref(vrsa))
++            return 0;
++        RSA_free(prsactx-&gt;rsa);
++        prsactx-&gt;rsa = vrsa;
++    }
+ 
+-    if (!RSA_up_ref(vrsa))
+-        return 0;
+-    RSA_free(prsactx-&gt;rsa);
+-    prsactx-&gt;rsa = vrsa;
+     prsactx-&gt;operation = operation;
+ 
+     if (!rsa_set_ctx_params(prsactx, params))
+@@ -842,6 +847,7 @@ static int rsa_digest_signverify_init(void *vprsactx, const char *mdname,
+ 
+     if (!rsa_signverify_init(vprsactx, vrsa, params, operation))
+         return 0;
++
+     if (mdname != NULL
+         /* was rsa_setup_md already called in rsa_signverify_init()? */
+         &amp;&amp; (mdname[0] == '\0' || strcasecmp(prsactx-&gt;mdname, mdname) != 0)
+@@ -849,10 +855,11 @@ static int rsa_digest_signverify_init(void *vprsactx, const char *mdname,
+         return 0;
+ 
+     prsactx-&gt;flag_allow_md = 0;
+-    prsactx-&gt;mdctx = EVP_MD_CTX_new();
++
+     if (prsactx-&gt;mdctx == NULL) {
+-        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+-        goto error;
++        prsactx-&gt;mdctx = EVP_MD_CTX_new();
++        if (prsactx-&gt;mdctx == NULL)
++            goto error;
+     }
+ 
+     if (!EVP_DigestInit_ex2(prsactx-&gt;mdctx, prsactx-&gt;md, params))
+@@ -862,9 +869,7 @@ static int rsa_digest_signverify_init(void *vprsactx, const char *mdname,
+ 
+  error:
+     EVP_MD_CTX_free(prsactx-&gt;mdctx);
+-    EVP_MD_free(prsactx-&gt;md);
+     prsactx-&gt;mdctx = NULL;
+-    prsactx-&gt;md = NULL;
+     return 0;
+ }
+ 
+diff --git a/providers/implementations/signature/sm2_sig.c b/providers/implementations/signature/sm2_sig.c
+index 10a9496904..3c700ac887 100644
+--- a/providers/implementations/signature/sm2_sig.c
++++ b/providers/implementations/signature/sm2_sig.c
+@@ -27,6 +27,7 @@
+ #include &quot;internal/cryptlib.h&quot;
+ #include &quot;internal/sm3.h&quot;
+ #include &quot;prov/implementations.h&quot;
++#include &quot;prov/providercommon.h&quot;
+ #include &quot;prov/provider_ctx.h&quot;
+ #include &quot;crypto/ec.h&quot;
+ #include &quot;crypto/sm2.h&quot;
+@@ -97,6 +98,9 @@ static int sm2sig_set_mdname(PROV_SM2_CTX *psm2ctx, const char *mdname)
+     if (psm2ctx-&gt;md == NULL)
+         return 0;
+ 
++    if (mdname == NULL)
++        return 1;
++
+     if (strlen(mdname) &gt;= sizeof(psm2ctx-&gt;mdname)
+         || !EVP_MD_is_a(psm2ctx-&gt;md, mdname)) {
+         ERR_raise_data(ERR_LIB_PROV, PROV_R_INVALID_DIGEST, &quot;digest=%s&quot;,
+@@ -131,10 +135,22 @@ static int sm2sig_signature_init(void *vpsm2ctx, void *ec,
+ {
+     PROV_SM2_CTX *psm2ctx = (PROV_SM2_CTX *)vpsm2ctx;
+ 
+-    if (psm2ctx == NULL || ec == NULL || !EC_KEY_up_ref(ec))
++    if (!ossl_prov_is_running()
++            || psm2ctx == NULL)
++        return 0;
++
++    if (ec == NULL &amp;&amp; psm2ctx-&gt;ec == NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_NO_KEY_SET);
+         return 0;
+-    EC_KEY_free(psm2ctx-&gt;ec);
+-    psm2ctx-&gt;ec = ec;
++    }
++
++    if (ec != NULL) {
++        if (!EC_KEY_up_ref(ec))
++            return 0;
++        EC_KEY_free(psm2ctx-&gt;ec);
++        psm2ctx-&gt;ec = ec;
++    }
++
+     return sm2sig_set_ctx_params(psm2ctx, params);
+ }
+ 
+@@ -197,10 +213,11 @@ static int sm2sig_digest_signverify_init(void *vpsm2ctx, const char *mdname,
+         || !sm2sig_set_mdname(ctx, mdname))
+         return ret;
+ 
+-    EVP_MD_CTX_free(ctx-&gt;mdctx);
+-    ctx-&gt;mdctx = EVP_MD_CTX_new();
+-    if (ctx-&gt;mdctx == NULL)
+-        goto error;
++    if (ctx-&gt;mdctx == NULL) {
++        ctx-&gt;mdctx = EVP_MD_CTX_new();
++        if (ctx-&gt;mdctx == NULL)
++            goto error;
++    }
+ 
+     md_nid = EVP_MD_get_type(ctx-&gt;md);
+ 
+@@ -228,8 +245,6 @@ static int sm2sig_digest_signverify_init(void *vpsm2ctx, const char *mdname,
+     ret = 1;
+ 
+  error:
+-    if (!ret)
+-        free_md(ctx);
+     return ret;
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="035642.html">[openssl]  openssl-3.0 update
+</A></li>
+	<LI>Next message (by thread): <A HREF="035644.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35643">[ date ]</a>
+              <a href="thread.html#35643">[ thread ]</a>
+              <a href="subject.html#35643">[ subject ]</a>
+              <a href="author.html#35643">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,389 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1600023265.774089.28612.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030647.html">
+   <LINK REL="Next"  HREF="030656.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1600023265.774089.28612.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sun Sep 13 18:54:25 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030647.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030656.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30649">[ date ]</a>
+              <a href="thread.html#30649">[ thread ]</a>
+              <a href="subject.html#30649">[ subject ]</a>
+              <a href="author.html#30649">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ec0ce188f44b7ab261b1d691e34913b338479b1f (commit)
+      from  225c9660a5a3435d9bcfc9166b9f79f132996249 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ec0ce188f44b7ab261b1d691e34913b338479b1f
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat Aug 29 09:46:24 2020 +0200
+
+    EVP: Centralise fetching error reporting
+    
+    Instead of sometimes, and sometimes not reporting an error in the
+    caller of EVP_XXX_fetch(), where the error may or may not be very
+    accurate, it's now centralised to the inner EVP fetch functionality.
+    It's made in such a way that it can determine if an error occured
+    because the algorithm in question is not there, or if something else
+    went wrong, and will report EVP_R_UNSUPPORTED_ALGORITHM for the
+    former, and EVP_R_FETCH_FAILED for the latter.
+    
+    This helps our own test/evp_test.c when it tries to figure out why an
+    EVP_PKEY it tried to load failed to do so.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12857">https://github.com/openssl/openssl/pull/12857</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/digest.c    |   4 +-
+ crypto/evp/evp_enc.c   |   4 +-
+ crypto/evp/evp_fetch.c | 139 +++++++++++++++++++++++++++----------------------
+ test/evp_test.c        |   3 +-
+ 4 files changed, 81 insertions(+), 69 deletions(-)
+
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index 07bf12e5ae..a177abdb67 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -213,10 +213,8 @@ int EVP_DigestInit_ex(EVP_MD_CTX *ctx, const EVP_MD *type, ENGINE *impl)
+ #else
+         EVP_MD *provmd = EVP_MD_fetch(NULL, OBJ_nid2sn(type-&gt;type), &quot;&quot;);
+ 
+-        if (provmd == NULL) {
+-            EVPerr(EVP_F_EVP_DIGESTINIT_EX, EVP_R_INITIALIZATION_ERROR);
++        if (provmd == NULL)
+             return 0;
+-        }
+         type = provmd;
+         EVP_MD_free(ctx-&gt;fetched_digest);
+         ctx-&gt;fetched_digest = provmd;
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index 71b5386232..62c0966409 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -174,10 +174,8 @@ int EVP_CipherInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+                                                       : OBJ_nid2sn(cipher-&gt;nid),
+                              &quot;&quot;);
+ 
+-        if (provciph == NULL) {
+-            EVPerr(EVP_F_EVP_CIPHERINIT_EX, EVP_R_INITIALIZATION_ERROR);
++        if (provciph == NULL)
+             return 0;
+-        }
+         cipher = provciph;
+         EVP_CIPHER_free(ctx-&gt;fetched_cipher);
+         ctx-&gt;fetched_cipher = provciph;
+diff --git a/crypto/evp/evp_fetch.c b/crypto/evp/evp_fetch.c
+index 7b0cea7f0b..253b76a786 100644
+--- a/crypto/evp/evp_fetch.c
++++ b/crypto/evp/evp_fetch.c
+@@ -47,6 +47,9 @@ struct evp_method_data_st {
+     int name_id;                 /* For get_evp_method_from_store() */
+     const char *names;           /* For get_evp_method_from_store() */
+     const char *propquery;       /* For get_evp_method_from_store() */
++
++    unsigned int flag_construct_error_occured : 1;
++
+     void *(*method_from_dispatch)(int name_id, const OSSL_DISPATCH *,
+                                   OSSL_PROVIDER *);
+     int (*refcnt_up_method)(void *method);
+@@ -186,11 +189,23 @@ static void *construct_evp_method(const OSSL_ALGORITHM *algodef,
+     OSSL_NAMEMAP *namemap = ossl_namemap_stored(libctx);
+     const char *names = algodef-&gt;algorithm_names;
+     int name_id = ossl_namemap_add_names(namemap, 0, names, NAME_SEPARATOR);
++    void *method;
+ 
+     if (name_id == 0)
+         return NULL;
+-    return methdata-&gt;method_from_dispatch(name_id, algodef-&gt;implementation,
+-                                          prov);
++
++    method = methdata-&gt;method_from_dispatch(name_id, algodef-&gt;implementation,
++                                            prov);
++
++    /*
++     * Flag to indicate that there was actual construction errors.  This
++     * helps inner_evp_generic_fetch() determine what error it should
++     * record on inaccessible algorithms.
++     */
++    if (method == NULL)
++        methdata-&gt;flag_construct_error_occured = 1;
++
++    return method;
+ }
+ 
+ static void destruct_evp_method(void *method, void *data)
+@@ -200,6 +215,19 @@ static void destruct_evp_method(void *method, void *data)
+     methdata-&gt;destruct_method(method);
+ }
+ 
++static const char *libctx_descriptor(OPENSSL_CTX *libctx)
++{
++#ifdef FIPS_MODULE
++    return &quot;FIPS internal library context&quot;;
++#else
++    if (openssl_ctx_is_global_default(libctx))
++        return &quot;Global default library context&quot;;
++    if (openssl_ctx_is_default(libctx))
++        return &quot;Thread-local default library context&quot;;
++    return &quot;Non-default library context&quot;;
++#endif
++}
++
+ static void *
+ inner_evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+                         int name_id, const char *name,
+@@ -214,23 +242,30 @@ inner_evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+     OSSL_NAMEMAP *namemap = ossl_namemap_stored(libctx);
+     uint32_t meth_id = 0;
+     void *method = NULL;
++    int unsupported = 0;
+ 
+-    if (store == NULL || namemap == NULL)
++    if (store == NULL || namemap == NULL) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_INVALID_ARGUMENT);
+         return NULL;
++    }
+ 
+     /*
+      * If there's ever an operation_id == 0 passed, we have an internal
+      * programming error.
+      */
+-    if (!ossl_assert(operation_id &gt; 0))
++    if (!ossl_assert(operation_id &gt; 0)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+         return NULL;
++    }
+ 
+     /*
+      * If we have been passed neither a name_id or a name, we have an
+      * internal programming error.
+      */
+-    if (!ossl_assert(name_id != 0 || name != NULL))
++    if (!ossl_assert(name_id != 0 || name != NULL)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+         return NULL;
++    }
+ 
+     /* If we haven't received a name id yet, try to get one for the name */
+     if (name_id == 0)
+@@ -242,9 +277,19 @@ inner_evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+      * evp_method_id returns 0 if we have too many operations (more than
+      * about 2^8) or too many names (more than about 2^24).  In that case,
+      * we can't create any new method.
++     * For all intents and purposes, this is an internal error.
+      */
+-    if (name_id != 0 &amp;&amp; (meth_id = evp_method_id(name_id, operation_id)) == 0)
++    if (name_id != 0 &amp;&amp; (meth_id = evp_method_id(name_id, operation_id)) == 0) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+         return NULL;
++    }
++
++    /*
++     * If we haven't found the name yet, chances are that the algorithm to
++     * be fetched is unsupported.
++     */
++    if (name_id == 0)
++        unsupported = 1;
+ 
+     if (meth_id == 0
+         || !ossl_method_store_cache_get(store, meth_id, properties, &amp;method)) {
+@@ -267,6 +312,7 @@ inner_evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+         mcmdata.method_from_dispatch = new_method;
+         mcmdata.refcnt_up_method = up_ref_method;
+         mcmdata.destruct_method = free_method;
++        mcmdata.flag_construct_error_occured = 0;
+         if ((method = ossl_method_construct(libctx, operation_id,
+                                             0 /* !force_cache */,
+                                             &amp;mcm, &amp;mcmdata)) != NULL) {
+@@ -282,21 +328,29 @@ inner_evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+             ossl_method_store_cache_set(store, meth_id, properties, method,
+                                         up_ref_method, free_method);
+         }
++
++        /*
++         * If we never were in the constructor, the algorithm to be fetched
++         * is unsupported.
++         */
++        unsupported = !mcmdata.flag_construct_error_occured;
+     }
+ 
+-    return method;
+-}
++    if (method == NULL) {
++        int code =
++            unsupported ? EVP_R_UNSUPPORTED_ALGORITHM : EVP_R_FETCH_FAILED;
+ 
+-#ifndef FIPS_MODULE
+-static const char *libctx_descriptor(OPENSSL_CTX *libctx)
+-{
+-    if (openssl_ctx_is_global_default(libctx))
+-        return &quot;Global default library context&quot;;
+-    if (openssl_ctx_is_default(libctx))
+-        return &quot;Thread-local default library context&quot;;
+-    return &quot;Non-default library context&quot;;
++        if (name == NULL)
++            name = ossl_namemap_num2name(namemap, name_id, 0);
++        ERR_raise_data(ERR_LIB_EVP, code,
++                       &quot;%s, Algorithm (%s : %d), Properties (%s)&quot;,
++                       libctx_descriptor(libctx),
++                       name = NULL ? &quot;&lt;null&gt;&quot; : name, name_id,
++                       properties == NULL ? &quot;&lt;null&gt;&quot; : properties);
++    }
++
++    return method;
+ }
+-#endif
+ 
+ void *evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+                         const char *name, const char *properties,
+@@ -306,24 +360,9 @@ void *evp_generic_fetch(OPENSSL_CTX *libctx, int operation_id,
+                         int (*up_ref_method)(void *),
+                         void (*free_method)(void *))
+ {
+-    void *ret = inner_evp_generic_fetch(libctx,
+-                                        operation_id, 0, name, properties,
+-                                        new_method, up_ref_method, free_method);
+-
+-    if (ret == NULL) {
+-        int code = EVP_R_FETCH_FAILED;
+-
+-#ifdef FIPS_MODULE
+-        ERR_raise(ERR_LIB_EVP, code);
+-#else
+-        ERR_raise_data(ERR_LIB_EVP, code,
+-                       &quot;%s, Algorithm (%s), Properties (%s)&quot;,
+-                       libctx_descriptor(libctx),
+-                       name = NULL ? &quot;&lt;null&gt;&quot; : name,
+-                       properties == NULL ? &quot;&lt;null&gt;&quot; : properties);
+-#endif
+-    }
+-    return ret;
++    return inner_evp_generic_fetch(libctx,
++                                   operation_id, 0, name, properties,
++                                   new_method, up_ref_method, free_method);
+ }
+ 
+ /*
+@@ -341,32 +380,10 @@ void *evp_generic_fetch_by_number(OPENSSL_CTX *libctx, int operation_id,
+                                   int (*up_ref_method)(void *),
+                                   void (*free_method)(void *))
+ {
+-    void *ret = inner_evp_generic_fetch(libctx,
+-                                        operation_id, name_id, NULL,
+-                                        properties, new_method, up_ref_method,
+-                                        free_method);
+-
+-    if (ret == NULL) {
+-        int code = EVP_R_FETCH_FAILED;
+-
+-#ifdef FIPS_MODULE
+-        ERR_raise(ERR_LIB_EVP, code);
+-#else
+-        {
+-            OSSL_NAMEMAP *namemap = ossl_namemap_stored(libctx);
+-            const char *name = (namemap == NULL)
+-                               ? NULL
+-                               : ossl_namemap_num2name(namemap, name_id, 0);
+-
+-            ERR_raise_data(ERR_LIB_EVP, code,
+-                           &quot;%s, Algorithm (%s), Properties (%s)&quot;,
+-                           libctx_descriptor(libctx),
+-                           name = NULL ? &quot;&lt;null&gt;&quot; : name,
+-                           properties == NULL ? &quot;&lt;null&gt;&quot; : properties);
+-        }
+-#endif
+-    }
+-    return ret;
++    return inner_evp_generic_fetch(libctx,
++                                   operation_id, name_id, NULL,
++                                   properties, new_method, up_ref_method,
++                                   free_method);
+ }
+ 
+ void evp_method_store_flush(OPENSSL_CTX *libctx)
+diff --git a/test/evp_test.c b/test/evp_test.c
+index 0b58d1f97e..69857dea37 100644
+--- a/test/evp_test.c
++++ b/test/evp_test.c
+@@ -3254,8 +3254,7 @@ static int key_unsupported(void)
+     long err = ERR_peek_last_error();
+ 
+     if (ERR_GET_LIB(err) == ERR_LIB_EVP
+-            &amp;&amp; (ERR_GET_REASON(err) == EVP_R_UNSUPPORTED_ALGORITHM
+-                || ERR_GET_REASON(err) == EVP_R_FETCH_FAILED)) {
++            &amp;&amp; (ERR_GET_REASON(err) == EVP_R_UNSUPPORTED_ALGORITHM)) {
+         ERR_clear_error();
+         return 1;
+     }
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030647.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030656.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30649">[ date ]</a>
+              <a href="thread.html#30649">[ thread ]</a>
+              <a href="subject.html#30649">[ subject ]</a>
+              <a href="author.html#30649">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

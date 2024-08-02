@@ -1,0 +1,361 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1551907830.636433.17415.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022219.html">
+   <LINK REL="Next"  HREF="022232.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1551907830.636433.17415.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Wed Mar  6 21:30:30 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022219.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="022232.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22221">[ date ]</a>
+              <a href="thread.html#22221">[ thread ]</a>
+              <a href="subject.html#22221">[ subject ]</a>
+              <a href="author.html#22221">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  bcf082d130a413a728a382bd6e6bfdbf2cedba45 (commit)
+      from  9fdcc21fdc9d148f78d9cd5be34030f38cc45812 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit bcf082d130a413a728a382bd6e6bfdbf2cedba45
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu Feb 21 08:27:25 2019 +1000
+
+    FIPS AES_GCM IV gen changes
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8393">https://github.com/openssl/openssl/pull/8393</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/e_aes.c                                 |  47 +++++++-
+ test/aesgcmtest.c                                  | 123 +++++++++++++++++++++
+ test/build.info                                    |   6 +-
+ .../{03-test_property.t =&gt; 30-test_aesgcm.t}       |   4 +-
+ 4 files changed, 175 insertions(+), 5 deletions(-)
+ create mode 100644 test/aesgcmtest.c
+ copy test/recipes/{03-test_property.t =&gt; 30-test_aesgcm.t} (75%)
+
+diff --git a/crypto/evp/e_aes.c b/crypto/evp/e_aes.c
+index 3d2068c..5b473bc 100644
+--- a/crypto/evp/e_aes.c
++++ b/crypto/evp/e_aes.c
+@@ -44,6 +44,7 @@ typedef struct {
+     int ivlen;                  /* IV length */
+     int taglen;
+     int iv_gen;                 /* It is OK to generate IVs */
++    int iv_gen_rand;            /* No IV was specified, so generate a rand IV */
+     int tls_aad_len;            /* TLS AAD length */
+     uint64_t tls_enc_records;   /* Number of TLS records encrypted */
+     ctr128_f ctr;
+@@ -1396,7 +1397,7 @@ static int s390x_aes_ctr_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                                     (OPENSSL_s390xcap_P.kma[0] &amp;	\
+                                      S390X_CAPBIT(S390X_AES_256)))
+ 
+-/* iv + padding length for iv lenghts != 12 */
++/* iv + padding length for iv lengths != 12 */
+ # define S390X_gcm_ivpadlen(i)	((((i) + 15) &gt;&gt; 4 &lt;&lt; 4) + 16)
+ 
+ /*-
+@@ -2890,7 +2891,7 @@ static int aes_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr)
+         return 1;
+ 
+     case EVP_CTRL_GET_IV:
+-        if (gctx-&gt;iv_gen != 1)
++        if (gctx-&gt;iv_gen != 1 &amp;&amp; gctx-&gt;iv_gen_rand != 1)
+             return 0;
+         if (gctx-&gt;ivlen != arg)
+             return 0;
+@@ -3202,10 +3203,35 @@ static int aes_gcm_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+     return rv;
+ }
+ 
++#ifdef FIPS_MODE
++/*
++ * See SP800-38D (GCM) Section 8 &quot;Uniqueness requirement on IVS and keys&quot;
++ *
++ * See also 8.2.2 RBG-based construction.
++ * Random construction consists of a free field (which can be NULL) and a
++ * random field which will use a DRBG that can return at least 96 bits of
++ * entropy strength. (The DRBG must be seeded by the FIPS module).
++ */
++static int aes_gcm_iv_generate(EVP_AES_GCM_CTX *gctx, int offset)
++{
++    int sz = gctx-&gt;ivlen - offset;
++
++    /* Must be at least 96 bits */
++    if (sz &lt;= 0 || gctx-&gt;ivlen &lt; 12)
++        return 0;
++
++    /* Use DRBG to generate random iv */
++    if (RAND_bytes(gctx-&gt;iv + offset, sz) &lt;= 0)
++        return 0;
++    return 1;
++}
++#endif /* FIPS_MODE */
++
+ static int aes_gcm_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                           const unsigned char *in, size_t len)
+ {
+     EVP_AES_GCM_CTX *gctx = EVP_C_DATA(EVP_AES_GCM_CTX,ctx);
++
+     /* If not set up, return error */
+     if (!gctx-&gt;key_set)
+         return -1;
+@@ -3213,8 +3239,25 @@ static int aes_gcm_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+     if (gctx-&gt;tls_aad_len &gt;= 0)
+         return aes_gcm_tls_cipher(ctx, out, in, len);
+ 
++#ifdef FIPS_MODE
++    /*
++     * FIPS requires generation of AES-GCM IV's inside the FIPS module.
++     * The IV can still be set externally (the security policy will state that
++     * this is not FIPS compliant). There are some applications
++     * where setting the IV externally is the only option available.
++     */
++    if (!gctx-&gt;iv_set) {
++        if (!ctx-&gt;encrypt || !aes_gcm_iv_generate(gctx, 0))
++            return -1;
++        CRYPTO_gcm128_setiv(&amp;gctx-&gt;gcm, gctx-&gt;iv, gctx-&gt;ivlen);
++        gctx-&gt;iv_set = 1;
++        gctx-&gt;iv_gen_rand = 1;
++    }
++#else
+     if (!gctx-&gt;iv_set)
+         return -1;
++#endif /* FIPS_MODE */
++
+     if (in) {
+         if (out == NULL) {
+             if (CRYPTO_gcm128_aad(&amp;gctx-&gt;gcm, in, len))
+diff --git a/test/aesgcmtest.c b/test/aesgcmtest.c
+new file mode 100644
+index 0000000..c616438
+--- /dev/null
++++ b/test/aesgcmtest.c
+@@ -0,0 +1,123 @@
++/*
++ * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/evp.h&gt;
++#include &quot;testutil.h&quot;
++
++static const unsigned char gcm_key[] = {
++    0xee, 0xbc, 0x1f, 0x57, 0x48, 0x7f, 0x51, 0x92, 0x1c, 0x04, 0x65, 0x66,
++    0x5f, 0x8a, 0xe6, 0xd1, 0x65, 0x8b, 0xb2, 0x6d, 0xe6, 0xf8, 0xa0, 0x69,
++    0xa3, 0x52, 0x02, 0x93, 0xa5, 0x72, 0x07, 0x8f
++};
++static const unsigned char gcm_iv[] = {
++    0x99, 0xaa, 0x3e, 0x68, 0xed, 0x81, 0x73, 0xa0, 0xee, 0xd0, 0x66, 0x84
++};
++static const unsigned char gcm_pt[] = {
++    0xf5, 0x6e, 0x87, 0x05, 0x5b, 0xc3, 0x2d, 0x0e, 0xeb, 0x31, 0xb2, 0xea,
++    0xcc, 0x2b, 0xf2, 0xa5
++};
++static const unsigned char gcm_aad[] = {
++    0x4d, 0x23, 0xc3, 0xce, 0xc3, 0x34, 0xb4, 0x9b, 0xdb, 0x37, 0x0c, 0x43,
++    0x7f, 0xec, 0x78, 0xde
++};
++static const unsigned char gcm_ct[] = {
++    0xf7, 0x26, 0x44, 0x13, 0xa8, 0x4c, 0x0e, 0x7c, 0xd5, 0x36, 0x86, 0x7e,
++    0xb9, 0xf2, 0x17, 0x36
++};
++static const unsigned char gcm_tag[] = {
++    0x67, 0xba, 0x05, 0x10, 0x26, 0x2a, 0xe4, 0x87, 0xd7, 0x37, 0xee, 0x62,
++    0x98, 0xf7, 0x7e, 0x0c
++};
++
++static int do_encrypt(unsigned char *iv_gen, unsigned char *ct, int *ct_len,
++                      unsigned char *tag, int *tag_len)
++{
++    int ret = 0;
++    EVP_CIPHER_CTX *ctx = NULL;
++    int outlen;
++    unsigned char outbuf[64];
++
++    *tag_len = 16;
++    ret = TEST_ptr(ctx = EVP_CIPHER_CTX_new())
++          &amp;&amp; TEST_true(EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL,
++                                          NULL) &gt; 0)
++          &amp;&amp; TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, gcm_key,
++                                          iv_gen != NULL ? NULL : gcm_iv) &gt; 0)
++          &amp;&amp; TEST_true(EVP_EncryptUpdate(ctx, NULL, &amp;outlen, gcm_aad,
++                                         sizeof(gcm_aad)) &gt; 0)
++          &amp;&amp; TEST_true(EVP_EncryptUpdate(ctx, ct, ct_len, gcm_pt,
++                                         sizeof(gcm_pt)) &gt; 0)
++          &amp;&amp; TEST_true(EVP_EncryptFinal_ex(ctx, outbuf, &amp;outlen) &gt; 0)
++          &amp;&amp; TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16,
++                                           tag) &gt; 0)
++          &amp;&amp; TEST_true(iv_gen == NULL
++                  || EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GET_IV, 12, iv_gen) &gt; 0);
++    EVP_CIPHER_CTX_free(ctx);
++    return ret;
++}
++
++static int do_decrypt(const unsigned char *iv, const unsigned char *ct,
++                      int ct_len, const unsigned char *tag, int tag_len)
++{
++    int ret = 0;
++    EVP_CIPHER_CTX *ctx = NULL;
++    int outlen, ptlen;
++    unsigned char pt[32];
++    unsigned char outbuf[32];
++
++    ret = TEST_ptr(ctx = EVP_CIPHER_CTX_new())
++              &amp;&amp; TEST_true(EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL,
++                                              NULL, NULL) &gt; 0)
++              &amp;&amp; TEST_true(EVP_DecryptInit_ex(ctx, NULL, NULL, gcm_key, iv) &gt; 0)
++              &amp;&amp; TEST_true(EVP_DecryptUpdate(ctx, NULL, &amp;outlen, gcm_aad,
++                                             sizeof(gcm_aad)) &gt; 0)
++              &amp;&amp; TEST_true(EVP_DecryptUpdate(ctx, pt, &amp;ptlen, ct,
++                                             ct_len) &gt; 0)
++              &amp;&amp; TEST_true(EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
++                                               tag_len, (void *)tag) &gt; 0)
++              &amp;&amp; TEST_true(EVP_DecryptFinal_ex(ctx, outbuf, &amp;outlen) &gt; 0)
++              &amp;&amp; TEST_mem_eq(gcm_pt, sizeof(gcm_pt), pt, ptlen);
++
++    EVP_CIPHER_CTX_free(ctx);
++    return ret;
++}
++
++static int kat_test(void)
++{
++    unsigned char tag[32];
++    unsigned char ct[32];
++    int ctlen = 0, taglen = 0;
++
++    return do_encrypt(NULL, ct, &amp;ctlen, tag, &amp;taglen)
++           &amp;&amp; TEST_mem_eq(gcm_ct, sizeof(gcm_ct), ct, ctlen)
++           &amp;&amp; TEST_mem_eq(gcm_tag, sizeof(gcm_tag), tag, taglen)
++           &amp;&amp; do_decrypt(gcm_iv, ct, ctlen, tag, taglen);
++}
++
++#ifdef FIPS_MODE
++static int ivgen_test(void)
++{
++    unsigned char iv_gen[16];
++    unsigned char tag[32];
++    unsigned char ct[32];
++    int ctlen = 0, taglen = 0;
++
++    return do_encrypt(iv_gen, ct, &amp;ctlen, tag, &amp;taglen)
++           &amp;&amp; do_decrypt(iv_gen, ct, ctlen, tag, taglen);
++}
++#endif /* FIPS_MODE */
++
++int setup_tests(void)
++{
++    ADD_TEST(kat_test);
++#ifdef FIPS_MODE
++    ADD_TEST(ivgen_test);
++#endif /* FIPS_MODE */
++    return 1;
++}
+diff --git a/test/build.info b/test/build.info
+index 5bf6fd0..4dd400f 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -50,7 +50,7 @@ IF[{- !$disabled{tests} -}]
+           time_offset_test pemtest ssl_cert_table_internal_test ciphername_test \
+           servername_test ocspapitest rsa_mp_test fatalerrtest tls13ccstest \
+           sysdefaulttest errtest gosttest \
+-          context_internal_test
++          context_internal_test aesgcmtest
+ 
+   SOURCE[versions]=versions.c
+   INCLUDE[versions]=../include ../apps/include
+@@ -570,6 +570,10 @@ IF[{- !$disabled{tests} -}]
+   INCLUDE[gosttest]=../include ../apps/include ..
+   DEPEND[gosttest]=../libcrypto ../libssl libtestutil.a
+ 
++  SOURCE[aesgcmtest]=aesgcmtest.c
++  INCLUDE[aesgcmtest]=../include ../apps/include ..
++  DEPEND[aesgcmtest]=../libcrypto libtestutil.a
++
+   PROGRAMS{noinst}=context_internal_test
+   SOURCE[context_internal_test]=context_internal_test.c
+   INCLUDE[context_internal_test]=.. ../include ../apps/include
+diff --git a/test/recipes/03-test_property.t b/test/recipes/30-test_aesgcm.t
+similarity index 75%
+copy from test/recipes/03-test_property.t
+copy to test/recipes/30-test_aesgcm.t
+index 2654215..f4862bf 100644
+--- a/test/recipes/03-test_property.t
++++ b/test/recipes/30-test_aesgcm.t
+@@ -1,12 +1,12 @@
+ #! /usr/bin/env perl
+ # Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
+-# Copyright (c) 2019, Oracle and/or its affiliates.  All rights reserved.
+ #
+ # Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+ # in the file LICENSE in the source distribution or at
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ 
++
+ use OpenSSL::Test::Simple;
+ 
+-simple_test(&quot;test_property&quot;, &quot;property_test&quot;);
++simple_test(&quot;test_aesgcm&quot;, &quot;aesgcmtest&quot;, &quot;aesgcm&quot;);
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022219.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="022232.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22221">[ date ]</a>
+              <a href="thread.html#22221">[ thread ]</a>
+              <a href="subject.html#22221">[ subject ]</a>
+              <a href="author.html#22221">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

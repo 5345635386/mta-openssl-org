@@ -1,0 +1,878 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1442512326.200270.3828.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001831.html">
+   <LINK REL="Next"  HREF="001837.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1442512326.200270.3828.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Thu Sep 17 17:52:06 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001831.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001837.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1832">[ date ]</a>
+              <a href="thread.html#1832">[ thread ]</a>
+              <a href="subject.html#1832">[ subject ]</a>
+              <a href="author.html#1832">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3cdd1e94b1d71f2ce3002738f9506da91fe2af45 (commit)
+      from  4bd16463b84efb13ce5fb35add284e284b0fd819 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3cdd1e94b1d71f2ce3002738f9506da91fe2af45
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Wed Sep 2 15:31:28 2015 +0200
+
+    RT3757: base64 encoding bugs
+    
+    Rewrite EVP_DecodeUpdate.
+    
+    In particular: reject extra trailing padding, and padding in the middle
+    of the content. Don't limit line length. Add tests.
+    
+    Previously, the behaviour was ill-defined, and depended on the position
+    of the padding within the input.
+    
+    In addition, this appears to fix a possible two-byte oob read.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Dr Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES             |   6 ++
+ crypto/evp/encode.c | 182 +++++++++++++++++--------------------
+ test/evp_test.c     | 253 ++++++++++++++++++++++++++++++++++++++++++++--------
+ test/evptests.txt   | 173 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 480 insertions(+), 134 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index a7dab6c..3aa9dc8 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -4,6 +4,12 @@
+ 
+  Changes between 1.0.2 and 1.1.0  [xx XXX xxxx]
+ 
++  *) Rewrite EVP_DecodeUpdate (base64 decoding) to fix several bugs.
++     This changes the decoding behaviour for some invalid messages,
++     though the change is mostly in the more lenient direction, and
++     legacy behaviour is preserved as much as possible.
++     [Emilia K&#228;sper]
++
+   *) New testing framework
+      The testing framework has been largely rewritten and is now using
+      perl and the perl modules Test::Harness and an extended variant of
+diff --git a/crypto/evp/encode.c b/crypto/evp/encode.c
+index 4d3c5c8..985fd29 100644
+--- a/crypto/evp/encode.c
++++ b/crypto/evp/encode.c
+@@ -103,6 +103,7 @@ abcdefghijklmnopqrstuvwxyz0123456789+/&quot;;
+ #define B64_WS                  0xE0
+ #define B64_ERROR               0xFF
+ #define B64_NOT_BASE64(a)       (((a)|0x13) == 0xF3)
++#define B64_BASE64(a)           !B64_NOT_BASE64(a)
+ 
+ static const unsigned char data_ascii2bin[128] = {
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+@@ -218,8 +219,9 @@ int EVP_EncodeBlock(unsigned char *t, const unsigned char *f, int dlen)
+ 
+ void EVP_DecodeInit(EVP_ENCODE_CTX *ctx)
+ {
+-    ctx-&gt;length = 30;
++    /* Only ctx-&gt;num is used during decoding. */
+     ctx-&gt;num = 0;
++    ctx-&gt;length = 0;
+     ctx-&gt;line_num = 0;
+     ctx-&gt;expect_nl = 0;
+ }
+@@ -228,139 +230,123 @@ void EVP_DecodeInit(EVP_ENCODE_CTX *ctx)
+  * -1 for error
+  *  0 for last line
+  *  1 for full line
++ *
++ * Note: even though EVP_DecodeUpdate attempts to detect and report end of
++ * content, the context doesn't currently remember it and will accept more data
++ * in the next call. Therefore, the caller is responsible for checking and
++ * rejecting a 0 return value in the middle of content.
++ *
++ * Note: even though EVP_DecodeUpdate has historically tried to detect end of
++ * content based on line length, this has never worked properly. Therefore,
++ * we now return 0 when one of the following is true:
++ *   - Padding or B64_EOF was detected and the last block is complete.
++ *   - Input has zero-length.
++ * -1 is returned if:
++ *   - Invalid characters are detected.
++ *   - There is extra trailing padding, or data after padding.
++ *   - B64_EOF is detected after an incomplete base64 block.
+  */
+ int EVP_DecodeUpdate(EVP_ENCODE_CTX *ctx, unsigned char *out, int *outl,
+                      const unsigned char *in, int inl)
+ {
+-    int seof = -1, eof = 0, rv = -1, ret = 0, i, v, tmp, n, ln, exp_nl;
++    int seof = 0, eof = 0, rv = -1, ret = 0, i, v, tmp, n, decoded_len;
+     unsigned char *d;
+ 
+     n = ctx-&gt;num;
+     d = ctx-&gt;enc_data;
+-    ln = ctx-&gt;line_num;
+-    exp_nl = ctx-&gt;expect_nl;
+ 
+-    /* last line of input. */
+-    if ((inl == 0) || ((n == 0) &amp;&amp; (conv_ascii2bin(in[0]) == B64_EOF))) {
++    if (n &gt; 0 &amp;&amp; d[n - 1] == '=') {
++        eof++;
++        if (n &gt; 1 &amp;&amp; d[n - 2] == '=')
++            eof++;
++    }
++
++     /* Legacy behaviour: an empty input chunk signals end of input. */
++    if (inl == 0) {
+         rv = 0;
+         goto end;
+     }
+ 
+-    /* We parse the input data */
+     for (i = 0; i &lt; inl; i++) {
+-        /* If the current line is &gt; 80 characters, scream a lot */
+-        if (ln &gt;= 80) {
+-            rv = -1;
+-            goto end;
+-        }
+-
+-        /* Get char and put it into the buffer */
+         tmp = *(in++);
+         v = conv_ascii2bin(tmp);
+-        /* only save the good data :-) */
+-        if (!B64_NOT_BASE64(v)) {
+-            OPENSSL_assert(n &lt; (int)sizeof(ctx-&gt;enc_data));
+-            d[n++] = tmp;
+-            ln++;
+-        } else if (v == B64_ERROR) {
++        if (v == B64_ERROR) {
+             rv = -1;
+             goto end;
+         }
+ 
+-        /*
+-         * have we seen a '=' which is 'definitly' the last input line.  seof
+-         * will point to the character that holds it. and eof will hold how
+-         * many characters to chop off.
+-         */
+         if (tmp == '=') {
+-            if (seof == -1)
+-                seof = n;
+             eof++;
++        } else if (eof &gt; 0 &amp;&amp; B64_BASE64(v)) {
++            /* More data after padding. */
++            rv = -1;
++            goto end;
+         }
+ 
+-        if (v == B64_CR) {
+-            ln = 0;
+-            if (exp_nl)
+-                continue;
++        if (eof &gt; 2) {
++            rv = -1;
++            goto end;
+         }
+ 
+-        /* eoln */
+-        if (v == B64_EOLN) {
+-            ln = 0;
+-            if (exp_nl) {
+-                exp_nl = 0;
+-                continue;
+-            }
+-        }
+-        exp_nl = 0;
+-
+-        /*
+-         * If we are at the end of input and it looks like a line, process
+-         * it.
+-         */
+-        if (((i + 1) == inl) &amp;&amp; (((n &amp; 3) == 0) || eof)) {
+-            v = B64_EOF;
+-            /*
+-             * In case things were given us in really small records (so two
+-             * '=' were given in separate updates), eof may contain the
+-             * incorrect number of ending bytes to skip, so let's redo the
+-             * count
+-             */
+-            eof = 0;
+-            if (d[n - 1] == '=')
+-                eof++;
+-            if (d[n - 2] == '=')
+-                eof++;
+-            /* There will never be more than two '=' */
++        if (v == B64_EOF) {
++            seof = 1;
++            goto tail;
+         }
+ 
+-        if ((v == B64_EOF &amp;&amp; (n &amp; 3) == 0) || (n &gt;= 64)) {
+-            /*
+-             * This is needed to work correctly on 64 byte input lines.  We
+-             * process the line and then need to accept the '\n'
+-             */
+-            if ((v != B64_EOF) &amp;&amp; (n &gt;= 64))
+-                exp_nl = 1;
+-            if (n &gt; 0) {
+-                v = EVP_DecodeBlock(out, d, n);
+-                n = 0;
+-                if (v &lt; 0) {
+-                    rv = 0;
+-                    goto end;
+-                }
+-                if (eof &gt; v) {
+-                    rv = -1;
+-                    goto end;
+-                }
+-                ret += (v - eof);
+-            } else {
+-                eof = 1;
+-                v = 0;
+-            }
+-
+-            /*
+-             * This is the case where we have had a short but valid input
+-             * line
+-             */
+-            if ((v &lt; ctx-&gt;length) &amp;&amp; eof) {
+-                rv = 0;
++        /* Only save valid base64 characters. */
++        if (B64_BASE64(v)) {
++            if (n &gt;= 64) {
++                /*
++                 * We increment n once per loop, and empty the buffer as soon as
++                 * we reach 64 characters, so this can only happen if someone's
++                 * manually messed with the ctx. Refuse to write any more data.
++                 */
++                rv = -1;
+                 goto end;
+-            } else
+-                ctx-&gt;length = v;
++            }
++            OPENSSL_assert(n &lt; (int)sizeof(ctx-&gt;enc_data));
++            d[n++] = tmp;
++        }
+ 
+-            if (seof &gt;= 0) {
+-                rv = 0;
++        if (n == 64) {
++            decoded_len = EVP_DecodeBlock(out, d, n);
++            n = 0;
++            if (decoded_len &lt; 0 || eof &gt; decoded_len) {
++                rv = -1;
+                 goto end;
+             }
+-            out += v;
++            ret += decoded_len - eof;
++            out += decoded_len - eof;
+         }
+     }
+-    rv = 1;
+- end:
++
++    /*
++     * Legacy behaviour: if the current line is a full base64-block (i.e., has
++     * 0 mod 4 base64 characters), it is processed immediately. We keep this
++     * behaviour as applications may not be calling EVP_DecodeFinal properly.
++     */
++tail:
++    if (n &gt; 0) {
++        if ((n &amp; 3) == 0) {
++        decoded_len = EVP_DecodeBlock(out, d, n);
++        n = 0;
++        if (decoded_len &lt; 0 || eof &gt; decoded_len) {
++            rv = -1;
++            goto end;
++        }
++        ret += (decoded_len - eof);
++        } else if (seof) {
++            /* EOF in the middle of a base64 block. */
++            rv = -1;
++            goto end;
++        }
++    }
++
++    rv = seof || (n == 0 &amp;&amp; eof) ? 0 : 1;
++end:
++    /* Legacy behaviour. This should probably rather be zeroed on error. */
+     *outl = ret;
+     ctx-&gt;num = n;
+-    ctx-&gt;line_num = ln;
+-    ctx-&gt;expect_nl = exp_nl;
+     return (rv);
+ }
+ 
+diff --git a/test/evp_test.c b/test/evp_test.c
+index c5c6e07..eb7ef50 100644
+--- a/test/evp_test.c
++++ b/test/evp_test.c
+@@ -124,12 +124,58 @@ static int parse_line(char **pkw, char **pval, char *linebuf)
+     return 1;
+ }
+ 
++/*
++ * Unescape some escape sequences in string literals.
++ * Return the result in a newly allocated buffer.
++ * Currently only supports '\n'.
++ * If the input length is 0, returns a valid 1-byte buffer, but sets
++ * the length to 0.
++ */
++static unsigned char* unescape(const char *input, size_t input_len,
++                               size_t *out_len)
++{
++    unsigned char *ret, *p;
++    size_t i;
++    if (input_len == 0) {
++        *out_len = 0;
++        return OPENSSL_zalloc(1);
++    }
++
++    /* Escaping is non-expanding; over-allocate original size for simplicity. */
++    ret = p = OPENSSL_malloc(input_len);
++    if (ret == NULL)
++        return NULL;
++
++    for (i = 0; i &lt; input_len; i++) {
++        if (input[i] == '\\') {
++            if (i == input_len - 1 || input[i+1] != 'n')
++                goto err;
++            *p++ = '\n';
++            i++;
++        } else {
++            *p++ = input[i];
++        }
++    }
++
++    *out_len = p - ret;
++    return ret;
++
++ err:
++    OPENSSL_free(ret);
++    return NULL;
++}
++
+ /* For a hex string &quot;value&quot; convert to a binary allocated buffer */
+ static int test_bin(const char *value, unsigned char **buf, size_t *buflen)
+ {
+     long len;
+     if (!*value) {
+-        /* Don't return NULL for zero length buffer */
++        /*
++         * Don't return NULL for zero length buffer.
++         * This is needed for some tests with empty keys: HMAC_Init_ex() expects
++         * a non-NULL key buffer even if the key length is 0, in order to detect
++         * key reset.
++         */
+         *buf = OPENSSL_malloc(1);
+         if (!*buf)
+             return 0;
+@@ -145,19 +191,12 @@ static int test_bin(const char *value, unsigned char **buf, size_t *buflen)
+         if (value[vlen - 1] != '&quot;')
+             return 0;
+         vlen--;
+-        if (vlen == 0) {
+-            *buf = OPENSSL_malloc(1);
+-            if (*buf == NULL)
+-                return 0;
+-            **buf = 0;
+-        } else {
+-            *buf = BUF_memdup(value, vlen);
+-            if (*buf == NULL)
+-                return 0;
+-        }
+-        *buflen = vlen;
++        *buf = unescape(value, vlen, buflen);
++        if (*buf == NULL)
++            return 0;
+         return 1;
+     }
++
+     *buf = string_to_hex(value, &amp;len);
+     if (!*buf) {
+         fprintf(stderr, &quot;Value=%s\n&quot;, value);
+@@ -217,9 +256,10 @@ struct evp_test {
+     /* Number of tests skipped */
+     int nskip;
+     /* If output mismatch expected and got value */
+-    unsigned char *out_got;
++    unsigned char *out_received;
++    size_t out_received_len;
+     unsigned char *out_expected;
+-    size_t out_len;
++    size_t out_expected_len;
+     /* test specific data */
+     void *data;
+     /* Current test should be skipped */
+@@ -252,6 +292,7 @@ static const struct evp_test_method psign_test_method, pverify_test_method;
+ static const struct evp_test_method pdecrypt_test_method;
+ static const struct evp_test_method pverify_recover_test_method;
+ static const struct evp_test_method pbe_test_method;
++static const struct evp_test_method encode_test_method;
+ 
+ static const struct evp_test_method *evp_test_list[] = {
+     &amp;digest_test_method,
+@@ -262,6 +303,7 @@ static const struct evp_test_method *evp_test_list[] = {
+     &amp;pdecrypt_test_method,
+     &amp;pverify_recover_test_method,
+     &amp;pbe_test_method,
++    &amp;encode_test_method,
+     NULL
+ };
+ 
+@@ -290,17 +332,21 @@ static void free_expected(struct evp_test *t)
+     OPENSSL_free(t-&gt;expected_err);
+     t-&gt;expected_err = NULL;
+     OPENSSL_free(t-&gt;out_expected);
+-    OPENSSL_free(t-&gt;out_got);
++    OPENSSL_free(t-&gt;out_received);
+     t-&gt;out_expected = NULL;
+-    t-&gt;out_got = NULL;
++    t-&gt;out_received = NULL;
++    t-&gt;out_expected_len = 0;
++    t-&gt;out_received_len = 0;
++    /* Literals. */
++    t-&gt;err = NULL;
+ }
+ 
+ static void print_expected(struct evp_test *t)
+ {
+-    if (t-&gt;out_expected == NULL)
++    if (t-&gt;out_expected == NULL &amp;&amp; t-&gt;out_received == NULL)
+         return;
+-    hex_print(&quot;Expected:&quot;, t-&gt;out_expected, t-&gt;out_len);
+-    hex_print(&quot;Got:     &quot;, t-&gt;out_got, t-&gt;out_len);
++    hex_print(&quot;Expected:&quot;, t-&gt;out_expected, t-&gt;out_expected_len);
++    hex_print(&quot;Got:     &quot;, t-&gt;out_received, t-&gt;out_received_len);
+     free_expected(t);
+ }
+ 
+@@ -496,21 +542,37 @@ static int process_test(struct evp_test *t, char *buf, int verbose)
+     return 1;
+ }
+ 
+-static int check_output(struct evp_test *t, const unsigned char *expected,
+-                        const unsigned char *got, size_t len)
++static int check_var_length_output(struct evp_test *t,
++                                   const unsigned char *expected,
++                                   size_t expected_len,
++                                   const unsigned char *received,
++                                   size_t received_len)
+ {
+-    if (!memcmp(expected, got, len))
++    if (expected_len == received_len &amp;&amp;
++        memcmp(expected, received, expected_len) == 0) {
+         return 0;
+-    t-&gt;out_expected = BUF_memdup(expected, len);
+-    t-&gt;out_got = BUF_memdup(got, len);
+-    t-&gt;out_len = len;
+-    if (t-&gt;out_expected == NULL || t-&gt;out_got == NULL) {
++    }
++
++    /* The result printing code expects a non-NULL buffer. */
++    t-&gt;out_expected = BUF_memdup(expected, expected_len ? expected_len : 1);
++    t-&gt;out_expected_len = expected_len;
++    t-&gt;out_received = BUF_memdup(received, received_len ? received_len : 1);
++    t-&gt;out_received_len = received_len;
++    if (t-&gt;out_expected == NULL || t-&gt;out_received == NULL) {
+         fprintf(stderr, &quot;Memory allocation error!\n&quot;);
+         exit(1);
+     }
+     return 1;
+ }
+ 
++static int check_output(struct evp_test *t,
++                        const unsigned char *expected,
++                        const unsigned char *received,
++                        size_t len)
++{
++    return check_var_length_output(t, expected, len, received, len);
++}
++
+ int main(int argc, char **argv)
+ {
+     FILE *in = NULL;
+@@ -528,17 +590,7 @@ int main(int argc, char **argv)
+     OpenSSL_add_all_algorithms();
+ 
+     memset(&amp;t, 0, sizeof(t));
+-    t.meth = NULL;
+-    t.public = NULL;
+-    t.private = NULL;
+-    t.err = NULL;
+-    t.line = 0;
+     t.start_line = -1;
+-    t.errors = 0;
+-    t.ntests = 0;
+-    t.out_expected = NULL;
+-    t.out_got = NULL;
+-    t.out_len = 0;
+     in = fopen(argv[1], &quot;r&quot;);
+     t.in = in;
+     while (fgets(buf, sizeof(buf), in)) {
+@@ -1473,3 +1525,132 @@ static const struct evp_test_method pbe_test_method = {
+     pbe_test_parse,
+     pbe_test_run
+ };
++
++/* Base64 tests */
++
++typedef enum {
++    BASE64_CANONICAL_ENCODING = 0,
++    BASE64_VALID_ENCODING = 1,
++    BASE64_INVALID_ENCODING = 2
++} base64_encoding_type;
++
++struct encode_data {
++    /* Input to encoding */
++    unsigned char *input;
++    size_t input_len;
++    /* Expected output */
++    unsigned char *output;
++    size_t output_len;
++    base64_encoding_type encoding;
++};
++
++static int encode_test_init(struct evp_test *t, const char *encoding)
++{
++    struct encode_data *edata = OPENSSL_zalloc(sizeof(*edata));
++
++    if (strcmp(encoding, &quot;canonical&quot;) == 0) {
++        edata-&gt;encoding = BASE64_CANONICAL_ENCODING;
++    } else if (strcmp(encoding, &quot;valid&quot;) == 0) {
++        edata-&gt;encoding = BASE64_VALID_ENCODING;
++    } else if (strcmp(encoding, &quot;invalid&quot;) == 0) {
++        edata-&gt;encoding = BASE64_INVALID_ENCODING;
++        t-&gt;expected_err = BUF_strdup(&quot;DECODE_ERROR&quot;);
++        if (t-&gt;expected_err == NULL)
++            return 0;
++    } else {
++        fprintf(stderr, &quot;Bad encoding: %s. Should be one of &quot;
++                &quot;{canonical, valid, invalid}\n&quot;, encoding);
++        return 0;
++    }
++    t-&gt;data = edata;
++    return 1;
++}
++
++static void encode_test_cleanup(struct evp_test *t)
++{
++    struct encode_data *edata = t-&gt;data;
++    test_free(edata-&gt;input);
++    test_free(edata-&gt;output);
++    memset(edata, 0, sizeof(*edata));
++}
++
++static int encode_test_parse(struct evp_test *t,
++                             const char *keyword, const char *value)
++{
++    struct encode_data *edata = t-&gt;data;
++    if (strcmp(keyword, &quot;Input&quot;) == 0)
++        return test_bin(value, &amp;edata-&gt;input, &amp;edata-&gt;input_len);
++    if (strcmp(keyword, &quot;Output&quot;) == 0)
++        return test_bin(value, &amp;edata-&gt;output, &amp;edata-&gt;output_len);
++    return 0;
++}
++
++static int encode_test_run(struct evp_test *t)
++{
++    struct encode_data *edata = t-&gt;data;
++    unsigned char *encode_out = NULL, *decode_out = NULL;
++    int output_len, chunk_len;
++    const char *err = &quot;INTERNAL_ERROR&quot;;
++    EVP_ENCODE_CTX decode_ctx;
++
++    if (edata-&gt;encoding == BASE64_CANONICAL_ENCODING) {
++        EVP_ENCODE_CTX encode_ctx;
++        encode_out = OPENSSL_malloc(EVP_ENCODE_LENGTH(edata-&gt;input_len));
++        if (encode_out == NULL)
++            goto err;
++
++        EVP_EncodeInit(&amp;encode_ctx);
++        EVP_EncodeUpdate(&amp;encode_ctx, encode_out, &amp;chunk_len,
++                         edata-&gt;input, edata-&gt;input_len);
++        output_len = chunk_len;
++
++        EVP_EncodeFinal(&amp;encode_ctx, encode_out + chunk_len, &amp;chunk_len);
++        output_len += chunk_len;
++
++        if (check_var_length_output(t, edata-&gt;output, edata-&gt;output_len,
++                                    encode_out, output_len)) {
++            err = &quot;BAD_ENCODING&quot;;
++            goto err;
++        }
++    }
++
++    decode_out = OPENSSL_malloc(EVP_DECODE_LENGTH(edata-&gt;output_len));
++    if (decode_out == NULL)
++        goto err;
++
++    EVP_DecodeInit(&amp;decode_ctx);
++    if (EVP_DecodeUpdate(&amp;decode_ctx, decode_out, &amp;chunk_len, edata-&gt;output,
++                         edata-&gt;output_len) &lt; 0) {
++        err = &quot;DECODE_ERROR&quot;;
++        goto err;
++    }
++    output_len = chunk_len;
++
++    if (EVP_DecodeFinal(&amp;decode_ctx, decode_out + chunk_len, &amp;chunk_len) != 1) {
++        err = &quot;DECODE_ERROR&quot;;
++        goto err;
++    }
++    output_len += chunk_len;
++
++    if (edata-&gt;encoding != BASE64_INVALID_ENCODING &amp;&amp;
++        check_var_length_output(t, edata-&gt;input, edata-&gt;input_len,
++                                decode_out, output_len)) {
++        err = &quot;BAD_DECODING&quot;;
++        goto err;
++    }
++
++    err = NULL;
++ err:
++    t-&gt;err = err;
++    OPENSSL_free(encode_out);
++    OPENSSL_free(decode_out);
++    return 1;
++}
++
++static const struct evp_test_method encode_test_method = {
++    &quot;Encoding&quot;,
++    encode_test_init,
++    encode_test_cleanup,
++    encode_test_parse,
++    encode_test_run,
++};
+diff --git a/test/evptests.txt b/test/evptests.txt
+index 2b0b7ba..e8de2c1 100644
+--- a/test/evptests.txt
++++ b/test/evptests.txt
+@@ -2624,3 +2624,176 @@ Salt = 7361006c74
+ iter = 4096
+ MD = sha512
+ Key = 9d9e9c4cd21fe4be24d5b8244c759665
++
++# Base64 tests
++
++Encoding = canonical
++Input = &quot;&quot;
++Output = &quot;&quot;
++
++Encoding = canonical
++Input = &quot;h&quot;
++Output = &quot;aA==\n&quot;
++
++Encoding = canonical
++Input = &quot;hello&quot;
++Output = &quot;aGVsbG8=\n&quot;
++
++Encoding = canonical
++Input = &quot;hello world!&quot;
++Output = &quot;aGVsbG8gd29ybGQh\n&quot;
++
++Encoding = canonical
++Input = 00010203040506070809a0b0c0d0e0f000
++Output = &quot;AAECAwQFBgcICaCwwNDg8AA=\n&quot;
++
++# Missing padding
++Encoding = invalid
++Output = &quot;aGVsbG8&quot;
++
++Encoding = invalid
++Output = &quot;aGVsbG8\n&quot;
++
++# Tolerate missing newline
++Encoding = valid
++Input = &quot;hello&quot;
++Output = &quot;aGVsbG8=&quot;
++
++# Don't tolerate extra trailing '='
++Encoding = invalid
++Input = &quot;hello&quot;
++Output = &quot;aGVsbG8==\n&quot;
++
++Encoding = invalid
++Output = &quot;aGVsbG8===\n&quot;
++
++# Don't tolerate data after '='
++Encoding = invalid
++Output = &quot;aGV=sbG8=\n&quot;
++
++# Newlines are ignored
++Encoding = valid
++Input = &quot;hello&quot;
++Output = &quot;aGV\nsbG8=\n&quot;
++
++Encoding = canonical
++Input = &quot;hello&quot;
++Output = 614756736247383d0a
++
++# Invalid characters
++Encoding = invalid
++Output = 614756736247383d0a00
++
++Encoding = invalid
++Output = 61475600736247383d0a
++
++Encoding = invalid
++Output = 61475601736247383d0a
++
++Encoding = canonical
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE9wZW5TU0wK\n&quot;
++
++Encoding = valid
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE9wZW5TU0wK&quot;
++
++# Truncate 1-3 chars
++Encoding = invalid
++Output = &quot;T3BlblNTTE9wZW5TU0w&quot;
++
++Encoding = invalid
++Output = &quot;T3BlblNTTE9wZW5TU0&quot;
++
++Encoding = invalid
++Output = &quot;T3BlblNTTE9wZW5TU&quot;
++
++Encoding = invalid
++Output = &quot;T3BlblNTTE9wZW5TU0wK====&quot;
++
++Encoding = invalid
++Output = &quot;T3BlblNTTE9wZW5TU0wK============================================\n&quot;
++
++Encoding = invalid
++Output = &quot;YQ==YQ==YQ==\n&quot;
++
++Encoding = invalid
++Output = &quot;A&quot;
++
++Encoding = invalid
++Output = &quot;A\n&quot;
++
++Encoding = invalid
++Output = &quot;A=&quot;
++
++Encoding = invalid
++Output = &quot;A==\n&quot;
++
++Encoding = invalid
++Output = &quot;A===\n&quot;
++
++Encoding = invalid
++Output = &quot;A====\n&quot;
++
++Encoding = valid
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE9wZW5TU0wK\n\n&quot;
++
++Encoding = valid
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE\n9wZW5TU0wK&quot;
++
++# CVE 2015-0292
++Encoding = invalid
++Output = &quot;ZW5jb2RlIG1lCg==================================================================\n&quot;
++
++Encoding = canonical
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA==\n&quot;
++
++Encoding = valid
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA\n==\n&quot;
++
++Encoding = valid
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA=\n=\n&quot;
++
++Encoding = invalid
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA====\n&quot;
++
++# Multiline output without padding
++Encoding = canonical
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neHh4eHh4eHh4eHh4\n&quot;
++
++# Multiline output with padding
++Encoding = canonical
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neHh4eHh4eHh4eHh4eHh4eA==\n&quot;
++
++# Multiline output with line break in the middle of a b64 block is accepted
++Encoding = valid
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh\n4eHh4eHh4eHh4eHh4eHh4eA==\n&quot;
++
++# Long lines are accepted
++Encoding = valid
++Input = &quot;xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&quot;
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA==\n&quot;
++
++# Multiline input with data after '='.
++Encoding = invalid
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA==\neHh4eHh4eHh4eHh4eHh4eHh4\n&quot;
++
++Encoding = invalid
++Output = &quot;eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neA==eHh4eHh4eHh4eHh4eHh4\n&quot;
++
++# B64_EOF ('-') terminates input and trailing bytes are ignored
++Encoding = valid
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE9wZW5TU0wK\n-abcd&quot;
++
++Encoding = valid
++Input = &quot;OpenSSLOpenSSL\n&quot;
++Output = &quot;T3BlblNTTE9wZW5TU0wK-abcd&quot;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001831.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001837.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1832">[ date ]</a>
+              <a href="thread.html#1832">[ thread ]</a>
+              <a href="subject.html#1832">[ subject ]</a>
+              <a href="author.html#1832">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

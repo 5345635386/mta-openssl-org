@@ -1,0 +1,312 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530887639.723379.29270.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019741.html">
+   <LINK REL="Next"  HREF="019745.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530887639.723379.29270.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Fri Jul  6 14:33:59 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019741.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019745.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19744">[ date ]</a>
+              <a href="thread.html#19744">[ thread ]</a>
+              <a href="subject.html#19744">[ subject ]</a>
+              <a href="author.html#19744">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0edb109f97c1bbbd5961326f93b2ccf385b26674 (commit)
+      from  2ce71b60272325c4453914b501a2c2ff1b75c80d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0edb109f97c1bbbd5961326f93b2ccf385b26674
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Tue Jul 3 21:34:08 2018 +0200
+
+    evp/e_chacha20_poly1305.c: further improve small-fragment TLS performance.
+    
+    Improvement coefficients vary with TLS fragment length and platform, on
+    most Intel processors maximum improvement is ~50%, while on Ryzen - 80%.
+    The &quot;secret&quot; is new dedicated ChaCha20_128 code path and vectorized xor
+    helpers.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6638">https://github.com/openssl/openssl/pull/6638</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/e_chacha20_poly1305.c       |  54 ++++++++++++++---
+ crypto/poly1305/asm/poly1305-x86_64.pl | 104 +++++++++++++++++++++++++++++++++
+ 2 files changed, 150 insertions(+), 8 deletions(-)
+
+diff --git a/crypto/evp/e_chacha20_poly1305.c b/crypto/evp/e_chacha20_poly1305.c
+index 47d5e50..6a9bccf 100644
+--- a/crypto/evp/e_chacha20_poly1305.c
++++ b/crypto/evp/e_chacha20_poly1305.c
+@@ -196,14 +196,23 @@ static int chacha20_poly1305_init_key(EVP_CIPHER_CTX *ctx,
+ }
+ 
+ #  if !defined(OPENSSL_SMALL_FOOTPRINT)
++
++#   if defined(POLY1305_ASM) &amp;&amp; (defined(__x86_64) || defined(__x86_64__) || \
++                                 defined(_M_AMD64) || defined(_M_X64))
++#    define XOR128_HELPERS
++void *xor128_encrypt_n_pad(void *out, const void *inp, void *otp, size_t len);
++void *xor128_decrypt_n_pad(void *out, const void *inp, void *otp, size_t len);
++static const unsigned char zero[4 * CHACHA_BLK_SIZE] = { 0 };
++#   else
+ static const unsigned char zero[2 * CHACHA_BLK_SIZE] = { 0 };
++#   endif
+ 
+ static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                                         const unsigned char *in, size_t len)
+ {
+     EVP_CHACHA_AEAD_CTX *actx = aead_data(ctx);
+-    size_t i, tail, tohash_len, plen = actx-&gt;tls_payload_length;
+-    unsigned char *buf, *tohash, *ctr, storage[2 * CHACHA_BLK_SIZE + 32];
++    size_t tail, tohash_len, buf_len, plen = actx-&gt;tls_payload_length;
++    unsigned char *buf, *tohash, *ctr, storage[sizeof(zero) + 32];
+ 
+     if (len != plen + POLY1305_BLOCK_SIZE)
+         return -1;
+@@ -212,9 +221,11 @@ static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+     ctr = buf + CHACHA_BLK_SIZE;
+     tohash = buf + CHACHA_BLK_SIZE - POLY1305_BLOCK_SIZE;
+ 
+-    if (plen &lt;= CHACHA_BLK_SIZE) {
++#   ifdef XOR128_HELPERS
++    if (plen &lt;= 3 * CHACHA_BLK_SIZE) {
+         actx-&gt;key.counter[0] = 0;
+-        ChaCha20_ctr32(buf, zero, 2 * CHACHA_BLK_SIZE, actx-&gt;key.key.d,
++        buf_len = (plen + 2 * CHACHA_BLK_SIZE - 1) &amp; (0 - CHACHA_BLK_SIZE);
++        ChaCha20_ctr32(buf, zero, buf_len, actx-&gt;key.key.d,
+                        actx-&gt;key.counter);
+         Poly1305_Init(POLY1305_ctx(actx), buf);
+         actx-&gt;key.partial_len = 0;
+@@ -223,6 +234,31 @@ static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+         actx-&gt;len.aad = EVP_AEAD_TLS1_AAD_LEN;
+         actx-&gt;len.text = plen;
+ 
++        if (plen) {
++            if (ctx-&gt;encrypt)
++                ctr = xor128_encrypt_n_pad(out, in, ctr, plen);
++            else
++                ctr = xor128_decrypt_n_pad(out, in, ctr, plen);
++
++            in += plen;
++            out += plen;
++            tohash_len = (size_t)(ctr - tohash);
++        }
++    }
++#   else
++    if (plen &lt;= CHACHA_BLK_SIZE) {
++        size_t i;
++
++        actx-&gt;key.counter[0] = 0;
++        ChaCha20_ctr32(buf, zero, (buf_len = 2 * CHACHA_BLK_SIZE),
++                       actx-&gt;key.key.d, actx-&gt;key.counter);
++        Poly1305_Init(POLY1305_ctx(actx), buf);
++        actx-&gt;key.partial_len = 0;
++        memcpy(tohash, actx-&gt;tls_aad, POLY1305_BLOCK_SIZE);
++        tohash_len = POLY1305_BLOCK_SIZE;
++        actx-&gt;len.aad = EVP_AEAD_TLS1_AAD_LEN;
++        actx-&gt;len.text = plen;
++
+         if (ctx-&gt;encrypt) {
+             for (i = 0; i &lt; plen; i++) {
+                 out[i] = ctr[i] ^= in[i];
+@@ -242,10 +278,12 @@ static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+         memset(ctr + i, 0, tail);
+         ctr += i + tail;
+         tohash_len += i + tail;
+-    } else {
++    }
++#   endif
++    else {
+         actx-&gt;key.counter[0] = 0;
+-        ChaCha20_ctr32(buf, zero, CHACHA_BLK_SIZE, actx-&gt;key.key.d,
+-                       actx-&gt;key.counter);
++        ChaCha20_ctr32(buf, zero, (buf_len = CHACHA_BLK_SIZE),
++                       actx-&gt;key.key.d, actx-&gt;key.counter);
+         Poly1305_Init(POLY1305_ctx(actx), buf);
+         actx-&gt;key.counter[0] = 1;
+         actx-&gt;key.partial_len = 0;
+@@ -300,7 +338,7 @@ static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+     }
+ 
+     Poly1305_Update(POLY1305_ctx(actx), tohash, tohash_len);
+-    OPENSSL_cleanse(buf, 2 * CHACHA_BLK_SIZE);
++    OPENSSL_cleanse(buf, buf_len);
+     Poly1305_Final(POLY1305_ctx(actx), ctx-&gt;encrypt ? actx-&gt;tag
+                                                     : tohash);
+ 
+diff --git a/crypto/poly1305/asm/poly1305-x86_64.pl b/crypto/poly1305/asm/poly1305-x86_64.pl
+index 0d1c0de..0b4c56e 100755
+--- a/crypto/poly1305/asm/poly1305-x86_64.pl
++++ b/crypto/poly1305/asm/poly1305-x86_64.pl
+@@ -3753,6 +3753,110 @@ poly1305_emit_base2_44:
+ .size	poly1305_emit_base2_44,.-poly1305_emit_base2_44
+ ___
+ }	}	}
++
++{	# chacha20-poly1305 helpers
++my ($out,$inp,$otp,$len)=$win64 ? (&quot;%rcx&quot;,&quot;%rdx&quot;,&quot;%r8&quot;, &quot;%r9&quot;) :  # Win64 order
++                                  (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;);  # Unix order
++$code.=&lt;&lt;___;
++.globl	xor128_encrypt_n_pad
++.type	xor128_encrypt_n_pad,\@abi-omnipotent
++.align	16
++xor128_encrypt_n_pad:
++	sub	$otp,$inp
++	sub	$otp,$out
++	mov	$len,%r10		# put len aside
++	shr	\$4,$len		# len / 16
++	jz	.Ltail_enc
++	nop
++.Loop_enc_xmm:
++	movdqu	($inp,$otp),%xmm0
++	pxor	($otp),%xmm0
++	movdqu	%xmm0,($out,$otp)
++	movdqa	%xmm0,($otp)
++	lea	16($otp),$otp
++	dec	$len
++	jnz	.Loop_enc_xmm
++
++	and	\$15,%r10		# len % 16
++	jz	.Ldone_enc
++
++.Ltail_enc:
++	mov	\$16,$len
++	sub	%r10,$len
++	xor	%eax,%eax
++.Loop_enc_byte:
++	mov	($inp,$otp),%al
++	xor	($otp),%al
++	mov	%al,($out,$otp)
++	mov	%al,($otp)
++	lea	1($otp),$otp
++	dec	%r10
++	jnz	.Loop_enc_byte
++
++	xor	%eax,%eax
++.Loop_enc_pad:
++	mov	%al,($otp)
++	lea	1($otp),$otp
++	dec	$len
++	jnz	.Loop_enc_pad
++
++.Ldone_enc:
++	mov	$otp,%rax
++	ret
++.size	xor128_encrypt_n_pad,.-xor128_encrypt_n_pad
++
++.globl	xor128_decrypt_n_pad
++.type	xor128_decrypt_n_pad,\@abi-omnipotent
++.align	16
++xor128_decrypt_n_pad:
++	sub	$otp,$inp
++	sub	$otp,$out
++	mov	$len,%r10		# put len aside
++	shr	\$4,$len		# len / 16
++	jz	.Ltail_dec
++	nop
++.Loop_dec_xmm:
++	movdqu	($inp,$otp),%xmm0
++	movdqa	($otp),%xmm1
++	pxor	%xmm0,%xmm1
++	movdqu	%xmm1,($out,$otp)
++	movdqa	%xmm0,($otp)
++	lea	16($otp),$otp
++	dec	$len
++	jnz	.Loop_dec_xmm
++
++	pxor	%xmm1,%xmm1
++	and	\$15,%r10		# len % 16
++	jz	.Ldone_dec
++
++.Ltail_dec:
++	mov	\$16,$len
++	sub	%r10,$len
++	xor	%eax,%eax
++	xor	%r11,%r11
++.Loop_dec_byte:
++	mov	($inp,$otp),%r11b
++	mov	($otp),%al
++	xor	%r11b,%al
++	mov	%al,($out,$otp)
++	mov	%r11b,($otp)
++	lea	1($otp),$otp
++	dec	%r10
++	jnz	.Loop_dec_byte
++
++	xor	%eax,%eax
++.Loop_dec_pad:
++	mov	%al,($otp)
++	lea	1($otp),$otp
++	dec	$len
++	jnz	.Loop_dec_pad
++
++.Ldone_dec:
++	mov	$otp,%rax
++	ret
++.size	xor128_decrypt_n_pad,.-xor128_decrypt_n_pad
++___
++}
+ $code.=&lt;&lt;___;
+ .align	64
+ .Lconst:
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019741.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019745.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19744">[ date ]</a>
+              <a href="thread.html#19744">[ thread ]</a>
+              <a href="subject.html#19744">[ subject ]</a>
+              <a href="author.html#19744">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,270 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1524421050.923451.12893.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019097.html">
+   <LINK REL="Next"  HREF="019111.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Kurt Roeckx</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1524421050.923451.12893.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kurt at openssl.org
+       </A><BR>
+    <I>Sun Apr 22 18:17:30 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019097.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019111.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19105">[ date ]</a>
+              <a href="thread.html#19105">[ thread ]</a>
+              <a href="subject.html#19105">[ subject ]</a>
+              <a href="author.html#19105">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  148796291e47ad402ddfd1bbe6f34a2652657ec2 (commit)
+      from  0e0f8116e247912f5c48f8b3786e543f37fc1f87 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 148796291e47ad402ddfd1bbe6f34a2652657ec2
+Author: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+Date:   Sun Apr 8 20:20:25 2018 +0200
+
+    Add support for getrandom() or equivalent system calls and use them by default
+    
+    Reviewed-by: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    GH: #5910
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ INSTALL                 |   3 +-
+ crypto/rand/rand_unix.c | 101 +++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 93 insertions(+), 11 deletions(-)
+
+diff --git a/INSTALL b/INSTALL
+index c0163a9..a0ebef9 100644
+--- a/INSTALL
++++ b/INSTALL
+@@ -224,7 +224,8 @@
+                    os:         Use a trusted operating system entropy source.
+                                This is the default method if such an entropy
+                                source exists.
+-                   getrandom:  Use the L&lt;getrandom(2)&gt; system call if available.
++                   getrandom:  Use the L&lt;getrandom(2)&gt; or equivalent system
++                               call.
+                    devrandom:  Use the the first device from the DEVRANDOM list
+                                which can be opened to read random bytes. The
+                                DEVRANDOM preprocessor constant expands to
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index beb35a3..f6fef9a 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -7,6 +7,7 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
++#define _GNU_SOURCE
+ #include &quot;e_os.h&quot;
+ #include &lt;stdio.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
+@@ -14,6 +15,17 @@
+ #include &quot;rand_lcl.h&quot;
+ #include &quot;internal/rand_int.h&quot;
+ #include &lt;stdio.h&gt;
++#if defined(__linux)
++# include &lt;sys/syscall.h&gt;
++#endif
++#if defined(__FreeBSD__)
++# include &lt;sys/types.h&gt;
++# include &lt;sys/sysctl.h&gt;
++# include &lt;sys/param.h&gt;
++#endif
++#if defined(__OpenBSD__)
++# include &lt;sys/param.h&gt;
++#endif
+ #ifdef OPENSSL_SYS_UNIX
+ # include &lt;sys/types.h&gt;
+ # include &lt;unistd.h&gt;
+@@ -59,6 +71,8 @@ static uint64_t get_timer_bits(void);
+ # endif
+ #endif
+ 
++int syscall_random(void *buf, size_t buflen);
++
+ #if (defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI)) &amp;&amp; \
+         !defined(OPENSSL_RAND_SEED_NONE)
+ # error &quot;UEFI and VXWorks only support seeding NONE&quot;
+@@ -149,26 +163,93 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ #   error &quot;Seeding uses urandom but DEVRANDOM is not configured&quot;
+ #  endif
+ 
++#  if defined(__GLIBC__) &amp;&amp; defined(__GLIBC_PREREQ)
++#   if __GLIBC_PREREQ(2, 25)
++#    define OPENSSL_HAVE_GETRANDOM
++#   endif
++#  endif
++
++#  if (defined(__FreeBSD__) &amp;&amp; __FreeBSD_version &gt;= 1200061)
++#   define OPENSSL_HAVE_GETRANDOM
++#  endif
++
++#  if defined(OPENSSL_HAVE_GETRANDOM)
++#   include &lt;sys/random.h&gt;
++#  endif
++
+ #  if defined(OPENSSL_RAND_SEED_OS)
+ #   if !defined(DEVRANDOM)
+ #    error &quot;OS seeding requires DEVRANDOM to be configured&quot;
+ #   endif
++#   define OPENSSL_RAND_SEED_GETRANDOM
+ #   define OPENSSL_RAND_SEED_DEVRANDOM
+-#   if defined(__GLIBC__) &amp;&amp; defined(__GLIBC_PREREQ)
+-#    if __GLIBC_PREREQ(2, 25)
+-#     define OPENSSL_RAND_SEED_GETRANDOM
+-#    endif
+-#   endif
+-#  endif
+-
+-#  ifdef OPENSSL_RAND_SEED_GETRANDOM
+-#   include &lt;sys/random.h&gt;
+ #  endif
+ 
+ #  if defined(OPENSSL_RAND_SEED_LIBRANDOM)
+ #   error &quot;librandom not (yet) supported&quot;
+ #  endif
+ 
++#  if defined(__FreeBSD__) &amp;&amp; defined(KERN_ARND)
++/*
++ * sysctl_random(): Use sysctl() to read a random number from the kernel
++ * Returns the size on success, 0 on failure.
++ */
++static size_t sysctl_random(char *buf, size_t buflen)
++{
++    int mib[2];
++    size_t done = 0;
++    size_t len;
++
++    /*
++     * Old implementations returned longs, newer versions support variable
++     * sizes up to 256 byte. The code below would not work properly when
++     * the sysctl returns long and we want to request something not a multiple
++     * of longs, which should never be the case.
++     */
++    ossl_assert(buflen % sizeof(long) == 0);
++
++    mib[0] = CTL_KERN;
++    mib[1] = KERN_ARND;
++
++    do {
++        len = buflen;
++        if (sysctl(mib, 2, buf, &amp;len, NULL, 0) == -1)
++            return done;
++        done += len;
++        buf += len;
++        buflen -= len;
++    } while (buflen &gt; 0);
++
++    return done;
++}
++#  endif
++
++/*
++ * syscall_random(): Try to get random data using a system call
++ * returns the number of bytes returned in buf, or &lt;= 0 on error.
++ */
++int syscall_random(void *buf, size_t buflen)
++{
++#  if defined(OPENSSL_HAVE_GETRANDOM)
++    return (int)getrandom(buf, buflen, 0);
++#  endif
++
++#  if defined(__linux) &amp;&amp; defined(SYS_getrandom)
++    return (int)syscall(SYS_getrandom, buf, buflen, 0);
++#  endif
++
++#  if defined(__FreeBSD__) &amp;&amp; defined(KERN_ARND)
++    return (int)sysctl_random(buf, buflen);
++#  endif
++
++   /* Supported since OpenBSD 5.6 */
++#  if defined(__OpenBSD__) &amp;&amp; OpenBSD &gt;= 201411
++    return getentropy(buf, buflen);
++#  endif
++
++    return -1;
++}
++
+ /*
+  * Try the various seeding methods in turn, exit when successful.
+  *
+@@ -201,7 +282,7 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     if (buffer != NULL) {
+         size_t bytes = 0;
+ 
+-        if (getrandom(buffer, bytes_needed, 0) == (int)bytes_needed)
++        if (syscall_random(buffer, bytes_needed) == (int)bytes_needed)
+             bytes = bytes_needed;
+ 
+         rand_pool_add_end(pool, bytes, 8 * bytes);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019097.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019111.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19105">[ date ]</a>
+              <a href="thread.html#19105">[ thread ]</a>
+              <a href="subject.html#19105">[ subject ]</a>
+              <a href="author.html#19105">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,200 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1563423746.434937.10026.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024006.html">
+   <LINK REL="Next"  HREF="024017.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>matthias.st.pierre at ncp-e.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1563423746.434937.10026.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matthias.st.pierre at ncp-e.com
+       </A><BR>
+    <I>Thu Jul 18 04:22:26 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024006.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024017.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24015">[ date ]</a>
+              <a href="thread.html#24015">[ thread ]</a>
+              <a href="subject.html#24015">[ subject ]</a>
+              <a href="author.html#24015">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3b438ef95b5b1c45602b1332921209363e4776bd (commit)
+      from  e7aa7c11c71e84b2d6c06b1c81d130e8c1fba296 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3b438ef95b5b1c45602b1332921209363e4776bd
+Author: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+Date:   Wed Jul 17 19:14:01 2019 +0200
+
+    Fix init_get_thread_local()
+    
+    Previously, init_get_thread_local() pushed the thread event handler
+    list onto the global register before calling CRYPTO_THREAD_set_local(),
+    and when the latter failed, forgot to pop the list from the stack again.
+    
+    Instead of cleaning the stack on error, this commit avoids the situation
+    entirely by postponing the push operation until all other operations
+    succeeded. This reordering also significantly reduces the scope of the
+    critical section.
+    
+    Another simplification of the code is achieved by moving the push operation
+    onto the register (which is disabled in FIPS mode) into a separate function.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9401">https://github.com/openssl/openssl/pull/9401</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/initthread.c | 64 +++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 38 insertions(+), 26 deletions(-)
+
+diff --git a/crypto/initthread.c b/crypto/initthread.c
+index b3f45b9..7de8a36 100644
+--- a/crypto/initthread.c
++++ b/crypto/initthread.c
+@@ -77,6 +77,12 @@ static GLOBAL_TEVENT_REGISTER *get_global_tevent_register(void)
+ }
+ #endif
+ 
++#ifndef FIPS_MODE
++static int  init_thread_push_handlers(THREAD_EVENT_HANDLER **hands);
++static void init_thread_remove_handlers(THREAD_EVENT_HANDLER **handsin);
++static void init_thread_destructor(void *hands);
++static int  init_thread_deregister(void *arg, int all);
++#endif
+ static void init_thread_stop(void *arg, THREAD_EVENT_HANDLER **hands);
+ 
+ static THREAD_EVENT_HANDLER **
+@@ -86,40 +92,22 @@ init_get_thread_local(CRYPTO_THREAD_LOCAL *local, int alloc, int keep)
+ 
+     if (alloc) {
+         if (hands == NULL) {
+-#ifndef FIPS_MODE
+-            GLOBAL_TEVENT_REGISTER *gtr;
+-#endif
+ 
+-            if ((hands = OPENSSL_zalloc(sizeof(*hands))) == NULL) {
+-                OPENSSL_free(hands);
++            if ((hands = OPENSSL_zalloc(sizeof(*hands))) == NULL)
+                 return NULL;
+-            }
+ 
+-#ifndef FIPS_MODE
+-            /*
+-             * The thread event handler is thread specific and is a linked
+-             * list of all handler functions that should be called for the
+-             * current thread. We also keep a global reference to that linked
+-             * list, so that we can deregister handlers if necessary before all
+-             * the threads are stopped.
+-             */
+-            gtr = get_global_tevent_register();
+-            if (gtr == NULL) {
++            if (!CRYPTO_THREAD_set_local(local, hands)) {
+                 OPENSSL_free(hands);
+                 return NULL;
+             }
+-            CRYPTO_THREAD_write_lock(gtr-&gt;lock);
+-            if (!sk_THREAD_EVENT_HANDLER_PTR_push(gtr-&gt;skhands, hands)) {
++
++#ifndef FIPS_MODE
++            if (!init_thread_push_handlers(hands)) {
++                CRYPTO_THREAD_set_local(local, NULL);
+                 OPENSSL_free(hands);
+-                CRYPTO_THREAD_unlock(gtr-&gt;lock);
+                 return NULL;
+             }
+-            CRYPTO_THREAD_unlock(gtr-&gt;lock);
+ #endif
+-            if (!CRYPTO_THREAD_set_local(local, hands)) {
+-                OPENSSL_free(hands);
+-                return NULL;
+-            }
+         }
+     } else if (!keep) {
+         CRYPTO_THREAD_set_local(local, NULL);
+@@ -148,6 +136,32 @@ static union {
+     CRYPTO_THREAD_LOCAL value;
+ } destructor_key = { -1 };
+ 
++/*
++ * The thread event handler list is a thread specific linked list
++ * of callback functions which are invoked in list order by the
++ * current thread in case of certain events. (Currently, there is
++ * only one type of event, the 'thread stop' event.)
++ *
++ * We also keep a global reference to that linked list, so that we
++ * can deregister handlers if necessary before all the threads are
++ * stopped.
++ */
++static int init_thread_push_handlers(THREAD_EVENT_HANDLER **hands)
++{
++    int ret;
++    GLOBAL_TEVENT_REGISTER *gtr;
++
++    gtr = get_global_tevent_register();
++    if (gtr == NULL)
++        return 0;
++
++    CRYPTO_THREAD_write_lock(gtr-&gt;lock);
++    ret = (sk_THREAD_EVENT_HANDLER_PTR_push(gtr-&gt;skhands, hands) != 0);
++    CRYPTO_THREAD_unlock(gtr-&gt;lock);
++
++    return ret;
++}
++
+ static void init_thread_remove_handlers(THREAD_EVENT_HANDLER **handsin)
+ {
+     GLOBAL_TEVENT_REGISTER *gtr;
+@@ -187,8 +201,6 @@ int ossl_init_thread(void)
+     return 1;
+ }
+ 
+-static int init_thread_deregister(void *arg, int all);
+-
+ void ossl_cleanup_thread(void)
+ {
+     init_thread_deregister(NULL, 1);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024006.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024017.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24015">[ date ]</a>
+              <a href="thread.html#24015">[ thread ]</a>
+              <a href="subject.html#24015">[ subject ]</a>
+              <a href="author.html#24015">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

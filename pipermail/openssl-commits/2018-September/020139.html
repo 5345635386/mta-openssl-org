@@ -1,0 +1,195 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1536330347.197292.13117.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020138.html">
+   <LINK REL="Next"  HREF="020140.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1536330347.197292.13117.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri Sep  7 14:25:47 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020138.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="020140.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20139">[ date ]</a>
+              <a href="thread.html#20139">[ thread ]</a>
+              <a href="subject.html#20139">[ subject ]</a>
+              <a href="author.html#20139">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  328a0547ad61d9e260fca73a280d2288714f2b92 (commit)
+       via  2c0267fdc99f8a06cb205f0faecc2ff06f0de8bf (commit)
+      from  cd3b53b8f85ad66336936073d822b3315e0ddd4f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 328a0547ad61d9e260fca73a280d2288714f2b92
+Author: Ben Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaduk at mit.edu</A>&gt;
+Date:   Tue Sep 4 12:30:00 2018 -0500
+
+    Simplify SSL_get_servername() to avoid session references
+    
+    Ideally, SSL_get_servername() would do exactly as it is documented
+    and return exactly what the client sent (i.e., what we currently
+    are stashing in the SSL's ext.hostname), without needing to refer
+    to an SSL_SESSION object.  For historical reasons, including the
+    parsed SNI value from the ClientHello originally being stored in the
+    SSL_SESSION's ext.hostname field, we have had references to the
+    SSL_SESSION in this function.  We cannot fully excise them due to
+    the interaction between user-supplied callbacks and TLS 1.2 resumption
+    flows, where we call all callbacks but the client did not supply an
+    SNI value.  Existing callbacks expect to receive a valid SNI value
+    in this case, so we must fake one up from the resumed session in
+    order to avoid breakage.
+    
+    Otherwise, greatly simplify the implementation and just return the
+    value in the SSL, as sent by the client.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/7115">https://github.com/openssl/openssl/pull/7115</A>)
+
+commit 2c0267fdc99f8a06cb205f0faecc2ff06f0de8bf
+Author: Ben Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaduk at mit.edu</A>&gt;
+Date:   Tue Sep 4 11:44:07 2018 -0500
+
+    Restore historical SSL_get_servername() behavior
+    
+    Commit 1c4aa31d79821dee9be98e915159d52cc30d8403 modified the state machine
+    to clean up stale ext.hostname values from SSL objects in the case when
+    SNI was not negotiated for the current handshake.  This is natural from
+    the TLS perspective, since this information is an extension that the client
+    offered but we ignored, and since we ignored it we do not need to keep it
+    around for anything else.
+    
+    However, as documented in <A HREF="https://github.com/openssl/openssl/issues/7014">https://github.com/openssl/openssl/issues/7014</A> ,
+    there appear to be some deployed code that relies on retrieving such an
+    ignored SNI value from the client, after the handshake has completed.
+    Because the 1.1.1 release is on a stable branch and should preserve the
+    published ABI, restore the historical behavior by retaining the ext.hostname
+    value sent by the client, in the SSL structure, for subsequent retrieval.
+    
+    [extended tests]
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/7115">https://github.com/openssl/openssl/pull/7115</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c           | 18 +++++++-----------
+ ssl/statem/extensions.c |  7 ++-----
+ 2 files changed, 9 insertions(+), 16 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index 7e8093b..3d25da6 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -2600,18 +2600,14 @@ const char *SSL_get_servername(const SSL *s, const int type)
+         return NULL;
+ 
+     /*
+-     * TODO(OpenSSL1.2) clean up this compat mess.  This API is
+-     * currently a mix of &quot;what did I configure&quot; and &quot;what did the
+-     * peer send&quot; and &quot;what was actually negotiated&quot;; we should have
+-     * a clear distinction amongst those three.
++     * SNI is not negotiated in pre-TLS-1.3 resumption flows, so fake up an
++     * SNI value to return if we are resuming/resumed.  N.B. that we still
++     * call the relevant callbacks for such resumption flows, and callbacks
++     * might error out if there is not a SNI value available.
+      */
+-    if (SSL_in_init(s)) {
+-        if (s-&gt;hit)
+-            return s-&gt;session-&gt;ext.hostname;
+-        return s-&gt;ext.hostname;
+-    }
+-    return (s-&gt;session != NULL &amp;&amp; s-&gt;ext.hostname == NULL) ?
+-        s-&gt;session-&gt;ext.hostname : s-&gt;ext.hostname;
++    if (s-&gt;hit)
++        return s-&gt;session-&gt;ext.hostname;
++    return s-&gt;ext.hostname;
+ }
+ 
+ int SSL_get_servername_type(const SSL *s)
+diff --git a/ssl/statem/extensions.c b/ssl/statem/extensions.c
+index 307e6b9..cd4f078 100644
+--- a/ssl/statem/extensions.c
++++ b/ssl/statem/extensions.c
+@@ -938,11 +938,8 @@ static int final_server_name(SSL *s, unsigned int context, int sent)
+      * was successful.
+      */
+     if (s-&gt;server) {
+-        if (!sent) {
+-            /* Nothing from the client this handshake; cleanup stale value */
+-            OPENSSL_free(s-&gt;ext.hostname);
+-            s-&gt;ext.hostname = NULL;
+-        } else if (ret == SSL_TLSEXT_ERR_OK &amp;&amp; (!s-&gt;hit || SSL_IS_TLS13(s))) {
++        /* TODO(OpenSSL1.2) revisit !sent case */
++        if (sent &amp;&amp; ret == SSL_TLSEXT_ERR_OK &amp;&amp; (!s-&gt;hit || SSL_IS_TLS13(s))) {
+             /* Only store the hostname in the session if we accepted it. */
+             OPENSSL_free(s-&gt;session-&gt;ext.hostname);
+             s-&gt;session-&gt;ext.hostname = OPENSSL_strdup(s-&gt;ext.hostname);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020138.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="020140.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20139">[ date ]</a>
+              <a href="thread.html#20139">[ thread ]</a>
+              <a href="subject.html#20139">[ subject ]</a>
+              <a href="author.html#20139">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

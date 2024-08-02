@@ -1,0 +1,462 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1503955112.036072.25720.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016165.html">
+   <LINK REL="Next"  HREF="016181.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Kurt Roeckx</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1503955112.036072.25720.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">kurt at openssl.org
+       </A><BR>
+    <I>Mon Aug 28 21:18:32 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016165.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="016181.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16171">[ date ]</a>
+              <a href="thread.html#16171">[ thread ]</a>
+              <a href="subject.html#16171">[ subject ]</a>
+              <a href="author.html#16171">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  58891025eff2fb42a6a5cf2fa861d46308826d07 (commit)
+       via  0b14a5b7ccd1618fe47d74a51c4873144c57ac83 (commit)
+      from  b23171744b01e473ebbfd6edad70c1c3825ffbcd (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 58891025eff2fb42a6a5cf2fa861d46308826d07
+Author: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+Date:   Sun Aug 27 23:13:05 2017 +0200
+
+    Make the global DRBGs static
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    GH: #4268
+
+commit 0b14a5b7ccd1618fe47d74a51c4873144c57ac83
+Author: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+Date:   Sun Aug 27 17:46:33 2017 +0200
+
+    Don't auto-instantiate a DRBG when trying to use it and it's not
+    
+    The one creating the DRBG should instantiate it, it's there that we
+    know which parameters we should use to instantiate it.
+    
+    This splits the rand init in two parts to avoid a deadlock
+    because when the global drbg is created it wands to call
+    rand_add on the global rand method.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    GH: #4268
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/include/internal/rand_int.h |   1 +
+ crypto/init.c                      |   1 +
+ crypto/rand/drbg_lib.c             | 128 ++++++++++++++++++++++++++++---------
+ crypto/rand/rand_lcl.h             |   2 -
+ crypto/rand/rand_lib.c             |  39 ++---------
+ include/internal/rand.h            |   1 +
+ ssl/ssl_lib.c                      |   3 +-
+ util/libcrypto.num                 |   1 +
+ 8 files changed, 109 insertions(+), 67 deletions(-)
+
+diff --git a/crypto/include/internal/rand_int.h b/crypto/include/internal/rand_int.h
+index 90b0094..d0999f2 100644
+--- a/crypto/include/internal/rand_int.h
++++ b/crypto/include/internal/rand_int.h
+@@ -18,4 +18,5 @@
+ #include &lt;openssl/rand.h&gt;
+ 
+ void rand_cleanup_int(void);
++void rand_cleanup_drbg_int(void);
+ void rand_fork(void);
+diff --git a/crypto/init.c b/crypto/init.c
+index c8f0a3f..ccfd003 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -488,6 +488,7 @@ void OPENSSL_cleanup(void)
+      * obj_cleanup_int() must be called last
+      */
+     rand_cleanup_int();
++    rand_cleanup_drbg_int();
+     conf_modules_free_int();
+ #ifndef OPENSSL_NO_ENGINE
+     engine_cleanup_int();
+diff --git a/crypto/rand/drbg_lib.c b/crypto/rand/drbg_lib.c
+index d1f419d..83ddc27 100644
+--- a/crypto/rand/drbg_lib.c
++++ b/crypto/rand/drbg_lib.c
+@@ -12,6 +12,11 @@
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/rand.h&gt;
+ #include &quot;rand_lcl.h&quot;
++#include &quot;internal/thread_once.h&quot;
++#include &quot;internal/rand_int.h&quot;
++
++static RAND_DRBG rand_drbg; /* The default global DRBG. */
++static RAND_DRBG priv_drbg; /* The global private-key DRBG. */
+ 
+ /*
+  * Support framework for NIST SP 800-90A DRBG, AES-CTR mode.
+@@ -25,6 +30,8 @@
+  * a much bigger deal than just re-setting an allocated resource.)
+  */
+ 
++static CRYPTO_ONCE rand_init_drbg = CRYPTO_ONCE_STATIC_INIT;
++
+ /*
+  * Set/initialize |drbg| to be of type |nid|, with optional |flags|.
+  * Return -2 if the type is not supported, 1 on success and -1 on
+@@ -76,18 +83,9 @@ RAND_DRBG *RAND_DRBG_new(int type, unsigned int flags, RAND_DRBG *parent)
+         goto err;
+ 
+     if (parent != NULL) {
+-        if (parent-&gt;state == DRBG_UNINITIALISED
+-                &amp;&amp; RAND_DRBG_instantiate(parent, NULL, 0) == 0)
+-            goto err;
+         if (!RAND_DRBG_set_callbacks(drbg, drbg_entropy_from_parent,
+                                      drbg_release_entropy,
+-                                     NULL, NULL)
+-                /*
+-                 * Add in our address.  Note we are adding the pointer
+-                 * itself, not its contents!
+-                 */
+-                || !RAND_DRBG_instantiate(drbg,
+-                                          (unsigned char*)&amp;drbg, sizeof(drbg)))
++                                     NULL, NULL))
+             goto err;
+     }
+ 
+@@ -98,17 +96,12 @@ err:
+     return NULL;
+ }
+ 
+-RAND_DRBG *RAND_DRBG_get0_global(void)
+-{
+-    return &amp;rand_drbg;
+-}
+-
+ /*
+  * Uninstantiate |drbg| and free all memory.
+  */
+ void RAND_DRBG_free(RAND_DRBG *drbg)
+ {
+-    /* The global DRBG is free'd by rand_cleanup_int() */
++    /* The global DRBG is free'd by rand_cleanup_drbg_int() */
+     if (drbg == NULL || drbg == &amp;rand_drbg)
+         return;
+ 
+@@ -340,28 +333,80 @@ void *RAND_DRBG_get_ex_data(const RAND_DRBG *drbg, int idx)
+  * global DRBG.  They lock.
+  */
+ 
++/*
++ * Creates a global DRBG with default settings.
++ * Returns 1 on success, 0 on failure
++ */
++static int setup_drbg(RAND_DRBG *drbg)
++{
++    int ret = 1;
++
++    drbg-&gt;lock = CRYPTO_THREAD_lock_new();
++    ret &amp;= drbg-&gt;lock != NULL;
++    drbg-&gt;size = RANDOMNESS_NEEDED;
++    drbg-&gt;secure = CRYPTO_secure_malloc_initialized();
++    /* If you change these parameters, see RANDOMNESS_NEEDED */
++    ret &amp;= RAND_DRBG_set(drbg,
++                         NID_aes_128_ctr, RAND_DRBG_FLAG_CTR_USE_DF) == 1;
++    ret &amp;= RAND_DRBG_set_callbacks(drbg, drbg_entropy_from_system,
++                                   drbg_release_entropy, NULL, NULL) == 1;
++    ret &amp;= RAND_DRBG_instantiate(drbg, NULL, 0) == 1;
++    return ret;
++}
++
++/*
++ * Initialize the global DRBGs on first use.
++ * Returns 1 on success, 0 on failure.
++ */
++DEFINE_RUN_ONCE_STATIC(do_rand_init_drbg)
++{
++    int ret = 1;
++
++    ret &amp;= setup_drbg(&amp;rand_drbg);
++    ret &amp;= setup_drbg(&amp;priv_drbg);
++
++    return ret;
++}
++
++/* Clean up a DRBG and free it */
++static void free_drbg(RAND_DRBG *drbg)
++{
++    CRYPTO_THREAD_lock_free(drbg-&gt;lock);
++    RAND_DRBG_uninstantiate(drbg);
++}
++
++/* Clean up the global DRBGs before exit */
++void rand_cleanup_drbg_int(void)
++{
++    free_drbg(&amp;rand_drbg);
++    free_drbg(&amp;priv_drbg);
++}
++
+ static int drbg_bytes(unsigned char *out, int count)
+ {
+     int ret = 0;
+     size_t chunk;
++    RAND_DRBG *drbg = RAND_DRBG_get0_global();
++
++    if (drbg == NULL)
++        return 0;
+ 
+-    CRYPTO_THREAD_write_lock(rand_drbg.lock);
+-    if (rand_drbg.state == DRBG_UNINITIALISED
+-            &amp;&amp; RAND_DRBG_instantiate(&amp;rand_drbg, NULL, 0) == 0)
++    CRYPTO_THREAD_write_lock(drbg-&gt;lock);
++    if (drbg-&gt;state == DRBG_UNINITIALISED)
+         goto err;
+ 
+     for ( ; count &gt; 0; count -= chunk, out += chunk) {
+         chunk = count;
+-        if (chunk &gt; rand_drbg.max_request)
+-            chunk = rand_drbg.max_request;
+-        ret = RAND_DRBG_generate(&amp;rand_drbg, out, chunk, 0, NULL, 0);
++        if (chunk &gt; drbg-&gt;max_request)
++            chunk = drbg-&gt;max_request;
++        ret = RAND_DRBG_generate(drbg, out, chunk, 0, NULL, 0);
+         if (!ret)
+             goto err;
+     }
+     ret = 1;
+ 
+ err:
+-    CRYPTO_THREAD_unlock(rand_drbg.lock);
++    CRYPTO_THREAD_unlock(drbg-&gt;lock);
+     return ret;
+ }
+ 
+@@ -396,17 +441,40 @@ static int drbg_seed(const void *buf, int num)
+ static int drbg_status(void)
+ {
+     int ret;
++    RAND_DRBG *drbg = RAND_DRBG_get0_global();
+ 
+-    CRYPTO_THREAD_write_lock(rand_drbg.lock);
+-    if (rand_drbg.state == DRBG_UNINITIALISED)
+-        RAND_DRBG_instantiate(&amp;rand_drbg, NULL, 0);
+-    ret = rand_drbg.state == DRBG_READY ? 1 : 0;
+-    CRYPTO_THREAD_unlock(rand_drbg.lock);
++    if (drbg == NULL)
++        return 0;
++
++    CRYPTO_THREAD_write_lock(drbg-&gt;lock);
++    ret = drbg-&gt;state == DRBG_READY ? 1 : 0;
++    CRYPTO_THREAD_unlock(drbg-&gt;lock);
+     return ret;
+ }
+ 
+-RAND_DRBG rand_drbg; /* The default global DRBG. */
+-RAND_DRBG priv_drbg; /* The global private-key DRBG. */
++/*
++ * Get the global public DRBG.
++ * Returns pointer to the DRBG on success, NULL on failure.
++ */
++RAND_DRBG *RAND_DRBG_get0_global(void)
++{
++    if (!RUN_ONCE(&amp;rand_init_drbg, do_rand_init_drbg))
++        return NULL;
++
++    return &amp;rand_drbg;
++}
++
++/*
++ * Get the global private DRBG.
++ * Returns pointer to the DRBG on success, NULL on failure.
++ */
++RAND_DRBG *RAND_DRBG_get0_priv_global(void)
++{
++    if (!RUN_ONCE(&amp;rand_init_drbg, do_rand_init_drbg))
++        return NULL;
++
++    return &amp;priv_drbg;
++}
+ 
+ RAND_METHOD rand_meth = {
+     drbg_seed,
+diff --git a/crypto/rand/rand_lcl.h b/crypto/rand/rand_lcl.h
+index f9de279..498b7e6 100644
+--- a/crypto/rand/rand_lcl.h
++++ b/crypto/rand/rand_lcl.h
+@@ -144,8 +144,6 @@ struct rand_drbg_st {
+ /* The global RAND method, and the global buffer and DRBG instance. */
+ extern RAND_METHOD rand_meth;
+ extern RAND_BYTES_BUFFER rand_bytes;
+-extern RAND_DRBG rand_drbg;
+-extern RAND_DRBG priv_drbg;
+ 
+ /* How often we've forked (only incremented in child). */
+ extern int rand_fork_count;
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 5ed08f1..a27281c 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -144,7 +144,7 @@ size_t drbg_entropy_from_parent(RAND_DRBG *drbg,
+ {
+     int st;
+     unsigned char *randomness;
+-    
++
+     if (min_len &gt; (size_t)drbg-&gt;size) {
+         /* Should not happen.  See comment near RANDOMNESS_NEEDED. */
+         min_len = drbg-&gt;size;
+@@ -172,32 +172,6 @@ void drbg_release_entropy(RAND_DRBG *drbg, unsigned char *out, size_t outlen)
+         OPENSSL_clear_free(out, outlen);
+ }
+ 
+-
+-/*
+- * Set up a global DRBG.
+- */
+-static int setup_drbg(RAND_DRBG *drbg)
+-{
+-    int ret = 1;
+-
+-    drbg-&gt;lock = CRYPTO_THREAD_lock_new();
+-    ret &amp;= drbg-&gt;lock != NULL;
+-    drbg-&gt;size = RANDOMNESS_NEEDED;
+-    drbg-&gt;secure = CRYPTO_secure_malloc_initialized();
+-    /* If you change these parameters, see RANDOMNESS_NEEDED */
+-    ret &amp;= RAND_DRBG_set(drbg,
+-                         NID_aes_128_ctr, RAND_DRBG_FLAG_CTR_USE_DF) == 1;
+-    ret &amp;= RAND_DRBG_set_callbacks(drbg, drbg_entropy_from_system,
+-                                   drbg_release_entropy, NULL, NULL) == 1;
+-    return ret;
+-}
+-
+-static void free_drbg(RAND_DRBG *drbg)
+-{
+-    CRYPTO_THREAD_lock_free(drbg-&gt;lock);
+-    RAND_DRBG_uninstantiate(drbg);
+-}
+-
+ void rand_fork()
+ {
+     rand_fork_count++;
+@@ -223,8 +197,6 @@ DEFINE_RUN_ONCE_STATIC(do_rand_init)
+         ? OPENSSL_secure_malloc(rand_bytes.size)
+         : OPENSSL_malloc(rand_bytes.size);
+     ret &amp;= rand_bytes.buff != NULL;
+-    ret &amp;= setup_drbg(&amp;rand_drbg);
+-    ret &amp;= setup_drbg(&amp;priv_drbg);
+     return ret;
+ }
+ 
+@@ -244,8 +216,6 @@ void rand_cleanup_int(void)
+         OPENSSL_secure_clear_free(rand_bytes.buff, rand_bytes.size);
+     else
+         OPENSSL_clear_free(rand_bytes.buff, rand_bytes.size);
+-    free_drbg(&amp;rand_drbg);
+-    free_drbg(&amp;priv_drbg);
+ }
+ 
+ /*
+@@ -357,15 +327,16 @@ void RAND_add(const void *buf, int num, double randomness)
+ int RAND_priv_bytes(unsigned char *buf, int num)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
++    RAND_DRBG *drbg;
+ 
+     if (meth != RAND_OpenSSL())
+         return RAND_bytes(buf, num);
+ 
+-    if (priv_drbg.state == DRBG_UNINITIALISED
+-            &amp;&amp; RAND_DRBG_instantiate(&amp;priv_drbg, NULL, 0) == 0)
++    drbg = RAND_DRBG_get0_priv_global();
++    if (drbg == NULL)
+         return 0;
+-    return RAND_DRBG_generate(&amp;priv_drbg, buf, num, 0, NULL, 0);
+ 
++    return RAND_DRBG_generate(drbg, buf, num, 0, NULL, 0);
+ }
+ 
+ int RAND_bytes(unsigned char *buf, int num)
+diff --git a/include/internal/rand.h b/include/internal/rand.h
+index 444c806..07f141d 100644
+--- a/include/internal/rand.h
++++ b/include/internal/rand.h
+@@ -33,6 +33,7 @@ int RAND_DRBG_generate(RAND_DRBG *drbg, unsigned char *out, size_t outlen,
+                        const unsigned char *adin, size_t adinlen);
+ int RAND_DRBG_set_reseed_interval(RAND_DRBG *drbg, int interval);
+ RAND_DRBG *RAND_DRBG_get0_global(void);
++RAND_DRBG *RAND_DRBG_get0_priv_global(void);
+ 
+ /*
+  * EXDATA
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index ed2113c..501a12c 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -630,7 +630,8 @@ SSL *SSL_new(SSL_CTX *ctx)
+     if (RAND_get_rand_method() == RAND_OpenSSL()) {
+         s-&gt;drbg = RAND_DRBG_new(NID_aes_128_ctr, RAND_DRBG_FLAG_CTR_USE_DF,
+                                 RAND_DRBG_get0_global());
+-        if (s-&gt;drbg == NULL) {
++        if (s-&gt;drbg == NULL
++            || RAND_DRBG_instantiate(s-&gt;drbg, NULL, 0) == 0) {
+             CRYPTO_THREAD_lock_free(s-&gt;lock);
+             goto err;
+         }
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index c7f1905..df89345 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4382,3 +4382,4 @@ ASN1_TIME_compare                       4325	1_1_1	EXIST::FUNCTION:
+ EVP_PKEY_CTX_ctrl_uint64                4326	1_1_1	EXIST::FUNCTION:
+ EVP_DigestFinalXOF                      4327	1_1_1	EXIST::FUNCTION:
+ ERR_clear_last_mark                     4328	1_1_1	EXIST::FUNCTION:
++RAND_DRBG_get0_priv_global              4329	1_1_1	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016165.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="016181.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16171">[ date ]</a>
+              <a href="thread.html#16171">[ thread ]</a>
+              <a href="subject.html#16171">[ subject ]</a>
+              <a href="author.html#16171">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

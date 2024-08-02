@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1554773216.386692.6158.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022727.html">
+   <LINK REL="Next"  HREF="022734.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>nic.tuv at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1554773216.386692.6158.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">nic.tuv at gmail.com
+       </A><BR>
+    <I>Tue Apr  9 01:26:56 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022727.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="022734.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22729">[ date ]</a>
+              <a href="thread.html#22729">[ thread ]</a>
+              <a href="subject.html#22729">[ subject ]</a>
+              <a href="author.html#22729">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  bb315ca716656b7aff89f86d35988062952ccb21 (commit)
+      from  97cc9c9b01217f41438472db98fc41ab96fc466b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit bb315ca716656b7aff89f86d35988062952ccb21
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Fri Mar 22 14:10:31 2019 +1000
+
+    EC keygen updates + changed ecdsa_sign to use BN_secure_new
+    
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8557">https://github.com/openssl/openssl/pull/8557</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_key.c     | 61 +++++++++++++++++++++++++++++++++++++-------------
+ crypto/ec/ecdsa_ossl.c |  2 +-
+ 2 files changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/crypto/ec/ec_key.c b/crypto/ec/ec_key.c
+index 637ba14..416c0e0 100644
+--- a/crypto/ec/ec_key.c
++++ b/crypto/ec/ec_key.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2002-2018 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2002-2019 The OpenSSL Project Authors. All Rights Reserved.
+  * Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+@@ -195,59 +195,90 @@ int ossl_ec_key_gen(EC_KEY *eckey)
+     return eckey-&gt;group-&gt;meth-&gt;keygen(eckey);
+ }
+ 
++/*
++ * ECC Key generation.
++ * See SP800-56AR3 5.6.1.2.2 &quot;Key Pair Generation by Testing Candidates&quot;
++ *
++ * Params:
++ *     eckey An EC key object that contains domain params. The generated keypair
++ *           is stored in this object.
++ * Returns 1 if the keypair was generated or 0 otherwise.
++ */
+ int ec_key_simple_generate_key(EC_KEY *eckey)
+ {
+     int ok = 0;
+-    BN_CTX *ctx = NULL;
+     BIGNUM *priv_key = NULL;
+     const BIGNUM *order = NULL;
+     EC_POINT *pub_key = NULL;
+-
+-    if ((ctx = BN_CTX_new()) == NULL)
+-        goto err;
++    const EC_GROUP *group = eckey-&gt;group;
+ 
+     if (eckey-&gt;priv_key == NULL) {
+-        priv_key = BN_new();
++        priv_key = BN_secure_new();
+         if (priv_key == NULL)
+             goto err;
+     } else
+         priv_key = eckey-&gt;priv_key;
+ 
+-    order = EC_GROUP_get0_order(eckey-&gt;group);
++    /*
++     * Steps (1-2): Check domain parameters and security strength.
++     * These steps must be done by the user. This would need to be
++     * stated in the security policy.
++     */
++
++    order = EC_GROUP_get0_order(group);
+     if (order == NULL)
+         goto err;
+ 
++    /*
++     * Steps (3-7): priv_key = DRBG_RAND(order_n_bits) (range [1, n-1]).
++     * Although this is slightly different from the standard, it is effectively
++     * equivalent as it gives an unbiased result ranging from 1..n-1. It is also
++     * faster as the standard needs to retry more often. Also doing
++     * 1 + rand[0..n-2] would effect the way that tests feed dummy entropy into
++     * rand so the simpler backward compatible method has been used here.
++     */
+     do
+         if (!BN_priv_rand_range(priv_key, order))
+             goto err;
+     while (BN_is_zero(priv_key)) ;
+ 
+     if (eckey-&gt;pub_key == NULL) {
+-        pub_key = EC_POINT_new(eckey-&gt;group);
++        pub_key = EC_POINT_new(group);
+         if (pub_key == NULL)
+             goto err;
+     } else
+         pub_key = eckey-&gt;pub_key;
+ 
+-    if (!EC_POINT_mul(eckey-&gt;group, pub_key, priv_key, NULL, NULL, ctx))
++    /* Step (8) : pub_key = priv_key * G (where G is a point on the curve) */
++    if (!EC_POINT_mul(group, pub_key, priv_key, NULL, NULL, NULL))
+         goto err;
+ 
+     eckey-&gt;priv_key = priv_key;
+     eckey-&gt;pub_key = pub_key;
++    priv_key = NULL;
++    pub_key = NULL;
+ 
+     ok = 1;
+ 
+- err:
+-    if (eckey-&gt;pub_key == NULL)
+-        EC_POINT_free(pub_key);
+-    if (eckey-&gt;priv_key != priv_key)
+-        BN_free(priv_key);
+-    BN_CTX_free(ctx);
++err:
++    /* Step (9): If there is an error return an invalid keypair. */
++    if (!ok) {
++        BN_clear(eckey-&gt;priv_key);
++        if (eckey-&gt;pub_key != NULL)
++            EC_POINT_set_to_infinity(group, eckey-&gt;pub_key);
++    }
++
++    EC_POINT_free(pub_key);
++    BN_clear_free(priv_key);
+     return ok;
+ }
+ 
+ int ec_key_simple_generate_public_key(EC_KEY *eckey)
+ {
++    /*
++     * See SP800-56AR3 5.6.1.2.2: Step (8)
++     * pub_key = priv_key * G (where G is a point on the curve)
++     */
+     return EC_POINT_mul(eckey-&gt;group, eckey-&gt;pub_key, eckey-&gt;priv_key, NULL,
+                         NULL, NULL);
+ }
+diff --git a/crypto/ec/ecdsa_ossl.c b/crypto/ec/ecdsa_ossl.c
+index a790e0a..a488d5c 100644
+--- a/crypto/ec/ecdsa_ossl.c
++++ b/crypto/ec/ecdsa_ossl.c
+@@ -59,7 +59,7 @@ static int ecdsa_sign_setup(EC_KEY *eckey, BN_CTX *ctx_in,
+         }
+     }
+ 
+-    k = BN_new();               /* this value is later returned in *kinvp */
++    k = BN_secure_new();        /* this value is later returned in *kinvp */
+     r = BN_new();               /* this value is later returned in *rp */
+     X = BN_new();
+     if (k == NULL || r == NULL || X == NULL) {
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022727.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="022734.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22729">[ date ]</a>
+              <a href="thread.html#22729">[ thread ]</a>
+              <a href="subject.html#22729">[ subject ]</a>
+              <a href="author.html#22729">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

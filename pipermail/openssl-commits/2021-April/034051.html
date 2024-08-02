@@ -1,0 +1,414 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619622230.318532.16461.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034049.html">
+   <LINK REL="Next"  HREF="034052.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619622230.318532.16461.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Apr 28 15:03:50 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034049.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034052.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34051">[ date ]</a>
+              <a href="thread.html#34051">[ thread ]</a>
+              <a href="subject.html#34051">[ subject ]</a>
+              <a href="author.html#34051">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  2d5695016d880b9c6681f293ed5afb0379ce86b7 (commit)
+       via  98369ef25f87ee1dfc5d17da5489bbacb4150972 (commit)
+      from  4189dc3782c5989dbaa7d247e41a96a25b27c940 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 2d5695016d880b9c6681f293ed5afb0379ce86b7
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Apr 23 16:18:28 2021 +0100
+
+    Properly protect access to the provider flag_activated field
+    
+    This was not always locked when it should be.
+    
+    Fixes #15005
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15010">https://github.com/openssl/openssl/pull/15010</A>)
+
+commit 98369ef25f87ee1dfc5d17da5489bbacb4150972
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Apr 23 14:10:07 2021 +0100
+
+    Add a threading test for loading/unloading providers
+    
+    Check that we don't see any threading issues when loading/unloading a
+    provider from multiple threads.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15010">https://github.com/openssl/openssl/pull/15010</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_core.c | 110 +++++++++++++++++++++++++++++++------------------
+ test/threadstest.c     |  26 +++++++++++-
+ 2 files changed, 94 insertions(+), 42 deletions(-)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index f3a4f297bf..1ef2cd5ca7 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -48,7 +48,6 @@ struct ossl_provider_st {
+     unsigned int flag_initialized:1;
+     unsigned int flag_activated:1;
+     unsigned int flag_fallback:1; /* Can be used as fallback */
+-    unsigned int flag_activated_as_fallback:1;
+ 
+     /* Getting and setting the flags require synchronization */
+     CRYPTO_RWLOCK *flag_lock;
+@@ -56,8 +55,7 @@ struct ossl_provider_st {
+     /* OpenSSL library side data */
+     CRYPTO_REF_COUNT refcnt;
+     CRYPTO_RWLOCK *refcnt_lock;  /* For the ref counter */
+-    CRYPTO_REF_COUNT activatecnt;
+-    CRYPTO_RWLOCK *activatecnt_lock; /* For the activate counter */
++    int activatecnt;
+     char *name;
+     char *path;
+     DSO *module;
+@@ -263,7 +261,6 @@ static OSSL_PROVIDER *provider_new(const char *name,
+     if ((prov = OPENSSL_zalloc(sizeof(*prov))) == NULL
+ #ifndef HAVE_ATOMICS
+         || (prov-&gt;refcnt_lock = CRYPTO_THREAD_lock_new()) == NULL
+-        || (prov-&gt;activatecnt_lock = CRYPTO_THREAD_lock_new()) == NULL
+ #endif
+         || !ossl_provider_up_ref(prov) /* +1 One reference to be returned */
+         || (prov-&gt;opbits_lock = CRYPTO_THREAD_lock_new()) == NULL
+@@ -395,7 +392,6 @@ void ossl_provider_free(OSSL_PROVIDER *prov)
+             CRYPTO_THREAD_lock_free(prov-&gt;flag_lock);
+ #ifndef HAVE_ATOMICS
+             CRYPTO_THREAD_lock_free(prov-&gt;refcnt_lock);
+-            CRYPTO_THREAD_lock_free(prov-&gt;activatecnt_lock);
+ #endif
+             OPENSSL_free(prov);
+         }
+@@ -479,7 +475,7 @@ int OSSL_PROVIDER_set_default_search_path(OSSL_LIB_CTX *libctx,
+  * locking.  Direct callers must remember to set the store flags when
+  * appropriate.
+  */
+-static int provider_init(OSSL_PROVIDER *prov)
++static int provider_init(OSSL_PROVIDER *prov, int flag_lock)
+ {
+     const OSSL_DISPATCH *provider_dispatch = NULL;
+     void *tmp_provctx = NULL;    /* safety measure */
+@@ -496,7 +492,7 @@ static int provider_init(OSSL_PROVIDER *prov)
+      * modifies a number of things in the provider structure that this
+      * function needs to perform under lock anyway.
+      */
+-    if (!CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
++    if (flag_lock &amp;&amp; !CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
+         goto end;
+     if (prov-&gt;flag_initialized) {
+         ok = 1;
+@@ -675,48 +671,41 @@ static int provider_init(OSSL_PROVIDER *prov)
+     ok = 1;
+ 
+  end:
+-    CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++    if (flag_lock)
++        CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
+     return ok;
+ }
+ 
+ static int provider_deactivate(OSSL_PROVIDER *prov)
+ {
+-    int ref = 0;
+-
+     if (!ossl_assert(prov != NULL))
+         return 0;
+ 
+-    if (CRYPTO_DOWN_REF(&amp;prov-&gt;activatecnt, &amp;ref, prov-&gt;activatecnt_lock) &lt;= 0)
++    if (!CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
+         return 0;
+ 
+-    if (ref &lt; 1) {
+-        if (!CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
+-            return 0;
++    if (--prov-&gt;activatecnt &lt; 1)
+         prov-&gt;flag_activated = 0;
+-        CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
+-    }
++
++    CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
+ 
+     /* We don't deinit here, that's done in ossl_provider_free() */
+     return 1;
+ }
+ 
+-static int provider_activate(OSSL_PROVIDER *prov)
++static int provider_activate(OSSL_PROVIDER *prov, int flag_lock)
+ {
+-    int ref = 0;
+-
+-    if (CRYPTO_UP_REF(&amp;prov-&gt;activatecnt, &amp;ref, prov-&gt;activatecnt_lock) &lt;= 0)
+-        return 0;
+-
+-    if (provider_init(prov)) {
+-        if (!CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
++    if (provider_init(prov, flag_lock)) {
++        if (flag_lock &amp;&amp; !CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
+             return 0;
++        prov-&gt;activatecnt++;
+         prov-&gt;flag_activated = 1;
+-        CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++        if (flag_lock)
++            CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
+ 
+         return 1;
+     }
+ 
+-    provider_deactivate(prov);
+     return 0;
+ }
+ 
+@@ -724,7 +713,7 @@ int ossl_provider_activate(OSSL_PROVIDER *prov, int retain_fallbacks)
+ {
+     if (prov == NULL)
+         return 0;
+-    if (provider_activate(prov)) {
++    if (provider_activate(prov, 1)) {
+         if (!retain_fallbacks) {
+             if (!CRYPTO_THREAD_write_lock(prov-&gt;store-&gt;lock)) {
+                 provider_deactivate(prov);
+@@ -784,10 +773,8 @@ static void provider_activate_fallbacks(struct provider_store_st *store)
+ 
+         if (ossl_provider_up_ref(prov)) {
+             if (prov-&gt;flag_fallback) {
+-                if (provider_activate(prov)) {
+-                    prov-&gt;flag_activated_as_fallback = 1;
++                if (provider_activate(prov, 1))
+                     activated_fallback_count++;
+-                }
+             }
+             ossl_provider_free(prov);
+         }
+@@ -810,7 +797,7 @@ int ossl_provider_doall_activated(OSSL_LIB_CTX *ctx,
+                                             void *cbdata),
+                                   void *cbdata)
+ {
+-    int ret = 0, i, j;
++    int ret = 0, curr, max;
+     struct provider_store_st *store = get_provider_store(ctx);
+     STACK_OF(OSSL_PROVIDER) *provs = NULL;
+ 
+@@ -837,21 +824,48 @@ int ossl_provider_doall_activated(OSSL_LIB_CTX *ctx,
+         CRYPTO_THREAD_unlock(store-&gt;lock);
+         return 0;
+     }
+-    j = sk_OSSL_PROVIDER_num(provs);
+-    for (i = 0; i &lt; j; i++)
+-        if (!ossl_provider_up_ref(sk_OSSL_PROVIDER_value(provs, i)))
++    max = sk_OSSL_PROVIDER_num(provs);
++    /*
++     * We work backwards through the stack so that we can safely delete items
++     * as we go.
++     */
++    for (curr = max - 1; curr &gt;= 0; curr--) {
++        OSSL_PROVIDER *prov = sk_OSSL_PROVIDER_value(provs, curr);
++
++        if (!CRYPTO_THREAD_write_lock(prov-&gt;flag_lock))
+             goto err_unlock;
++        if (prov-&gt;flag_activated) {
++            if (!ossl_provider_up_ref(prov)){
++                CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++                goto err_unlock;
++            }
++            /*
++             * It's already activated, but we up the activated count to ensure
++             * it remains activated until after we've called the user callback.
++             */
++            if (!provider_activate(prov, 0)) {
++                ossl_provider_free(prov);
++                CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++                goto err_unlock;
++            }
++        } else {
++            sk_OSSL_PROVIDER_delete(provs, curr);
++            max--;
++        }
++        CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++    }
+     CRYPTO_THREAD_unlock(store-&gt;lock);
+ 
+     /*
+      * Now, we sweep through all providers not under lock
+      */
+-    for (j = 0; j &lt; i; j++) {
+-        OSSL_PROVIDER *prov = sk_OSSL_PROVIDER_value(provs, j);
++    for (curr = 0; curr &lt; max; curr++) {
++        OSSL_PROVIDER *prov = sk_OSSL_PROVIDER_value(provs, curr);
+ 
+-        if (prov-&gt;flag_activated &amp;&amp; !cb(prov, cbdata))
++        if (!cb(prov, cbdata))
+             goto finish;
+     }
++    curr = -1;
+ 
+     ret = 1;
+     goto finish;
+@@ -859,19 +873,33 @@ int ossl_provider_doall_activated(OSSL_LIB_CTX *ctx,
+  err_unlock:
+     CRYPTO_THREAD_unlock(store-&gt;lock);
+  finish:
+-    /* The pop_free call doesn't do what we want on an error condition */
+-    for (j = 0; j &lt; i; j++)
+-        ossl_provider_free(sk_OSSL_PROVIDER_value(provs, j));
++    /*
++     * The pop_free call doesn't do what we want on an error condition. We
++     * either start from the first item in the stack, or part way through if
++     * we only processed some of the items.
++     */
++    for (curr++; curr &lt; max; curr++) {
++        OSSL_PROVIDER *prov = sk_OSSL_PROVIDER_value(provs, curr);
++
++        provider_deactivate(prov);
++        ossl_provider_free(prov);
++    }
+     sk_OSSL_PROVIDER_free(provs);
+     return ret;
+ }
+ 
+ int ossl_provider_available(OSSL_PROVIDER *prov)
+ {
++    int ret;
++
+     if (prov != NULL) {
+         provider_activate_fallbacks(prov-&gt;store);
+ 
+-        return prov-&gt;flag_activated;
++        if (!CRYPTO_THREAD_read_lock(prov-&gt;flag_lock))
++            return 0;
++        ret = prov-&gt;flag_activated;
++        CRYPTO_THREAD_unlock(prov-&gt;flag_lock);
++        return ret;
+     }
+     return 0;
+ }
+diff --git a/test/threadstest.c b/test/threadstest.c
+index 83a3f978f9..b82e16f8c6 100644
+--- a/test/threadstest.c
++++ b/test/threadstest.c
+@@ -419,6 +419,16 @@ static void thread_downgrade_shared_evp_pkey(void)
+ #endif
+ }
+ 
++static void thread_provider_load_unload(void)
++{
++    OSSL_PROVIDER *deflt = OSSL_PROVIDER_load(multi_libctx, &quot;default&quot;);
++
++    if (!TEST_ptr(deflt)
++            || !TEST_true(OSSL_PROVIDER_available(multi_libctx, &quot;default&quot;)))
++        multi_success = 0;
++
++    OSSL_PROVIDER_unload(deflt);
++}
+ 
+ /*
+  * Do work in multiple worker threads at the same time.
+@@ -427,6 +437,7 @@ static void thread_downgrade_shared_evp_pkey(void)
+  * Test 2: Simple fetch worker
+  * Test 3: Worker downgrading a shared EVP_PKEY
+  * Test 4: Worker using a shared EVP_PKEY
++ * Test 5: Workder loading and unloading a provider
+  */
+ static int test_multi(int idx)
+ {
+@@ -435,6 +446,7 @@ static int test_multi(int idx)
+     OSSL_PROVIDER *prov = NULL, *prov2 = NULL;
+     void (*worker)(void) = NULL;
+     void (*worker2)(void) = NULL;
++    EVP_MD *sha256 = NULL;
+ 
+     if (idx == 1 &amp;&amp; !do_fips)
+         return TEST_skip(&quot;FIPS not supported&quot;);
+@@ -475,6 +487,17 @@ static int test_multi(int idx)
+             goto err;
+         worker = thread_shared_evp_pkey;
+         break;
++    case 5:
++        /*
++         * We ensure we get an md from the default provider, and then unload the
++         * provider. This ensures the provider remains around but in a
++         * deactivated state.
++         */
++        sha256 = EVP_MD_fetch(multi_libctx, &quot;SHA2-256&quot;, NULL);
++        OSSL_PROVIDER_unload(prov);
++        prov = NULL;
++        worker = thread_provider_load_unload;
++        break;
+     default:
+         TEST_error(&quot;Invalid test index&quot;);
+         goto err;
+@@ -496,6 +519,7 @@ static int test_multi(int idx)
+     testresult = 1;
+ 
+  err:
++    EVP_MD_free(sha256);
+     OSSL_PROVIDER_unload(prov);
+     OSSL_PROVIDER_unload(prov2);
+     OSSL_LIB_CTX_free(multi_libctx);
+@@ -612,7 +636,7 @@ int setup_tests(void)
+     ADD_TEST(test_thread_local);
+     ADD_TEST(test_atomic);
+     ADD_TEST(test_multi_load);
+-    ADD_ALL_TESTS(test_multi, 5);
++    ADD_ALL_TESTS(test_multi, 6);
+     return 1;
+ }
+ 
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034049.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034052.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34051">[ date ]</a>
+              <a href="thread.html#34051">[ thread ]</a>
+              <a href="subject.html#34051">[ subject ]</a>
+              <a href="author.html#34051">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

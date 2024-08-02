@@ -1,0 +1,397 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1449049833.990824.8210.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002247.html">
+   <LINK REL="Next"  HREF="002251.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1449049833.990824.8210.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Wed Dec  2 09:50:33 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002247.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002251.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2250">[ date ]</a>
+              <a href="thread.html#2250">[ thread ]</a>
+              <a href="subject.html#2250">[ subject ]</a>
+              <a href="author.html#2250">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  81f3d6323dcda6a18b06c718600d6a4739e83263 (commit)
+       via  b9e3d7e0f6678a991621cfbc4b11ace7860031a0 (commit)
+      from  338f5727c88b1ce44a802c5115707309d6316fc4 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 81f3d6323dcda6a18b06c718600d6a4739e83263
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Nov 30 23:07:38 2015 +0100
+
+    modes/ocb128.c: split fixed block xors to aligned and misaligned.
+    
+    Main goal was to improve performance on RISC platforms, e.g. 10%
+    was measured on MIPS, POWER8...
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+commit b9e3d7e0f6678a991621cfbc4b11ace7860031a0
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Nov 30 13:26:21 2015 +0100
+
+    modes/ocb128.c: ocb_lookup_l to allow non-contiguous lookup
+    and CRYPTO_ocb128_encrypt to handle in==out.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/modes/modes_lcl.h | 25 +++++++------
+ crypto/modes/ocb128.c    | 93 ++++++++++++++++++++++--------------------------
+ 2 files changed, 54 insertions(+), 64 deletions(-)
+
+diff --git a/crypto/modes/modes_lcl.h b/crypto/modes/modes_lcl.h
+index 0fd11ce..2f61afe 100644
+--- a/crypto/modes/modes_lcl.h
++++ b/crypto/modes/modes_lcl.h
+@@ -144,20 +144,19 @@ struct ccm128_context {
+ 
+ #ifndef OPENSSL_NO_OCB
+ 
+-# ifdef STRICT_ALIGNMENT
+-typedef struct {
+-    unsigned char a[16];
++typedef union {
++    u64 a[2];
++    unsigned char c[16];
+ } OCB_BLOCK;
+-#  define ocb_block16_xor(in1,in2,out) \
+-    ocb_block_xor((in1)-&gt;a,(in2)-&gt;a,16,(out)-&gt;a)
+-# else                          /* STRICT_ALIGNMENT */
+-typedef struct {
+-    u64 a;
+-    u64 b;
+-} OCB_BLOCK;
+-#  define ocb_block16_xor(in1,in2,out) \
+-    (out)-&gt;a=(in1)-&gt;a^(in2)-&gt;a; (out)-&gt;b=(in1)-&gt;b^(in2)-&gt;b;
+-# endif                         /* STRICT_ALIGNMENT */
++# define ocb_block16_xor(in1,in2,out) \
++    ( (out)-&gt;a[0]=(in1)-&gt;a[0]^(in2)-&gt;a[0], \
++      (out)-&gt;a[1]=(in1)-&gt;a[1]^(in2)-&gt;a[1] )
++# if STRICT_ALIGNMENT
++#  define ocb_block16_xor_misaligned(in1,in2,out) \
++    ocb_block_xor((in1)-&gt;c,(in2)-&gt;c,16,(out)-&gt;c)
++# else
++#  define ocb_block16_xor_misaligned ocb_block16_xor
++# endif
+ 
+ struct ocb128_context {
+     /* Need both encrypt and decrypt key schedules for decryption */
+diff --git a/crypto/modes/ocb128.c b/crypto/modes/ocb128.c
+index 2685652..d49aa6e 100644
+--- a/crypto/modes/ocb128.c
++++ b/crypto/modes/ocb128.c
+@@ -53,11 +53,6 @@
+ 
+ #ifndef OPENSSL_NO_OCB
+ 
+-union ublock {
+-    unsigned char *chrblk;
+-    OCB_BLOCK *ocbblk;
+-};
+-
+ /*
+  * Calculate the number of binary trailing zero's in any given number
+  */
+@@ -88,23 +83,18 @@ static void ocb_block_lshift(OCB_BLOCK *in, size_t shift, OCB_BLOCK *out)
+     unsigned char shift_mask;
+     int i;
+     unsigned char mask[15];
+-    union ublock locin;
+-    union ublock locout;
+-
+-    locin.ocbblk = in;
+-    locout.ocbblk = out;
+ 
+     shift_mask = 0xff;
+     shift_mask &lt;&lt;= (8 - shift);
+     for (i = 15; i &gt;= 0; i--) {
+         if (i &gt; 0) {
+-            mask[i - 1] = locin.chrblk[i] &amp; shift_mask;
++            mask[i - 1] = in-&gt;c[i] &amp; shift_mask;
+             mask[i - 1] &gt;&gt;= 8 - shift;
+         }
+-        locout.chrblk[i] = locin.chrblk[i] &lt;&lt; shift;
++        out-&gt;c[i] = in-&gt;c[i] &lt;&lt; shift;
+ 
+         if (i != 15) {
+-            locout.chrblk[i] ^= mask[i];
++            out-&gt;c[i] ^= mask[i];
+         }
+     }
+ }
+@@ -115,23 +105,18 @@ static void ocb_block_lshift(OCB_BLOCK *in, size_t shift, OCB_BLOCK *out)
+ static void ocb_double(OCB_BLOCK *in, OCB_BLOCK *out)
+ {
+     unsigned char mask;
+-    union ublock locin;
+-    union ublock locout;
+-
+-    locin.ocbblk = in;
+-    locout.ocbblk = out;
+ 
+     /*
+      * Calculate the mask based on the most significant bit. There are more
+      * efficient ways to do this - but this way is constant time
+      */
+-    mask = locin.chrblk[0] &amp; 0x80;
++    mask = in-&gt;c[0] &amp; 0x80;
+     mask &gt;&gt;= 7;
+     mask *= 135;
+ 
+     ocb_block_lshift(in, 1, out);
+ 
+-    locout.chrblk[15] ^= mask;
++    out-&gt;c[15] ^= mask;
+ }
+ 
+ /*
+@@ -153,20 +138,34 @@ static void ocb_block_xor(const unsigned char *in1,
+  */
+ static OCB_BLOCK *ocb_lookup_l(OCB128_CONTEXT *ctx, size_t idx)
+ {
+-    if (idx &lt;= ctx-&gt;l_index) {
++    size_t l_index = ctx-&gt;l_index;
++
++    if (idx &lt;= l_index) {
+         return ctx-&gt;l + idx;
+     }
+ 
+     /* We don't have it - so calculate it */
+-    ctx-&gt;l_index++;
+-    if (ctx-&gt;l_index == ctx-&gt;max_l_index) {
+-        ctx-&gt;max_l_index *= 2;
++    if (idx &gt;= ctx-&gt;max_l_index) {
++        /*
++         * Each additional entry allows to process almost double as
++         * much data, so that in linear world the table will need to
++         * be expanded with smaller and smaller increments. Originally
++         * it was doubling in size, which was a waste. Growing it
++         * linearly is not formally optimal, but is simpler to implement.
++         * We grow table by minimally required 4*n that would accommodate
++         * the index.
++         */
++        ctx-&gt;max_l_index += (idx - ctx-&gt;max_l_index + 4) &amp; ~3;
+         ctx-&gt;l =
+             OPENSSL_realloc(ctx-&gt;l, ctx-&gt;max_l_index * sizeof(OCB_BLOCK));
+         if (!ctx-&gt;l)
+             return NULL;
+     }
+-    ocb_double(ctx-&gt;l + (idx - 1), ctx-&gt;l + idx);
++    while (l_index &lt;= idx) {
++        ocb_double(ctx-&gt;l + l_index, ctx-&gt;l + l_index + 1);
++        l_index++;
++    }
++    ctx-&gt;l_index = l_index;
+ 
+     return ctx-&gt;l + idx;
+ }
+@@ -177,13 +176,7 @@ static OCB_BLOCK *ocb_lookup_l(OCB128_CONTEXT *ctx, size_t idx)
+ static void ocb_encrypt(OCB128_CONTEXT *ctx, OCB_BLOCK *in, OCB_BLOCK *out,
+                         void *keyenc)
+ {
+-    union ublock locin;
+-    union ublock locout;
+-
+-    locin.ocbblk = in;
+-    locout.ocbblk = out;
+-
+-    ctx-&gt;encrypt(locin.chrblk, locout.chrblk, keyenc);
++    ctx-&gt;encrypt(in-&gt;c, out-&gt;c, keyenc);
+ }
+ 
+ /*
+@@ -192,13 +185,7 @@ static void ocb_encrypt(OCB128_CONTEXT *ctx, OCB_BLOCK *in, OCB_BLOCK *out,
+ static void ocb_decrypt(OCB128_CONTEXT *ctx, OCB_BLOCK *in, OCB_BLOCK *out,
+                         void *keydec)
+ {
+-    union ublock locin;
+-    union ublock locout;
+-
+-    locin.ocbblk = in;
+-    locout.ocbblk = out;
+-
+-    ctx-&gt;decrypt(locin.chrblk, locout.chrblk, keydec);
++    ctx-&gt;decrypt(in-&gt;c, out-&gt;c, keydec);
+ }
+ 
+ /*
+@@ -228,7 +215,7 @@ int CRYPTO_ocb128_init(OCB128_CONTEXT *ctx, void *keyenc, void *keydec,
+ {
+     memset(ctx, 0, sizeof(*ctx));
+     ctx-&gt;l_index = 0;
+-    ctx-&gt;max_l_index = 1;
++    ctx-&gt;max_l_index = 5;
+     ctx-&gt;l = OPENSSL_malloc(ctx-&gt;max_l_index * 16);
+     if (ctx-&gt;l == NULL)
+         return 0;
+@@ -252,6 +239,13 @@ int CRYPTO_ocb128_init(OCB128_CONTEXT *ctx, void *keyenc, void *keydec,
+     /* L_0 = double(L_$) */
+     ocb_double(&amp;ctx-&gt;l_dollar, ctx-&gt;l);
+ 
++    /* L_{i} = double(L_{i-1}) */
++    ocb_double(ctx-&gt;l, ctx-&gt;l+1);
++    ocb_double(ctx-&gt;l+1, ctx-&gt;l+2);
++    ocb_double(ctx-&gt;l+2, ctx-&gt;l+3);
++    ocb_double(ctx-&gt;l+3, ctx-&gt;l+4);
++    ctx-&gt;l_index = 4;   /* enough to process up to 496 bytes */
++
+     return 1;
+ }
+ 
+@@ -284,9 +278,6 @@ int CRYPTO_ocb128_setiv(OCB128_CONTEXT *ctx, const unsigned char *iv,
+     unsigned char ktop[16], tmp[16], mask;
+     unsigned char stretch[24], nonce[16];
+     size_t bottom, shift;
+-    union ublock offset;
+-
+-    offset.ocbblk = &amp;ctx-&gt;offset;
+ 
+     /*
+      * Spec says IV is 120 bits or fewer - it allows non byte aligned lengths.
+@@ -320,7 +311,7 @@ int CRYPTO_ocb128_setiv(OCB128_CONTEXT *ctx, const unsigned char *iv,
+                      &amp;ctx-&gt;offset);
+     mask = 0xff;
+     mask &lt;&lt;= 8 - shift;
+-    offset.chrblk[15] |=
++    ctx-&gt;offset.c[15] |=
+         (*(stretch + (bottom / 8) + 16) &amp; mask) &gt;&gt; (8 - shift);
+ 
+     return 1;
+@@ -423,14 +414,14 @@ int CRYPTO_ocb128_encrypt(OCB128_CONTEXT *ctx,
+ 
+         /* C_i = Offset_i xor ENCIPHER(K, P_i xor Offset_i) */
+         inblock = (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
++        /* Checksum_i = Checksum_{i-1} xor P_i */
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, inblock, &amp;ctx-&gt;checksum);
+         ocb_encrypt(ctx, &amp;tmp1, &amp;tmp2, ctx-&gt;keyenc);
+         outblock =
+             (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
+ 
+-        /* Checksum_i = Checksum_{i-1} xor P_i */
+-        ocb_block16_xor(&amp;ctx-&gt;checksum, inblock, &amp;ctx-&gt;checksum);
+     }
+ 
+     /*
+@@ -496,14 +487,14 @@ int CRYPTO_ocb128_decrypt(OCB128_CONTEXT *ctx,
+ 
+         /* P_i = Offset_i xor DECIPHER(K, C_i xor Offset_i) */
+         inblock = (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
+         ocb_decrypt(ctx, &amp;tmp1, &amp;tmp2, ctx-&gt;keydec);
+         outblock =
+             (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
+ 
+         /* Checksum_i = Checksum_{i-1} xor P_i */
+-        ocb_block16_xor(&amp;ctx-&gt;checksum, outblock, &amp;ctx-&gt;checksum);
++        ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, outblock, &amp;ctx-&gt;checksum);
+     }
+ 
+     /*
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002247.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002251.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2250">[ date ]</a>
+              <a href="thread.html#2250">[ thread ]</a>
+              <a href="subject.html#2250">[ subject ]</a>
+              <a href="author.html#2250">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

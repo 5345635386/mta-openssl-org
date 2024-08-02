@@ -1,0 +1,316 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429638038.820556.8960.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000924.html">
+   <LINK REL="Next"  HREF="000930.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429638038.820556.8960.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Tue Apr 21 17:40:38 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000924.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000930.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#929">[ date ]</a>
+              <a href="thread.html#929">[ thread ]</a>
+              <a href="subject.html#929">[ subject ]</a>
+              <a href="author.html#929">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6e3d015363ed09c4eff5c02ad41153387ffdf5af (commit)
+      from  c3b9bd11f9908c5103a3b39753bb48e78a9cf0d3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6e3d015363ed09c4eff5c02ad41153387ffdf5af
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Tue Apr 21 18:12:58 2015 +0200
+
+    Repair EAP-FAST session resumption
+    
+    EAP-FAST session resumption relies on handshake message lookahead
+    to determine server intentions. Commits
+    980bc1ec6114f5511b20c2e6ca741e61a39b99d6
+    and
+    7b3ba508af5c86afe43e28174aa3c53a0a24f4d9
+    removed the lookahead so broke session resumption.
+    
+    This change partially reverts the commits and brings the lookahead back
+    in reduced capacity for TLS + EAP-FAST only. Since EAP-FAST does not
+    support regular session tickets, the lookahead now only checks for a
+    Finished message.
+    
+    Regular handshakes are unaffected by this change.
+    
+    Reviewed-by: David Benjamin &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">davidben at chromium.org</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ include/openssl/ssl.h |   3 +-
+ ssl/s3_clnt.c         | 116 ++++++++++++++++++++++++++++++++++++++++++--------
+ ssl/ssl_err.c         |   1 +
+ 3 files changed, 101 insertions(+), 19 deletions(-)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index fae706b..a24f742 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1981,6 +1981,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_SSL3_CHANGE_CIPHER_STATE                   129
+ # define SSL_F_SSL3_CHECK_CERT_AND_ALGORITHM              130
+ # define SSL_F_SSL3_CHECK_CLIENT_HELLO                    304
++# define SSL_F_SSL3_CHECK_FINISHED                        339
+ # define SSL_F_SSL3_CLIENT_HELLO                          131
+ # define SSL_F_SSL3_CONNECT                               132
+ # define SSL_F_SSL3_CTRL                                  213
+@@ -2038,7 +2039,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_SSL_BAD_METHOD                             160
+ # define SSL_F_SSL_BUILD_CERT_CHAIN                       332
+ # define SSL_F_SSL_BYTES_TO_CIPHER_LIST                   161
+-# define SSL_F_SSL_CERT_ADD0_CHAIN_CERT                   339
++# define SSL_F_SSL_CERT_ADD0_CHAIN_CERT                   346
+ # define SSL_F_SSL_CERT_DUP                               221
+ # define SSL_F_SSL_CERT_INSTANTIATE                       214
+ # define SSL_F_SSL_CERT_NEW                               162
+diff --git a/ssl/s3_clnt.c b/ssl/s3_clnt.c
+index 697a3b4..3eb67ef 100644
+--- a/ssl/s3_clnt.c
++++ b/ssl/s3_clnt.c
+@@ -165,6 +165,9 @@
+ #endif
+ 
+ static int ca_dn_cmp(const X509_NAME *const *a, const X509_NAME *const *b);
++#ifndef OPENSSL_NO_TLSEXT
++static int ssl3_check_finished(SSL *s);
++#endif
+ 
+ #ifndef OPENSSL_NO_SSL3_METHOD
+ static const SSL_METHOD *ssl3_get_client_method(int ver)
+@@ -321,6 +324,18 @@ int ssl3_connect(SSL *s)
+             break;
+         case SSL3_ST_CR_CERT_A:
+         case SSL3_ST_CR_CERT_B:
++#ifndef OPENSSL_NO_TLSEXT
++            /* Noop (ret = 0) for everything but EAP-FAST. */
++            ret = ssl3_check_finished(s);
++            if (ret &lt; 0)
++                goto end;
++            if (ret == 1) {
++                s-&gt;hit = 1;
++                s-&gt;state = SSL3_ST_CR_FINISHED_A;
++                s-&gt;init_num = 0;
++                break;
++            }
++#endif
+             /* Check if it is anon DH/ECDH, SRP auth */
+             /* or PSK */
+             if (!
+@@ -557,7 +572,8 @@ int ssl3_connect(SSL *s)
+ 
+         case SSL3_ST_CR_FINISHED_A:
+         case SSL3_ST_CR_FINISHED_B:
+-            s-&gt;s3-&gt;flags |= SSL3_FLAGS_CCS_OK;
++            if (!s-&gt;s3-&gt;change_cipher_spec)
++                s-&gt;s3-&gt;flags |= SSL3_FLAGS_CCS_OK;
+             ret = ssl3_get_finished(s, SSL3_ST_CR_FINISHED_A,
+                                     SSL3_ST_CR_FINISHED_B);
+             if (ret &lt;= 0)
+@@ -663,9 +679,17 @@ int ssl3_client_hello(SSL *s)
+     buf = (unsigned char *)s-&gt;init_buf-&gt;data;
+     if (s-&gt;state == SSL3_ST_CW_CLNT_HELLO_A) {
+         SSL_SESSION *sess = s-&gt;session;
+-        if ((sess == NULL) ||
+-            (sess-&gt;ssl_version != s-&gt;version) ||
+-            !sess-&gt;session_id_length || (sess-&gt;not_resumable)) {
++        if ((sess == NULL) || (sess-&gt;ssl_version != s-&gt;version) ||
++#ifdef OPENSSL_NO_TLSEXT
++            !sess-&gt;session_id_length ||
++#else
++            /*
++             * In the case of EAP-FAST, we can have a pre-shared
++             * &quot;ticket&quot; without a session ID.
++             */
++            (!sess-&gt;session_id_length &amp;&amp; !sess-&gt;tlsext_tick) ||
++#endif
++            (sess-&gt;not_resumable)) {
+             if (!ssl_get_new_session(s, 0))
+                 goto err;
+         }
+@@ -953,10 +977,19 @@ int ssl3_get_server_hello(SSL *s)
+     }
+ #ifndef OPENSSL_NO_TLSEXT
+     /*
+-     * check if we want to resume the session based on external pre-shared
+-     * secret
++     * Check if we can resume the session based on external pre-shared secret.
++     * EAP-FAST (RFC 4851) supports two types of session resumption.
++     * Resumption based on server-side state works with session IDs.
++     * Resumption based on pre-shared Protected Access Credentials (PACs)
++     * works by overriding the SessionTicket extension at the application
++     * layer, and does not send a session ID. (We do not know whether EAP-FAST
++     * servers would honour the session ID.) Therefore, the session ID alone
++     * is not a reliable indicator of session resumption, so we first check if
++     * we can resume, and later peek at the next handshake message to see if the
++     * server wants to resume.
+      */
+-    if (s-&gt;version &gt;= TLS1_VERSION &amp;&amp; s-&gt;tls_session_secret_cb) {
++    if (s-&gt;version &gt;= TLS1_VERSION &amp;&amp; s-&gt;tls_session_secret_cb &amp;&amp;
++        s-&gt;session-&gt;tlsext_tick) {
+         SSL_CIPHER *pref_cipher = NULL;
+         s-&gt;session-&gt;master_key_length = sizeof(s-&gt;session-&gt;master_key);
+         if (s-&gt;tls_session_secret_cb(s, s-&gt;session-&gt;master_key,
+@@ -965,12 +998,15 @@ int ssl3_get_server_hello(SSL *s)
+                                      s-&gt;tls_session_secret_cb_arg)) {
+             s-&gt;session-&gt;cipher = pref_cipher ?
+                 pref_cipher : ssl_get_cipher_by_char(s, p + j);
+-            s-&gt;hit = 1;
++        } else {
++            SSLerr(SSL_F_SSL3_GET_SERVER_HELLO, ERR_R_INTERNAL_ERROR);
++            al = SSL_AD_INTERNAL_ERROR;
++            goto f_err;
+         }
+     }
+ #endif                          /* OPENSSL_NO_TLSEXT */
+ 
+-    if (!s-&gt;hit &amp;&amp; j != 0 &amp;&amp; j == s-&gt;session-&gt;session_id_length
++    if (j != 0 &amp;&amp; j == s-&gt;session-&gt;session_id_length
+         &amp;&amp; memcmp(p, s-&gt;session-&gt;session_id, j) == 0) {
+         if (s-&gt;sid_ctx_length != s-&gt;session-&gt;sid_ctx_length
+             || memcmp(s-&gt;session-&gt;sid_ctx, s-&gt;sid_ctx, s-&gt;sid_ctx_length)) {
+@@ -981,12 +1017,13 @@ int ssl3_get_server_hello(SSL *s)
+             goto f_err;
+         }
+         s-&gt;hit = 1;
+-    }
+-    /* a miss or crap from the other end */
+-    if (!s-&gt;hit) {
++    } else {
+         /*
+-         * If we were trying for session-id reuse, make a new SSL_SESSION so
+-         * we don't stuff up other people
++         * If we were trying for session-id reuse but the server
++         * didn't echo the ID, make a new SSL_SESSION.
++         * In the case of EAP-FAST and PAC, we do not send a session ID,
++         * so the PAC-based session secret is always preserved. It'll be
++         * overwritten if the server refuses resumption.
+          */
+         if (s-&gt;session-&gt;session_id_length &gt; 0) {
+             if (!ssl_get_new_session(s, 0)) {
+@@ -3473,13 +3510,56 @@ int ssl3_check_cert_and_algorithm(SSL *s)
+     return (0);
+ }
+ 
++#ifndef OPENSSL_NO_TLSEXT
+ /*
+- * Check to see if handshake is full or resumed. Usually this is just a case
+- * of checking to see if a cache hit has occurred. In the case of session
+- * tickets we have to check the next message to be sure.
++ * Normally, we can tell if the server is resuming the session from
++ * the session ID. EAP-FAST (RFC 4851), however, relies on the next server
++ * message after the ServerHello to determine if the server is resuming.
++ * Therefore, we allow EAP-FAST to peek ahead.
++ * ssl3_check_finished returns 1 if we are resuming from an external
++ * pre-shared secret, we have a &quot;ticket&quot; and the next server handshake message
++ * is Finished; and 0 otherwise. It returns -1 upon an error.
+  */
++static int ssl3_check_finished(SSL *s)
++{
++    int ok = 0;
++
++    if (s-&gt;version &lt; TLS1_VERSION || !s-&gt;tls_session_secret_cb ||
++        !s-&gt;session-&gt;tlsext_tick)
++        return 0;
++
++    /* Need to permit this temporarily, in case the next message is Finished. */
++    s-&gt;s3-&gt;flags |= SSL3_FLAGS_CCS_OK;
++    /*
++     * This function is called when we might get a Certificate message instead,
++     * so permit appropriate message length.
++     * We ignore the return value as we're only interested in the message type
++     * and not its length.
++     */
++    s-&gt;method-&gt;ssl_get_message(s,
++                               SSL3_ST_CR_CERT_A,
++                               SSL3_ST_CR_CERT_B,
++                               -1, s-&gt;max_cert_list, &amp;ok);
++    s-&gt;s3-&gt;flags &amp;= ~SSL3_FLAGS_CCS_OK;
++
++    if (!ok)
++        return -1;
++
++    s-&gt;s3-&gt;tmp.reuse_message = 1;
++
++    if (s-&gt;s3-&gt;tmp.message_type == SSL3_MT_FINISHED)
++        return 1;
++
++    /* If we're not done, then the CCS arrived early and we should bail. */
++    if (s-&gt;s3-&gt;change_cipher_spec) {
++        SSLerr(SSL_F_SSL3_CHECK_FINISHED, SSL_R_CCS_RECEIVED_EARLY);
++        ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_UNEXPECTED_MESSAGE);
++        return -1;
++    }
++
++    return 0;
++}
+ 
+-#ifndef OPENSSL_NO_TLSEXT
+ # ifndef OPENSSL_NO_NEXTPROTONEG
+ int ssl3_send_next_proto(SSL *s)
+ {
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index 5792906..5c40b49 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -126,6 +126,7 @@ static ERR_STRING_DATA SSL_str_functs[] = {
+     {ERR_FUNC(SSL_F_SSL3_CHECK_CERT_AND_ALGORITHM),
+      &quot;ssl3_check_cert_and_algorithm&quot;},
+     {ERR_FUNC(SSL_F_SSL3_CHECK_CLIENT_HELLO), &quot;ssl3_check_client_hello&quot;},
++    {ERR_FUNC(SSL_F_SSL3_CHECK_FINISHED), &quot;SSL3_CHECK_FINISHED&quot;},
+     {ERR_FUNC(SSL_F_SSL3_CLIENT_HELLO), &quot;ssl3_client_hello&quot;},
+     {ERR_FUNC(SSL_F_SSL3_CONNECT), &quot;ssl3_connect&quot;},
+     {ERR_FUNC(SSL_F_SSL3_CTRL), &quot;ssl3_ctrl&quot;},
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000924.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000930.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#929">[ date ]</a>
+              <a href="thread.html#929">[ thread ]</a>
+              <a href="subject.html#929">[ subject ]</a>
+              <a href="author.html#929">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

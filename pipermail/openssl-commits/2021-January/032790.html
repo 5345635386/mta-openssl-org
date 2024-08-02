@@ -1,0 +1,230 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1610557512.813782.22382.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032787.html">
+   <LINK REL="Next"  HREF="032794.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tmraz at fedoraproject.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1610557512.813782.22382.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tmraz at fedoraproject.org
+       </A><BR>
+    <I>Wed Jan 13 17:05:12 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032787.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032794.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32790">[ date ]</a>
+              <a href="thread.html#32790">[ thread ]</a>
+              <a href="subject.html#32790">[ subject ]</a>
+              <a href="author.html#32790">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8bc5b0a570c8a2c9886a3cae9dea2016d510578d (commit)
+      from  2ed63033e46953d0d95ff100c1334da7cc32c49b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8bc5b0a570c8a2c9886a3cae9dea2016d510578d
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+Date:   Tue Jan 12 16:53:33 2021 +0100
+
+    chacha20: Properly reinitialize the cipher context with NULL key
+    
+    Same for chacha20-poly1305.
+    
+    The test_cipher_reinit and test_cipher_reinit_partialupdate is modified
+    to test this case of cipher context reinitialization.
+    
+    Fixes #13064
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13850">https://github.com/openssl/openssl/pull/13850</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ .../implementations/ciphers/cipher_chacha20_hw.c   |  1 +
+ .../ciphers/cipher_chacha20_poly1305_hw.c          |  6 ++++
+ test/evp_libctx_test.c                             | 36 ++++++++++++++++------
+ 3 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/providers/implementations/ciphers/cipher_chacha20_hw.c b/providers/implementations/ciphers/cipher_chacha20_hw.c
+index 06cb6b12d3..4ce4af0906 100644
+--- a/providers/implementations/ciphers/cipher_chacha20_hw.c
++++ b/providers/implementations/ciphers/cipher_chacha20_hw.c
+@@ -34,6 +34,7 @@ static int chacha20_initiv(PROV_CIPHER_CTX *bctx)
+         for (i = 0; i &lt; CHACHA_CTR_SIZE; i += 4)
+             ctx-&gt;counter[i / 4] = CHACHA_U8TOU32(bctx-&gt;oiv + i);
+     }
++    ctx-&gt;partial_len = 0;
+     return 1;
+ }
+ 
+diff --git a/providers/implementations/ciphers/cipher_chacha20_poly1305_hw.c b/providers/implementations/ciphers/cipher_chacha20_poly1305_hw.c
+index 65f0fe1ee8..55a57de726 100644
+--- a/providers/implementations/ciphers/cipher_chacha20_poly1305_hw.c
++++ b/providers/implementations/ciphers/cipher_chacha20_poly1305_hw.c
+@@ -79,6 +79,12 @@ static int chacha20_poly1305_initiv(PROV_CIPHER_CTX *bctx)
+     unsigned char tempiv[CHACHA_CTR_SIZE] = { 0 };
+     int ret = 1;
+ 
++    ctx-&gt;len.aad = 0;
++    ctx-&gt;len.text = 0;
++    ctx-&gt;aad = 0;
++    ctx-&gt;mac_inited = 0;
++    ctx-&gt;tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++
+         /* pad on the left */
+     if (ctx-&gt;nonce_len &lt;= CHACHA_CTR_SIZE) {
+             memcpy(tempiv + CHACHA_CTR_SIZE - ctx-&gt;nonce_len, bctx-&gt;oiv,
+diff --git a/test/evp_libctx_test.c b/test/evp_libctx_test.c
+index c306bd9a16..66d2d4cddb 100644
+--- a/test/evp_libctx_test.c
++++ b/test/evp_libctx_test.c
+@@ -295,11 +295,13 @@ err:
+ 
+ static int test_cipher_reinit(int test_id)
+ {
+-    int ret = 0, out1_len = 0, out2_len = 0, diff, ccm;
++    int ret = 0, diff, ccm, siv;
++    int out1_len = 0, out2_len = 0, out3_len = 0;
+     EVP_CIPHER *cipher = NULL;
+     EVP_CIPHER_CTX *ctx = NULL;
+     unsigned char out1[256];
+     unsigned char out2[256];
++    unsigned char out3[256];
+     unsigned char in[16] = {
+         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+         0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
+@@ -330,6 +332,9 @@ static int test_cipher_reinit(int test_id)
+     /* ccm fails on the second update - this matches OpenSSL 1_1_1 behaviour */
+     ccm = (EVP_CIPHER_mode(cipher) == EVP_CIPH_CCM_MODE);
+ 
++    /* siv cannot be called with NULL key as the iv is irrelevant */
++    siv = (EVP_CIPHER_mode(cipher) == EVP_CIPH_SIV_MODE);
++
+     /* DES3-WRAP uses random every update - so it will give a different value */
+     diff = EVP_CIPHER_is_a(cipher, &quot;DES3-WRAP&quot;);
+ 
+@@ -337,15 +342,21 @@ static int test_cipher_reinit(int test_id)
+         || !TEST_true(EVP_EncryptUpdate(ctx, out1, &amp;out1_len, in, sizeof(in)))
+         || !TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv))
+         || !TEST_int_eq(EVP_EncryptUpdate(ctx, out2, &amp;out2_len, in, sizeof(in)),
+-                        ccm ? 0 : 1))
++                        ccm ? 0 : 1)
++        || !TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, iv))
++        || !TEST_int_eq(EVP_EncryptUpdate(ctx, out3, &amp;out3_len, in, sizeof(in)),
++                        ccm || siv ? 0 : 1))
+         goto err;
+ 
+     if (ccm == 0) {
+         if (diff) {
+-            if (!TEST_mem_ne(out1, out1_len, out2, out2_len))
++            if (!TEST_mem_ne(out1, out1_len, out2, out2_len)
++                || !TEST_mem_ne(out1, out1_len, out3, out3_len)
++                || !TEST_mem_ne(out2, out2_len, out3, out3_len))
+                 goto err;
+         } else {
+-            if (!TEST_mem_eq(out1, out1_len, out2, out2_len))
++            if (!TEST_mem_eq(out1, out1_len, out2, out2_len)
++                || (!siv &amp;&amp; !TEST_mem_eq(out1, out1_len, out3, out3_len)))
+                 goto err;
+         }
+     }
+@@ -364,11 +375,13 @@ err:
+  */
+ static int test_cipher_reinit_partialupdate(int test_id)
+ {
+-    int ret = 0, out1_len = 0, out2_len = 0, in_len;
++    int ret = 0, in_len;
++    int out1_len = 0, out2_len = 0, out3_len = 0;
+     EVP_CIPHER *cipher = NULL;
+     EVP_CIPHER_CTX *ctx = NULL;
+     unsigned char out1[256];
+     unsigned char out2[256];
++    unsigned char out3[256];
+     static const unsigned char in[32] = {
+         0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+         0xba, 0xbe, 0xba, 0xbe, 0x00, 0x00, 0xba, 0xbe,
+@@ -416,12 +429,15 @@ static int test_cipher_reinit_partialupdate(int test_id)
+         || !TEST_true(EVP_EncryptUpdate(ctx, out2, &amp;out2_len, in, in_len)))
+         goto err;
+ 
+-    /* DES3-WRAP uses random every update - so it will give a different value */
+-    if (EVP_CIPHER_is_a(cipher, &quot;DES3-WRAP&quot;)) {
+-        if (!TEST_mem_ne(out1, out1_len, out2, out2_len))
++    if (!TEST_mem_eq(out1, out1_len, out2, out2_len))
++        goto err;
++
++    if (EVP_CIPHER_mode(cipher) != EVP_CIPH_SIV_MODE) {
++        if (!TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, iv))
++            || !TEST_true(EVP_EncryptUpdate(ctx, out3, &amp;out3_len, in, in_len)))
+             goto err;
+-    } else {
+-        if (!TEST_mem_eq(out1, out1_len, out2, out2_len))
++
++        if (!TEST_mem_eq(out1, out1_len, out3, out3_len))
+             goto err;
+     }
+     ret = 1;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032787.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032794.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32790">[ date ]</a>
+              <a href="thread.html#32790">[ thread ]</a>
+              <a href="subject.html#32790">[ subject ]</a>
+              <a href="author.html#32790">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,253 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1500218523.992574.27581.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015437.html">
+   <LINK REL="Next"  HREF="015462.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>bernd.edlinger at hotmail.de</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1500218523.992574.27581.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">bernd.edlinger at hotmail.de
+       </A><BR>
+    <I>Sun Jul 16 15:22:03 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015437.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="015462.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15447">[ date ]</a>
+              <a href="thread.html#15447">[ thread ]</a>
+              <a href="subject.html#15447">[ subject ]</a>
+              <a href="author.html#15447">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  c63a5ea848cf0ccd3c991198ddff08b36c312340 (commit)
+      from  b83265697cae0e211c55a58078c0650bc78b0908 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c63a5ea848cf0ccd3c991198ddff08b36c312340
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Fri Jul 14 17:05:37 2017 +0200
+
+    Backport of 5b8fa43 and remove resolved TODO: see PR#3924.
+    Make RSA key exchange code actually constant-time.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3935">https://github.com/openssl/openssl/pull/3935</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rsa/rsa_pk1.c |  2 --
+ ssl/s3_srvr.c        | 36 +++++++++++++++++++++++++++++-------
+ 2 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/rsa/rsa_pk1.c b/crypto/rsa/rsa_pk1.c
+index efa1fd3..017766c 100644
+--- a/crypto/rsa/rsa_pk1.c
++++ b/crypto/rsa/rsa_pk1.c
+@@ -255,8 +255,6 @@ int RSA_padding_check_PKCS1_type_2(unsigned char *to, int tlen,
+      * We can't continue in constant-time because we need to copy the result
+      * and we cannot fake its length. This unavoidably leaks timing
+      * information at the API boundary.
+-     * TODO(emilia): this could be addressed at the call site,
+-     * see BoringSSL commit 0aa0767340baf925bda4804882aab0cb974b2d26.
+      */
+     if (!good) {
+         mlen = -1;
+diff --git a/ssl/s3_srvr.c b/ssl/s3_srvr.c
+index ba17f1b..0fb4845 100644
+--- a/ssl/s3_srvr.c
++++ b/ssl/s3_srvr.c
+@@ -2202,7 +2202,7 @@ int ssl3_get_client_key_exchange(SSL *s)
+         unsigned char rand_premaster_secret[SSL_MAX_MASTER_KEY_LENGTH];
+         int decrypt_len;
+         unsigned char decrypt_good, version_good;
+-        size_t j;
++        size_t j, padding_len;
+ 
+         /* FIX THIS UP EAY EAY EAY EAY */
+         if (s-&gt;s3-&gt;tmp.use_rsa_tmp) {
+@@ -2270,16 +2270,38 @@ int ssl3_get_client_key_exchange(SSL *s)
+         if (RAND_bytes(rand_premaster_secret,
+                        sizeof(rand_premaster_secret)) &lt;= 0)
+             goto err;
++
++        /*
++         * Decrypt with no padding. PKCS#1 padding will be removed as part of
++         * the timing-sensitive code below.
++         */
+         decrypt_len =
+-            RSA_private_decrypt((int)n, p, p, rsa, RSA_PKCS1_PADDING);
+-        ERR_clear_error();
++            RSA_private_decrypt((int)n, p, p, rsa, RSA_NO_PADDING);
++        if (decrypt_len &lt; 0)
++            goto err;
++
++        /* Check the padding. See RFC 3447, section 7.2.2. */
+ 
+         /*
+-         * decrypt_len should be SSL_MAX_MASTER_KEY_LENGTH. decrypt_good will
+-         * be 0xff if so and zero otherwise.
++         * The smallest padded premaster is 11 bytes of overhead. Small keys
++         * are publicly invalid, so this may return immediately. This ensures
++         * PS is at least 8 bytes.
+          */
+-        decrypt_good =
+-            constant_time_eq_int_8(decrypt_len, SSL_MAX_MASTER_KEY_LENGTH);
++        if (decrypt_len &lt; 11 + SSL_MAX_MASTER_KEY_LENGTH) {
++            al = SSL_AD_DECRYPT_ERROR;
++            SSLerr(SSL_F_SSL3_GET_CLIENT_KEY_EXCHANGE,
++                   SSL_R_DECRYPTION_FAILED);
++            goto f_err;
++        }
++
++        padding_len = decrypt_len - SSL_MAX_MASTER_KEY_LENGTH;
++        decrypt_good = constant_time_eq_int_8(p[0], 0) &amp;
++                       constant_time_eq_int_8(p[1], 2);
++        for (j = 2; j &lt; padding_len - 1; j++) {
++            decrypt_good &amp;= ~constant_time_is_zero_8(p[j]);
++        }
++        decrypt_good &amp;= constant_time_is_zero_8(p[padding_len - 1]);
++        p += padding_len;
+ 
+         /*
+          * If the version in the decrypted pre-master secret is correct then
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015437.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="015462.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15447">[ date ]</a>
+              <a href="thread.html#15447">[ thread ]</a>
+              <a href="subject.html#15447">[ subject ]</a>
+              <a href="author.html#15447">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

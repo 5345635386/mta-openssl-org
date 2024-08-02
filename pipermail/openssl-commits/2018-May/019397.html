@@ -1,0 +1,188 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1526895641.592320.2450.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019394.html">
+   <LINK REL="Next"  HREF="019400.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1526895641.592320.2450.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon May 21 09:40:41 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019394.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019400.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19397">[ date ]</a>
+              <a href="thread.html#19397">[ thread ]</a>
+              <a href="subject.html#19397">[ subject ]</a>
+              <a href="author.html#19397">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ee94ec2ef88e0ec25dedf2829d8e48dff0aa1c50 (commit)
+      from  511190b691183a1fb160e7e05e2974dc73cab0c6 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ee94ec2ef88e0ec25dedf2829d8e48dff0aa1c50
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri May 18 11:31:31 2018 +0100
+
+    Don't cache stateless tickets in TLSv1.3
+    
+    In TLSv1.2 and below we always cache new sessions by default on the server
+    side in the internal cache (even when we're using session tickets). This is
+    in order to support resumption from a session id.
+    
+    In TLSv1.3 there is no session id. It is only possible to resume using the
+    ticket. Therefore, in the default case,  there is no point in caching the
+    session in the internal store.
+    
+    There is still a reason to call the external cache new session callback
+    because applications may be using the callbacks just to know about when
+    sessions are created (and not necessarily implementing a full cache). If
+    the application also implements the remove session callback then we are
+    forced to also store it in the internal cache so that we can create
+    timeout events. Otherwise the external cache could just fill up
+    indefinitely.
+    
+    This mostly addresses the issue described in #5628. That issue also proposes
+    having an option to not create full stateless tickets when using the
+    internal cache. That aspect hasn't been addressed yet.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Ben Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaduk at mit.edu</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6293">https://github.com/openssl/openssl/pull/6293</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c     | 34 +++++++++++++++++++++++++++-------
+ test/sslapitest.c | 21 +++++++++++++++++----
+ 2 files changed, 44 insertions(+), 11 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index c38fc58..1dd355d 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -3365,13 +3365,33 @@ void ssl_update_cache(SSL *s, int mode)
+ 
+     i = s-&gt;session_ctx-&gt;session_cache_mode;
+     if ((i &amp; mode) != 0
+-        &amp;&amp; (!s-&gt;hit || SSL_IS_TLS13(s))
+-        &amp;&amp; ((i &amp; SSL_SESS_CACHE_NO_INTERNAL_STORE) != 0
+-            || SSL_CTX_add_session(s-&gt;session_ctx, s-&gt;session))
+-        &amp;&amp; s-&gt;session_ctx-&gt;new_session_cb != NULL) {
+-        SSL_SESSION_up_ref(s-&gt;session);
+-        if (!s-&gt;session_ctx-&gt;new_session_cb(s, s-&gt;session))
+-            SSL_SESSION_free(s-&gt;session);
++        &amp;&amp; (!s-&gt;hit || SSL_IS_TLS13(s))) {
++        /*
++         * Add the session to the internal cache. In server side TLSv1.3 we
++         * normally don't do this because its a full stateless ticket with only
++         * a dummy session id so there is no reason to cache it, unless:
++         * - we are doing early_data, in which case we cache so that we can
++         *   detect replays
++         * - the application has set a remove_session_cb so needs to know about
++         *   session timeout events
++         */
++        if ((i &amp; SSL_SESS_CACHE_NO_INTERNAL_STORE) == 0
++                &amp;&amp; (!SSL_IS_TLS13(s)
++                    || !s-&gt;server
++                    || s-&gt;max_early_data &gt; 0
++                    || s-&gt;session_ctx-&gt;remove_session_cb != NULL))
++            SSL_CTX_add_session(s-&gt;session_ctx, s-&gt;session);
++
++        /*
++         * Add the session to the external cache. We do this even in server side
++         * TLSv1.3 without early data because some applications just want to
++         * know about the creation of a session and aren't doing a full cache.
++         */
++        if (s-&gt;session_ctx-&gt;new_session_cb != NULL) {
++            SSL_SESSION_up_ref(s-&gt;session);
++            if (!s-&gt;session_ctx-&gt;new_session_cb(s, s-&gt;session))
++                SSL_SESSION_free(s-&gt;session);
++        }
+     }
+ 
+     /* auto flush every 255 connections */
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index fe355f2..fe1c1e6 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -1072,9 +1072,22 @@ static int execute_test_session(int maxprot, int use_int_cache,
+             || !TEST_ptr(sess2 = SSL_get1_session(serverssl1)))
+         goto end;
+ 
+-    /* Should fail because it should already be in the cache */
+-    if (use_int_cache &amp;&amp; !TEST_false(SSL_CTX_add_session(sctx, sess2)))
+-        goto end;
++    if (use_int_cache) {
++        if (maxprot == TLS1_3_VERSION &amp;&amp; !use_ext_cache) {
++            /*
++             * In TLSv1.3 it should not have been added to the internal cache,
++             * except in the case where we also have an external cache (in that
++             * case it gets added to the cache in order to generate remove
++             * events after timeout).
++             */
++            if (!TEST_false(SSL_CTX_remove_session(sctx, sess2)))
++                goto end;
++        } else {
++            /* Should fail because it should already be in the cache */
++            if (!TEST_false(SSL_CTX_add_session(sctx, sess2)))
++                goto end;
++        }
++    }
+ 
+     if (use_ext_cache) {
+         SSL_SESSION *tmp = sess2;
+@@ -1088,7 +1101,7 @@ static int execute_test_session(int maxprot, int use_int_cache,
+          * the external cache. We take a copy first because
+          * SSL_CTX_remove_session() also marks the session as non-resumable.
+          */
+-        if (use_int_cache) {
++        if (use_int_cache &amp;&amp; maxprot != TLS1_3_VERSION) {
+             if (!TEST_ptr(tmp = SSL_SESSION_dup(sess2))
+                     || !TEST_true(SSL_CTX_remove_session(sctx, sess2)))
+                 goto end;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019394.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019400.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19397">[ date ]</a>
+              <a href="thread.html#19397">[ thread ]</a>
+              <a href="subject.html#19397">[ subject ]</a>
+              <a href="author.html#19397">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

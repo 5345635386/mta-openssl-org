@@ -1,0 +1,434 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1478868513.293734.28588.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011470.html">
+   <LINK REL="Next"  HREF="011479.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1478868513.293734.28588.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Fri Nov 11 12:48:33 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011470.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="011479.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11471">[ date ]</a>
+              <a href="thread.html#11471">[ thread ]</a>
+              <a href="subject.html#11471">[ subject ]</a>
+              <a href="author.html#11471">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  866e505e0d663158b0fe63a7fb7455eebacc6470 (commit)
+      from  79dfc3ddfd80cd4294136b19fa48037e149cbd9e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 866e505e0d663158b0fe63a7fb7455eebacc6470
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Nov 4 12:24:14 2016 +0100
+
+    sha/asm/sha512-armv8.pl: add NEON version of SHA256.
+    
+    This provides up to 30% better performance on some of recent processors.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/sha/asm/sha512-armv8.pl | 317 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 313 insertions(+), 4 deletions(-)
+
+diff --git a/crypto/sha/asm/sha512-armv8.pl b/crypto/sha/asm/sha512-armv8.pl
+index ffd80d6..ffae5f2 100644
+--- a/crypto/sha/asm/sha512-armv8.pl
++++ b/crypto/sha/asm/sha512-armv8.pl
+@@ -37,6 +37,20 @@
+ #	indication of some compiler &quot;pathology&quot;, most notably code
+ #	generated with -mgeneral-regs-only is significanty faster
+ #	and the gap is only 40-90%.
++#
++# October 2016.
++#
++# Originally it was reckoned that it makes no sense to implement NEON
++# version of SHA256 for 64-bit processors. This is because performance
++# improvement on most wide-spread Cortex-A5x processors was observed
++# to be marginal, same on Cortex-A53 and ~10% on A57. But then it was
++# observed that 32-bit NEON SHA256 performs significantly better than
++# 64-bit scalar version on *some* of the more recent processors. As
++# result 64-bit NEON version of SHA256 was added to provide best
++# all-round performance. For example it executes ~30% faster on X-Gene
++# and Mongoose. [For reference, NEON version of SHA512 is bound to
++# deliver much less improvement, likely *negative* on Cortex-A5x.
++# Which is why NEON support is limited to SHA256.]
+ 
+ $output=pop;
+ $flavour=pop;
+@@ -195,6 +209,8 @@ $code.=&lt;&lt;___	if ($SZ==4);
+ 	ldr	w16,[x16]
+ 	tst	w16,#ARMV8_SHA256
+ 	b.ne	.Lv8_entry
++	tst	w16,#ARMV7_NEON
++	b.ne	.Lneon_entry
+ #endif
+ ___
+ $code.=&lt;&lt;___;
+@@ -425,6 +441,296 @@ $code.=&lt;&lt;___;
+ ___
+ }
+ 
++if ($SZ==4) {	######################################### NEON stuff #
++# You'll surely note a lot of similarities with sha256-armv4 module,
++# and of course it's not a coincidence. sha256-armv4 was used as
++# initial template, but was adapted for ARMv8 instruction set and
++# extensively re-tuned for all-round performance.
++
++my @V = ($A,$B,$C,$D,$E,$F,$G,$H) = map(&quot;w$_&quot;,(3..10));
++my ($t0,$t1,$t2,$t3,$t4) = map(&quot;w$_&quot;,(11..15));
++my $Ktbl=&quot;x16&quot;;
++my $Xfer=&quot;x17&quot;;
++my @X = map(&quot;q$_&quot;,(0..3));
++my ($T0,$T1,$T2,$T3,$T4,$T5,$T6,$T7) = map(&quot;q$_&quot;,(4..7,16..19));
++my $j=0;
++
++sub AUTOLOAD()          # thunk [simplified] x86-style perlasm
++{ my $opcode = $AUTOLOAD; $opcode =~ s/.*:://; $opcode =~ s/_/\./;
++  my $arg = pop;
++    $arg = &quot;#$arg&quot; if ($arg*1 eq $arg);
++    $code .= &quot;\t$opcode\t&quot;.join(','<A HREF="../../../mailman/listinfo/openssl-commits.html">, at _</A>,$arg).&quot;\n&quot;;
++}
++
++sub Dscalar { shift =~ m|[qv]([0-9]+)|?&quot;d$1&quot;:&quot;&quot;; }
++sub Dlo     { shift =~ m|[qv]([0-9]+)|?&quot;v$1.d[0]&quot;:&quot;&quot;; }
++sub Dhi     { shift =~ m|[qv]([0-9]+)|?&quot;v$1.d[1]&quot;:&quot;&quot;; }
++
++sub Xupdate()
++{ use integer;
++  my $body = shift;
++  my @insns = (&amp;$body,&amp;$body,&amp;$body,&amp;$body);
++  my ($a,$b,$c,$d,$e,$f,$g,$h);
++
++	&amp;ext_8		($<A HREF="../../../mailman/listinfo/openssl-commits.html">T0, at X</A>[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[1],4);	# X[1..4]
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ext_8		($<A HREF="../../../mailman/listinfo/openssl-commits.html">T3, at X</A>[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[3],4);	# X[9..12]
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;mov		(&amp;Dscalar($T7),&amp;Dhi(@X[3]));	# X[14..15]
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ushr_32	($T2,$T0,$sigma0[0]);
++	 eval(shift(@insns));
++	&amp;ushr_32	($T1,$T0,$sigma0[2]);
++	 eval(shift(@insns));
++	&amp;add_32 	(@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0],$T3);	# X[0..3] += X[9..12]
++	 eval(shift(@insns));
++	&amp;sli_32		($T2,$T0,32-$sigma0[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ushr_32	($T3,$T0,$sigma0[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;eor_8		($T1,$T1,$T2);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;sli_32		($T3,$T0,32-$sigma0[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;ushr_32	($T4,$T7,$sigma1[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;eor_8		($T1,$T1,$T3);		# sigma0(X[1..4])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;sli_32	($T4,$T7,32-$sigma1[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;ushr_32	($T5,$T7,$sigma1[2]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;ushr_32	($T3,$T7,$sigma1[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;add_32		(@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0],$T1);	# X[0..3] += sigma0(X[1..4])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;sli_u32	($T3,$T7,32-$sigma1[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;eor_8	($T5,$T5,$T4);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;eor_8	($T5,$T5,$T3);		# sigma1(X[14..15])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;add_32		(@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0],$T5);	# X[0..1] += sigma1(X[14..15])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;ushr_32	($<A HREF="../../../mailman/listinfo/openssl-commits.html">T6, at X</A>[0],$sigma1[0]);
++	 eval(shift(@insns));
++	  &amp;ushr_32	($<A HREF="../../../mailman/listinfo/openssl-commits.html">T7, at X</A>[0],$sigma1[2]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;sli_32	($<A HREF="../../../mailman/listinfo/openssl-commits.html">T6, at X</A>[0],32-$sigma1[0]);
++	 eval(shift(@insns));
++	  &amp;ushr_32	($<A HREF="../../../mailman/listinfo/openssl-commits.html">T5, at X</A>[0],$sigma1[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;eor_8	($T7,$T7,$T6);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	  &amp;sli_32	($<A HREF="../../../mailman/listinfo/openssl-commits.html">T5, at X</A>[0],32-$sigma1[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ld1_32		(&quot;{$T0}&quot;,&quot;[$Ktbl], #16&quot;);
++	 eval(shift(@insns));
++	  &amp;eor_8	($T7,$T7,$T5);		# sigma1(X[16..17])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;eor_8		($T5,$T5,$T5);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;mov		(&amp;Dhi($T5), &amp;Dlo($T7));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;add_32		(@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0],$T5);	# X[2..3] += sigma1(X[16..17])
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;add_32		($T0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T0, at X</A>[0]);
++	 while($#insns&gt;=1) { eval(shift(@insns)); }
++	&amp;st1_32		(&quot;{$T0}&quot;,&quot;[$Xfer], #16&quot;);
++	 eval(shift(@insns));
++
++	push(@X,shift(@X));		# &quot;rotate&quot; X[]
++}
++
++sub Xpreload()
++{ use integer;
++  my $body = shift;
++  my @insns = (&amp;$body,&amp;$body,&amp;$body,&amp;$body);
++  my ($a,$b,$c,$d,$e,$f,$g,$h);
++
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ld1_8		(&quot;{@X[0]}&quot;,&quot;[$inp],#16&quot;);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;ld1_32		(&quot;{$T0}&quot;,&quot;[$Ktbl],#16&quot;);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;rev32		(@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	&amp;add_32		($T0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T0, at X</A>[0]);
++	 foreach (@insns) { eval; }	# remaining instructions
++	&amp;st1_32		(&quot;{$T0}&quot;,&quot;[$Xfer], #16&quot;);
++
++	push(@X,shift(@X));		# &quot;rotate&quot; X[]
++}
++
++sub body_00_15 () {
++	(
++	'($a,$b,$c,$d,$e,$f,$g,$h)=@V;'.
++	'&amp;add	($h,$h,$t1)',			# h+=X[i]+K[i]
++	'&amp;add	($a,$a,$t4);'.			# h+=Sigma0(a) from the past
++	'&amp;and	($t1,$f,$e)',
++	'&amp;bic	($t4,$g,$e)',
++	'&amp;eor	($t0,$e,$e,&quot;ror#&quot;.($Sigma1[1]-$Sigma1[0]))',
++	'&amp;add	($a,$a,$t2)',			# h+=Maj(a,b,c) from the past
++	'&amp;orr	($t1,$t1,$t4)',			# Ch(e,f,g)
++	'&amp;eor	($t0,$t0,$e,&quot;ror#&quot;.($Sigma1[2]-$Sigma1[0]))',	# Sigma1(e)
++	'&amp;eor	($t4,$a,$a,&quot;ror#&quot;.($Sigma0[1]-$Sigma0[0]))',
++	'&amp;add	($h,$h,$t1)',			# h+=Ch(e,f,g)
++	'&amp;ror	($t0,$t0,&quot;#$Sigma1[0]&quot;)',
++	'&amp;eor	($t2,$a,$b)',			# a^b, b^c in next round
++	'&amp;eor	($t4,$t4,$a,&quot;ror#&quot;.($Sigma0[2]-$Sigma0[0]))',	# Sigma0(a)
++	'&amp;add	($h,$h,$t0)',			# h+=Sigma1(e)
++	'&amp;ldr	($t1,sprintf &quot;[sp,#%d]&quot;,4*(($j+1)&amp;15))	if (($j&amp;15)!=15);'.
++	'&amp;ldr	($t1,&quot;[$Ktbl]&quot;)				if ($j==15);'.
++	'&amp;and	($t3,$t3,$t2)',			# (b^c)&amp;=(a^b)
++	'&amp;ror	($t4,$t4,&quot;#$Sigma0[0]&quot;)',
++	'&amp;add	($d,$d,$h)',			# d+=h
++	'&amp;eor	($t3,$t3,$b)',			# Maj(a,b,c)
++	'$j++;	unshift(@V,pop(@V)); ($t2,$t3)=($t3,$t2);'
++	)
++}
++
++$code.=&lt;&lt;___;
++#ifdef	__KERNEL__
++.globl	sha256_block_neon
++#endif
++.type	sha256_block_neon,%function
++.align	4
++sha256_block_neon:
++.Lneon_entry:
++	stp	x29, x30, [sp, #-16]!
++	mov	x29, sp
++	sub	sp,sp,#16*4
++
++	adr	$Ktbl,.LK256
++	add	$num,$inp,$num,lsl#6	// len to point at the end of inp
++
++	ld1.8	{@X[0]},[$inp], #16
++	ld1.8	{@X[1]},[$inp], #16
++	ld1.8	{@X[2]},[$inp], #16
++	ld1.8	{@X[3]},[$inp], #16
++	ld1.32	{$T0},[$Ktbl], #16
++	ld1.32	{$T1},[$Ktbl], #16
++	ld1.32	{$T2},[$Ktbl], #16
++	ld1.32	{$T3},[$Ktbl], #16
++	rev32	@X[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[0]		// yes, even on
++	rev32	@X[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[1]		// big-endian
++	rev32	@X[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[2]
++	rev32	@X[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at X</A>[3]
++	mov	$Xfer,sp
++	add.32	$T0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T0, at X</A>[0]
++	add.32	$T1,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T1, at X</A>[1]
++	add.32	$T2,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T2, at X</A>[2]
++	st1.32	{$T0-$T1},[$Xfer], #32
++	add.32	$T3,$<A HREF="../../../mailman/listinfo/openssl-commits.html">T3, at X</A>[3]
++	st1.32	{$T2-$T3},[$Xfer]
++	sub	$Xfer,$Xfer,#32
++
++	ldp	$A,$B,[$ctx]
++	ldp	$C,$D,[$ctx,#8]
++	ldp	$E,$F,[$ctx,#16]
++	ldp	$G,$H,[$ctx,#24]
++	ldr	$t1,[sp,#0]
++	mov	$t2,wzr
++	eor	$t3,$B,$C
++	mov	$t4,wzr
++	b	.L_00_48
++
++.align	4
++.L_00_48:
++___
++	&amp;Xupdate(\&amp;body_00_15);
++	&amp;Xupdate(\&amp;body_00_15);
++	&amp;Xupdate(\&amp;body_00_15);
++	&amp;Xupdate(\&amp;body_00_15);
++$code.=&lt;&lt;___;
++	cmp	$t1,#0				// check for K256 terminator
++	ldr	$t1,[sp,#0]
++	sub	$Xfer,$Xfer,#64
++	bne	.L_00_48
++
++	sub	$Ktbl,$Ktbl,#256		// rewind $Ktbl
++	cmp	$inp,$num
++	mov	$Xfer, #64
++	csel	$Xfer, $Xfer, xzr, eq
++	sub	$inp,$inp,$Xfer			// avoid SEGV
++	mov	$Xfer,sp
++___
++	&amp;Xpreload(\&amp;body_00_15);
++	&amp;Xpreload(\&amp;body_00_15);
++	&amp;Xpreload(\&amp;body_00_15);
++	&amp;Xpreload(\&amp;body_00_15);
++$code.=&lt;&lt;___;
++	add	$A,$A,$t4			// h+=Sigma0(a) from the past
++	ldp	$t0,$t1,[$ctx,#0]
++	add	$A,$A,$t2			// h+=Maj(a,b,c) from the past
++	ldp	$t2,$t3,[$ctx,#8]
++	add	$A,$A,$t0			// accumulate
++	add	$B,$B,$t1
++	ldp	$t0,$t1,[$ctx,#16]
++	add	$C,$C,$t2
++	add	$D,$D,$t3
++	ldp	$t2,$t3,[$ctx,#24]
++	add	$E,$E,$t0
++	add	$F,$F,$t1
++	 ldr	$t1,[sp,#0]
++	stp	$A,$B,[$ctx,#0]
++	add	$G,$G,$t2
++	 mov	$t2,wzr
++	stp	$C,$D,[$ctx,#8]
++	add	$H,$H,$t3
++	stp	$E,$F,[$ctx,#16]
++	 eor	$t3,$B,$C
++	stp	$G,$H,[$ctx,#24]
++	 mov	$t4,wzr
++	 mov	$Xfer,sp
++	b.ne	.L_00_48
++
++	ldr	x29,[x29]
++	add	sp,sp,#16*4+16
++	ret
++.size	sha256_block_neon,.-sha256_block_neon
++___
++}
++
+ $code.=&lt;&lt;___;
+ #ifndef	__KERNEL__
+ .comm	OPENSSL_armcap_P,4,4
+@@ -456,12 +762,15 @@ close SELF;
+ 
+ foreach(split(&quot;\n&quot;,$code)) {
+ 
+-	s/\`([^\`]*)\`/eval($1)/geo;
++	s/\`([^\`]*)\`/eval($1)/ge;
++
++	s/\b(sha256\w+)\s+([qv].*)/unsha256($1,$2)/ge;
+ 
+-	s/\b(sha256\w+)\s+([qv].*)/unsha256($1,$2)/geo;
++	s/\bq([0-9]+)\b/v$1.16b/g;		# old-&gt;new registers
+ 
+-	s/\.\w?32\b//o		and s/\.16b/\.4s/go;
+-	m/(ld|st)1[^\[]+\[0\]/o	and s/\.4s/\.s/go;
++	s/\.[ui]?8(\s)/$1/;
++	s/\.\w?32\b//		and s/\.16b/\.4s/g;
++	m/(ld|st)1[^\[]+\[0\]/	and s/\.4s/\.s/g;
+ 
+ 	print $_,&quot;\n&quot;;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011470.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="011479.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11471">[ date ]</a>
+              <a href="thread.html#11471">[ thread ]</a>
+              <a href="subject.html#11471">[ subject ]</a>
+              <a href="author.html#11471">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

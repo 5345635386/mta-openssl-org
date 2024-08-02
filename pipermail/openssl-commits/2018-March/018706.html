@@ -1,0 +1,172 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1521628293.499760.28599.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018705.html">
+   <LINK REL="Next"  HREF="018708.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1521628293.499760.28599.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Mar 21 10:31:33 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018705.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018708.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18706">[ date ]</a>
+              <a href="thread.html#18706">[ thread ]</a>
+              <a href="subject.html#18706">[ subject ]</a>
+              <a href="author.html#18706">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  424afe931e7d813f75c7d1eacad7a5cd946c6456 (commit)
+       via  2e92af5ea5987354fd7fe582a07440ff7aca01f4 (commit)
+      from  696de86f8edefdf885a665ed9166ee2432f2ee30 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 424afe931e7d813f75c7d1eacad7a5cd946c6456
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jan 16 11:26:50 2018 +0000
+
+    Don't wait for dry at the end of a handshake
+    
+    For DTLS/SCTP we were waiting for a dry event during the call to
+    tls_finish_handshake(). This function just tidies up various internal
+    things, and after it completes the handshake is over. I can find no good
+    reason for waiting for a dry event here, and nothing in RFC6083 suggests
+    to me that we should need to. More importantly though it seems to be
+    wrong. It is perfectly possible for a peer to send app data/alerts/new
+    handshake while we are still cleaning up our handshake. If this happens
+    then we will never get the dry event and so we cannot continue.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5084">https://github.com/openssl/openssl/pull/5084</A>)
+
+commit 2e92af5ea5987354fd7fe582a07440ff7aca01f4
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jan 16 10:48:01 2018 +0000
+
+    Check for alerts while waiting for a dry event
+    
+    At a couple of points in a DTLS/SCTP handshake we need to wait for a dry
+    event before continuing. However if an alert has been sent by the peer
+    then we will never receive that dry event and an infinite loop results.
+    
+    This commit changes things so that we attempt to read a message if we
+    are waiting for a dry event but haven't got one yet. This should never
+    succeed, but any alerts will be processed.
+    
+    Fixes #4763
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5084">https://github.com/openssl/openssl/pull/5084</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem_dtls.c | 20 +++++++++++++++++++-
+ ssl/statem/statem_lib.c  |  9 ---------
+ 2 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/ssl/statem/statem_dtls.c b/ssl/statem/statem_dtls.c
+index 9bda18b..b5e62a2 100644
+--- a/ssl/statem/statem_dtls.c
++++ b/ssl/statem/statem_dtls.c
+@@ -922,9 +922,14 @@ int dtls_construct_change_cipher_spec(SSL *s, WPACKET *pkt)
+ }
+ 
+ #ifndef OPENSSL_NO_SCTP
++/*
++ * Wait for a dry event. Should only be called at a point in the handshake
++ * where we are not expecting any data from the peer except an alert.
++ */
+ WORK_STATE dtls_wait_for_dry(SSL *s)
+ {
+-    int ret;
++    int ret, errtype;
++    size_t len;
+ 
+     /* read app data until dry event */
+     ret = BIO_dgram_sctp_wait_for_dry(SSL_get_wbio(s));
+@@ -935,6 +940,19 @@ WORK_STATE dtls_wait_for_dry(SSL *s)
+     }
+ 
+     if (ret == 0) {
++        /*
++         * We're not expecting any more messages from the peer at this point -
++         * but we could get an alert. If an alert is waiting then we will never
++         * return successfully. Therefore we attempt to read a message. This
++         * should never succeed but will process any waiting alerts.
++         */
++        if (dtls_get_reassembled_message(s, &amp;errtype, &amp;len)) {
++            /* The call succeeded! This should never happen */
++            SSLfatal(s, SSL_AD_UNEXPECTED_MESSAGE, SSL_F_DTLS_WAIT_FOR_DRY,
++                     SSL_R_UNEXPECTED_MESSAGE);
++            return WORK_ERROR;
++        }
++
+         s-&gt;s3-&gt;in_read_app_data = 2;
+         s-&gt;rwstate = SSL_READING;
+         BIO_clear_retry_flags(SSL_get_rbio(s));
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index a82079c..190050c 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -1004,15 +1004,6 @@ WORK_STATE tls_finish_handshake(SSL *s, WORK_STATE wst, int clearbufs, int stop)
+     int discard;
+     void (*cb) (const SSL *ssl, int type, int val) = NULL;
+ 
+-#ifndef OPENSSL_NO_SCTP
+-    if (SSL_IS_DTLS(s) &amp;&amp; BIO_dgram_is_sctp(SSL_get_wbio(s))) {
+-        WORK_STATE ret;
+-        ret = dtls_wait_for_dry(s);
+-        if (ret != WORK_FINISHED_CONTINUE)
+-            return ret;
+-    }
+-#endif
+-
+     if (clearbufs) {
+         if (!SSL_IS_DTLS(s)) {
+             /*
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018705.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018708.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18706">[ date ]</a>
+              <a href="thread.html#18706">[ thread ]</a>
+              <a href="subject.html#18706">[ subject ]</a>
+              <a href="author.html#18706">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

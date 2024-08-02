@@ -1,0 +1,1066 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471517410.231466.18038.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009817.html">
+   <LINK REL="Next"  HREF="009831.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471517410.231466.18038.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Thu Aug 18 10:50:10 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009817.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009831.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9830">[ date ]</a>
+              <a href="thread.html#9830">[ thread ]</a>
+              <a href="subject.html#9830">[ subject ]</a>
+              <a href="author.html#9830">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dd8e5a573272d369cb6dd21592e2b1b1d3941939 (commit)
+       via  6dc9974547427261db25758612b6a570083d52e6 (commit)
+      from  9d8c2dfe14cb371d242c04a52182aa0aee25ed18 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dd8e5a573272d369cb6dd21592e2b1b1d3941939
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Fri Aug 12 14:29:24 2016 +0200
+
+    Test that the peers send at most one fatal alert
+    
+    Duplicate alerts have happened, see
+    70c22888c1648fe8652e77107f3c74bf2212de36
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit 6dc9974547427261db25758612b6a570083d52e6
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Tue Aug 16 15:11:08 2016 +0200
+
+    Port multi-buffer tests
+    
+    Make maximum fragment length configurable and add various fragmentation
+    tests, in addition to the existing multi-buffer tests.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/README.ssltest.md                  |  19 +-
+ test/handshake_helper.c                 |  41 +++-
+ test/handshake_helper.h                 |  12 +-
+ test/recipes/80-test_ssl_new.t          |   7 +-
+ test/recipes/80-test_ssl_old.t          |  24 +-
+ test/ssl-tests/13-fragmentation.conf    | 397 ++++++++++++++++++++++++++++++++
+ test/ssl-tests/13-fragmentation.conf.in | 181 +++++++++++++++
+ test/ssl_test.c                         |  10 +
+ test/ssl_test_ctx.c                     |  12 +-
+ test/ssl_test_ctx.h                     |   2 +
+ test/ssl_test_ctx_test.c                |   7 +
+ test/ssl_test_ctx_test.conf             |   1 +
+ 12 files changed, 677 insertions(+), 36 deletions(-)
+ create mode 100644 test/ssl-tests/13-fragmentation.conf
+ create mode 100644 test/ssl-tests/13-fragmentation.conf.in
+
+diff --git a/test/README.ssltest.md b/test/README.ssltest.md
+index d6b020d..4e9c0e1 100644
+--- a/test/README.ssltest.md
++++ b/test/README.ssltest.md
+@@ -60,6 +60,19 @@ When HandshakeMode is Resume or Renegotiate, the original handshake is expected
+ to succeed. All configured test expectations are verified against the second
+ handshake.
+ 
++* ApplicationData - amount of application data bytes to send (integer, defaults
++  to 256 bytes). Applies to both client and server. Application data is sent in
++  64kB chunks (but limited by MaxFragmentSize and available parallelization, see
++  below).
++
++* MaxFragmentSize - maximum send fragment size (integer, defaults to 512 in
++  tests - see `SSL_CTX_set_max_send_fragment` for documentation). Applies to
++  both client and server. Lowering the fragment size will split handshake and
++  application data up between more `SSL_write` calls, thus allowing to exercise
++  different code paths. In particular, if the buffer size (64kB) is at least
++  four times as large as the maximum fragment, interleaved multi-buffer crypto
++  implementations may be used on some platforms.
++
+ ### Test expectations
+ 
+ * ExpectedResult - expected handshake outcome. One of
+@@ -69,7 +82,11 @@ handshake.
+   - InternalError - some other error
+ 
+ * ExpectedClientAlert, ExpectedServerAlert - expected alert. See
+-  `ssl_test_ctx.c` for known values.
++  `ssl_test_ctx.c` for known values. Note: the expected alert is currently
++  matched against the _last_ received alert (i.e., a fatal alert or a
++  `close_notify`). Warning alert expectations are not yet supported. (A warning
++  alert will not be correctly matched, if followed by a `close_notify` or
++  another alert.)
+ 
+ * ExpectedProtocol - expected negotiated protocol. One of
+   SSLv3, TLSv1, TLSv1.1, TLSv1.2.
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index c4b14e7..409f16c 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -41,6 +41,7 @@ void HANDSHAKE_RESULT_free(HANDSHAKE_RESULT *result)
+  */
+ typedef struct handshake_ex_data_st {
+     int alert_sent;
++    int num_fatal_alerts_sent;
+     int alert_received;
+     int session_ticket_do_not_call;
+     ssl_servername_t servername;
+@@ -71,6 +72,9 @@ static void info_cb(const SSL *s, int where, int ret)
+             (HANDSHAKE_EX_DATA*)(SSL_get_ex_data(s, ex_data_idx));
+         if (where &amp; SSL_CB_WRITE) {
+             ex_data-&gt;alert_sent = ret;
++            if (strcmp(SSL_alert_type_string(ret), &quot;F&quot;) == 0
++                || strcmp(SSL_alert_desc_string(ret), &quot;CN&quot;) == 0)
++                ex_data-&gt;num_fatal_alerts_sent++;
+         } else {
+             ex_data-&gt;alert_received = ret;
+         }
+@@ -270,6 +274,7 @@ static int server_alpn_cb(SSL *s, const unsigned char **out,
+  */
+ static void configure_handshake_ctx(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+                                     SSL_CTX *client_ctx,
++                                    const SSL_TEST_CTX *test,
+                                     const SSL_TEST_EXTRA_CONF *extra,
+                                     CTX_DATA *server_ctx_data,
+                                     CTX_DATA *server2_ctx_data,
+@@ -278,6 +283,15 @@ static void configure_handshake_ctx(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     unsigned char *ticket_keys;
+     size_t ticket_key_len;
+ 
++    TEST_check(SSL_CTX_set_max_send_fragment(server_ctx,
++                                             test-&gt;max_fragment_size) == 1);
++    if (server2_ctx != NULL) {
++        TEST_check(SSL_CTX_set_max_send_fragment(server2_ctx,
++                                                 test-&gt;max_fragment_size) == 1);
++    }
++    TEST_check(SSL_CTX_set_max_send_fragment(client_ctx,
++                                             test-&gt;max_fragment_size) == 1);
++
+     switch (extra-&gt;client.verify_callback) {
+     case SSL_TEST_VERIFY_ACCEPT_ALL:
+         SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_accept_cb,
+@@ -686,9 +700,22 @@ static char *dup_str(const unsigned char *in, size_t len)
+     return ret;
+ }
+ 
++/*
++ * Note that |extra| points to the correct client/server configuration
++ * within |test_ctx|. When configuring the handshake, general mode settings
++ * are taken from |test_ctx|, and client/server-specific settings should be
++ * taken from |extra|.
++ *
++ * The configuration code should never reach into |test_ctx-&gt;extra| or
++ * |test_ctx-&gt;resume_extra| directly.
++ *
++ * (We could refactor test mode settings into a substructure. This would result
++ * in cleaner argument passing but would complicate the test configuration
++ * parsing.)
++ */
+ static HANDSHAKE_RESULT *do_handshake_internal(
+     SSL_CTX *server_ctx, SSL_CTX *server2_ctx, SSL_CTX *client_ctx,
+-    const SSL_TEST_EXTRA_CONF *extra, int app_data_size,
++    const SSL_TEST_CTX *test_ctx, const SSL_TEST_EXTRA_CONF *extra,
+     SSL_SESSION *session_in, SSL_SESSION **session_out)
+ {
+     PEER server, client;
+@@ -712,15 +739,15 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     memset(&amp;server, 0, sizeof(server));
+     memset(&amp;client, 0, sizeof(client));
+ 
+-    configure_handshake_ctx(server_ctx, server2_ctx, client_ctx, extra,
++    configure_handshake_ctx(server_ctx, server2_ctx, client_ctx, test_ctx, extra,
+                             &amp;server_ctx_data, &amp;server2_ctx_data, &amp;client_ctx_data);
+ 
+     /* Setup SSL and buffers; additional configuration happens below. */
+     create_peer(&amp;server, server_ctx);
+     create_peer(&amp;client, client_ctx);
+ 
+-    server.bytes_to_write = client.bytes_to_read = app_data_size;
+-    client.bytes_to_write = server.bytes_to_read = app_data_size;
++    server.bytes_to_write = client.bytes_to_read = test_ctx-&gt;app_data_size;
++    client.bytes_to_write = server.bytes_to_read = test_ctx-&gt;app_data_size;
+ 
+     configure_handshake_ssl(server.ssl, client.ssl, extra);
+     if (session_in != NULL) {
+@@ -817,8 +844,10 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     }
+  err:
+     ret-&gt;server_alert_sent = server_ex_data.alert_sent;
++    ret-&gt;server_num_fatal_alerts_sent = server_ex_data.num_fatal_alerts_sent;
+     ret-&gt;server_alert_received = client_ex_data.alert_received;
+     ret-&gt;client_alert_sent = client_ex_data.alert_sent;
++    ret-&gt;client_num_fatal_alerts_sent = client_ex_data.num_fatal_alerts_sent;
+     ret-&gt;client_alert_received = server_ex_data.alert_received;
+     ret-&gt;server_protocol = SSL_version(server.ssl);
+     ret-&gt;client_protocol = SSL_version(client.ssl);
+@@ -869,7 +898,7 @@ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     SSL_SESSION *session = NULL;
+ 
+     result = do_handshake_internal(server_ctx, server2_ctx, client_ctx,
+-                                   &amp;test_ctx-&gt;extra, test_ctx-&gt;app_data_size,
++                                   test_ctx, &amp;test_ctx-&gt;extra,
+                                    NULL, &amp;session);
+     if (test_ctx-&gt;handshake_mode == SSL_TEST_HANDSHAKE_SIMPLE)
+         goto end;
+@@ -884,7 +913,7 @@ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     HANDSHAKE_RESULT_free(result);
+     /* We don't support SNI on second handshake yet, so server2_ctx is NULL. */
+     result = do_handshake_internal(resume_server_ctx, NULL, resume_client_ctx,
+-                                   &amp;test_ctx-&gt;resume_extra, test_ctx-&gt;app_data_size,
++                                   test_ctx, &amp;test_ctx-&gt;resume_extra,
+                                    session, NULL);
+  end:
+     SSL_SESSION_free(session);
+diff --git a/test/handshake_helper.h b/test/handshake_helper.h
+index 2fb8ac0..8425b2a 100644
+--- a/test/handshake_helper.h
++++ b/test/handshake_helper.h
+@@ -15,13 +15,17 @@
+ typedef struct handshake_result {
+     ssl_test_result_t result;
+     /* These alerts are in the 2-byte format returned by the info_callback. */
+-    /* Alert sent by the client; 0 if no alert. */
++    /* (Latest) alert sent by the client; 0 if no alert. */
+     int client_alert_sent;
+-    /* Alert received by the server; 0 if no alert. */
++    /* Number of fatal or close_notify alerts sent. */
++    int client_num_fatal_alerts_sent;
++    /* (Latest) alert received by the server; 0 if no alert. */
+     int client_alert_received;
+-    /* Alert sent by the server; 0 if no alert. */
++    /* (Latest) alert sent by the server; 0 if no alert. */
+     int server_alert_sent;
+-    /* Alert received by the client; 0 if no alert. */
++    /* Number of fatal or close_notify alerts sent. */
++    int server_num_fatal_alerts_sent;
++    /* (Latest) alert received by the client; 0 if no alert. */
+     int server_alert_received;
+     /* Negotiated protocol. On success, these should always match. */
+     int server_protocol;
+diff --git a/test/recipes/80-test_ssl_new.t b/test/recipes/80-test_ssl_new.t
+index 06ddbdc..7cd3856 100644
+--- a/test/recipes/80-test_ssl_new.t
++++ b/test/recipes/80-test_ssl_new.t
+@@ -29,7 +29,7 @@ map { s/\.in// } @conf_files;
+ 
+ # We hard-code the number of tests to double-check that the globbing above
+ # finds all files as expected.
+-plan tests =&gt; 12;  # = scalar @conf_srcs
++plan tests =&gt; 13;  # = scalar @conf_srcs
+ 
+ # Some test results depend on the configuration of enabled protocols. We only
+ # verify generated sources in the default configuration.
+@@ -59,6 +59,11 @@ my %skip = (
+   &quot;10-resumption.conf&quot; =&gt; disabled(&quot;tls1_1&quot;) || disabled(&quot;tls1_2&quot;),
+   &quot;11-dtls_resumption.conf&quot; =&gt; disabled(&quot;dtls1&quot;) || disabled(&quot;dtls1_2&quot;),
+   &quot;12-ct.conf&quot; =&gt; $no_tls || $no_ct || $no_ec,
++  # We could run some of these tests without TLS 1.2 if we had a per-test
++  # disable instruction but that's a bizarre configuration not worth
++  # special-casing for.
++  # We should review this once we have TLS 1.3.
++  &quot;13-fragmentation.conf&quot; =&gt; disabled(&quot;tls1_2&quot;)
+ );
+ 
+ foreach my $conf (@conf_files) {
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index 9347c96..ff1a50a 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -79,7 +79,7 @@ my $client_sess=&quot;client.ss&quot;;
+ # new format in ssl_test.c and add recipes to 80-test_ssl_new.t instead.
+ plan tests =&gt;
+     1				# For testss
+-    +7  			# For the first testssl
++    +6  			# For the first testssl
+     ;
+ 
+ subtest 'test_ss' =&gt; sub {
+@@ -579,28 +579,6 @@ sub testssl {
+ 	     'test tls1 with SRP auth via BIO pair');
+ 	}
+     };
+-
+-    subtest 'Multi-buffer tests' =&gt; sub {
+-	######################################################################
+-
+-	plan tests =&gt; 2;
+-
+-      SKIP: {
+-	  skip &quot;Neither SSLv3 nor any TLS version are supported by this OpenSSL build&quot;, 2
+-	      if $no_anytls;
+-
+-	  skip &quot;skipping multi-buffer tests&quot;, 2
+-	      if (POSIX::uname())[4] ne &quot;x86_64&quot;;
+-
+-	  ok(run(test([@ssltest, &quot;-cipher&quot;, &quot;AES128-SHA&quot;,    &quot;-bytes&quot;, &quot;8m&quot;])));
+-
+-	  # We happen to know that AES128-SHA256 is TLSv1.2 only... for now.
+-	  skip &quot;TLSv1.2 is not supported by this OpenSSL configuration&quot;, 1
+-	      if $no_tls1_2;
+-
+-	  ok(run(test([@ssltest, &quot;-cipher&quot;, &quot;AES128-SHA256&quot;, &quot;-bytes&quot;, &quot;8m&quot;])));
+-	}
+-    };
+ }
+ 
+ unlink $CAkey;
+diff --git a/test/ssl-tests/13-fragmentation.conf b/test/ssl-tests/13-fragmentation.conf
+new file mode 100644
+index 0000000..4c1e9e2
+--- /dev/null
++++ b/test/ssl-tests/13-fragmentation.conf
+@@ -0,0 +1,397 @@
++# Generated with generate_ssl_tests.pl
++
++num_tests = 16
++
++test-0 = 0-one-fragment-minus-app-data
++test-1 = 1-one-fragment-app-data
++test-2 = 2-one-fragment-plus-app-data
++test-3 = 3-small-app-data
++test-4 = 4-small-app-data-large-fragment-size
++test-5 = 5-medium-app-data
++test-6 = 6-medium-plus-app-data
++test-7 = 7-large-app-data
++test-8 = 8-large-app-data-large-fragment-size
++test-9 = 9-large-app-data-odd-fragment-size
++test-10 = 10-large-app-data-aes-sha1-multibuffer
++test-11 = 11-large-app-data-aes-sha2-multibuffer
++test-12 = 12-large-app-data-aes-sha1-multibuffer-odd-fragment
++test-13 = 13-large-app-data-aes-sha2-multibuffer-odd-fragment
++test-14 = 14-small-app-data-aes-sha1-multibuffer
++test-15 = 15-small-app-data-aes-sha2-multibuffer
++# ===========================================================
++
++[0-one-fragment-minus-app-data]
++ssl_conf = 0-one-fragment-minus-app-data-ssl
++
++[0-one-fragment-minus-app-data-ssl]
++server = 0-one-fragment-minus-app-data-server
++client = 0-one-fragment-minus-app-data-client
++
++[0-one-fragment-minus-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[0-one-fragment-minus-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-0]
++ApplicationData = 511
++
++
++# ===========================================================
++
++[1-one-fragment-app-data]
++ssl_conf = 1-one-fragment-app-data-ssl
++
++[1-one-fragment-app-data-ssl]
++server = 1-one-fragment-app-data-server
++client = 1-one-fragment-app-data-client
++
++[1-one-fragment-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[1-one-fragment-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-1]
++ApplicationData = 512
++
++
++# ===========================================================
++
++[2-one-fragment-plus-app-data]
++ssl_conf = 2-one-fragment-plus-app-data-ssl
++
++[2-one-fragment-plus-app-data-ssl]
++server = 2-one-fragment-plus-app-data-server
++client = 2-one-fragment-plus-app-data-client
++
++[2-one-fragment-plus-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[2-one-fragment-plus-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-2]
++ApplicationData = 513
++
++
++# ===========================================================
++
++[3-small-app-data]
++ssl_conf = 3-small-app-data-ssl
++
++[3-small-app-data-ssl]
++server = 3-small-app-data-server
++client = 3-small-app-data-client
++
++[3-small-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[3-small-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-3]
++ApplicationData = 4097
++
++
++# ===========================================================
++
++[4-small-app-data-large-fragment-size]
++ssl_conf = 4-small-app-data-large-fragment-size-ssl
++
++[4-small-app-data-large-fragment-size-ssl]
++server = 4-small-app-data-large-fragment-size-server
++client = 4-small-app-data-large-fragment-size-client
++
++[4-small-app-data-large-fragment-size-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[4-small-app-data-large-fragment-size-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-4]
++ApplicationData = 4097
++MaxFragmentSize = 16384
++
++
++# ===========================================================
++
++[5-medium-app-data]
++ssl_conf = 5-medium-app-data-ssl
++
++[5-medium-app-data-ssl]
++server = 5-medium-app-data-server
++client = 5-medium-app-data-client
++
++[5-medium-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[5-medium-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-5]
++ApplicationData = 32775
++
++
++# ===========================================================
++
++[6-medium-plus-app-data]
++ssl_conf = 6-medium-plus-app-data-ssl
++
++[6-medium-plus-app-data-ssl]
++server = 6-medium-plus-app-data-server
++client = 6-medium-plus-app-data-client
++
++[6-medium-plus-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[6-medium-plus-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-6]
++ApplicationData = 131069
++
++
++# ===========================================================
++
++[7-large-app-data]
++ssl_conf = 7-large-app-data-ssl
++
++[7-large-app-data-ssl]
++server = 7-large-app-data-server
++client = 7-large-app-data-client
++
++[7-large-app-data-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[7-large-app-data-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-7]
++ApplicationData = 1048576
++
++
++# ===========================================================
++
++[8-large-app-data-large-fragment-size]
++ssl_conf = 8-large-app-data-large-fragment-size-ssl
++
++[8-large-app-data-large-fragment-size-ssl]
++server = 8-large-app-data-large-fragment-size-server
++client = 8-large-app-data-large-fragment-size-client
++
++[8-large-app-data-large-fragment-size-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[8-large-app-data-large-fragment-size-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-8]
++ApplicationData = 1048576
++MaxFragmentSize = 16384
++
++
++# ===========================================================
++
++[9-large-app-data-odd-fragment-size]
++ssl_conf = 9-large-app-data-odd-fragment-size-ssl
++
++[9-large-app-data-odd-fragment-size-ssl]
++server = 9-large-app-data-odd-fragment-size-server
++client = 9-large-app-data-odd-fragment-size-client
++
++[9-large-app-data-odd-fragment-size-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[9-large-app-data-odd-fragment-size-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-9]
++ApplicationData = 1048576
++MaxFragmentSize = 5115
++
++
++# ===========================================================
++
++[10-large-app-data-aes-sha1-multibuffer]
++ssl_conf = 10-large-app-data-aes-sha1-multibuffer-ssl
++
++[10-large-app-data-aes-sha1-multibuffer-ssl]
++server = 10-large-app-data-aes-sha1-multibuffer-server
++client = 10-large-app-data-aes-sha1-multibuffer-client
++
++[10-large-app-data-aes-sha1-multibuffer-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[10-large-app-data-aes-sha1-multibuffer-client]
++CipherString = AES128-SHA
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-10]
++ApplicationData = 1048576
++MaxFragmentSize = 4096
++
++
++# ===========================================================
++
++[11-large-app-data-aes-sha2-multibuffer]
++ssl_conf = 11-large-app-data-aes-sha2-multibuffer-ssl
++
++[11-large-app-data-aes-sha2-multibuffer-ssl]
++server = 11-large-app-data-aes-sha2-multibuffer-server
++client = 11-large-app-data-aes-sha2-multibuffer-client
++
++[11-large-app-data-aes-sha2-multibuffer-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[11-large-app-data-aes-sha2-multibuffer-client]
++CipherString = AES128-SHA256
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-11]
++ApplicationData = 1048576
++MaxFragmentSize = 4096
++
++
++# ===========================================================
++
++[12-large-app-data-aes-sha1-multibuffer-odd-fragment]
++ssl_conf = 12-large-app-data-aes-sha1-multibuffer-odd-fragment-ssl
++
++[12-large-app-data-aes-sha1-multibuffer-odd-fragment-ssl]
++server = 12-large-app-data-aes-sha1-multibuffer-odd-fragment-server
++client = 12-large-app-data-aes-sha1-multibuffer-odd-fragment-client
++
++[12-large-app-data-aes-sha1-multibuffer-odd-fragment-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[12-large-app-data-aes-sha1-multibuffer-odd-fragment-client]
++CipherString = AES128-SHA
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-12]
++ApplicationData = 1048579
++MaxFragmentSize = 5115
++
++
++# ===========================================================
++
++[13-large-app-data-aes-sha2-multibuffer-odd-fragment]
++ssl_conf = 13-large-app-data-aes-sha2-multibuffer-odd-fragment-ssl
++
++[13-large-app-data-aes-sha2-multibuffer-odd-fragment-ssl]
++server = 13-large-app-data-aes-sha2-multibuffer-odd-fragment-server
++client = 13-large-app-data-aes-sha2-multibuffer-odd-fragment-client
++
++[13-large-app-data-aes-sha2-multibuffer-odd-fragment-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[13-large-app-data-aes-sha2-multibuffer-odd-fragment-client]
++CipherString = AES128-SHA256
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-13]
++ApplicationData = 1048573
++MaxFragmentSize = 5125
++
++
++# ===========================================================
++
++[14-small-app-data-aes-sha1-multibuffer]
++ssl_conf = 14-small-app-data-aes-sha1-multibuffer-ssl
++
++[14-small-app-data-aes-sha1-multibuffer-ssl]
++server = 14-small-app-data-aes-sha1-multibuffer-server
++client = 14-small-app-data-aes-sha1-multibuffer-client
++
++[14-small-app-data-aes-sha1-multibuffer-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[14-small-app-data-aes-sha1-multibuffer-client]
++CipherString = AES128-SHA
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-14]
++ApplicationData = 4096
++MaxFragmentSize = 4096
++
++
++# ===========================================================
++
++[15-small-app-data-aes-sha2-multibuffer]
++ssl_conf = 15-small-app-data-aes-sha2-multibuffer-ssl
++
++[15-small-app-data-aes-sha2-multibuffer-ssl]
++server = 15-small-app-data-aes-sha2-multibuffer-server
++client = 15-small-app-data-aes-sha2-multibuffer-client
++
++[15-small-app-data-aes-sha2-multibuffer-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[15-small-app-data-aes-sha2-multibuffer-client]
++CipherString = AES128-SHA256
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-15]
++ApplicationData = 4096
++MaxFragmentSize = 4096
++
++
+diff --git a/test/ssl-tests/13-fragmentation.conf.in b/test/ssl-tests/13-fragmentation.conf.in
+new file mode 100644
+index 0000000..645163c
+--- /dev/null
++++ b/test/ssl-tests/13-fragmentation.conf.in
+@@ -0,0 +1,181 @@
++# -*- mode: perl; -*-
++# Copyright 2016-2016 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++
++## Test version negotiation
++
++use strict;
++use warnings;
++
++package ssltests;
++
++
++our @tests = (
++    # Default fragment size is 512.
++    {
++        name =&gt; &quot;one-fragment-minus-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 511,
++        }
++    },
++    {
++        name =&gt; &quot;one-fragment-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 512,
++        }
++    },
++    {
++        name =&gt; &quot;one-fragment-plus-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 513,
++        }
++    },
++    {
++        name =&gt; &quot;small-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 4 * 1024 + 1,
++        }
++    },
++    {
++        name =&gt; &quot;small-app-data-large-fragment-size&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 4 * 1024 + 1,
++            MaxFragmentSize =&gt; 16384,
++        }
++    },
++    {
++        name =&gt; &quot;medium-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 32 * 1024 + 7,
++        }
++    },
++    # Exceeds the 64kB write buffer size.
++    {
++        name =&gt; &quot;medium-plus-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 128 * 1024 - 3,
++        }
++    },
++    {
++        name =&gt; &quot;large-app-data&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024,
++        }
++    },
++    {
++        name =&gt; &quot;large-app-data-large-fragment-size&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024,
++            MaxFragmentSize =&gt; 16384,
++        }
++    },
++    {
++        name =&gt; &quot;large-app-data-odd-fragment-size&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024,
++            MaxFragmentSize =&gt; 5 * 1024 - 5,
++        }
++    },
++    # When the buffer / fragment size ratio is sufficiently large,
++    # multi-buffer code kicks in on some platforms for AES-SHA.  The
++    # exact minimum ratio depends on the platform, and is usually
++    # around 4. Since the the test buffer is 64kB, a 4kB fragment is
++    # easily sufficient.
++    #
++    # (We run this test on all platforms though it's only true multibuffer
++    #  on some of them.)
++    {
++        name =&gt; &quot;large-app-data-aes-sha1-multibuffer&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024,
++            MaxFragmentSize =&gt; 4 * 1024,
++        }
++    },
++    {
++        name =&gt; &quot;large-app-data-aes-sha2-multibuffer&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA256&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024,
++            MaxFragmentSize =&gt; 4 * 1024,
++        }
++    },
++        {
++        name =&gt; &quot;large-app-data-aes-sha1-multibuffer-odd-fragment&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024 + 3,
++            MaxFragmentSize =&gt; 5 * 1024 - 5,
++        }
++    },
++    {
++        name =&gt; &quot;large-app-data-aes-sha2-multibuffer-odd-fragment&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA256&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 1024 * 1024 - 3,
++            MaxFragmentSize =&gt; 5 * 1024 + 5,
++        }
++    },
++    # Test that multibuffer-capable code also handles small data correctly.
++    # Here fragment size == app data size &lt; buffer size,
++    # so no multibuffering should happen.
++    {
++        name =&gt; &quot;small-app-data-aes-sha1-multibuffer&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 4 * 1024,
++            MaxFragmentSize =&gt; 4 * 1024,
++        }
++    },
++    {
++        name =&gt; &quot;small-app-data-aes-sha2-multibuffer&quot;,
++        server =&gt; { },
++        client =&gt; {
++            CipherString =&gt; &quot;AES128-SHA256&quot;,
++        },
++        test =&gt; {
++            ApplicationData =&gt; 4 * 1024,
++            MaxFragmentSize =&gt; 4 * 1024,
++        }
++    },
++);
+diff --git a/test/ssl_test.c b/test/ssl_test.c
+index c2324bf..9f14618 100644
+--- a/test/ssl_test.c
++++ b/test/ssl_test.c
+@@ -100,6 +100,16 @@ static int check_alerts(HANDSHAKE_RESULT *result, SSL_TEST_CTX *test_ctx)
+         return 0;
+     }
+ 
++    if (result-&gt;client_num_fatal_alerts_sent &gt; 1) {
++        fprintf(stderr, &quot;Client sent %d fatal alerts.\n&quot;,
++                result-&gt;client_num_fatal_alerts_sent);
++        return 0;
++    }
++    if (result-&gt;server_num_fatal_alerts_sent &gt; 1) {
++        fprintf(stderr, &quot;Server sent %d alerts.\n&quot;,
++                result-&gt;server_num_fatal_alerts_sent);
++        return 0;
++    }
+     return 1;
+ }
+ 
+diff --git a/test/ssl_test_ctx.c b/test/ssl_test_ctx.c
+index 8c953a3..ac90f19 100644
+--- a/test/ssl_test_ctx.c
++++ b/test/ssl_test_ctx.c
+@@ -17,6 +17,8 @@
+ #include &quot;testutil.h&quot;
+ 
+ static const int default_app_data_size = 256;
++/* Default set to be as small as possible to exercise fragmentation. */
++static const int default_max_fragment_size = 512;
+ 
+ static int parse_boolean(const char *value, int *result)
+ {
+@@ -389,11 +391,17 @@ IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, resumption_expected)
+ IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_SERVER_CONF, server, broken_session_ticket)
+ 
+ /***********************/
+-/* Applicationdata     */
++/* ApplicationData     */
+ /***********************/
+ 
+ IMPLEMENT_SSL_TEST_INT_OPTION(SSL_TEST_CTX, test, app_data_size)
+ 
++/***********************/
++/* MaxFragmentSize     */
++/***********************/
++
++IMPLEMENT_SSL_TEST_INT_OPTION(SSL_TEST_CTX, test, max_fragment_size)
++
+ /*************************************************************/
+ /* Known test options and their corresponding parse methods. */
+ /*************************************************************/
+@@ -417,6 +425,7 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
+     { &quot;HandshakeMode&quot;, &amp;parse_handshake_mode },
+     { &quot;ResumptionExpected&quot;, &amp;parse_test_resumption_expected },
+     { &quot;ApplicationData&quot;, &amp;parse_test_app_data_size },
++    { &quot;MaxFragmentSize&quot;, &amp;parse_test_max_fragment_size },
+ };
+ 
+ /* Nested client options. */
+@@ -456,6 +465,7 @@ SSL_TEST_CTX *SSL_TEST_CTX_new()
+     ret = OPENSSL_zalloc(sizeof(*ret));
+     TEST_check(ret != NULL);
+     ret-&gt;app_data_size = default_app_data_size;
++    ret-&gt;max_fragment_size = default_max_fragment_size;
+     return ret;
+ }
+ 
+diff --git a/test/ssl_test_ctx.h b/test/ssl_test_ctx.h
+index 1074f8e..11b6c33 100644
+--- a/test/ssl_test_ctx.h
++++ b/test/ssl_test_ctx.h
+@@ -109,6 +109,8 @@ typedef struct {
+      * Both peers will send |app_data_size| bytes interleaved.
+      */
+     int app_data_size;
++    /* Maximum send fragment size. */
++    int max_fragment_size;
+ 
+     /*
+      * Extra server/client configurations. Per-handshake.
+diff --git a/test/ssl_test_ctx_test.c b/test/ssl_test_ctx_test.c
+index f110bd1..b54d7ea 100644
+--- a/test/ssl_test_ctx_test.c
++++ b/test/ssl_test_ctx_test.c
+@@ -115,6 +115,12 @@ static int SSL_TEST_CTX_equal(SSL_TEST_CTX *ctx, SSL_TEST_CTX *ctx2)
+         return 0;
+     }
+ 
++    if (ctx-&gt;max_fragment_size != ctx2-&gt;max_fragment_size) {
++        fprintf(stderr, &quot;MaxFragmentSize mismatch: %d vs %d.\n&quot;,
++                ctx-&gt;max_fragment_size, ctx2-&gt;max_fragment_size);
++        return 0;
++    }
++
+     if (!SSL_TEST_EXTRA_CONF_equal(&amp;ctx-&gt;extra, &amp;ctx2-&gt;extra)) {
+         fprintf(stderr, &quot;Extra conf mismatch.\n&quot;);
+         return 0;
+@@ -246,6 +252,7 @@ static int test_good_configuration()
+     fixture.expected_ctx-&gt;method = SSL_TEST_METHOD_DTLS;
+     fixture.expected_ctx-&gt;handshake_mode = SSL_TEST_HANDSHAKE_RESUME;
+     fixture.expected_ctx-&gt;app_data_size = 1024;
++    fixture.expected_ctx-&gt;max_fragment_size = 2048;
+ 
+     fixture.expected_ctx-&gt;expected_result = SSL_TEST_SERVER_FAIL;
+     fixture.expected_ctx-&gt;expected_client_alert = SSL_AD_UNKNOWN_CA;
+diff --git a/test/ssl_test_ctx_test.conf b/test/ssl_test_ctx_test.conf
+index d1dbd22..a062d75 100644
+--- a/test/ssl_test_ctx_test.conf
++++ b/test/ssl_test_ctx_test.conf
+@@ -9,6 +9,7 @@ resume-client = ssltest_good_resume_client_extra
+ Method = DTLS
+ HandshakeMode = Resume
+ ApplicationData = 1024
++MaxFragmentSize = 2048
+ 
+ ExpectedResult = ServerFail
+ ExpectedClientAlert = UnknownCA
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009817.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009831.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9830">[ date ]</a>
+              <a href="thread.html#9830">[ thread ]</a>
+              <a href="subject.html#9830">[ subject ]</a>
+              <a href="author.html#9830">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

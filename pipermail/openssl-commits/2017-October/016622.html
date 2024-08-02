@@ -1,0 +1,486 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1507861012.807960.2651.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016620.html">
+   <LINK REL="Next"  HREF="016625.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1507861012.807960.2651.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Fri Oct 13 02:16:52 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016620.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="016625.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16622">[ date ]</a>
+              <a href="thread.html#16622">[ thread ]</a>
+              <a href="subject.html#16622">[ subject ]</a>
+              <a href="author.html#16622">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0e598a3d185e9bbfe1a513c05063970a1c532e23 (commit)
+      from  8abeefeccc4cfbfba9b5ebfc7604fe257a97317a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0e598a3d185e9bbfe1a513c05063970a1c532e23
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Wed Oct 4 21:17:58 2017 -0400
+
+    Add CRYPTO_get_alloc_counts.
+    
+    Use atomic operations for the counters
+    Rename malloc_lock to memdbg_lock
+    Also fix some style errors in mem_dbg.c
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4359">https://github.com/openssl/openssl/pull/4359</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem.c                | 22 ++++++++++++++
+ crypto/mem_dbg.c            | 72 ++++++++++++++++++++++++---------------------
+ doc/man3/OPENSSL_malloc.pod | 62 ++++++++++++++++++++++----------------
+ include/internal/cryptlib.h |  1 +
+ include/openssl/crypto.h    |  1 +
+ util/libcrypto.num          |  1 +
+ 6 files changed, 100 insertions(+), 59 deletions(-)
+
+diff --git a/crypto/mem.c b/crypto/mem.c
+index c171ae4..c77584c 100644
+--- a/crypto/mem.c
++++ b/crypto/mem.c
+@@ -31,6 +31,14 @@ static void (*free_impl)(void *, const char *, int)
+     = CRYPTO_free;
+ 
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
++static int malloc_count;
++static int realloc_count;
++static int free_count;
++static int dummy;
++
++# define INCREMENT(x) CRYPTO_atomic_add(&amp;x, 1, &amp;dummy, memdbg_lock)
++# define GET(ret, val) CRYPTO_atomic_read(&amp;val, ret, memdbg_lock)
++
+ static char *md_failstring;
+ static long md_count;
+ static int md_fail_percent = 0;
+@@ -45,6 +53,7 @@ static int shouldfail(void);
+ #else
+ static int call_malloc_debug = 0;
+ 
++# define INCREMENT(x) /* empty */
+ # define FAILTEST() /* empty */
+ #endif
+ 
+@@ -86,6 +95,16 @@ void CRYPTO_get_mem_functions(
+ }
+ 
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
++void CRYPTO_get_alloc_counts(int *mcount, int *rcount, int *fcount)
++{
++    if (mcount != NULL)
++        GET(mcount, malloc_count);
++    if (rcount != NULL)
++        GET(rcount, realloc_count);
++    if (fcount != NULL)
++        GET(fcount, free_count);
++}
++
+ /*
+  * Parse a &quot;malloc failure spec&quot; string.  This likes like a set of fields
+  * separated by semicolons.  Each field has a count and an optional failure
+@@ -171,6 +190,7 @@ void *CRYPTO_malloc(size_t num, const char *file, int line)
+ {
+     void *ret = NULL;
+ 
++    INCREMENT(malloc_count);
+     if (malloc_impl != NULL &amp;&amp; malloc_impl != CRYPTO_malloc)
+         return malloc_impl(num, file, line);
+ 
+@@ -207,6 +227,7 @@ void *CRYPTO_zalloc(size_t num, const char *file, int line)
+ 
+ void *CRYPTO_realloc(void *str, size_t num, const char *file, int line)
+ {
++    INCREMENT(realloc_count);
+     if (realloc_impl != NULL &amp;&amp; realloc_impl != &amp;CRYPTO_realloc)
+         return realloc_impl(str, num, file, line);
+ 
+@@ -264,6 +285,7 @@ void *CRYPTO_clear_realloc(void *str, size_t old_len, size_t num,
+ 
+ void CRYPTO_free(void *str, const char *file, int line)
+ {
++    INCREMENT(free_count);
+     if (free_impl != NULL &amp;&amp; free_impl != &amp;CRYPTO_free) {
+         free_impl(str, file, line);
+         return;
+diff --git a/crypto/mem_dbg.c b/crypto/mem_dbg.c
+index 9228dce..b394de8 100644
+--- a/crypto/mem_dbg.c
++++ b/crypto/mem_dbg.c
+@@ -56,8 +56,8 @@ struct app_mem_info_st {
+ };
+ 
+ static CRYPTO_ONCE memdbg_init = CRYPTO_ONCE_STATIC_INIT;
+-static CRYPTO_RWLOCK *malloc_lock = NULL;
+-static CRYPTO_RWLOCK *long_malloc_lock = NULL;
++CRYPTO_RWLOCK *memdbg_lock;
++static CRYPTO_RWLOCK *long_memdbg_lock;
+ static CRYPTO_THREAD_LOCAL appinfokey;
+ 
+ /* memory-block description */
+@@ -76,28 +76,32 @@ struct mem_st {
+ #endif
+ };
+ 
+-static LHASH_OF(MEM) *mh = NULL; /* hash-table of memory requests (address as
+-                                  * key); access requires MALLOC2 lock */
++/*
++ * hash-table of memory requests (address as * key); access requires
++ * long_memdbg_lock lock
++ */
++static LHASH_OF(MEM) *mh = NULL;
+ 
+ /* num_disable &gt; 0 iff mh_mode == CRYPTO_MEM_CHECK_ON (w/o ..._ENABLE) */
+ static unsigned int num_disable = 0;
+ 
+ /*
+- * Valid iff num_disable &gt; 0.  long_malloc_lock is locked exactly in this
++ * Valid iff num_disable &gt; 0.  long_memdbg_lock is locked exactly in this
+  * case (by the thread named in disabling_thread).
+  */
+ static CRYPTO_THREAD_ID disabling_threadid;
+ 
+ DEFINE_RUN_ONCE_STATIC(do_memdbg_init)
+ {
+-    malloc_lock = CRYPTO_THREAD_glock_new(&quot;malloc&quot;);
+-    long_malloc_lock = CRYPTO_THREAD_glock_new(&quot;long_malloc&quot;);
+-    if (malloc_lock == NULL || long_malloc_lock == NULL
+-        || !CRYPTO_THREAD_init_local(&amp;appinfokey, NULL)) {
+-        CRYPTO_THREAD_lock_free(malloc_lock);
+-        malloc_lock = NULL;
+-        CRYPTO_THREAD_lock_free(long_malloc_lock);
+-        long_malloc_lock = NULL;
++    memdbg_lock = CRYPTO_THREAD_glock_new(&quot;malloc&quot;);
++    long_memdbg_lock = CRYPTO_THREAD_glock_new(&quot;long_malloc&quot;);
++    if (memdbg_lock == NULL
++            || long_memdbg_lock == NULL
++            || !CRYPTO_THREAD_init_local(&amp;appinfokey, NULL)) {
++        CRYPTO_THREAD_lock_free(memdbg_lock);
++        memdbg_lock = NULL;
++        CRYPTO_THREAD_lock_free(long_memdbg_lock);
++        long_memdbg_lock = NULL;
+         return 0;
+     }
+     return 1;
+@@ -105,7 +109,7 @@ DEFINE_RUN_ONCE_STATIC(do_memdbg_init)
+ 
+ static void app_info_free(APP_INFO *inf)
+ {
+-    if (!inf)
++    if (inf == NULL)
+         return;
+     if (--(inf-&gt;references) &lt;= 0) {
+         app_info_free(inf-&gt;next);
+@@ -124,7 +128,7 @@ int CRYPTO_mem_ctrl(int mode)
+     if (!RUN_ONCE(&amp;memdbg_init, do_memdbg_init))
+         return -1;
+ 
+-    CRYPTO_THREAD_write_lock(malloc_lock);
++    CRYPTO_THREAD_write_lock(memdbg_lock);
+     switch (mode) {
+     default:
+         break;
+@@ -143,26 +147,26 @@ int CRYPTO_mem_ctrl(int mode)
+     case CRYPTO_MEM_CHECK_DISABLE:
+         if (mh_mode &amp; CRYPTO_MEM_CHECK_ON) {
+             CRYPTO_THREAD_ID cur = CRYPTO_THREAD_get_current_id();
+-            /* see if we don't have long_malloc_lock already */
++            /* see if we don't have long_memdbg_lock already */
+             if (!num_disable
+                 || !CRYPTO_THREAD_compare_id(disabling_threadid, cur)) {
+                 /*
+-                 * Long-time lock long_malloc_lock must not be claimed
+-                 * while we're holding malloc_lock, or we'll deadlock
+-                 * if somebody else holds long_malloc_lock (and cannot
++                 * Long-time lock long_memdbg_lock must not be claimed
++                 * while we're holding memdbg_lock, or we'll deadlock
++                 * if somebody else holds long_memdbg_lock (and cannot
+                  * release it because we block entry to this function). Give
+                  * them a chance, first, and then claim the locks in
+                  * appropriate order (long-time lock first).
+                  */
+-                CRYPTO_THREAD_unlock(malloc_lock);
++                CRYPTO_THREAD_unlock(memdbg_lock);
+                 /*
+-                 * Note that after we have waited for long_malloc_lock and
+-                 * malloc_lock, we'll still be in the right &quot;case&quot; and
++                 * Note that after we have waited for long_memdbg_lock and
++                 * memdbg_lock, we'll still be in the right &quot;case&quot; and
+                  * &quot;if&quot; branch because MemCheck_start and MemCheck_stop may
+                  * never be used while there are multiple OpenSSL threads.
+                  */
+-                CRYPTO_THREAD_write_lock(long_malloc_lock);
+-                CRYPTO_THREAD_write_lock(malloc_lock);
++                CRYPTO_THREAD_write_lock(long_memdbg_lock);
++                CRYPTO_THREAD_write_lock(memdbg_lock);
+                 mh_mode &amp;= ~CRYPTO_MEM_CHECK_ENABLE;
+                 disabling_threadid = cur;
+             }
+@@ -176,13 +180,13 @@ int CRYPTO_mem_ctrl(int mode)
+                 num_disable--;
+                 if (num_disable == 0) {
+                     mh_mode |= CRYPTO_MEM_CHECK_ENABLE;
+-                    CRYPTO_THREAD_unlock(long_malloc_lock);
++                    CRYPTO_THREAD_unlock(long_memdbg_lock);
+                 }
+             }
+         }
+         break;
+     }
+-    CRYPTO_THREAD_unlock(malloc_lock);
++    CRYPTO_THREAD_unlock(memdbg_lock);
+     return ret;
+ #endif
+ }
+@@ -199,12 +203,12 @@ static int mem_check_on(void)
+             return 0;
+ 
+         cur = CRYPTO_THREAD_get_current_id();
+-        CRYPTO_THREAD_read_lock(malloc_lock);
++        CRYPTO_THREAD_read_lock(memdbg_lock);
+ 
+         ret = (mh_mode &amp; CRYPTO_MEM_CHECK_ENABLE)
+             || !CRYPTO_THREAD_compare_id(disabling_threadid, cur);
+ 
+-        CRYPTO_THREAD_unlock(malloc_lock);
++        CRYPTO_THREAD_unlock(memdbg_lock);
+     }
+     return ret;
+ }
+@@ -598,7 +602,7 @@ int CRYPTO_mem_leaks_cb(int (*cb) (const char *str, size_t len, void *u),
+          */
+         int old_mh_mode;
+ 
+-        CRYPTO_THREAD_write_lock(malloc_lock);
++        CRYPTO_THREAD_write_lock(memdbg_lock);
+ 
+         /*
+          * avoid deadlock when lh_free() uses CRYPTO_mem_debug_free(), which uses
+@@ -611,16 +615,16 @@ int CRYPTO_mem_leaks_cb(int (*cb) (const char *str, size_t len, void *u),
+         mh = NULL;
+ 
+         mh_mode = old_mh_mode;
+-        CRYPTO_THREAD_unlock(malloc_lock);
++        CRYPTO_THREAD_unlock(memdbg_lock);
+     }
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_OFF);
+ 
+     /* Clean up locks etc */
+     CRYPTO_THREAD_cleanup_local(&amp;appinfokey);
+-    CRYPTO_THREAD_lock_free(malloc_lock);
+-    CRYPTO_THREAD_lock_free(long_malloc_lock);
+-    malloc_lock = NULL;
+-    long_malloc_lock = NULL;
++    CRYPTO_THREAD_lock_free(memdbg_lock);
++    CRYPTO_THREAD_lock_free(long_memdbg_lock);
++    memdbg_lock = NULL;
++    long_memdbg_lock = NULL;
+ 
+     return ml.chunks == 0 ? 1 : 0;
+ }
+diff --git a/doc/man3/OPENSSL_malloc.pod b/doc/man3/OPENSSL_malloc.pod
+index 39f9047..2d48ae2 100644
+--- a/doc/man3/OPENSSL_malloc.pod
++++ b/doc/man3/OPENSSL_malloc.pod
+@@ -14,6 +14,7 @@ OPENSSL_mem_debug_push, OPENSSL_mem_debug_pop,
+ CRYPTO_mem_debug_push, CRYPTO_mem_debug_pop,
+ CRYPTO_clear_realloc, CRYPTO_clear_free,
+ CRYPTO_get_mem_functions, CRYPTO_set_mem_functions,
++CRYPTO_get_alloc_counts,
+ CRYPTO_set_mem_debug, CRYPTO_mem_ctrl,
+ CRYPTO_mem_leaks, CRYPTO_mem_leaks_fp, CRYPTO_mem_leaks_cb,
+ OPENSSL_MALLOC_FAILURES,
+@@ -62,6 +63,8 @@ OPENSSL_MALLOC_FD
+          void *(*r)(void *, size_t, const char *, int),
+          void (*f)(void *, const char *, int))
+ 
++ void CRYPTO_get_alloc_counts(int *m, int *r, int *f)
++
+  int CRYPTO_set_mem_debug(int onoff)
+ 
+  env OPENSSL_MALLOC_FAILURES=... &lt;application&gt;
+@@ -148,31 +151,6 @@ CRYPTO_set_mem_debug() turns this tracking on and off.  In order to have
+ any effect, is must be called before any of the allocation functions
+ (e.g., CRYPTO_malloc()) are called, and is therefore normally one of the
+ first lines of main() in an application.
+-
+-If the library is built with the C&lt;crypto-mdebug&gt; option, then two additional
+-environment variables can be used for testing failure handling.  The variable
+-B&lt;OPENSSL_MALLOC_FAILURES&gt; controls how often allocations should fail.
+-It is a set of fields separated by semicolons, which each field is a count
+-(defaulting to zero) and an optional atsign and percentage (defaulting
+-to 100).  If the count is zero, then it lasts forever.  For example,
+-C&lt;100;@25&gt; or C&lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">100 at 0</A>;<A HREF="../../../mailman/listinfo/openssl-commits.html">0 at 25</A>&gt; means the first 100 allocations pass, then all
+-other allocations (until the program exits or crashes) have a 25% chance of
+-failing.
+-
+-If the variable B&lt;OPENSSL_MALLOC_FD&gt; is parsed as a positive integer, then
+-it is taken as an open file descriptor, and a record of all allocations is
+-written to that descriptor.  If an allocation will fail, and the platform
+-supports it, then a backtrace will be written to the descriptor.  This can
+-be useful because a malloc may fail but not be checked, and problems will
+-only occur later.  The following example in classic shell syntax shows how
+-to use this (will not work on all platforms):
+-
+-  OPENSSL_MALLOC_FAILURES='200;@10'
+-  export OPENSSL_MALLOC_FAILURES
+-  OPENSSL_MALLOC_FD=3
+-  export OPENSSL_MALLOC_FD
+-  ...app invocation... 3&gt;/tmp/log$$
+-
+ CRYPTO_mem_ctrl() provides fine-grained control of memory leak tracking.
+ To enable tracking call CRYPTO_mem_ctrl() with a B&lt;mode&gt; argument of
+ the B&lt;CRYPTO_MEM_CHECK_ON&gt;.
+@@ -198,6 +176,40 @@ of writing to a given BIO, the callback function is called for each
+ output string with the string, length, and userdata B&lt;u&gt; as the callback
+ parameters.
+ 
++If the library is built with the C&lt;crypto-mdebug&gt; option, then one
++function, CRYPTO_get_alloc_counts(), and two additional environment
++variables, B&lt;OPENSSL_MALLOC_FAILURES&gt; and B&lt;OPENSSL_MALLOC_FD&gt;,
++are available.
++
++The function CRYPTO_get_alloc_counts() fills in the number of times
++each of CRYPTO_malloc(), CRYPTO_realloc(), and CRYPTO_free() have been
++called, into the values pointed to by B&lt;mcount&gt;, B&lt;rcount&gt;, and B&lt;fcount&gt;,
++respectively.  If a pointer is NULL, then the corresponding count is not stored.
++
++The variable
++B&lt;OPENSSL_MALLOC_FAILURES&gt; controls how often allocations should fail.
++It is a set of fields separated by semicolons, which each field is a count
++(defaulting to zero) and an optional atsign and percentage (defaulting
++to 100).  If the count is zero, then it lasts forever.  For example,
++C&lt;100;@25&gt; or C&lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">100 at 0</A>;<A HREF="../../../mailman/listinfo/openssl-commits.html">0 at 25</A>&gt; means the first 100 allocations pass, then all
++other allocations (until the program exits or crashes) have a 25% chance of
++failing.
++
++If the variable B&lt;OPENSSL_MALLOC_FD&gt; is parsed as a positive integer, then
++it is taken as an open file descriptor, and a record of all allocations is
++written to that descriptor.  If an allocation will fail, and the platform
++supports it, then a backtrace will be written to the descriptor.  This can
++be useful because a malloc may fail but not be checked, and problems will
++only occur later.  The following example in classic shell syntax shows how
++to use this (will not work on all platforms):
++
++  OPENSSL_MALLOC_FAILURES='200;@10'
++  export OPENSSL_MALLOC_FAILURES
++  OPENSSL_MALLOC_FD=3
++  export OPENSSL_MALLOC_FD
++  ...app invocation... 3&gt;/tmp/log$$
++
++
+ =head1 RETURN VALUES
+ 
+ OPENSSL_malloc_init(), OPENSSL_free(), OPENSSL_clear_free()
+diff --git a/include/internal/cryptlib.h b/include/internal/cryptlib.h
+index 5f2cb44..4280185 100644
+--- a/include/internal/cryptlib.h
++++ b/include/internal/cryptlib.h
+@@ -86,6 +86,7 @@ extern int OPENSSL_NONPIC_relocated;
+ void crypto_cleanup_all_ex_data_int(void);
+ int openssl_init_fork_handlers(void);
+ 
++extern CRYPTO_RWLOCK *memdbg_lock;
+ int openssl_strerror_r(int errnum, char *buf, size_t buflen);
+ # if !defined(OPENSSL_NO_STDIO)
+ FILE *openssl_fopen(const char *filename, const char *mode);
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 8df7f3c..5e9517d 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -303,6 +303,7 @@ void OPENSSL_cleanse(void *ptr, size_t len);
+         CRYPTO_mem_debug_pop()
+ int CRYPTO_mem_debug_push(const char *info, const char *file, int line);
+ int CRYPTO_mem_debug_pop(void);
++void CRYPTO_get_alloc_counts(int *mcount, int *rcount, int *fcount);
+ 
+ /*-
+  * Debugging functions (enabled by CRYPTO_set_mem_debug(1))
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 04f35e3..0a29e8c 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4403,3 +4403,4 @@ CRYPTO_atomic_write                     4346	1_1_1	EXIST::FUNCTION:
+ EVP_PKEY_set1_engine                    4347	1_1_0g	EXIST::FUNCTION:ENGINE
+ DH_new_by_nid                           4348	1_1_1	EXIST::FUNCTION:DH
+ DH_get_nid                              4349	1_1_1	EXIST::FUNCTION:DH
++CRYPTO_get_alloc_counts                 4350	1_1_1	EXIST::FUNCTION:CRYPTO_MDEBUG
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016620.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="016625.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16622">[ date ]</a>
+              <a href="thread.html#16622">[ thread ]</a>
+              <a href="subject.html#16622">[ subject ]</a>
+              <a href="author.html#16622">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

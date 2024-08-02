@@ -1,0 +1,253 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578308128.362337.5309.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026924.html">
+   <LINK REL="Next"  HREF="026934.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578308128.362337.5309.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon Jan  6 10:55:28 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026924.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026934.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26925">[ date ]</a>
+              <a href="thread.html#26925">[ thread ]</a>
+              <a href="subject.html#26925">[ subject ]</a>
+              <a href="author.html#26925">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  b1558c0bc895afd93170378053bae800efacee1e (commit)
+      from  60a3399721a48931b137ae4d966a9ef4b6a85d11 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit b1558c0bc895afd93170378053bae800efacee1e
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Jan 3 09:37:19 2020 +0000
+
+    Don't store an HMAC key for longer than we need
+    
+    The HMAC_CTX structure stores the original key in case the ctx is reused
+    without changing the key.
+    
+    However, HMAC_Init_ex() checks its parameters such that the only code path
+    where the stored key is ever used is in the case where HMAC_Init_ex is
+    called with a NULL key and an explicit md is provided which is the same as
+    the md that was provided previously. But in that case we can actually reuse
+    the pre-digested key that we calculated last time, so we can refactor the
+    code not to use the stored key at all.
+    
+    With that refactor done it is no longer necessary to store the key in the
+    ctx at all. This means that long running ctx's will not keep the key in
+    memory for any longer than required. Note though that the digested key
+    *is* still kept in memory for the duration of the life of the ctx.
+    
+    Fixes #10743
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10747">https://github.com/openssl/openssl/pull/10747</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/hmac/hmac.c       | 40 +++++++++++++++++++---------------------
+ crypto/hmac/hmac_local.h |  2 --
+ test/hmactest.c          | 21 +++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 23 deletions(-)
+
+diff --git a/crypto/hmac/hmac.c b/crypto/hmac/hmac.c
+index 6d4d24d77b..a94550a37a 100644
+--- a/crypto/hmac/hmac.c
++++ b/crypto/hmac/hmac.c
+@@ -18,16 +18,17 @@
+ int HMAC_Init_ex(HMAC_CTX *ctx, const void *key, int len,
+                  const EVP_MD *md, ENGINE *impl)
+ {
+-    int rv = 0;
+-    int i, j, reset = 0;
++    int rv = 0, reset = 0;
++    int i, j;
+     unsigned char pad[HMAC_MAX_MD_CBLOCK_SIZE];
++    unsigned int keytmp_length;
++    unsigned char keytmp[HMAC_MAX_MD_CBLOCK_SIZE];
+ 
+     /* If we are changing MD then we must have a key */
+     if (md != NULL &amp;&amp; md != ctx-&gt;md &amp;&amp; (key == NULL || len &lt; 0))
+         return 0;
+ 
+     if (md != NULL) {
+-        reset = 1;
+         ctx-&gt;md = md;
+     } else if (ctx-&gt;md) {
+         md = ctx-&gt;md;
+@@ -44,35 +45,34 @@ int HMAC_Init_ex(HMAC_CTX *ctx, const void *key, int len,
+ 
+     if (key != NULL) {
+         reset = 1;
++
+         j = EVP_MD_block_size(md);
+-        if (!ossl_assert(j &lt;= (int)sizeof(ctx-&gt;key)))
++        if (!ossl_assert(j &lt;= (int)sizeof(keytmp)))
+             return 0;
+         if (j &lt; len) {
+             if (!EVP_DigestInit_ex(ctx-&gt;md_ctx, md, impl)
+                     || !EVP_DigestUpdate(ctx-&gt;md_ctx, key, len)
+-                    || !EVP_DigestFinal_ex(ctx-&gt;md_ctx, ctx-&gt;key,
+-                                           &amp;ctx-&gt;key_length))
++                    || !EVP_DigestFinal_ex(ctx-&gt;md_ctx, keytmp,
++                                           &amp;keytmp_length))
+                 return 0;
+         } else {
+-            if (len &lt; 0 || len &gt; (int)sizeof(ctx-&gt;key))
++            if (len &lt; 0 || len &gt; (int)sizeof(keytmp))
+                 return 0;
+-            memcpy(ctx-&gt;key, key, len);
+-            ctx-&gt;key_length = len;
++            memcpy(keytmp, key, len);
++            keytmp_length = len;
+         }
+-        if (ctx-&gt;key_length != HMAC_MAX_MD_CBLOCK_SIZE)
+-            memset(&amp;ctx-&gt;key[ctx-&gt;key_length], 0,
+-                   HMAC_MAX_MD_CBLOCK_SIZE - ctx-&gt;key_length);
+-    }
++        if (keytmp_length != HMAC_MAX_MD_CBLOCK_SIZE)
++            memset(&amp;keytmp[keytmp_length], 0,
++                   HMAC_MAX_MD_CBLOCK_SIZE - keytmp_length);
+ 
+-    if (reset) {
+         for (i = 0; i &lt; HMAC_MAX_MD_CBLOCK_SIZE; i++)
+-            pad[i] = 0x36 ^ ctx-&gt;key[i];
++            pad[i] = 0x36 ^ keytmp[i];
+         if (!EVP_DigestInit_ex(ctx-&gt;i_ctx, md, impl)
+                 || !EVP_DigestUpdate(ctx-&gt;i_ctx, pad, EVP_MD_block_size(md)))
+             goto err;
+ 
+         for (i = 0; i &lt; HMAC_MAX_MD_CBLOCK_SIZE; i++)
+-            pad[i] = 0x5c ^ ctx-&gt;key[i];
++            pad[i] = 0x5c ^ keytmp[i];
+         if (!EVP_DigestInit_ex(ctx-&gt;o_ctx, md, impl)
+                 || !EVP_DigestUpdate(ctx-&gt;o_ctx, pad, EVP_MD_block_size(md)))
+             goto err;
+@@ -81,8 +81,10 @@ int HMAC_Init_ex(HMAC_CTX *ctx, const void *key, int len,
+         goto err;
+     rv = 1;
+  err:
+-    if (reset)
++    if (reset) {
++        OPENSSL_cleanse(keytmp, sizeof(keytmp));
+         OPENSSL_cleanse(pad, sizeof(pad));
++    }
+     return rv;
+ }
+ 
+@@ -149,8 +151,6 @@ static void hmac_ctx_cleanup(HMAC_CTX *ctx)
+     EVP_MD_CTX_reset(ctx-&gt;o_ctx);
+     EVP_MD_CTX_reset(ctx-&gt;md_ctx);
+     ctx-&gt;md = NULL;
+-    ctx-&gt;key_length = 0;
+-    OPENSSL_cleanse(ctx-&gt;key, sizeof(ctx-&gt;key));
+ }
+ 
+ void HMAC_CTX_free(HMAC_CTX *ctx)
+@@ -201,8 +201,6 @@ int HMAC_CTX_copy(HMAC_CTX *dctx, HMAC_CTX *sctx)
+         goto err;
+     if (!EVP_MD_CTX_copy_ex(dctx-&gt;md_ctx, sctx-&gt;md_ctx))
+         goto err;
+-    memcpy(dctx-&gt;key, sctx-&gt;key, HMAC_MAX_MD_CBLOCK_SIZE);
+-    dctx-&gt;key_length = sctx-&gt;key_length;
+     dctx-&gt;md = sctx-&gt;md;
+     return 1;
+  err:
+diff --git a/crypto/hmac/hmac_local.h b/crypto/hmac/hmac_local.h
+index 788721ef1f..d6fd4f39e0 100644
+--- a/crypto/hmac/hmac_local.h
++++ b/crypto/hmac/hmac_local.h
+@@ -18,8 +18,6 @@ struct hmac_ctx_st {
+     EVP_MD_CTX *md_ctx;
+     EVP_MD_CTX *i_ctx;
+     EVP_MD_CTX *o_ctx;
+-    unsigned int key_length;
+-    unsigned char key[HMAC_MAX_MD_CBLOCK_SIZE];
+ };
+ 
+ #endif
+diff --git a/test/hmactest.c b/test/hmactest.c
+index 893e6169b4..a4a9c849b9 100644
+--- a/test/hmactest.c
++++ b/test/hmactest.c
+@@ -169,6 +169,27 @@ static int test_hmac_run(void)
+     if (!TEST_str_eq(p, test[6].digest))
+         goto err;
+ 
++    /* Test reusing a key */
++    if (!TEST_true(HMAC_Init_ex(ctx, NULL, 0, NULL, NULL))
++        || !TEST_true(HMAC_Update(ctx, test[6].data, test[6].data_len))
++        || !TEST_true(HMAC_Final(ctx, buf, &amp;len)))
++        goto err;
++    p = pt(buf, len);
++    if (!TEST_str_eq(p, test[6].digest))
++        goto err;
++
++    /*
++     * Test reusing a key where the digest is provided again but is the same as
++     * last time
++     */
++    if (!TEST_true(HMAC_Init_ex(ctx, NULL, 0, EVP_sha256(), NULL))
++        || !TEST_true(HMAC_Update(ctx, test[6].data, test[6].data_len))
++        || !TEST_true(HMAC_Final(ctx, buf, &amp;len)))
++        goto err;
++    p = pt(buf, len);
++    if (!TEST_str_eq(p, test[6].digest))
++        goto err;
++
+     ret = 1;
+ err:
+     HMAC_CTX_free(ctx);
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026924.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026934.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26925">[ date ]</a>
+              <a href="thread.html#26925">[ thread ]</a>
+              <a href="subject.html#26925">[ subject ]</a>
+              <a href="author.html#26925">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

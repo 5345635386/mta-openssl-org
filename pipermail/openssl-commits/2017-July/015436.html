@@ -1,0 +1,1177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1500120744.071796.26147.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015432.html">
+   <LINK REL="Next"  HREF="015438.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1500120744.071796.26147.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Sat Jul 15 12:12:24 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015432.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="015438.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15436">[ date ]</a>
+              <a href="thread.html#15436">[ thread ]</a>
+              <a href="subject.html#15436">[ subject ]</a>
+              <a href="author.html#15436">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  da8fc25a989cf4f4d26d626a85477e8a9282da12 (commit)
+      from  71d57be52e7c4d5389dfe950ad9ee4e54aea5411 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit da8fc25a989cf4f4d26d626a85477e8a9282da12
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Thu Jun 22 09:21:43 2017 -0400
+
+    Start to overhaul RAND API
+    
+    Remove unused rand_hw_xor, MD/EVP indirection
+    Make rand_pseudo same as rand.
+    Cleanup formatting and ifdef control
+    Rename some things:
+        - rand_meth to openssl_rand_meth; make it global
+        - source file
+        - lock/init functions, start per-thread state
+        - ossl_meth_init to ossl_rand_init
+    Put state into RAND_STATE structure
+    And put OSSL_RAND_STATE into ossl_typ.h
+    Use &quot;randomness&quot; instead of &quot;entropy&quot;
+    
+    Reviewed-by: Ben Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaduk at mit.edu</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3758">https://github.com/openssl/openssl/pull/3758</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/build.info                 |   2 +-
+ crypto/rand/{md_rand.c =&gt; ossl_rand.c} | 329 ++++++++++++++-------------------
+ crypto/rand/rand_lcl.h                 |  36 +---
+ crypto/rand/rand_lib.c                 |  95 +++++-----
+ crypto/rand/rand_unix.c                |  19 +-
+ crypto/rand/rand_vms.c                 |  79 ++++----
+ 6 files changed, 238 insertions(+), 322 deletions(-)
+ rename crypto/rand/{md_rand.c =&gt; ossl_rand.c} (65%)
+
+diff --git a/crypto/rand/build.info b/crypto/rand/build.info
+index 3ad50e2..9e0a90b 100644
+--- a/crypto/rand/build.info
++++ b/crypto/rand/build.info
+@@ -1,4 +1,4 @@
+ LIBS=../../libcrypto
+ SOURCE[../../libcrypto]=\
+-        md_rand.c randfile.c rand_lib.c rand_err.c rand_egd.c \
++        ossl_rand.c randfile.c rand_lib.c rand_err.c rand_egd.c \
+         rand_win.c rand_unix.c rand_vms.c
+diff --git a/crypto/rand/md_rand.c b/crypto/rand/ossl_rand.c
+similarity index 65%
+rename from crypto/rand/md_rand.c
+rename to crypto/rand/ossl_rand.c
+index 8cbfae1..016653d 100644
+--- a/crypto/rand/md_rand.c
++++ b/crypto/rand/ossl_rand.c
+@@ -23,35 +23,40 @@
+ #include &lt;openssl/crypto.h&gt;
+ #include &lt;openssl/rand.h&gt;
+ #include &lt;openssl/async.h&gt;
+-#include &quot;rand_lcl.h&quot;
+-
+ #include &lt;openssl/err.h&gt;
+-
+ #include &lt;internal/thread_once.h&gt;
++#include &quot;rand_lcl.h&quot;
+ 
+ #if defined(BN_DEBUG) || defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+-# define PREDICT
++# define PREDICT 1
+ #endif
+ 
+-/* #define PREDICT      1 */
+-
+ #define STATE_SIZE      1023
+-static size_t state_num = 0, state_index = 0;
+-static unsigned char state[STATE_SIZE + MD_DIGEST_LENGTH];
+-static unsigned char md[MD_DIGEST_LENGTH];
+-static long md_count[2] = { 0, 0 };
+ 
+-static double entropy = 0;
+-static int initialized = 0;
++typedef struct ossl_rand_state_st OSSL_RAND_STATE;
++
++struct ossl_rand_state_st {
++    size_t num;
++    size_t index;
++    unsigned char state[STATE_SIZE + RAND_DIGEST_LENGTH];
++    unsigned char md[RAND_DIGEST_LENGTH];
++    long md_count[2];
++};
+ 
++static OSSL_RAND_STATE global_state;
++static double randomness = 0;
++static int initialized = 0;
+ static CRYPTO_RWLOCK *rand_lock = NULL;
+ static CRYPTO_RWLOCK *rand_tmp_lock = NULL;
+-static CRYPTO_ONCE rand_lock_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_ONCE ossl_rand_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_THREAD_LOCAL key;
+ 
+ /* May be set only when a thread holds rand_lock (to prevent double locking) */
+ static unsigned int crypto_lock_rand = 0;
+-/* access to locking_threadid is synchronized by rand_tmp_lock */
+-/* valid iff crypto_lock_rand is set */
++/*
++ * access to locking_threadid is synchronized by rand_tmp_lock;
++ * valid iff crypto_lock_rand is set
++ */
+ static CRYPTO_THREAD_ID locking_threadid;
+ 
+ #ifdef PREDICT
+@@ -60,51 +65,35 @@ int rand_predictable = 0;
+ 
+ static int rand_hw_seed(EVP_MD_CTX *ctx);
+ 
+-static void rand_cleanup(void);
+-static int rand_seed(const void *buf, int num);
+-static int rand_add(const void *buf, int num, double add_entropy);
+-static int rand_bytes(unsigned char *buf, int num, int pseudo);
+-static int rand_nopseudo_bytes(unsigned char *buf, int num);
+-#if OPENSSL_API_COMPAT &lt; 0x10100000L
+-static int rand_pseudo_bytes(unsigned char *buf, int num);
+-#endif
+-static int rand_status(void);
++static void rand_thread_cleanup(void *arg)
++{
++    OSSL_RAND_STATE *sp = arg;
+ 
+-static RAND_METHOD rand_meth = {
+-    rand_seed,
+-    rand_nopseudo_bytes,
+-    rand_cleanup,
+-    rand_add,
+-#if OPENSSL_API_COMPAT &lt; 0x10100000L
+-    rand_pseudo_bytes,
+-#else
+-    NULL,
+-#endif
+-    rand_status
+-};
++    OPENSSL_clear_free(sp, sizeof(*sp));
++}
+ 
+-DEFINE_RUN_ONCE_STATIC(do_rand_lock_init)
++DEFINE_RUN_ONCE_STATIC(do_ossl_rand_init)
+ {
++    int ret = 1;
++
+     OPENSSL_init_crypto(0, NULL);
+     rand_lock = CRYPTO_THREAD_lock_new();
++    ret &amp;= rand_lock != NULL;
+     rand_tmp_lock = CRYPTO_THREAD_lock_new();
+-    return rand_lock != NULL &amp;&amp; rand_tmp_lock != NULL;
++    ret &amp;= rand_tmp_lock != NULL;
++    ret &amp;= CRYPTO_THREAD_init_local(&amp;key, rand_thread_cleanup) == 1;
++    return ret;
+ }
+ 
+ RAND_METHOD *RAND_OpenSSL(void)
+ {
+-    return (&amp;rand_meth);
++    return &amp;openssl_rand_meth;
+ }
+ 
+ static void rand_cleanup(void)
+ {
+-    OPENSSL_cleanse(state, sizeof(state));
+-    state_num = 0;
+-    state_index = 0;
+-    OPENSSL_cleanse(md, MD_DIGEST_LENGTH);
+-    md_count[0] = 0;
+-    md_count[1] = 0;
+-    entropy = 0;
++    OPENSSL_cleanse(&amp;global_state, sizeof(global_state));
++    randomness = 0;
+     initialized = 0;
+     CRYPTO_THREAD_lock_free(rand_lock);
+     CRYPTO_THREAD_lock_free(rand_tmp_lock);
+@@ -114,10 +103,11 @@ static int rand_add(const void *buf, int num, double add)
+ {
+     int i, j, k, st_idx;
+     long md_c[2];
+-    unsigned char local_md[MD_DIGEST_LENGTH];
++    unsigned char local_md[RAND_DIGEST_LENGTH];
+     EVP_MD_CTX *m;
+     int do_not_lock;
+     int rv = 0;
++    OSSL_RAND_STATE *sp = &amp;global_state;
+ 
+     if (!num)
+         return 1;
+@@ -146,7 +136,7 @@ static int rand_add(const void *buf, int num, double add)
+     if (m == NULL)
+         goto err;
+ 
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;ossl_rand_init, do_ossl_rand_init))
+         goto err;
+ 
+     /* check if we already have the lock */
+@@ -160,58 +150,58 @@ static int rand_add(const void *buf, int num, double add)
+ 
+     if (!do_not_lock)
+         CRYPTO_THREAD_write_lock(rand_lock);
+-    st_idx = state_index;
++    st_idx = sp-&gt;index;
+ 
+     /*
+      * use our own copies of the counters so that even if a concurrent thread
+      * seeds with exactly the same data and uses the same subarray there's
+      * _some_ difference
+      */
+-    md_c[0] = md_count[0];
+-    md_c[1] = md_count[1];
+-
+-    memcpy(local_md, md, sizeof md);
+-
+-    /* state_index &lt;= state_num &lt;= STATE_SIZE */
+-    state_index += num;
+-    if (state_index &gt;= STATE_SIZE) {
+-        state_index %= STATE_SIZE;
+-        state_num = STATE_SIZE;
+-    } else if (state_num &lt; STATE_SIZE) {
+-        if (state_index &gt; state_num)
+-            state_num = state_index;
++    md_c[0] = sp-&gt;md_count[0];
++    md_c[1] = sp-&gt;md_count[1];
++
++    memcpy(local_md, sp-&gt;md, sizeof(sp-&gt;md));
++
++    /* sp-&gt;index &lt;= sp-&gt;num &lt;= STATE_SIZE */
++    sp-&gt;index += num;
++    if (sp-&gt;index &gt;= STATE_SIZE) {
++        sp-&gt;index %= STATE_SIZE;
++        sp-&gt;num = STATE_SIZE;
++    } else if (sp-&gt;num &lt; STATE_SIZE) {
++        if (sp-&gt;index &gt; sp-&gt;num)
++            sp-&gt;num = sp-&gt;index;
+     }
+-    /* state_index &lt;= state_num &lt;= STATE_SIZE */
++    /* sp-&gt;index &lt;= sp-&gt;num &lt;= STATE_SIZE */
+ 
+     /*
+      * state[st_idx], ..., state[(st_idx + num - 1) % STATE_SIZE] are what we
+      * will use now, but other threads may use them as well
+      */
+ 
+-    md_count[1] += (num / MD_DIGEST_LENGTH) + (num % MD_DIGEST_LENGTH &gt; 0);
++    sp-&gt;md_count[1] += (num / RAND_DIGEST_LENGTH) + (num % RAND_DIGEST_LENGTH &gt; 0);
+ 
+     if (!do_not_lock)
+         CRYPTO_THREAD_unlock(rand_lock);
+ 
+-    for (i = 0; i &lt; num; i += MD_DIGEST_LENGTH) {
++    for (i = 0; i &lt; num; i += RAND_DIGEST_LENGTH) {
+         j = (num - i);
+-        j = (j &gt; MD_DIGEST_LENGTH) ? MD_DIGEST_LENGTH : j;
++        j = (j &gt; RAND_DIGEST_LENGTH) ? RAND_DIGEST_LENGTH : j;
+ 
+-        if (!MD_Init(m))
++        if (!EVP_DigestInit_ex(m, RAND_DIGEST, NULL))
+             goto err;
+-        if (!MD_Update(m, local_md, MD_DIGEST_LENGTH))
++        if (!EVP_DigestUpdate(m, local_md, RAND_DIGEST_LENGTH))
+             goto err;
+         k = (st_idx + j) - STATE_SIZE;
+         if (k &gt; 0) {
+-            if (!MD_Update(m, &amp;(state[st_idx]), j - k))
++            if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[st_idx], j - k))
+                 goto err;
+-            if (!MD_Update(m, &amp;(state[0]), k))
++            if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[0], k))
+                 goto err;
+-        } else if (!MD_Update(m, &amp;(state[st_idx]), j))
++        } else if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[st_idx], j))
+             goto err;
+ 
+-        /* DO NOT REMOVE THE FOLLOWING CALL TO MD_Update()! */
+-        if (!MD_Update(m, buf, j))
++        /* DO NOT REMOVE THE FOLLOWING CALL TO EVP_DigestUpdate()! */
++        if (!EVP_DigestUpdate(m, buf, j))
+             goto err;
+         /*
+          * We know that line may cause programs such as purify and valgrind
+@@ -221,9 +211,9 @@ static int rand_add(const void *buf, int num, double add)
+          * insecure keys.
+          */
+ 
+-        if (!MD_Update(m, (unsigned char *)&amp;(md_c[0]), sizeof(md_c)))
++        if (!EVP_DigestUpdate(m, (unsigned char *)md_c, sizeof(md_c)))
+             goto err;
+-        if (!MD_Final(m, local_md))
++        if (!EVP_DigestFinal_ex(m, local_md, NULL))
+             goto err;
+         md_c[1]++;
+ 
+@@ -238,7 +228,7 @@ static int rand_add(const void *buf, int num, double add)
+              * conflicts occur only when the total seeding is longer than the
+              * random state.
+              */
+-            state[st_idx++] ^= local_md[k];
++            sp-&gt;state[st_idx++] ^= local_md[k];
+             if (st_idx &gt;= STATE_SIZE)
+                 st_idx = 0;
+         }
+@@ -249,14 +239,14 @@ static int rand_add(const void *buf, int num, double add)
+     /*
+      * Don't just copy back local_md into md -- this could mean that other
+      * thread's seeding remains without effect (except for the incremented
+-     * counter).  By XORing it we keep at least as much entropy as fits into
++     * counter).  By XORing it we keep at least as much randomness as fits into
+      * md.
+      */
+-    for (k = 0; k &lt; (int)sizeof(md); k++) {
+-        md[k] ^= local_md[k];
++    for (k = 0; k &lt; (int)sizeof(sp-&gt;md); k++) {
++        sp-&gt;md[k] ^= local_md[k];
+     }
+-    if (entropy &lt; ENTROPY_NEEDED) /* stop counting when we have enough */
+-        entropy += add;
++    if (randomness &lt; RANDOMNESS_NEEDED) /* stop counting when we have enough */
++        randomness += add;
+     if (!do_not_lock)
+         CRYPTO_THREAD_unlock(rand_lock);
+ 
+@@ -271,15 +261,16 @@ static int rand_seed(const void *buf, int num)
+     return rand_add(buf, num, (double)num);
+ }
+ 
+-static int rand_bytes(unsigned char *buf, int num, int pseudo)
++static int rand_bytes(unsigned char *buf, int num)
+ {
+     static volatile int stirred_pool = 0;
+     int i, j, k;
+     size_t num_ceil, st_idx, st_num;
+     int ok;
+     long md_c[2];
+-    unsigned char local_md[MD_DIGEST_LENGTH];
++    unsigned char local_md[RAND_DIGEST_LENGTH];
+     EVP_MD_CTX *m;
++    OSSL_RAND_STATE *sp = &amp;global_state;
+ #ifndef GETPID_IS_MEANINGLESS
+     pid_t curr_pid = getpid();
+ #endif
+@@ -323,9 +314,9 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     if (m == NULL)
+         goto err_mem;
+ 
+-    /* round upwards to multiple of MD_DIGEST_LENGTH/2 */
++    /* round upwards to multiple of RAND_DIGEST_LENGTH/2 */
+     num_ceil =
+-        (1 + (num - 1) / (MD_DIGEST_LENGTH / 2)) * (MD_DIGEST_LENGTH / 2);
++        (1 + (num - 1) / (RAND_DIGEST_LENGTH / 2)) * (RAND_DIGEST_LENGTH / 2);
+ 
+     /*
+      * (Based on the rand(3) manpage:)
+@@ -345,7 +336,7 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+      * global 'md'.
+      */
+ 
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;ossl_rand_init, do_ossl_rand_init))
+         goto err_mem;
+ 
+     CRYPTO_THREAD_write_lock(rand_lock);
+@@ -369,28 +360,28 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     if (!stirred_pool)
+         do_stir_pool = 1;
+ 
+-    ok = (entropy &gt;= ENTROPY_NEEDED);
++    ok = (randomness &gt;= RANDOMNESS_NEEDED);
+     if (!ok) {
+         /*
+          * If the PRNG state is not yet unpredictable, then seeing the PRNG
+          * output may help attackers to determine the new state; thus we have
+-         * to decrease the entropy estimate. Once we've had enough initial
+-         * seeding we don't bother to adjust the entropy count, though,
++         * to decrease the randomness estimate. Once we've had enough initial
++         * seeding we don't bother to adjust the randomness count, though,
+          * because we're not ambitious to provide *information-theoretic*
+          * randomness. NOTE: This approach fails if the program forks before
+-         * we have enough entropy. Entropy should be collected in a separate
+-         * input pool and be transferred to the output pool only when the
+-         * entropy limit has been reached.
++         * we have enough randomness. Randomness should be collected in a
++         * separate input pool and be transferred to the output pool only
++         * when the randomness limit has been reached.
+          */
+-        entropy -= num;
+-        if (entropy &lt; 0)
+-            entropy = 0;
++        randomness -= num;
++        if (randomness &lt; 0)
++            randomness = 0;
+     }
+ 
+     if (do_stir_pool) {
+         /*
+          * In the output function only half of 'md' remains secret, so we
+-         * better make sure that the required entropy gets 'evenly
++         * better make sure that the required randomness gets 'evenly
+          * distributed' through 'state', our randomness pool. The input
+          * function (rand_add) chains all of 'md', which makes it more
+          * suitable for this purpose.
+@@ -398,37 +389,37 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+ 
+         int n = STATE_SIZE;     /* so that the complete pool gets accessed */
+         while (n &gt; 0) {
+-#if MD_DIGEST_LENGTH &gt; 20
++#if RAND_DIGEST_LENGTH &gt; 20
+ # error &quot;Please adjust DUMMY_SEED.&quot;
+ #endif
+-#define DUMMY_SEED &quot;....................&quot; /* at least MD_DIGEST_LENGTH */
++#define DUMMY_SEED &quot;....................&quot; /* at least RAND_DIGEST_LENGTH */
+             /*
+              * Note that the seed does not matter, it's just that
+              * rand_add expects to have something to hash.
+              */
+-            rand_add(DUMMY_SEED, MD_DIGEST_LENGTH, 0.0);
+-            n -= MD_DIGEST_LENGTH;
++            rand_add(DUMMY_SEED, RAND_DIGEST_LENGTH, 0.0);
++            n -= RAND_DIGEST_LENGTH;
+         }
+         if (ok)
+             stirred_pool = 1;
+     }
+ 
+-    st_idx = state_index;
+-    st_num = state_num;
+-    md_c[0] = md_count[0];
+-    md_c[1] = md_count[1];
+-    memcpy(local_md, md, sizeof md);
++    st_idx = sp-&gt;index;
++    st_num = sp-&gt;num;
++    md_c[0] = sp-&gt;md_count[0];
++    md_c[1] = sp-&gt;md_count[1];
++    memcpy(local_md, sp-&gt;md, sizeof sp-&gt;md);
+ 
+-    state_index += num_ceil;
+-    if (state_index &gt; state_num)
+-        state_index %= state_num;
++    sp-&gt;index += num_ceil;
++    if (sp-&gt;index &gt; sp-&gt;num)
++        sp-&gt;index %= sp-&gt;num;
+ 
+     /*
+      * state[st_idx], ..., state[(st_idx + num_ceil - 1) % st_num] are now
+      * ours (but other threads may use them too)
+      */
+ 
+-    md_count[0] += 1;
++    sp-&gt;md_count[0] += 1;
+ 
+     /* before unlocking, we must clear 'crypto_lock_rand' */
+     crypto_lock_rand = 0;
+@@ -436,63 +427,64 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     CRYPTO_THREAD_unlock(rand_lock);
+ 
+     while (num &gt; 0) {
+-        /* num_ceil -= MD_DIGEST_LENGTH/2 */
+-        j = (num &gt;= MD_DIGEST_LENGTH / 2) ? MD_DIGEST_LENGTH / 2 : num;
++        /* num_ceil -= RAND_DIGEST_LENGTH / 2 */
++        j = (num &gt;= RAND_DIGEST_LENGTH / 2) ? RAND_DIGEST_LENGTH / 2 : num;
+         num -= j;
+-        if (!MD_Init(m))
++        if (!EVP_DigestInit_ex(m, RAND_DIGEST, NULL))
+             goto err;
+ #ifndef GETPID_IS_MEANINGLESS
+         if (curr_pid) {         /* just in the first iteration to save time */
+-            if (!MD_Update(m, (unsigned char *)&amp;curr_pid, sizeof curr_pid))
++            if (!EVP_DigestUpdate(m, (unsigned char *)&amp;curr_pid, sizeof curr_pid))
+                 goto err;
+             curr_pid = 0;
+         }
+ #endif
+         if (curr_time) {        /* just in the first iteration to save time */
+-            if (!MD_Update(m, (unsigned char *)&amp;curr_time, sizeof curr_time))
++            if (!EVP_DigestUpdate(m, (unsigned char *)&amp;curr_time, sizeof curr_time))
+                 goto err;
+-            if (!MD_Update(m, (unsigned char *)&amp;tv, sizeof tv))
++            if (!EVP_DigestUpdate(m, (unsigned char *)&amp;tv, sizeof tv))
+                 goto err;
+             curr_time = 0;
+             if (!rand_hw_seed(m))
+                 goto err;
+         }
+-        if (!MD_Update(m, local_md, MD_DIGEST_LENGTH))
++        if (!EVP_DigestUpdate(m, local_md, RAND_DIGEST_LENGTH))
+             goto err;
+-        if (!MD_Update(m, (unsigned char *)&amp;(md_c[0]), sizeof(md_c)))
++        if (!EVP_DigestUpdate(m, (unsigned char *)md_c, sizeof(md_c)))
+             goto err;
+ 
+-        k = (st_idx + MD_DIGEST_LENGTH / 2) - st_num;
++        k = (st_idx + RAND_DIGEST_LENGTH / 2) - st_num;
+         if (k &gt; 0) {
+-            if (!MD_Update(m, &amp;(state[st_idx]), MD_DIGEST_LENGTH / 2 - k))
++            if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[st_idx], RAND_DIGEST_LENGTH / 2 - k))
+                 goto err;
+-            if (!MD_Update(m, &amp;(state[0]), k))
++            if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[0], k))
+                 goto err;
+-        } else if (!MD_Update(m, &amp;(state[st_idx]), MD_DIGEST_LENGTH / 2))
++        } else if (!EVP_DigestUpdate(m, &amp;sp-&gt;state[st_idx], RAND_DIGEST_LENGTH / 2))
+             goto err;
+-        if (!MD_Final(m, local_md))
++        if (!EVP_DigestFinal_ex(m, local_md, NULL))
+             goto err;
+ 
+-        for (i = 0; i &lt; MD_DIGEST_LENGTH / 2; i++) {
++        for (i = 0; i &lt; RAND_DIGEST_LENGTH / 2; i++) {
+             /* may compete with other threads */
+-            state[st_idx++] ^= local_md[i];
++            sp-&gt;state[st_idx++] ^= local_md[i];
+             if (st_idx &gt;= st_num)
+                 st_idx = 0;
+             if (i &lt; j)
+-                *(buf++) = local_md[i + MD_DIGEST_LENGTH / 2];
++                *(buf++) = local_md[i + RAND_DIGEST_LENGTH / 2];
+         }
+     }
+ 
+-    if (!MD_Init(m)
+-        || !MD_Update(m, (unsigned char *)&amp;(md_c[0]), sizeof(md_c))
+-        || !MD_Update(m, local_md, MD_DIGEST_LENGTH))
++    if (!EVP_DigestInit_ex(m, RAND_DIGEST, NULL)
++        || !EVP_DigestUpdate(m, (unsigned char *)md_c, sizeof(md_c))
++        || !EVP_DigestUpdate(m, local_md, RAND_DIGEST_LENGTH))
+         goto err;
+     CRYPTO_THREAD_write_lock(rand_lock);
+     /*
+      * Prevent deadlocks if we end up in an async engine
+      */
+     ASYNC_block_pause();
+-    if (!MD_Update(m, md, MD_DIGEST_LENGTH) || !MD_Final(m, md)) {
++    if (!EVP_DigestUpdate(m, sp-&gt;md, sizeof(sp-&gt;md))
++            || !EVP_DigestFinal_ex(m, sp-&gt;md, NULL)) {
+         CRYPTO_THREAD_unlock(rand_lock);
+         goto err;
+     }
+@@ -502,14 +494,10 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+     EVP_MD_CTX_free(m);
+     if (ok)
+         return (1);
+-    else if (pseudo)
+-        return 0;
+-    else {
+-        RANDerr(RAND_F_RAND_BYTES, RAND_R_PRNG_NOT_SEEDED);
+-        ERR_add_error_data(1, &quot;You need to read the OpenSSL FAQ, &quot;
+-                           &quot;<A HREF="https://www.openssl.org/docs/faq.html">https://www.openssl.org/docs/faq.html</A>&quot;);
+-        return (0);
+-    }
++    RANDerr(RAND_F_RAND_BYTES, RAND_R_PRNG_NOT_SEEDED);
++    ERR_add_error_data(1, &quot;You need to read the OpenSSL FAQ, &quot;
++                       &quot;<A HREF="https://www.openssl.org/docs/faq.html">https://www.openssl.org/docs/faq.html</A>&quot;);
++    return (0);
+  err:
+     RANDerr(RAND_F_RAND_BYTES, ERR_R_EVP_LIB);
+     EVP_MD_CTX_free(m);
+@@ -521,28 +509,13 @@ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+ 
+ }
+ 
+-static int rand_nopseudo_bytes(unsigned char *buf, int num)
+-{
+-    return rand_bytes(buf, num, 0);
+-}
+-
+-#if OPENSSL_API_COMPAT &lt; 0x10100000L
+-/*
+- * pseudo-random bytes that are guaranteed to be unique but not unpredictable
+- */
+-static int rand_pseudo_bytes(unsigned char *buf, int num)
+-{
+-    return rand_bytes(buf, num, 1);
+-}
+-#endif
+-
+ static int rand_status(void)
+ {
+     CRYPTO_THREAD_ID cur;
+     int ret;
+     int do_not_lock;
+ 
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;ossl_rand_init, do_ossl_rand_init))
+         return 0;
+ 
+     cur = CRYPTO_THREAD_get_current_id();
+@@ -578,7 +551,7 @@ static int rand_status(void)
+         initialized = 1;
+     }
+ 
+-    ret = entropy &gt;= ENTROPY_NEEDED;
++    ret = randomness &gt;= RANDOMNESS_NEEDED;
+ 
+     if (!do_not_lock) {
+         /* before unlocking, we must clear 'crypto_lock_rand' */
+@@ -595,9 +568,6 @@ static int rand_status(void)
+  * rand_hw_seed: get seed data from any available hardware RNG. only
+  * currently supports rdrand.
+  */
+-
+-/* Adapted from eng_rdrand.c */
+-
+ #if (defined(__i386)   || defined(__i386__)   || defined(_M_IX86) || \
+      defined(__x86_64) || defined(__x86_64__) || \
+      defined(_M_AMD64) || defined (_M_X64)) &amp;&amp; defined(OPENSSL_CPUID_OBJ) \
+@@ -618,40 +588,12 @@ static int rand_hw_seed(EVP_MD_CTX *ctx)
+         rnd = OPENSSL_ia32_rdrand();
+         if (rnd == 0)
+             return 1;
+-        if (!MD_Update(ctx, (unsigned char *)&amp;rnd, sizeof(size_t)))
++        if (!EVP_DigestUpdate(ctx, (unsigned char *)&amp;rnd, sizeof(size_t)))
+             return 0;
+     }
+     return 1;
+ }
+ 
+-/* XOR an existing buffer with random data */
+-
+-void rand_hw_xor(unsigned char *buf, size_t num)
+-{
+-    size_t rnd;
+-    if (!(OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; (62 - 32))))
+-        return;
+-    while (num &gt;= sizeof(size_t)) {
+-        rnd = OPENSSL_ia32_rdrand();
+-        if (rnd == 0)
+-            return;
+-        *((size_t *)buf) ^= rnd;
+-        buf += sizeof(size_t);
+-        num -= sizeof(size_t);
+-    }
+-    if (num) {
+-        rnd = OPENSSL_ia32_rdrand();
+-        if (rnd == 0)
+-            return;
+-        while (num) {
+-            *buf ^= rnd &amp; 0xff;
+-            rnd &gt;&gt;= 8;
+-            buf++;
+-            num--;
+-        }
+-    }
+-}
+-
+ #else
+ 
+ static int rand_hw_seed(EVP_MD_CTX *ctx)
+@@ -659,9 +601,14 @@ static int rand_hw_seed(EVP_MD_CTX *ctx)
+     return 1;
+ }
+ 
+-void rand_hw_xor(unsigned char *buf, size_t num)
+-{
+-    return;
+-}
+-
+ #endif
++
++
++RAND_METHOD openssl_rand_meth = {
++    rand_seed,
++    rand_bytes,
++    rand_cleanup,
++    rand_add,
++    rand_bytes,
++    rand_status
++};
+diff --git a/crypto/rand/rand_lcl.h b/crypto/rand/rand_lcl.h
+index d98c90e..69c9630 100644
+--- a/crypto/rand/rand_lcl.h
++++ b/crypto/rand/rand_lcl.h
+@@ -10,37 +10,15 @@
+ #ifndef HEADER_RAND_LCL_H
+ # define HEADER_RAND_LCL_H
+ 
+-# define ENTROPY_NEEDED 32      /* require 256 bits = 32 bytes of randomness */
+-
+-# if !defined(USE_MD5_RAND) &amp;&amp; !defined(USE_SHA1_RAND) &amp;&amp; !defined(USE_MDC2_RAND) &amp;&amp; !defined(USE_MD2_RAND)
+-#  define USE_SHA1_RAND
+-# endif
++/* we require 256 bits of randomness */
++# define RANDOMNESS_NEEDED (256 / 8)
+ 
+ # include &lt;openssl/evp.h&gt;
+-# define MD_Update(a,b,c)        EVP_DigestUpdate(a,b,c)
+-# define MD_Final(a,b)           EVP_DigestFinal_ex(a,b,NULL)
+-# if defined(USE_MD5_RAND)
+-#  include &lt;openssl/md5.h&gt;
+-#  define MD_DIGEST_LENGTH        MD5_DIGEST_LENGTH
+-#  define MD_Init(a)              EVP_DigestInit_ex(a,EVP_md5(), NULL)
+-#  define MD(a,b,c)               EVP_Digest(a,b,c,NULL,EVP_md5(), NULL)
+-# elif defined(USE_SHA1_RAND)
+-#  include &lt;openssl/sha.h&gt;
+-#  define MD_DIGEST_LENGTH        SHA_DIGEST_LENGTH
+-#  define MD_Init(a)              EVP_DigestInit_ex(a,EVP_sha1(), NULL)
+-#  define MD(a,b,c)               EVP_Digest(a,b,c,NULL,EVP_sha1(), NULL)
+-# elif defined(USE_MDC2_RAND)
+-#  include &lt;openssl/mdc2.h&gt;
+-#  define MD_DIGEST_LENGTH        MDC2_DIGEST_LENGTH
+-#  define MD_Init(a)              EVP_DigestInit_ex(a,EVP_mdc2(), NULL)
+-#  define MD(a,b,c)               EVP_Digest(a,b,c,NULL,EVP_mdc2(), NULL)
+-# elif defined(USE_MD2_RAND)
+-#  include &lt;openssl/md2.h&gt;
+-#  define MD_DIGEST_LENGTH        MD2_DIGEST_LENGTH
+-#  define MD_Init(a)              EVP_DigestInit_ex(a,EVP_md2(), NULL)
+-#  define MD(a,b,c)               EVP_Digest(a,b,c,NULL,EVP_md2(), NULL)
+-# endif
++# include &lt;openssl/sha.h&gt;
++
++# define RAND_DIGEST EVP_sha1()
++# define RAND_DIGEST_LENGTH        SHA_DIGEST_LENGTH
+ 
+-void rand_hw_xor(unsigned char *buf, size_t num);
++extern RAND_METHOD openssl_rand_meth;
+ 
+ #endif
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 84d6b5d..1a1e282 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -14,17 +14,19 @@
+ #include &quot;internal/rand.h&quot;
+ #include &lt;openssl/engine.h&gt;
+ #include &quot;internal/thread_once.h&quot;
++#include &quot;rand_lcl.h&quot;
+ 
+ #ifndef OPENSSL_NO_ENGINE
+ /* non-NULL if default_RAND_meth is ENGINE-provided */
+-static ENGINE *funct_ref = NULL;
+-static CRYPTO_RWLOCK *rand_engine_lock = NULL;
++static ENGINE *funct_ref;
++static CRYPTO_RWLOCK *rand_engine_lock;
+ #endif
+-static const RAND_METHOD *default_RAND_meth = NULL;
+-static CRYPTO_RWLOCK *rand_meth_lock = NULL;
+-static CRYPTO_ONCE rand_lock_init = CRYPTO_ONCE_STATIC_INIT;
++static CRYPTO_RWLOCK *rand_meth_lock;
++static const RAND_METHOD *default_RAND_meth;
++static CRYPTO_ONCE rand_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+-DEFINE_RUN_ONCE_STATIC(do_rand_lock_init)
++
++DEFINE_RUN_ONCE_STATIC(do_rand_init)
+ {
+     int ret = 1;
+ #ifndef OPENSSL_NO_ENGINE
+@@ -36,9 +38,22 @@ DEFINE_RUN_ONCE_STATIC(do_rand_lock_init)
+     return ret;
+ }
+ 
++void rand_cleanup_int(void)
++{
++    const RAND_METHOD *meth = default_RAND_meth;
++
++    if (meth != NULL &amp;&amp; meth-&gt;cleanup != NULL)
++        meth-&gt;cleanup();
++    RAND_set_rand_method(NULL);
++#ifndef OPENSSL_NO_ENGINE
++    CRYPTO_THREAD_lock_free(rand_engine_lock);
++#endif
++    CRYPTO_THREAD_lock_free(rand_meth_lock);
++}
++
+ int RAND_set_rand_method(const RAND_METHOD *meth)
+ {
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;rand_init, do_rand_init))
+         return 0;
+ 
+     CRYPTO_THREAD_write_lock(rand_meth_lock);
+@@ -55,25 +70,26 @@ const RAND_METHOD *RAND_get_rand_method(void)
+ {
+     const RAND_METHOD *tmp_meth = NULL;
+ 
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;rand_init, do_rand_init))
+         return NULL;
+ 
+     CRYPTO_THREAD_write_lock(rand_meth_lock);
+-    if (!default_RAND_meth) {
++    if (default_RAND_meth == NULL) {
+ #ifndef OPENSSL_NO_ENGINE
+-        ENGINE *e = ENGINE_get_default_RAND();
+-        if (e) {
+-            default_RAND_meth = ENGINE_get_RAND(e);
+-            if (default_RAND_meth == NULL) {
+-                ENGINE_finish(e);
+-                e = NULL;
+-            }
+-        }
+-        if (e)
++        ENGINE *e;
++
++        /* If we have an engine that can do RAND, use it. */
++        if ((e = ENGINE_get_default_RAND()) != NULL
++                &amp;&amp; (tmp_meth = ENGINE_get_RAND(e)) != NULL) {
+             funct_ref = e;
+-        else
++            default_RAND_meth = tmp_meth;
++        } else {
++            ENGINE_finish(e);
++            default_RAND_meth = &amp;openssl_rand_meth;
++        }
++#else
++        default_RAND_meth = &amp;openssl_rand_meth;
+ #endif
+-            default_RAND_meth = RAND_OpenSSL();
+     }
+     tmp_meth = default_RAND_meth;
+     CRYPTO_THREAD_unlock(rand_meth_lock);
+@@ -85,10 +101,10 @@ int RAND_set_rand_engine(ENGINE *engine)
+ {
+     const RAND_METHOD *tmp_meth = NULL;
+ 
+-    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++    if (!RUN_ONCE(&amp;rand_init, do_rand_init))
+         return 0;
+ 
+-    if (engine) {
++    if (engine != NULL) {
+         if (!ENGINE_init(engine))
+             return 0;
+         tmp_meth = ENGINE_get_RAND(engine);
+@@ -106,55 +122,48 @@ int RAND_set_rand_engine(ENGINE *engine)
+ }
+ #endif
+ 
+-void rand_cleanup_int(void)
+-{
+-    const RAND_METHOD *meth = default_RAND_meth;
+-    if (meth &amp;&amp; meth-&gt;cleanup)
+-        meth-&gt;cleanup();
+-    RAND_set_rand_method(NULL);
+-    CRYPTO_THREAD_lock_free(rand_meth_lock);
+-#ifndef OPENSSL_NO_ENGINE
+-    CRYPTO_THREAD_lock_free(rand_engine_lock);
+-#endif
+-}
+-
+ void RAND_seed(const void *buf, int num)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
+-    if (meth &amp;&amp; meth-&gt;seed)
++
++    if (meth-&gt;seed != NULL)
+         meth-&gt;seed(buf, num);
+ }
+ 
+-void RAND_add(const void *buf, int num, double entropy)
++void RAND_add(const void *buf, int num, double randomness)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
+-    if (meth &amp;&amp; meth-&gt;add)
+-        meth-&gt;add(buf, num, entropy);
++
++    if (meth-&gt;add != NULL)
++        meth-&gt;add(buf, num, randomness);
+ }
+ 
+ int RAND_bytes(unsigned char *buf, int num)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
+-    if (meth &amp;&amp; meth-&gt;bytes)
++
++    if (meth-&gt;bytes != NULL)
+         return meth-&gt;bytes(buf, num);
+     RANDerr(RAND_F_RAND_BYTES, RAND_R_FUNC_NOT_IMPLEMENTED);
+-    return (-1);
++    return -1;
+ }
+ 
+ #if OPENSSL_API_COMPAT &lt; 0x10100000L
+ int RAND_pseudo_bytes(unsigned char *buf, int num)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
+-    if (meth &amp;&amp; meth-&gt;pseudorand)
++
++    if (meth-&gt;pseudorand != NULL)
+         return meth-&gt;pseudorand(buf, num);
+-    return (-1);
++    return -1;
+ }
+ #endif
+ 
+ int RAND_status(void)
+ {
+     const RAND_METHOD *meth = RAND_get_rand_method();
+-    if (meth &amp;&amp; meth-&gt;status)
++
++    if (meth-&gt;status != NULL)
+         return meth-&gt;status();
+     return 0;
+ }
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index 241f287..bfdd3e6 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -91,7 +91,7 @@ int RAND_poll(void)
+     RAND_add(&amp;curr_uid, sizeof curr_uid, 1);
+     curr_uid = 0;
+ 
+-    for (i = 0; i &lt; (ENTROPY_NEEDED * 4); i++) {
++    for (i = 0; i &lt; (RANDOMNESS_NEEDED * 4); i++) {
+         /*
+          * burn some cpu; hope for interrupts, cache collisions, bus
+          * interference, etc.
+@@ -127,7 +127,7 @@ int RAND_poll(void)
+     unsigned long l;
+     pid_t curr_pid = getpid();
+ #  if defined(DEVRANDOM) || (!defined(OPENSS_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD))
+-    unsigned char tmpbuf[ENTROPY_NEEDED];
++    unsigned char tmpbuf[RANDOMNESS_NEEDED];
+     int n = 0;
+ #  endif
+ #  ifdef DEVRANDOM
+@@ -144,12 +144,12 @@ int RAND_poll(void)
+ #  ifdef DEVRANDOM
+     memset(randomstats, 0, sizeof(randomstats));
+     /*
+-     * Use a random entropy pool device. Linux, FreeBSD and OpenBSD have
++     * Use a randomness device. Linux, FreeBSD and OpenBSD have
+      * this. Use /dev/urandom if you can as /dev/random may block if it runs
+      * out of random entries.
+      */
+ 
+-    for (i = 0; (i &lt; OSSL_NELEM(randomfiles)) &amp;&amp; (n &lt; ENTROPY_NEEDED); i++) {
++    for (i = 0; (i &lt; OSSL_NELEM(randomfiles)) &amp;&amp; (n &lt; RANDOMNESS_NEEDED); i++) {
+         if ((fd = open(randomfiles[i], O_RDONLY
+ #   ifdef O_NONBLOCK
+                        | O_NONBLOCK
+@@ -229,7 +229,7 @@ int RAND_poll(void)
+ 
+                 if (try_read) {
+                     r = read(fd, (unsigned char *)tmpbuf + n,
+-                             ENTROPY_NEEDED - n);
++                             RANDOMNESS_NEEDED - n);
+                     if (r &gt; 0)
+                         n += r;
+                 } else
+@@ -246,7 +246,7 @@ int RAND_poll(void)
+             }
+             while ((r &gt; 0 ||
+                     (errno == EINTR || errno == EAGAIN)) &amp;&amp; usec != 0
+-                   &amp;&amp; n &lt; ENTROPY_NEEDED);
++                   &amp;&amp; n &lt; RANDOMNESS_NEEDED);
+ 
+             close(fd);
+         }
+@@ -255,16 +255,15 @@ int RAND_poll(void)
+ 
+ #  if !defined(OPENSSL_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD)
+     /*
+-     * Use an EGD socket to read entropy from an EGD or PRNGD entropy
+-     * collecting daemon.
++     * Use an EGD socket to read randomness from the daemon.
+      */
+ 
+-    for (egdsocket = egdsockets; *egdsocket &amp;&amp; n &lt; ENTROPY_NEEDED;
++    for (egdsocket = egdsockets; *egdsocket &amp;&amp; n &lt; RANDOMNESS_NEEDED;
+          egdsocket++) {
+         int r;
+ 
+         r = RAND_query_egd_bytes(*egdsocket, (unsigned char *)tmpbuf + n,
+-                                 ENTROPY_NEEDED - n);
++                                 RANDOMNESS_NEEDED - n);
+         if (r &gt; 0)
+             n += r;
+     }
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index 9c462dd..ec99dbf 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -7,16 +7,11 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/*
+- * Modified by VMS Software, Inc (2016)
+- *    Eliminate looping through all processes (performance)
+- *    Add additional randomizations using rand() function
+- */
+-
+-#include &lt;openssl/rand.h&gt;
+-#include &quot;rand_lcl.h&quot;
++#include &quot;e_os.h&quot;
+ 
+ #if defined(OPENSSL_SYS_VMS)
++# include &lt;openssl/rand.h&gt;
++# include &quot;rand_lcl.h&quot;
+ # include &lt;descrip.h&gt;
+ # include &lt;jpidef.h&gt;
+ # include &lt;ssdef.h&gt;
+@@ -34,9 +29,9 @@
+ #  define PTR_T __void_ptr64
+ #  pragma pointer_size save
+ #  pragma pointer_size 32
+-# else                          /* __INITIAL_POINTER_SIZE == 64 */
++# else
+ #  define PTR_T void *
+-# endif                         /* __INITIAL_POINTER_SIZE == 64 [else] */
++# endif
+ 
+ static struct items_data_st {
+     short length, code;         /* length is number of bytes */
+@@ -52,27 +47,22 @@ static struct items_data_st {
+     {4, JPI$_PPGCNT},
+     {4, JPI$_WSPEAK},
+     {4, JPI$_FINALEXC},
+-    {0, 0}                      /* zero terminated */
++    {0, 0}
+ };
+ 
+ int RAND_poll(void)
+ {
+-
+     /* determine the number of items in the JPI array */
+-
+     struct items_data_st item_entry;
+-    int item_entry_count = sizeof(items_data)/sizeof(item_entry);
+-
++    int item_entry_count = OSSL_NELEM(items_data);
+     /* Create the JPI itemlist array to hold item_data content */
+-
+     struct {
+         short length, code;
+         int *buffer;
+         int *retlen;
+-    } item[item_entry_count], *pitem; /* number of entries in items_data */
+-
++    } item[item_entry_count], *pitem;
+     struct items_data_st *pitems_data;
+-    int data_buffer[(item_entry_count*2)+4]; /* 8 bytes per entry max */
++    int data_buffer[(item_entry_count * 2) + 4]; /* 8 bytes per entry max */
+     int iosb[2];
+     int sys_time[2];
+     int *ptr;
+@@ -80,53 +70,46 @@ int RAND_poll(void)
+     int tmp_length   = 0;
+     int total_length = 0;
+ 
+-    pitems_data = items_data;
+-    pitem = item;
+-
+-
+     /* Setup itemlist for GETJPI */
+-    while (pitems_data-&gt;length) {
++    pitems_data = items_data;
++    for (pitem = item; pitems_data-&gt;length != 0; pitem++) {
+         pitem-&gt;length = pitems_data-&gt;length;
+         pitem-&gt;code   = pitems_data-&gt;code;
+         pitem-&gt;buffer = &amp;data_buffer[total_length];
+         pitem-&gt;retlen = 0;
+         /* total_length is in longwords */
+-        total_length += pitems_data-&gt;length/4;
++        total_length += pitems_data-&gt;length / 4;
+         pitems_data++;
+-        pitem ++;
+     }
+     pitem-&gt;length = pitem-&gt;code = 0;
+ 
+     /* Fill data_buffer with various info bits from this process */
+-    /* and twist that data to seed the SSL random number init    */
++    if (sys$getjpiw(EFN$C_ENF, NULL, NULL, item, &amp;iosb, 0, 0) != SS$_NORMAL)
++        return 0;
+ 
+-    if (sys$getjpiw(EFN$C_ENF, NULL, NULL, item, &amp;iosb, 0, 0) == SS$_NORMAL) {
+-        for (i = 0; i &lt; total_length; i++) {
+-            sys$gettim((struct _generic_64 *)&amp;sys_time[0]);
+-            srand(sys_time[0] * data_buffer[0] * data_buffer[1] + i);
++    /* Now twist that data to seed the SSL random number init */
++    for (i = 0; i &lt; total_length; i++) {
++        sys$gettim((struct _generic_64 *)&amp;sys_time[0]);
++        srand(sys_time[0] * data_buffer[0] * data_buffer[1] + i);
+ 
+-            if (i == (total_length - 1)) { /* for JPI$_FINALEXC */
+-                ptr = &amp;data_buffer[i];
+-                for (j = 0; j &lt; 4; j++) {
+-                    data_buffer[i + j] = ptr[j];
+-                    /* OK to use rand() just to scramble the seed */
+-                    data_buffer[i + j] ^= (sys_time[0] ^ rand());
+-                    tmp_length++;
+-                }
+-            } else {
++        if (i == (total_length - 1)) { /* for JPI$_FINALEXC */
++            ptr = &amp;data_buffer[i];
++            for (j = 0; j &lt; 4; j++) {
++                data_buffer[i + j] = ptr[j];
+                 /* OK to use rand() just to scramble the seed */
+-                data_buffer[i] ^= (sys_time[0] ^ rand());
++                data_buffer[i + j] ^= (sys_time[0] ^ rand());
++                tmp_length++;
+             }
++        } else {
++            /* OK to use rand() just to scramble the seed */
++            data_buffer[i] ^= (sys_time[0] ^ rand());
+         }
+-
+-        total_length += (tmp_length - 1);
+-
+-        /* size of seed is total_length*4 bytes (64bytes) */
+-        RAND_add((PTR_T) data_buffer, total_length*4, total_length * 2);
+-    } else {
+-        return 0;
+     }
+ 
++    total_length += (tmp_length - 1);
++
++    /* size of seed is total_length*4 bytes (64bytes) */
++    RAND_add((PTR_T)data_buffer, total_length * 4, total_length * 2);
+     return 1;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015432.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="015438.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15436">[ date ]</a>
+              <a href="thread.html#15436">[ thread ]</a>
+              <a href="subject.html#15436">[ subject ]</a>
+              <a href="author.html#15436">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

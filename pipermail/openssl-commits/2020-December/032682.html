@@ -1,0 +1,296 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1608754385.552084.15461.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032681.html">
+   <LINK REL="Next"  HREF="032687.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>beldmit at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1608754385.552084.15461.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">beldmit at gmail.com
+       </A><BR>
+    <I>Wed Dec 23 20:13:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032681.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032687.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32682">[ date ]</a>
+              <a href="thread.html#32682">[ thread ]</a>
+              <a href="subject.html#32682">[ subject ]</a>
+              <a href="author.html#32682">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  38f7931429859a3bd07725dbc451c0b4cac26a10 (commit)
+       via  ae69da05a7749e21c7526831173405e3570917b2 (commit)
+      from  fdf05eb7611a1fdb283162228985286a09d07940 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 38f7931429859a3bd07725dbc451c0b4cac26a10
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Dec 22 11:36:30 2020 +0000
+
+    Cache Digest constants
+    
+    EVP_CIPHER already caches certain constants so that we don't have to
+    query the provider every time. We do the same thing with EVP_MD constants.
+    Without this we can get performance issues, e.g. running &quot;speed&quot; with
+    small blocks of data to digest can spend a long time in EVP_MD_size(),
+    which should be quick.
+    
+    Partialy fixes #13578
+    
+    Reviewed-by: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13730">https://github.com/openssl/openssl/pull/13730</A>)
+
+commit ae69da05a7749e21c7526831173405e3570917b2
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Dec 22 11:54:16 2020 +0000
+
+    Move the caching of cipher constants into evp_cipher_from_dispatch
+    
+    Previously we cached the cipher constants in EVP_CIPHER_fetch(). However,
+    this means we do the caching every time we call that function, even if
+    the core has previusly fetched the cipher and cached it already. This
+    means we can end up re-caching the constants even though they are already
+    present. This also means we could be updating these constants from
+    multiple threads at the same time.
+    
+    Reviewed-by: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13730">https://github.com/openssl/openssl/pull/13730</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/err/openssl.txt   |  1 +
+ crypto/evp/digest.c      | 29 +++++++++++++++++++++++++++++
+ crypto/evp/evp_enc.c     | 10 ++++++----
+ crypto/evp/evp_err.c     |  2 ++
+ crypto/evp/evp_lib.c     | 33 +++------------------------------
+ include/crypto/evperr.h  |  2 +-
+ include/openssl/evperr.h |  1 +
+ 7 files changed, 43 insertions(+), 35 deletions(-)
+
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 60f343eb7d..5440e47093 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -2528,6 +2528,7 @@ EVP_R_BAD_ALGORITHM_NAME:200:bad algorithm name
+ EVP_R_BAD_DECRYPT:100:bad decrypt
+ EVP_R_BAD_KEY_LENGTH:195:bad key length
+ EVP_R_BUFFER_TOO_SMALL:155:buffer too small
++EVP_R_CACHE_CONSTANTS_FAILED:225:cache constants failed
+ EVP_R_CAMELLIA_KEY_SETUP_FAILED:157:camellia key setup failed
+ EVP_R_CANNOT_GET_PARAMETERS:197:cannot get parameters
+ EVP_R_CANNOT_SET_PARAMETERS:198:cannot set parameters
+diff --git a/crypto/evp/digest.c b/crypto/evp/digest.c
+index 1d16c52060..46f4d201d9 100644
+--- a/crypto/evp/digest.c
++++ b/crypto/evp/digest.c
+@@ -827,6 +827,29 @@ static void set_legacy_nid(const char *name, void *vlegacy_nid)
+ }
+ #endif
+ 
++static int evp_md_cache_constants(EVP_MD *md)
++{
++    int ok;
++    size_t blksz = 0;
++    size_t mdsize = 0;
++    unsigned long flags = 0;
++    OSSL_PARAM params[4];
++
++    params[0] = OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_BLOCK_SIZE, &amp;blksz);
++    params[1] = OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &amp;mdsize);
++    params[2] = OSSL_PARAM_construct_ulong(OSSL_DIGEST_PARAM_FLAGS, &amp;flags);
++    params[3] = OSSL_PARAM_construct_end();
++    ok = evp_do_md_getparams(md, params);
++    if (mdsize &gt; INT_MAX || blksz &gt; INT_MAX)
++        ok = 0;
++    if (ok) {
++        md-&gt;block_size = (int)blksz;
++        md-&gt;md_size = (int)mdsize;
++        md-&gt;flags = flags;
++    }
++    return ok;
++}
++
+ static void *evp_md_from_dispatch(int name_id,
+                                   const OSSL_DISPATCH *fns,
+                                   OSSL_PROVIDER *prov)
+@@ -938,6 +961,12 @@ static void *evp_md_from_dispatch(int name_id,
+     if (prov != NULL)
+         ossl_provider_up_ref(prov);
+ 
++    if (!evp_md_cache_constants(md)) {
++        EVP_MD_free(md);
++        ERR_raise(ERR_LIB_EVP, EVP_R_CACHE_CONSTANTS_FAILED);
++        md = NULL;
++    }
++
+     return md;
+ }
+ 
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index 7818ab25ea..c1c8f1cf28 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -1470,6 +1470,12 @@ static void *evp_cipher_from_dispatch(const int name_id,
+     if (prov != NULL)
+         ossl_provider_up_ref(prov);
+ 
++    if (!evp_cipher_cache_constants(cipher)) {
++        EVP_CIPHER_free(cipher);
++        ERR_raise(ERR_LIB_EVP, EVP_R_CACHE_CONSTANTS_FAILED);
++        cipher = NULL;
++    }
++
+     return cipher;
+ }
+ 
+@@ -1491,10 +1497,6 @@ EVP_CIPHER *EVP_CIPHER_fetch(OSSL_LIB_CTX *ctx, const char *algorithm,
+                           evp_cipher_from_dispatch, evp_cipher_up_ref,
+                           evp_cipher_free);
+ 
+-    if (cipher != NULL &amp;&amp; !evp_cipher_cache_constants(cipher)) {
+-        EVP_CIPHER_free(cipher);
+-        cipher = NULL;
+-    }
+     return cipher;
+ }
+ 
+diff --git a/crypto/evp/evp_err.c b/crypto/evp/evp_err.c
+index c2259f0beb..894f0cebcb 100644
+--- a/crypto/evp/evp_err.c
++++ b/crypto/evp/evp_err.c
+@@ -23,6 +23,8 @@ static const ERR_STRING_DATA EVP_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_BAD_DECRYPT), &quot;bad decrypt&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_BAD_KEY_LENGTH), &quot;bad key length&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_BUFFER_TOO_SMALL), &quot;buffer too small&quot;},
++    {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_CACHE_CONSTANTS_FAILED),
++    &quot;cache constants failed&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_CAMELLIA_KEY_SETUP_FAILED),
+     &quot;camellia key setup failed&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_CANNOT_GET_PARAMETERS),
+diff --git a/crypto/evp/evp_lib.c b/crypto/evp/evp_lib.c
+index 48fa330ac3..954acaae0d 100644
+--- a/crypto/evp/evp_lib.c
++++ b/crypto/evp/evp_lib.c
+@@ -688,19 +688,7 @@ const OSSL_PROVIDER *EVP_MD_provider(const EVP_MD *md)
+ 
+ int EVP_MD_block_size(const EVP_MD *md)
+ {
+-    int ok;
+-    size_t v;
+-    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
+-
+-    if (md == NULL) {
+-        ERR_raise(ERR_LIB_EVP, EVP_R_MESSAGE_DIGEST_IS_NULL);
+-        return -1;
+-    }
+-    v = md-&gt;block_size;
+-    params[0] = OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_BLOCK_SIZE, &amp;v);
+-    ok = evp_do_md_getparams(md, params);
+-
+-    return ok != 0 ? (int)v : -1;
++    return md-&gt;block_size;
+ }
+ 
+ int EVP_MD_type(const EVP_MD *md)
+@@ -715,31 +703,16 @@ int EVP_MD_pkey_type(const EVP_MD *md)
+ 
+ int EVP_MD_size(const EVP_MD *md)
+ {
+-    int ok;
+-    size_t v;
+-    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
+-
+     if (md == NULL) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_MESSAGE_DIGEST_IS_NULL);
+         return -1;
+     }
+-    v = md-&gt;md_size;
+-    params[0] = OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &amp;v);
+-    ok = evp_do_md_getparams(md, params);
+-
+-    return ok != 0 ? (int)v : -1;
++    return md-&gt;md_size;
+ }
+ 
+ unsigned long EVP_MD_flags(const EVP_MD *md)
+ {
+-    int ok;
+-    unsigned long v = md-&gt;flags;
+-    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
+-
+-    params[0] = OSSL_PARAM_construct_ulong(OSSL_CIPHER_PARAM_FLAGS, &amp;v);
+-    ok = evp_do_md_getparams(md, params);
+-
+-    return ok != 0 ? v : 0;
++    return md-&gt;flags;
+ }
+ 
+ EVP_MD *EVP_MD_meth_new(int md_type, int pkey_type)
+diff --git a/include/crypto/evperr.h b/include/crypto/evperr.h
+index 7ca726d51c..2bfc71ad3c 100644
+--- a/include/crypto/evperr.h
++++ b/include/crypto/evperr.h
+@@ -1,6 +1,6 @@
+ /*
+  * Generated by util/mkerr.pl DO NOT EDIT
+- * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2020-2020 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+diff --git a/include/openssl/evperr.h b/include/openssl/evperr.h
+index 2fdd99336f..4e9989899f 100644
+--- a/include/openssl/evperr.h
++++ b/include/openssl/evperr.h
+@@ -164,6 +164,7 @@
+ # define EVP_R_BAD_DECRYPT                                100
+ # define EVP_R_BAD_KEY_LENGTH                             195
+ # define EVP_R_BUFFER_TOO_SMALL                           155
++# define EVP_R_CACHE_CONSTANTS_FAILED                     225
+ # define EVP_R_CAMELLIA_KEY_SETUP_FAILED                  157
+ # define EVP_R_CANNOT_GET_PARAMETERS                      197
+ # define EVP_R_CANNOT_SET_PARAMETERS                      198
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032681.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032687.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32682">[ date ]</a>
+              <a href="thread.html#32682">[ thread ]</a>
+              <a href="subject.html#32682">[ subject ]</a>
+              <a href="author.html#32682">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

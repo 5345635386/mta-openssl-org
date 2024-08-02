@@ -1,0 +1,333 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1568805332.377847.12034.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025189.html">
+   <LINK REL="Next"  HREF="025196.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1568805332.377847.12034.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Sep 18 11:15:32 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025189.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="025196.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25193">[ date ]</a>
+              <a href="thread.html#25193">[ thread ]</a>
+              <a href="subject.html#25193">[ subject ]</a>
+              <a href="author.html#25193">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  9a92bf1bffad15ede5ac97d1f1705c3e2c249a98 (commit)
+      from  18b0042731c739855cddf1f296b0b5a536ef88a3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 9a92bf1bffad15ede5ac97d1f1705c3e2c249a98
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Sep 18 11:49:55 2019 +0200
+
+    Refactor TLS1-PRF to create the MAC contexts early
+    
+    The TLS1-PRF implementation fetched the digest(s) for the underlying
+    MAC, just to get their names and pass those down to the MAC, which in
+    turn would fetch those same digests again.
+    
+    This change circumvents this by fetching the MAC (or MACs in the
+    MD5-SHA1 special case) and create the MAC contexts for them directly
+    when this PRF receives the relevant parameters, thus only having to
+    pass EVP_MAC_CTX pointers around.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9930">https://github.com/openssl/openssl/pull/9930</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/common/kdfs/tls1_prf.c | 138 +++++++++++++++++++++++----------------
+ 1 file changed, 80 insertions(+), 58 deletions(-)
+
+diff --git a/providers/common/kdfs/tls1_prf.c b/providers/common/kdfs/tls1_prf.c
+index 2c5e24b403..0acdcdf3b8 100644
+--- a/providers/common/kdfs/tls1_prf.c
++++ b/providers/common/kdfs/tls1_prf.c
+@@ -68,7 +68,7 @@ static OSSL_OP_kdf_derive_fn kdf_tls1_prf_derive;
+ static OSSL_OP_kdf_settable_ctx_params_fn kdf_tls1_prf_settable_ctx_params;
+ static OSSL_OP_kdf_set_ctx_params_fn kdf_tls1_prf_set_ctx_params;
+ 
+-static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
++static int tls1_prf_alg(EVP_MAC_CTX *mdctx, EVP_MAC_CTX *sha1ctx,
+                         const unsigned char *sec, size_t slen,
+                         const unsigned char *seed, size_t seed_len,
+                         unsigned char *out, size_t olen);
+@@ -78,10 +78,12 @@ static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
+ /* TLS KDF kdf context structure */
+ typedef struct {
+     void *provctx;
+-    /* Digest to use for PRF */
+-    PROV_DIGEST digest;
+-    /* Second digest for the MD5/SHA-1 combined PRF */
+-    PROV_DIGEST sha1;
++
++    /* MAC context for the main digest */
++    EVP_MAC_CTX *P_hash;
++    /* MAC context for SHA1 for the MD5/SHA-1 combined PRF */
++    EVP_MAC_CTX *P_sha1;
++
+     /* Secret value to use for PRF */
+     unsigned char *sec;
+     size_t seclen;
+@@ -112,8 +114,8 @@ static void kdf_tls1_prf_reset(void *vctx)
+ {
+     TLS1_PRF *ctx = (TLS1_PRF *)vctx;
+ 
+-    ossl_prov_digest_reset(&amp;ctx-&gt;sha1);
+-    ossl_prov_digest_reset(&amp;ctx-&gt;digest);
++    EVP_MAC_CTX_free(ctx-&gt;P_hash);
++    EVP_MAC_CTX_free(ctx-&gt;P_sha1);
+     OPENSSL_clear_free(ctx-&gt;sec, ctx-&gt;seclen);
+     OPENSSL_cleanse(ctx-&gt;seed, ctx-&gt;seedlen);
+     memset(ctx, 0, sizeof(*ctx));
+@@ -123,9 +125,8 @@ static int kdf_tls1_prf_derive(void *vctx, unsigned char *key,
+                                size_t keylen)
+ {
+     TLS1_PRF *ctx = (TLS1_PRF *)vctx;
+-    const EVP_MD *md = ossl_prov_digest_md(&amp;ctx-&gt;digest);
+ 
+-    if (md == NULL) {
++    if (ctx-&gt;P_hash == NULL) {
+         ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_MESSAGE_DIGEST);
+         return 0;
+     }
+@@ -137,38 +138,73 @@ static int kdf_tls1_prf_derive(void *vctx, unsigned char *key,
+         ERR_raise(ERR_LIB_PROV, PROV_R_MISSING_SEED);
+         return 0;
+     }
+-    return tls1_prf_alg(md, ossl_prov_digest_md(&amp;ctx-&gt;sha1),
++
++    return tls1_prf_alg(ctx-&gt;P_hash, ctx-&gt;P_sha1,
+                         ctx-&gt;sec, ctx-&gt;seclen,
+                         ctx-&gt;seed, ctx-&gt;seedlen,
+                         key, keylen);
+ }
+ 
++static EVP_MAC_CTX *kdf_tls1_prf_mkmacctx(OPENSSL_CTX *libctx,
++                                          const char *mdname,
++                                          const OSSL_PARAM params[])
++{
++    const OSSL_PARAM *p;
++    OSSL_PARAM mac_params[5], *mp = mac_params;
++    const char *properties = NULL;
++    /* TODO(3.0) rethink &quot;flags&quot;, also see hmac.c in providers */
++    int mac_flags = EVP_MD_CTX_FLAG_NON_FIPS_ALLOW;
++    EVP_MAC_CTX *macctx = NULL;
++
++    *mp++ = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
++                                             (char *)mdname, 0);
++#if !defined(OPENSSL_NO_ENGINE) &amp;&amp; !defined(FIPS_MODE)
++    if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_ENGINE)) != NULL)
++        *mp++ = *p;
++#endif
++    if ((p = OSSL_PARAM_locate_const(params,
++                                     OSSL_KDF_PARAM_PROPERTIES)) != NULL) {
++        properties = p-&gt;data;
++        *mp++ = *p;
++    }
++    *mp++ = OSSL_PARAM_construct_int(OSSL_MAC_PARAM_FLAGS, &amp;mac_flags);
++    *mp = OSSL_PARAM_construct_end();
++
++    /* Implicit fetch */
++    {
++        EVP_MAC *mac = EVP_MAC_fetch(libctx, OSSL_MAC_NAME_HMAC, properties);
++
++        macctx = EVP_MAC_CTX_new(mac);
++        /* The context holds on to the MAC */
++        EVP_MAC_free(mac);
++        if (macctx == NULL)
++            goto err;
++    }
++
++    if (EVP_MAC_CTX_set_params(macctx, mac_params))
++        goto done;
++ err:
++    EVP_MAC_CTX_free(macctx);
++    macctx = NULL;
++ done:
++    return macctx;
++}
++
+ static int kdf_tls1_prf_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+ {
+     const OSSL_PARAM *p;
+     TLS1_PRF *ctx = vctx;
+-    OPENSSL_CTX *provctx = PROV_LIBRARY_CONTEXT_OF(ctx-&gt;provctx);
+-
+-    if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_DIGEST)) != NULL
+-        &amp;&amp; p-&gt;data_type == OSSL_PARAM_UTF8_STRING
+-        &amp;&amp; strcasecmp(p-&gt;data, SN_md5_sha1) == 0) {
+-        OSSL_PARAM qaram[4], *q = qaram;
+-
+-        /* Handle combined MD5 / SHA1 digest specially */
+-        *q++ = OSSL_PARAM_construct_utf8_string(&quot;digest&quot;, SN_md5, 0);
+-        if ((p = OSSL_PARAM_locate_const(params, &quot;engine&quot;)) != NULL)
+-            *q++ = *p;
+-        if ((p = OSSL_PARAM_locate_const(params, &quot;properties&quot;)) != NULL)
+-            *q++ = *p;
+-        *q = OSSL_PARAM_construct_end();
+-        if (!ossl_prov_digest_load_from_params(&amp;ctx-&gt;digest, qaram, provctx))
+-            return 0;
+-        qaram[0] = OSSL_PARAM_construct_utf8_string(&quot;digest&quot;, SN_sha1, 0);
+-        if (!ossl_prov_digest_load_from_params(&amp;ctx-&gt;sha1, qaram, provctx))
+-            return 0;
+-    } else if (!ossl_prov_digest_load_from_params(&amp;ctx-&gt;digest, params,
+-                                                  provctx)) {
+-        return 0;
++    OPENSSL_CTX *libctx = PROV_LIBRARY_CONTEXT_OF(ctx-&gt;provctx);
++
++    if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_DIGEST)) != NULL) {
++        EVP_MAC_CTX_free(ctx-&gt;P_hash);
++        EVP_MAC_CTX_free(ctx-&gt;P_sha1);
++        if (strcasecmp(p-&gt;data, SN_md5_sha1) == 0) {
++            ctx-&gt;P_hash = kdf_tls1_prf_mkmacctx(libctx, SN_md5, params);
++            ctx-&gt;P_sha1 = kdf_tls1_prf_mkmacctx(libctx, SN_sha1, params);
++        } else {
++            ctx-&gt;P_hash = kdf_tls1_prf_mkmacctx(libctx, p-&gt;data, params);
++        }
+     }
+ 
+     if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_SECRET)) != NULL) {
+@@ -265,34 +301,21 @@ const OSSL_DISPATCH kdf_tls1_prf_functions[] = {
+  *     A(0) = seed
+  *     A(i) = HMAC_&lt;hash&gt;(secret, A(i-1))
+  */
+-static int tls1_prf_P_hash(const EVP_MD *md,
++static int tls1_prf_P_hash(EVP_MAC_CTX *ctx_init,
+                            const unsigned char *sec, size_t sec_len,
+                            const unsigned char *seed, size_t seed_len,
+                            unsigned char *out, size_t olen)
+ {
+     size_t chunk;
+-    EVP_MAC *mac = NULL;
+-    EVP_MAC_CTX *ctx = NULL, *ctx_Ai = NULL, *ctx_init = NULL;
++    EVP_MAC_CTX *ctx = NULL, *ctx_Ai = NULL;
+     unsigned char Ai[EVP_MAX_MD_SIZE];
+     size_t Ai_len;
+     int ret = 0;
+-    OSSL_PARAM params[4];
+-    int mac_flags;
+-    const char *mdname = EVP_MD_name(md);
+-
+-    mac = EVP_MAC_fetch(NULL, OSSL_MAC_NAME_HMAC, NULL); /* Implicit fetch */
+-    ctx_init = EVP_MAC_CTX_new(mac);
+-    if (ctx_init == NULL)
+-        goto err;
++    OSSL_PARAM params[2], *p = params;
+ 
+-    /* TODO(3.0) rethink &quot;flags&quot;, also see hmac.c in providers */
+-    mac_flags = EVP_MD_CTX_FLAG_NON_FIPS_ALLOW;
+-    params[0] = OSSL_PARAM_construct_int(OSSL_MAC_PARAM_FLAGS, &amp;mac_flags);
+-    params[1] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+-                                                 (char *)mdname, 0);
+-    params[2] = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY,
+-                                                  (void *)sec, sec_len);
+-    params[3] = OSSL_PARAM_construct_end();
++    *p++ = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY,
++                                             (void *)sec, sec_len);
++    *p = OSSL_PARAM_construct_end();
+     if (!EVP_MAC_CTX_set_params(ctx_init, params))
+         goto err;
+     if (!EVP_MAC_init(ctx_init))
+@@ -346,8 +369,6 @@ static int tls1_prf_P_hash(const EVP_MD *md,
+  err:
+     EVP_MAC_CTX_free(ctx);
+     EVP_MAC_CTX_free(ctx_Ai);
+-    EVP_MAC_CTX_free(ctx_init);
+-    EVP_MAC_free(mac);
+     OPENSSL_cleanse(Ai, sizeof(Ai));
+     return ret;
+ }
+@@ -372,12 +393,12 @@ static int tls1_prf_P_hash(const EVP_MD *md,
+  *
+  *   PRF(secret, label, seed) = P_&lt;hash&gt;(secret, label + seed)
+  */
+-static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
++static int tls1_prf_alg(EVP_MAC_CTX *mdctx, EVP_MAC_CTX *sha1ctx,
+                         const unsigned char *sec, size_t slen,
+                         const unsigned char *seed, size_t seed_len,
+                         unsigned char *out, size_t olen)
+ {
+-    if (sha1 != NULL) {
++    if (sha1ctx != NULL) {
+         /* TLS v1.0 and TLS v1.1 */
+         size_t i;
+         unsigned char *tmp;
+@@ -385,7 +406,7 @@ static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
+         size_t L_S1 = (slen + 1) / 2;
+         size_t L_S2 = L_S1;
+ 
+-        if (!tls1_prf_P_hash(md, sec, L_S1,
++        if (!tls1_prf_P_hash(mdctx, sec, L_S1,
+                              seed, seed_len, out, olen))
+             return 0;
+ 
+@@ -393,7 +414,8 @@ static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
+             ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+             return 0;
+         }
+-        if (!tls1_prf_P_hash(sha1, sec + slen - L_S2, L_S2,
++
++        if (!tls1_prf_P_hash(sha1ctx, sec + slen - L_S2, L_S2,
+                              seed, seed_len, tmp, olen)) {
+             OPENSSL_clear_free(tmp, olen);
+             return 0;
+@@ -405,7 +427,7 @@ static int tls1_prf_alg(const EVP_MD *md, const EVP_MD *sha1,
+     }
+ 
+     /* TLS v1.2 */
+-    if (!tls1_prf_P_hash(md, sec, slen, seed, seed_len, out, olen))
++    if (!tls1_prf_P_hash(mdctx, sec, slen, seed, seed_len, out, olen))
+         return 0;
+ 
+     return 1;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025189.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="025196.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25193">[ date ]</a>
+              <a href="thread.html#25193">[ thread ]</a>
+              <a href="subject.html#25193">[ subject ]</a>
+              <a href="author.html#25193">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,727 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1454524809.461968.656.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003545.html">
+   <LINK REL="Next"  HREF="003547.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1454524809.461968.656.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Feb  3 18:40:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003545.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="003547.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3546">[ date ]</a>
+              <a href="thread.html#3546">[ thread ]</a>
+              <a href="subject.html#3546">[ subject ]</a>
+              <a href="author.html#3546">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  4f1374e60566c0a6ca6b82e4c0f90f461215b8d6 (commit)
+       via  5bca70ca49d3368a9cbd35c3ae9c06d9fec5ed27 (commit)
+      from  2fcff74c879c3ff5bcbf11390daf37442cb6aa0c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 4f1374e60566c0a6ca6b82e4c0f90f461215b8d6
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Feb 2 22:43:01 2016 +0100
+
+    make update
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at openssl.org</A>&gt;
+
+commit 5bca70ca49d3368a9cbd35c3ae9c06d9fec5ed27
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Feb 2 22:33:57 2016 +0100
+
+    Refactoring BIO: reimplement old socket handling functions with new ones
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/b_sock.c   | 525 +++++++++-----------------------------------------
+ crypto/bio/bio_err.c  |   2 +
+ include/openssl/bio.h |   1 +
+ 3 files changed, 93 insertions(+), 435 deletions(-)
+
+diff --git a/crypto/bio/b_sock.c b/crypto/bio/b_sock.c
+index e07141b..fab5b09 100644
+--- a/crypto/bio/b_sock.c
++++ b/crypto/bio/b_sock.c
+@@ -88,138 +88,80 @@ static int wsa_init_done = 0;
+ #  define WSAAPI
+ # endif
+ 
+-/*
+- * We are currently using deprecated functions here, and GCC warns
+- * us about them, but since we know, we don't want to hear it.
+- */
+-#pragma GCC diagnostic ignored &quot;-Wdeprecated-declarations&quot;
+-
+ # if OPENSSL_API_COMPAT &lt; 0x10100000L
+-static int get_ip(const char *str, unsigned char *ip);
+ int BIO_get_host_ip(const char *str, unsigned char *ip)
+ {
+-    int i;
+-    int err = 1;
+-    int locked = 0;
+-    struct hostent *he;
+-
+-    i = get_ip(str, ip);
+-    if (i &lt; 0) {
+-        BIOerr(BIO_F_BIO_GET_HOST_IP, BIO_R_INVALID_IP_ADDRESS);
+-        goto err;
+-    }
++    BIO_ADDRINFO *res = NULL;
++    int ret = 0;
+ 
+-    /*
+-     * At this point, we have something that is most probably correct in some
+-     * way, so let's init the socket.
+-     */
+     if (BIO_sock_init() != 1)
+         return 0;               /* don't generate another error code here */
+ 
+-    /*
+-     * If the string actually contained an IP address, we need not do
+-     * anything more
+-     */
+-    if (i &gt; 0)
+-        return (1);
++    if (BIO_lookup(str, NULL, BIO_LOOKUP_CLIENT, AF_INET, SOCK_STREAM, &amp;res)) {
++        size_t l;
+ 
+-    /* do a gethostbyname */
+-    CRYPTO_w_lock(CRYPTO_LOCK_GETHOSTBYNAME);
+-    locked = 1;
+-    he = BIO_gethostbyname(str);
+-    if (he == NULL) {
+-        BIOerr(BIO_F_BIO_GET_HOST_IP, BIO_R_BAD_HOSTNAME_LOOKUP);
+-        goto err;
+-    }
++        if (BIO_ADDRINFO_family(res) != AF_INET) {
++            BIOerr(BIO_F_BIO_GET_HOST_IP,
++                   BIO_R_GETHOSTBYNAME_ADDR_IS_NOT_AF_INET);
++        } else {
++            BIO_ADDR_rawaddress(BIO_ADDRINFO_address(res), NULL, &amp;l);
++            /* Because only AF_INET addresses will reach this far,
++               we can assert that l should be 4 */
++            OPENSSL_assert(l == 4);
+ 
+-    if (he-&gt;h_addrtype != AF_INET) {
+-        BIOerr(BIO_F_BIO_GET_HOST_IP,
+-               BIO_R_GETHOSTBYNAME_ADDR_IS_NOT_AF_INET);
+-        goto err;
++            BIO_ADDR_rawaddress(BIO_ADDRINFO_address(res), ip, &amp;l);
++            ret = 1;
++        }
++        BIO_ADDRINFO_free(res);
++    } else {
++        ERR_add_error_data(2, &quot;host=&quot;, str);
+     }
+-    for (i = 0; i &lt; 4; i++)
+-        ip[i] = he-&gt;h_addr_list[0][i];
+-    err = 0;
+ 
+- err:
+-    if (locked)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_GETHOSTBYNAME);
+-    if (err) {
+-        ERR_add_error_data(2, &quot;host=&quot;, str);
+-        return 0;
+-    } else
+-        return 1;
++    return ret;
+ }
+ 
+ int BIO_get_port(const char *str, unsigned short *port_ptr)
+ {
+-    int i;
+-    struct servent *s;
++    BIO_ADDRINFO *res = NULL;
++    int ret = 0;
+ 
+     if (str == NULL) {
+         BIOerr(BIO_F_BIO_GET_PORT, BIO_R_NO_PORT_DEFINED);
+         return (0);
+     }
+-    i = atoi(str);
+-    if (i != 0)
+-        *port_ptr = (unsigned short)i;
+-    else {
+-        CRYPTO_w_lock(CRYPTO_LOCK_GETSERVBYNAME);
+-        /*
+-         * Note: under VMS with SOCKETSHR, it seems like the first parameter
+-         * is 'char *', instead of 'const char *'
+-         */
+-# ifndef CONST_STRICT
+-        s = getservbyname((char *)str, &quot;tcp&quot;);
+-# else
+-        s = getservbyname(str, &quot;tcp&quot;);
+-# endif
+-        if (s != NULL)
+-            *port_ptr = ntohs((unsigned short)s-&gt;s_port);
+-        CRYPTO_w_unlock(CRYPTO_LOCK_GETSERVBYNAME);
+-        if (s == NULL) {
+-            if (strcmp(str, &quot;http&quot;) == 0)
+-                *port_ptr = 80;
+-            else if (strcmp(str, &quot;telnet&quot;) == 0)
+-                *port_ptr = 23;
+-            else if (strcmp(str, &quot;socks&quot;) == 0)
+-                *port_ptr = 1080;
+-            else if (strcmp(str, &quot;https&quot;) == 0)
+-                *port_ptr = 443;
+-            else if (strcmp(str, &quot;ssl&quot;) == 0)
+-                *port_ptr = 443;
+-            else if (strcmp(str, &quot;ftp&quot;) == 0)
+-                *port_ptr = 21;
+-            else if (strcmp(str, &quot;gopher&quot;) == 0)
+-                *port_ptr = 70;
+-            else {
+-                SYSerr(SYS_F_GETSERVBYNAME, get_last_socket_error());
+-                ERR_add_error_data(3, &quot;service='&quot;, str, &quot;'&quot;);
+-                return (0);
+-            }
++
++    if (BIO_sock_init() != 1)
++        return 0;               /* don't generate another error code here */
++
++    if (BIO_lookup(NULL, str, BIO_LOOKUP_CLIENT, AF_INET, SOCK_STREAM, &amp;res)) {
++        if (BIO_ADDRINFO_family(res) != AF_INET) {
++            BIOerr(BIO_F_BIO_GET_PORT,
++                   BIO_R_ADDRINFO_ADDR_IS_NOT_AF_INET);
++        } else {
++            *port_ptr = ntohs(BIO_ADDR_rawport(BIO_ADDRINFO_address(res)));
++            ret = 1;
+         }
++        BIO_ADDRINFO_free(res);
++    } else {
++        ERR_add_error_data(2, &quot;host=&quot;, str);
+     }
+-    return (1);
++
++    return ret;
+ }
+ # endif
+ 
+ int BIO_sock_error(int sock)
+ {
+-    int j, i;
+-    union {
+-        size_t s;
+-        int i;
+-    } size;
+-
+-    /* heuristic way to adapt for platforms that expect 64-bit optlen */
+-    size.s = 0, size.i = sizeof(j);
++    int j = 0, i;
++    socklen_t size = 0;
++
+     /*
+      * Note: under Windows the third parameter is of type (char *) whereas
+      * under other systems it is (void *) if you don't have a cast it will
+      * choke the compiler: if you do have a cast then you can either go for
+      * (char *) or (void *).
+      */
+-    i = getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&amp;j, (void *)&amp;size);
++    i = getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&amp;j, &amp;size);
+     if (i &lt; 0)
+         return (1);
+     else
+@@ -233,11 +175,11 @@ struct hostent *BIO_gethostbyname(const char *name)
+      * Caching gethostbyname() results forever is wrong, so we have to let
+      * the true gethostbyname() worry about this
+      */
+-# if (defined(NETWARE_BSDSOCK) &amp;&amp; !defined(__NOVELL_LIBC__))
++#  if (defined(NETWARE_BSDSOCK) &amp;&amp; !defined(__NOVELL_LIBC__))
+     return gethostbyname((char *)name);
+-# else
++#  else
+     return gethostbyname(name);
+-# endif
++#  endif
+ }
+ # endif
+ 
+@@ -349,364 +291,77 @@ int BIO_socket_ioctl(int fd, long type, void *arg)
+ # endif                         /* __VMS_VER */
+ 
+ # if OPENSSL_API_COMPAT &lt; 0x10100000L
+-/*
+- * The reason I have implemented this instead of using sscanf is because
+- * Visual C 1.52c gives an unresolved external when linking a DLL :-(
+- */
+-static int get_ip(const char *str, unsigned char ip[4])
+-{
+-    unsigned int tmp[4];
+-    int num = 0, c, ok = 0;
+-
+-    tmp[0] = tmp[1] = tmp[2] = tmp[3] = 0;
+-
+-    for (;;) {
+-        c = *(str++);
+-        if ((c &gt;= '0') &amp;&amp; (c &lt;= '9')) {
+-            ok = 1;
+-            tmp[num] = tmp[num] * 10 + c - '0';
+-            if (tmp[num] &gt; 255)
+-                return (0);
+-        } else if (c == '.') {
+-            if (!ok)
+-                return (-1);
+-            if (num == 3)
+-                return (0);
+-            num++;
+-            ok = 0;
+-        } else if (c == '\0' &amp;&amp; (num == 3) &amp;&amp; ok)
+-            break;
+-        else
+-            return (0);
+-    }
+-    ip[0] = tmp[0];
+-    ip[1] = tmp[1];
+-    ip[2] = tmp[2];
+-    ip[3] = tmp[3];
+-    return (1);
+-}
+-
+ int BIO_get_accept_socket(char *host, int bind_mode)
+ {
+-    int ret = 0;
+-    union {
+-        struct sockaddr sa;
+-        struct sockaddr_in sa_in;
+-# if OPENSSL_USE_IPV6
+-        struct sockaddr_in6 sa_in6;
+-# endif
+-    } server, client;
+-    int s = (int)INVALID_SOCKET, cs, addrlen;
+-    unsigned char ip[4];
+-    unsigned short port;
+-    char *str = NULL, *e;
+-    char *h, *p;
+-    unsigned long l;
+-    int err_num;
++    int s = INVALID_SOCKET;
++    char *h = NULL, *p = NULL;
++    BIO_ADDRINFO *res = NULL;
+ 
+-    if (BIO_sock_init() != 1)
+-        return ((int)INVALID_SOCKET);
+-
+-    if ((str = OPENSSL_strdup(host)) == NULL)
+-        return ((int)INVALID_SOCKET);
+-
+-    h = p = NULL;
+-    h = str;
+-    for (e = str; *e; e++) {
+-        if (*e == ':') {
+-            p = e;
+-        } else if (*e == '/') {
+-            *e = '\0';
+-            break;
+-        }
+-    }
+-    if (p)
+-        *p++ = '\0';            /* points at last ':', '::port' is special
+-                                 * [see below] */
+-    else
+-        p = h, h = NULL;
+-
+-# ifdef EAI_FAMILY
+-    do {
+-        static union {
+-            void *p;
+-            int (WSAAPI *f) (const char *, const char *,
+-                             const struct addrinfo *, struct addrinfo **);
+-        } p_getaddrinfo = {
+-            NULL
+-        };
+-        static union {
+-            void *p;
+-            void (WSAAPI *f) (struct addrinfo *);
+-        } p_freeaddrinfo = {
+-            NULL
+-        };
+-        struct addrinfo *res, hint;
+-
+-        if (p_getaddrinfo.p == NULL) {
+-            if ((p_getaddrinfo.p = DSO_global_lookup(&quot;getaddrinfo&quot;)) == NULL
+-                || (p_freeaddrinfo.p =
+-                    DSO_global_lookup(&quot;freeaddrinfo&quot;)) == NULL)
+-                p_getaddrinfo.p = (void *)-1;
+-        }
+-        if (p_getaddrinfo.p == (void *)-1)
+-            break;
++    if (!BIO_parse_hostserv(host, &amp;h, &amp;p, BIO_PARSE_PRIO_SERV))
++        return INVALID_SOCKET;
+ 
+-        /*
+-         * '::port' enforces IPv6 wildcard listener. Some OSes, e.g. Solaris,
+-         * default to IPv6 without any hint. Also note that commonly IPv6
+-         * wildchard socket can service IPv4 connections just as well...
+-         */
+-        memset(&amp;hint, 0, sizeof(hint));
+-        hint.ai_flags = AI_PASSIVE;
+-        if (h) {
+-            if (strchr(h, ':')) {
+-                if (h[1] == '\0')
+-                    h = NULL;
+-#  if OPENSSL_USE_IPV6
+-                hint.ai_family = AF_INET6;
+-#  else
+-                h = NULL;
+-#  endif
+-            } else if (h[0] == '*' &amp;&amp; h[1] == '\0') {
+-                hint.ai_family = AF_INET;
+-                h = NULL;
+-            }
+-        }
+-
+-        if ((*p_getaddrinfo.f) (h, p, &amp;hint, &amp;res))
+-            break;
+-
+-        addrlen = res-&gt;ai_addrlen &lt;= sizeof(server) ?
+-            res-&gt;ai_addrlen : sizeof(server);
+-        memcpy(&amp;server, res-&gt;ai_addr, addrlen);
+-
+-        (*p_freeaddrinfo.f) (res);
+-        goto again;
+-    } while (0);
+-# endif
++    if (BIO_sock_init() != 1)
++        return INVALID_SOCKET;
+ 
+-    if (!BIO_get_port(p, &amp;port))
++    if (BIO_lookup(h, p, BIO_LOOKUP_SERVER, AF_UNSPEC, SOCK_STREAM, &amp;res) != 0)
+         goto err;
+ 
+-    memset(&amp;server, 0, sizeof(server));
+-    server.sa_in.sin_family = AF_INET;
+-    server.sa_in.sin_port = htons(port);
+-    addrlen = sizeof(server.sa_in);
+-
+-    if (h == NULL || strcmp(h, &quot;*&quot;) == 0)
+-        server.sa_in.sin_addr.s_addr = INADDR_ANY;
+-    else {
+-        if (!BIO_get_host_ip(h, &amp;(ip[0])))
+-            goto err;
+-        l = (unsigned long)
+-            ((unsigned long)ip[0] &lt;&lt; 24L) |
+-            ((unsigned long)ip[1] &lt;&lt; 16L) |
+-            ((unsigned long)ip[2] &lt;&lt; 8L) | ((unsigned long)ip[3]);
+-        server.sa_in.sin_addr.s_addr = htonl(l);
+-    }
+-
+- again:
+-    s = socket(server.sa.sa_family, SOCK_STREAM, SOCKET_PROTOCOL);
+-    if (s == (int)INVALID_SOCKET) {
+-        SYSerr(SYS_F_SOCKET, get_last_socket_error());
+-        ERR_add_error_data(3, &quot;port='&quot;, host, &quot;'&quot;);
+-        BIOerr(BIO_F_BIO_GET_ACCEPT_SOCKET, BIO_R_UNABLE_TO_CREATE_SOCKET);
++    if ((s = BIO_socket(BIO_ADDRINFO_family(res), BIO_ADDRINFO_socktype(res),
++                        BIO_ADDRINFO_protocol(res), 0)) == INVALID_SOCKET) {
++        s = INVALID_SOCKET;
+         goto err;
+     }
+-# ifdef SO_REUSEADDR
+-    if (bind_mode == BIO_BIND_REUSEADDR) {
+-        int i = 1;
+ 
+-        ret = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&amp;i, sizeof(i));
+-        bind_mode = BIO_BIND_NORMAL;
+-    }
+-# endif
+-    if (bind(s, &amp;server.sa, addrlen) == -1) {
+-# ifdef SO_REUSEADDR
+-        err_num = get_last_socket_error();
+-        if ((bind_mode == BIO_BIND_REUSEADDR_IF_UNUSED) &amp;&amp;
+-#  ifdef OPENSSL_SYS_WINDOWS
+-            /*
+-             * Some versions of Windows define EADDRINUSE to a dummy value.
+-             */
+-            (err_num == WSAEADDRINUSE))
+-#  else
+-            (err_num == EADDRINUSE))
+-#  endif
+-        {
+-            client = server;
+-            if (h == NULL || strcmp(h, &quot;*&quot;) == 0) {
+-#  if OPENSSL_USE_IPV6
+-                if (client.sa.sa_family == AF_INET6) {
+-                    memset(&amp;client.sa_in6.sin6_addr, 0,
+-                           sizeof(client.sa_in6.sin6_addr));
+-                    client.sa_in6.sin6_addr.s6_addr[15] = 1;
+-                } else
+-#  endif
+-                if (client.sa.sa_family == AF_INET) {
+-                    client.sa_in.sin_addr.s_addr = htonl(0x7F000001);
+-                } else
+-                    goto err;
+-            }
+-            cs = socket(client.sa.sa_family, SOCK_STREAM, SOCKET_PROTOCOL);
+-            if (cs != (int)INVALID_SOCKET) {
+-                int ii;
+-                ii = connect(cs, &amp;client.sa, addrlen);
+-                closesocket(cs);
+-                if (ii == (int)INVALID_SOCKET) {
+-                    bind_mode = BIO_BIND_REUSEADDR;
+-                    closesocket(s);
+-                    goto again;
+-                }
+-                /* else error */
+-            }
+-            /* else error */
+-        }
+-# endif
+-        SYSerr(SYS_F_BIND, err_num);
+-        ERR_add_error_data(3, &quot;port='&quot;, host, &quot;'&quot;);
+-        BIOerr(BIO_F_BIO_GET_ACCEPT_SOCKET, BIO_R_UNABLE_TO_BIND_SOCKET);
+-        goto err;
+-    }
+-    if (listen(s, MAX_LISTEN) == -1) {
+-        SYSerr(SYS_F_BIND, get_last_socket_error());
+-        ERR_add_error_data(3, &quot;port='&quot;, host, &quot;'&quot;);
+-        BIOerr(BIO_F_BIO_GET_ACCEPT_SOCKET, BIO_R_UNABLE_TO_LISTEN_SOCKET);
+-        goto err;
++    if (!BIO_listen(s, BIO_ADDRINFO_address(res),
++                    bind_mode ? BIO_SOCK_REUSEADDR : 0)) {
++        BIO_closesocket(s);
++        s = INVALID_SOCKET;
+     }
+-    ret = 1;
++
+  err:
+-    OPENSSL_free(str);
+-    if ((ret == 0) &amp;&amp; (s != (int)INVALID_SOCKET)) {
+-        closesocket(s);
+-        s = (int)INVALID_SOCKET;
+-    }
+-    return (s);
++    BIO_ADDRINFO_free(res);
++    OPENSSL_free(h);
++    OPENSSL_free(p);
++
++    return s;
+ }
+ 
+-int BIO_accept(int sock, char **addr)
++int BIO_accept(int sock, char **ip_port)
+ {
+-    int ret = (int)INVALID_SOCKET;
+-    unsigned long l;
+-    unsigned short port;
+-    char *p;
++    BIO_ADDR *res = BIO_ADDR_new();
++    int ret = -1;
+ 
+-    struct {
+-        /*
+-         * As for following union. Trouble is that there are platforms
+-         * that have socklen_t and there are platforms that don't, on
+-         * some platforms socklen_t is int and on some size_t. So what
+-         * one can do? One can cook #ifdef spaghetti, which is nothing
+-         * but masochistic. Or one can do union between int and size_t.
+-         * One naturally does it primarily for 64-bit platforms where
+-         * sizeof(int) != sizeof(size_t). But would it work? Note that
+-         * if size_t member is initialized to 0, then later int member
+-         * assignment naturally does the job on little-endian platforms
+-         * regardless accept's expectations! What about big-endians?
+-         * If accept expects int*, then it works, and if size_t*, then
+-         * length value would appear as unreasonably large. But this
+-         * won't prevent it from filling in the address structure. The
+-         * trouble of course would be if accept returns more data than
+-         * actual buffer can accomodate and overwrite stack... That's
+-         * where early OPENSSL_assert comes into picture. Besides, the
+-         * only 64-bit big-endian platform found so far that expects
+-         * size_t* is HP-UX, where stack grows towards higher address.
+-         * &lt;appro&gt;
+-         */
+-        union {
+-            size_t s;
+-            int i;
+-        } len;
+-        union {
+-            struct sockaddr sa;
+-            struct sockaddr_in sa_in;
+-# if OPENSSL_USE_IPV6
+-            struct sockaddr_in6 sa_in6;
+-# endif
+-        } from;
+-    } sa;
+-
+-    sa.len.s = 0;
+-    sa.len.i = sizeof(sa.from);
+-    memset(&amp;sa.from, 0, sizeof(sa.from));
+-    ret = accept(sock, &amp;sa.from.sa, (void *)&amp;sa.len);
+-    if (sizeof(sa.len.i) != sizeof(sa.len.s) &amp;&amp; sa.len.i == 0) {
+-        OPENSSL_assert(sa.len.s &lt;= sizeof(sa.from));
+-        sa.len.i = (int)sa.len.s;
+-        /* use sa.len.i from this point */
++    if (res == NULL) {
++        BIOerr(BIO_F_BIO_ACCEPT, ERR_R_MALLOC_FAILURE);
++        return ret;
+     }
++
++    ret = BIO_accept_ex(sock, res, 0);
++
+     if (ret == (int)INVALID_SOCKET) {
+-        if (BIO_sock_should_retry(ret))
+-            return -2;
++        if (BIO_sock_should_retry(ret)) {
++            ret = -2;
++            goto end;
++        }
+         SYSerr(SYS_F_ACCEPT, get_last_socket_error());
+         BIOerr(BIO_F_BIO_ACCEPT, BIO_R_ACCEPT_ERROR);
+         goto end;
+     }
+ 
+-    if (addr == NULL)
+-        goto end;
+-
+-# ifdef EAI_FAMILY
+-    do {
+-        char h[NI_MAXHOST], s[NI_MAXSERV];
+-        size_t nl;
+-        static union {
+-            void *p;
+-            int (WSAAPI *f) (const struct sockaddr *, size_t /* socklen_t */ ,
+-                             char *, size_t, char *, size_t, int);
+-        } p_getnameinfo = {
+-            NULL
+-        };
+-        /*
+-         * 2nd argument to getnameinfo is specified to be socklen_t.
+-         * Unfortunately there is a number of environments where socklen_t is
+-         * not defined. As it's passed by value, it's safe to pass it as
+-         * size_t... &lt;appro&gt;
+-         */
+-
+-        if (p_getnameinfo.p == NULL) {
+-            if ((p_getnameinfo.p = DSO_global_lookup(&quot;getnameinfo&quot;)) == NULL)
+-                p_getnameinfo.p = (void *)-1;
+-        }
+-        if (p_getnameinfo.p == (void *)-1)
+-            break;
+-
+-        if ((*p_getnameinfo.f) (&amp;sa.from.sa, sa.len.i, h, sizeof(h), s,
+-                                sizeof(s), NI_NUMERICHOST | NI_NUMERICSERV))
+-            break;
+-        nl = strlen(h) + strlen(s) + 2;
+-        p = *addr;
+-        if (p)
+-            *p = '\0';
+-        p = OPENSSL_realloc(p, nl);
+-        if (p == NULL) {
+-            BIOerr(BIO_F_BIO_ACCEPT, ERR_R_MALLOC_FAILURE);
+-            goto end;
+-        }
+-        *addr = p;
+-        BIO_snprintf(*addr, nl, &quot;%s:%s&quot;, h, s);
+-        goto end;
+-    } while (0);
+-# endif
+-    if (sa.from.sa.sa_family != AF_INET)
+-        goto end;
+-    l = ntohl(sa.from.sa_in.sin_addr.s_addr);
+-    port = ntohs(sa.from.sa_in.sin_port);
+-    if (*addr == NULL) {
+-        if ((p = OPENSSL_malloc(24)) == NULL) {
+-            BIOerr(BIO_F_BIO_ACCEPT, ERR_R_MALLOC_FAILURE);
+-            goto end;
+-        }
+-        *addr = p;
++    if (ip_port != NULL) {
++        char *host = BIO_ADDR_hostname_string(res, 1);
++        char *port = BIO_ADDR_service_string(res, 1);
++        *ip_port = OPENSSL_zalloc(strlen(host) + strlen(port) + 2);
++        strcpy(*ip_port, host);
++        strcat(*ip_port, &quot;:&quot;);
++        strcat(*ip_port, port);
++        OPENSSL_free(host);
++        OPENSSL_free(port);
+     }
+-    BIO_snprintf(*addr, 24, &quot;%d.%d.%d.%d:%d&quot;,
+-                 (unsigned char)(l &gt;&gt; 24L) &amp; 0xff,
+-                 (unsigned char)(l &gt;&gt; 16L) &amp; 0xff,
+-                 (unsigned char)(l &gt;&gt; 8L) &amp; 0xff,
+-                 (unsigned char)(l) &amp; 0xff, port);
++
+  end:
+-    return (ret);
++    BIO_ADDR_free(res);
++    return ret;
+ }
+ # endif
+ 
+diff --git a/crypto/bio/bio_err.c b/crypto/bio/bio_err.c
+index 0942c28..bf72ec6 100644
+--- a/crypto/bio/bio_err.c
++++ b/crypto/bio/bio_err.c
+@@ -117,6 +117,8 @@ static ERR_STRING_DATA BIO_str_functs[] = {
+ 
+ static ERR_STRING_DATA BIO_str_reasons[] = {
+     {ERR_REASON(BIO_R_ACCEPT_ERROR), &quot;accept error&quot;},
++    {ERR_REASON(BIO_R_ADDRINFO_ADDR_IS_NOT_AF_INET),
++     &quot;addrinfo addr is not af inet&quot;},
+     {ERR_REASON(BIO_R_AMBIGUOUS_HOST_OR_SERVICE), &quot;ambiguous host or service&quot;},
+     {ERR_REASON(BIO_R_BAD_FOPEN_MODE), &quot;bad fopen mode&quot;},
+     {ERR_REASON(BIO_R_BAD_HOSTNAME_LOOKUP), &quot;bad hostname lookup&quot;},
+diff --git a/include/openssl/bio.h b/include/openssl/bio.h
+index 62f9369..24e5f9f 100644
+--- a/include/openssl/bio.h
++++ b/include/openssl/bio.h
+@@ -870,6 +870,7 @@ void ERR_load_BIO_strings(void);
+ 
+ /* Reason codes. */
+ # define BIO_R_ACCEPT_ERROR                               100
++# define BIO_R_ADDRINFO_ADDR_IS_NOT_AF_INET               141
+ # define BIO_R_AMBIGUOUS_HOST_OR_SERVICE                  129
+ # define BIO_R_BAD_FOPEN_MODE                             101
+ # define BIO_R_BAD_HOSTNAME_LOOKUP                        102
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003545.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="003547.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3546">[ date ]</a>
+              <a href="thread.html#3546">[ thread ]</a>
+              <a href="subject.html#3546">[ subject ]</a>
+              <a href="author.html#3546">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

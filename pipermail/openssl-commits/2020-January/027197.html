@@ -1,0 +1,1114 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1579775738.030614.4441.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027195.html">
+   <LINK REL="Next"  HREF="027200.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1579775738.030614.4441.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Thu Jan 23 10:35:38 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027195.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027200.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27197">[ date ]</a>
+              <a href="thread.html#27197">[ thread ]</a>
+              <a href="subject.html#27197">[ subject ]</a>
+              <a href="author.html#27197">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  62f49b90d7e88d3c36fc1f5e4d677997aeb97b0a (commit)
+      from  f10048301390283523d3d1623880be7518cf46ac (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 62f49b90d7e88d3c36fc1f5e4d677997aeb97b0a
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu Jan 23 20:33:28 2020 +1000
+
+    Add DH key exchange to fips provider
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10826">https://github.com/openssl/openssl/pull/10826</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/dh/build.info                         |   9 +-
+ crypto/dh/dh_key.c                           | 200 ++++++++------
+ crypto/dh/dh_lib.c                           |  17 +-
+ crypto/dh/dh_local.h                         |   2 +-
+ crypto/evp/build.info                        |   4 +-
+ crypto/evp/exchange.c                        |  10 +-
+ crypto/evp/pmeth_lib.c                       |  10 +-
+ include/crypto/dh.h                          |  15 ++
+ providers/fips/fipsprov.c                    | 389 +++++++++++++++++++++------
+ providers/implementations/exchange/dh_exch.c |  16 +-
+ 10 files changed, 479 insertions(+), 193 deletions(-)
+ create mode 100644 include/crypto/dh.h
+
+diff --git a/crypto/dh/build.info b/crypto/dh/build.info
+index b19ff6dbac..924ca8f92f 100644
+--- a/crypto/dh/build.info
++++ b/crypto/dh/build.info
+@@ -1,5 +1,10 @@
+ LIBS=../../libcrypto
+-SOURCE[../../libcrypto]=\
+-        dh_asn1.c dh_gen.c dh_key.c dh_lib.c dh_check.c dh_err.c dh_depr.c \
++
++$COMMON=dh_lib.c dh_key.c
++
++SOURCE[../../libcrypto]=$COMMON\
++        dh_asn1.c dh_gen.c dh_check.c dh_err.c dh_depr.c \
+         dh_ameth.c dh_pmeth.c dh_prn.c dh_rfc5114.c dh_kdf.c dh_meth.c \
+         dh_rfc7919.c
++
++SOURCE[../../providers/libfips.a]=$COMMON
+diff --git a/crypto/dh/dh_key.c b/crypto/dh/dh_key.c
+index a8a9dbe764..bd9b5c824b 100644
+--- a/crypto/dh/dh_key.c
++++ b/crypto/dh/dh_key.c
+@@ -11,29 +11,94 @@
+ #include &quot;internal/cryptlib.h&quot;
+ #include &quot;dh_local.h&quot;
+ #include &quot;crypto/bn.h&quot;
++#include &quot;crypto/dh.h&quot;
+ 
++#ifndef FIPS_MODE
+ static int generate_key(DH *dh);
+-static int compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh);
++#endif /* FIPS_MODE */
++
+ static int dh_bn_mod_exp(const DH *dh, BIGNUM *r,
+                          const BIGNUM *a, const BIGNUM *p,
+                          const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *m_ctx);
+ static int dh_init(DH *dh);
+ static int dh_finish(DH *dh);
+ 
+-int DH_generate_key(DH *dh)
++int dh_compute_key(OPENSSL_CTX *libctx, unsigned char *key,
++                   const BIGNUM *pub_key, DH *dh)
+ {
+-    return dh-&gt;meth-&gt;generate_key(dh);
++    BN_CTX *ctx = NULL;
++    BN_MONT_CTX *mont = NULL;
++    BIGNUM *tmp;
++    int ret = -1;
++#ifndef FIPS_MODE
++    int check_result;
++#endif
++
++    if (BN_num_bits(dh-&gt;p) &gt; OPENSSL_DH_MAX_MODULUS_BITS) {
++        DHerr(0, DH_R_MODULUS_TOO_LARGE);
++        goto err;
++    }
++
++    if (BN_num_bits(dh-&gt;p) &lt; DH_MIN_MODULUS_BITS) {
++        DHerr(0, DH_R_MODULUS_TOO_SMALL);
++        return 0;
++    }
++
++    ctx = BN_CTX_new_ex(libctx);
++    if (ctx == NULL)
++        goto err;
++    BN_CTX_start(ctx);
++    tmp = BN_CTX_get(ctx);
++    if (tmp == NULL)
++        goto err;
++
++    if (dh-&gt;priv_key == NULL) {
++        DHerr(0, DH_R_NO_PRIVATE_VALUE);
++        goto err;
++    }
++
++    if (dh-&gt;flags &amp; DH_FLAG_CACHE_MONT_P) {
++        mont = BN_MONT_CTX_set_locked(&amp;dh-&gt;method_mont_p,
++                                      dh-&gt;lock, dh-&gt;p, ctx);
++        BN_set_flags(dh-&gt;priv_key, BN_FLG_CONSTTIME);
++        if (!mont)
++            goto err;
++    }
++/* TODO(3.0) : Solve in a PR related to Key validation for DH */
++#ifndef FIPS_MODE
++    if (!DH_check_pub_key(dh, pub_key, &amp;check_result) || check_result) {
++        DHerr(0, DH_R_INVALID_PUBKEY);
++        goto err;
++    }
++#endif
++    if (!dh-&gt;meth-&gt;bn_mod_exp(dh, tmp, pub_key, dh-&gt;priv_key, dh-&gt;p, ctx,
++                              mont)) {
++        DHerr(0, ERR_R_BN_LIB);
++        goto err;
++    }
++
++    ret = BN_bn2bin(tmp, key);
++ err:
++    BN_CTX_end(ctx);
++    BN_CTX_free(ctx);
++    return ret;
+ }
+ 
+-int DH_compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
++static int compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+ {
+-    return dh-&gt;meth-&gt;compute_key(key, pub_key, dh);
++    return dh_compute_key(NULL, key, pub_key, dh);
+ }
+ 
+-int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
++int dh_compute_key_padded(OPENSSL_CTX *libctx, unsigned char *key,
++                          const BIGNUM *pub_key, DH *dh)
+ {
+     int rv, pad;
++
++#ifdef FIPS_MODE
++    rv = dh_compute_key(libctx, key, pub_key, dh);
++#else
+     rv = dh-&gt;meth-&gt;compute_key(key, pub_key, dh);
++#endif
+     if (rv &lt;= 0)
+         return rv;
+     pad = BN_num_bytes(dh-&gt;p) - rv;
+@@ -44,9 +109,25 @@ int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+     return rv + pad;
+ }
+ 
++#ifndef FIPS_MODE
++int DH_compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
++{
++    return dh-&gt;meth-&gt;compute_key(key, pub_key, dh);
++}
++
++int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
++{
++    return dh_compute_key_padded(NULL, key, pub_key, dh);
++}
++#endif
++
+ static DH_METHOD dh_ossl = {
+     &quot;OpenSSL DH Method&quot;,
++#ifndef FIPS_MODE
+     generate_key,
++#else
++    NULL, /* TODO(3.0) : solve this in a keygen related PR */
++#endif
+     compute_key,
+     dh_bn_mod_exp,
+     dh_init,
+@@ -63,14 +144,40 @@ const DH_METHOD *DH_OpenSSL(void)
+     return &amp;dh_ossl;
+ }
+ 
++const DH_METHOD *DH_get_default_method(void)
++{
++    return default_DH_method;
++}
++
++static int dh_bn_mod_exp(const DH *dh, BIGNUM *r,
++                         const BIGNUM *a, const BIGNUM *p,
++                         const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *m_ctx)
++{
++    return BN_mod_exp_mont(r, a, p, m, ctx, m_ctx);
++}
++
++static int dh_init(DH *dh)
++{
++    dh-&gt;flags |= DH_FLAG_CACHE_MONT_P;
++    return 1;
++}
++
++static int dh_finish(DH *dh)
++{
++    BN_MONT_CTX_free(dh-&gt;method_mont_p);
++    return 1;
++}
++
++#ifndef FIPS_MODE
++
+ void DH_set_default_method(const DH_METHOD *meth)
+ {
+     default_DH_method = meth;
+ }
+ 
+-const DH_METHOD *DH_get_default_method(void)
++int DH_generate_key(DH *dh)
+ {
+-    return default_DH_method;
++    return dh-&gt;meth-&gt;generate_key(dh);
+ }
+ 
+ static int generate_key(DH *dh)
+@@ -173,82 +280,6 @@ static int generate_key(DH *dh)
+     return ok;
+ }
+ 
+-static int compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+-{
+-    BN_CTX *ctx = NULL;
+-    BN_MONT_CTX *mont = NULL;
+-    BIGNUM *tmp;
+-    int ret = -1;
+-    int check_result;
+-
+-    if (BN_num_bits(dh-&gt;p) &gt; OPENSSL_DH_MAX_MODULUS_BITS) {
+-        DHerr(DH_F_COMPUTE_KEY, DH_R_MODULUS_TOO_LARGE);
+-        goto err;
+-    }
+-
+-    if (BN_num_bits(dh-&gt;p) &lt; DH_MIN_MODULUS_BITS) {
+-        DHerr(DH_F_COMPUTE_KEY, DH_R_MODULUS_TOO_SMALL);
+-        return 0;
+-    }
+-
+-    ctx = BN_CTX_new();
+-    if (ctx == NULL)
+-        goto err;
+-    BN_CTX_start(ctx);
+-    tmp = BN_CTX_get(ctx);
+-    if (tmp == NULL)
+-        goto err;
+-
+-    if (dh-&gt;priv_key == NULL) {
+-        DHerr(DH_F_COMPUTE_KEY, DH_R_NO_PRIVATE_VALUE);
+-        goto err;
+-    }
+-
+-    if (dh-&gt;flags &amp; DH_FLAG_CACHE_MONT_P) {
+-        mont = BN_MONT_CTX_set_locked(&amp;dh-&gt;method_mont_p,
+-                                      dh-&gt;lock, dh-&gt;p, ctx);
+-        BN_set_flags(dh-&gt;priv_key, BN_FLG_CONSTTIME);
+-        if (!mont)
+-            goto err;
+-    }
+-
+-    if (!DH_check_pub_key(dh, pub_key, &amp;check_result) || check_result) {
+-        DHerr(DH_F_COMPUTE_KEY, DH_R_INVALID_PUBKEY);
+-        goto err;
+-    }
+-
+-    if (!dh-&gt;
+-        meth-&gt;bn_mod_exp(dh, tmp, pub_key, dh-&gt;priv_key, dh-&gt;p, ctx, mont)) {
+-        DHerr(DH_F_COMPUTE_KEY, ERR_R_BN_LIB);
+-        goto err;
+-    }
+-
+-    ret = BN_bn2bin(tmp, key);
+- err:
+-    BN_CTX_end(ctx);
+-    BN_CTX_free(ctx);
+-    return ret;
+-}
+-
+-static int dh_bn_mod_exp(const DH *dh, BIGNUM *r,
+-                         const BIGNUM *a, const BIGNUM *p,
+-                         const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *m_ctx)
+-{
+-    return BN_mod_exp_mont(r, a, p, m, ctx, m_ctx);
+-}
+-
+-static int dh_init(DH *dh)
+-{
+-    dh-&gt;flags |= DH_FLAG_CACHE_MONT_P;
+-    return 1;
+-}
+-
+-static int dh_finish(DH *dh)
+-{
+-    BN_MONT_CTX_free(dh-&gt;method_mont_p);
+-    return 1;
+-}
+-
+ int dh_buf2key(DH *dh, const unsigned char *buf, size_t len)
+ {
+     int err_reason = DH_R_BN_ERROR;
+@@ -311,3 +342,4 @@ size_t dh_key2buf(const DH *dh, unsigned char **pbuf_out)
+     *pbuf_out = pbuf;
+     return p_size;
+ }
++#endif /* FIPS_MODE */
+diff --git a/crypto/dh/dh_lib.c b/crypto/dh/dh_lib.c
+index 65c2154c26..c9679d7e52 100644
+--- a/crypto/dh/dh_lib.c
++++ b/crypto/dh/dh_lib.c
+@@ -12,8 +12,10 @@
+ #include &quot;internal/refcount.h&quot;
+ #include &lt;openssl/bn.h&gt;
+ #include &quot;dh_local.h&quot;
++#include &quot;crypto/dh.h&quot;
+ #include &lt;openssl/engine.h&gt;
+ 
++#ifndef FIPS_MODE
+ int DH_set_method(DH *dh, const DH_METHOD *meth)
+ {
+     /*
+@@ -33,6 +35,7 @@ int DH_set_method(DH *dh, const DH_METHOD *meth)
+         meth-&gt;init(dh);
+     return 1;
+ }
++#endif /* !FIPS_MODE */
+ 
+ DH *DH_new(void)
+ {
+@@ -57,7 +60,7 @@ DH *DH_new_method(ENGINE *engine)
+     }
+ 
+     ret-&gt;meth = DH_get_default_method();
+-#ifndef OPENSSL_NO_ENGINE
++#if !defined(FIPS_MODE) &amp;&amp; !defined(OPENSSL_NO_ENGINE)
+     ret-&gt;flags = ret-&gt;meth-&gt;flags;  /* early default init */
+     if (engine) {
+         if (!ENGINE_init(engine)) {
+@@ -81,7 +84,7 @@ DH *DH_new_method(ENGINE *engine)
+ #ifndef FIPS_MODE
+     if (!CRYPTO_new_ex_data(CRYPTO_EX_INDEX_DH, ret, &amp;ret-&gt;ex_data))
+         goto err;
+-#endif
++#endif /* FIPS_MODE */
+ 
+     if ((ret-&gt;meth-&gt;init != NULL) &amp;&amp; !ret-&gt;meth-&gt;init(ret)) {
+         DHerr(DH_F_DH_NEW_METHOD, ERR_R_INIT_FAIL);
+@@ -110,11 +113,10 @@ void DH_free(DH *r)
+ 
+     if (r-&gt;meth != NULL &amp;&amp; r-&gt;meth-&gt;finish != NULL)
+         r-&gt;meth-&gt;finish(r);
+-#ifndef OPENSSL_NO_ENGINE
++#if !defined(FIPS_MODE)
++# if !defined(OPENSSL_NO_ENGINE)
+     ENGINE_finish(r-&gt;engine);
+-#endif
+-
+-#ifndef FIPS_MODE
++# endif
+     CRYPTO_free_ex_data(CRYPTO_EX_INDEX_DH, r, &amp;r-&gt;ex_data);
+ #endif
+ 
+@@ -177,7 +179,6 @@ int DH_security_bits(const DH *dh)
+     return BN_security_bits(BN_num_bits(dh-&gt;p), N);
+ }
+ 
+-
+ void DH_get0_pqg(const DH *dh,
+                  const BIGNUM **p, const BIGNUM **q, const BIGNUM **g)
+ {
+@@ -293,7 +294,9 @@ void DH_set_flags(DH *dh, int flags)
+     dh-&gt;flags |= flags;
+ }
+ 
++#ifndef FIPS_MODE
+ ENGINE *DH_get0_engine(DH *dh)
+ {
+     return dh-&gt;engine;
+ }
++#endif /*FIPS_MODE */
+diff --git a/crypto/dh/dh_local.h b/crypto/dh/dh_local.h
+index 378cf5c957..2a200c748e 100644
+--- a/crypto/dh/dh_local.h
++++ b/crypto/dh/dh_local.h
+@@ -35,9 +35,9 @@ struct dh_st {
+     CRYPTO_REF_COUNT references;
+ #ifndef FIPS_MODE
+     CRYPTO_EX_DATA ex_data;
++    ENGINE *engine;
+ #endif
+     const DH_METHOD *meth;
+-    ENGINE *engine;
+     CRYPTO_RWLOCK *lock;
+ 
+     /* Provider data */
+diff --git a/crypto/evp/build.info b/crypto/evp/build.info
+index 71e0ebaf44..7f566b80ce 100644
+--- a/crypto/evp/build.info
++++ b/crypto/evp/build.info
+@@ -1,7 +1,7 @@
+ LIBS=../../libcrypto
+ $COMMON=digest.c evp_enc.c evp_lib.c evp_fetch.c cmeth_lib.c evp_utils.c \
+         mac_lib.c mac_meth.c keymgmt_meth.c keymgmt_lib.c kdf_lib.c kdf_meth.c \
+-        m_sigver.c pmeth_lib.c signature.c p_lib.c pmeth_gn.c
++        m_sigver.c pmeth_lib.c signature.c p_lib.c pmeth_gn.c exchange.c
+ 
+ SOURCE[../../libcrypto]=$COMMON\
+         encode.c evp_key.c evp_cnf.c \
+@@ -15,7 +15,7 @@ SOURCE[../../libcrypto]=$COMMON\
+         pkey_kdf.c e_old.c pmeth_fn.c\
+         e_aes_cbc_hmac_sha1.c e_aes_cbc_hmac_sha256.c e_rc4_hmac_md5.c \
+         e_chacha20_poly1305.c \
+-        pkey_mac.c exchange.c \
++        pkey_mac.c \
+         legacy_sha.c
+ 
+ IF[{- !$disabled{md2} -}]
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index 1f9e39be4c..1f87c59343 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -256,6 +256,9 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+      */
+     ERR_pop_to_mark();
+ 
++#ifdef FIPS_MODE
++    return 0;
++#else
+     if (ctx-&gt;pmeth == NULL || ctx-&gt;pmeth-&gt;derive == NULL) {
+         EVPerr(0, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+         return -2;
+@@ -267,11 +270,12 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+     if (ret &lt;= 0)
+         ctx-&gt;operation = EVP_PKEY_OP_UNDEFINED;
+     return ret;
++#endif
+ }
+ 
+ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ {
+-    int ret;
++    int ret = 0;
+     void *provkey = NULL;
+ 
+     if (ctx == NULL) {
+@@ -296,6 +300,9 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+     return ctx-&gt;op.kex.exchange-&gt;set_peer(ctx-&gt;op.kex.exchprovctx, provkey);
+ 
+  legacy:
++#ifdef FIPS_MODE
++    return ret;
++#else
+     if (ctx-&gt;pmeth == NULL
+         || !(ctx-&gt;pmeth-&gt;derive != NULL
+              || ctx-&gt;pmeth-&gt;encrypt != NULL
+@@ -356,6 +363,7 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ 
+     EVP_PKEY_up_ref(peer);
+     return 1;
++#endif
+ }
+ 
+ int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *pkeylen)
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index 24e2fdc9b6..e8bcb7e5a4 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -282,16 +282,16 @@ void evp_pkey_ctx_free_old_ops(EVP_PKEY_CTX *ctx)
+         EVP_SIGNATURE_free(ctx-&gt;op.sig.signature);
+         ctx-&gt;op.sig.sigprovctx = NULL;
+         ctx-&gt;op.sig.signature = NULL;
+-    }
+-/* TODO(3.0): add dependancies and uncomment this when available for fips mode */
+-#ifndef FIPS_MODE
+-    else if (EVP_PKEY_CTX_IS_DERIVE_OP(ctx)) {
++    } else if (EVP_PKEY_CTX_IS_DERIVE_OP(ctx)) {
+         if (ctx-&gt;op.kex.exchprovctx != NULL &amp;&amp; ctx-&gt;op.kex.exchange != NULL)
+             ctx-&gt;op.kex.exchange-&gt;freectx(ctx-&gt;op.kex.exchprovctx);
+         EVP_KEYEXCH_free(ctx-&gt;op.kex.exchange);
+         ctx-&gt;op.kex.exchprovctx = NULL;
+         ctx-&gt;op.kex.exchange = NULL;
+-    } else if (EVP_PKEY_CTX_IS_ASYM_CIPHER_OP(ctx)) {
++    }
++/* TODO(3.0): add dependancies and uncomment this when available for fips mode */
++#ifndef FIPS_MODE
++    else if (EVP_PKEY_CTX_IS_ASYM_CIPHER_OP(ctx)) {
+         if (ctx-&gt;op.ciph.ciphprovctx != NULL &amp;&amp; ctx-&gt;op.ciph.cipher != NULL)
+             ctx-&gt;op.ciph.cipher-&gt;freectx(ctx-&gt;op.ciph.ciphprovctx);
+         EVP_ASYM_CIPHER_free(ctx-&gt;op.ciph.cipher);
+diff --git a/include/crypto/dh.h b/include/crypto/dh.h
+new file mode 100644
+index 0000000000..4032bdc10e
+--- /dev/null
++++ b/include/crypto/dh.h
+@@ -0,0 +1,15 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/dh.h&gt;
++
++int dh_compute_key(OPENSSL_CTX *ctx, unsigned char *key, const BIGNUM *pub_key,
++                   DH *dh);
++int dh_compute_key_padded(OPENSSL_CTX *ctx, unsigned char *key,
++                          const BIGNUM *pub_key, DH *dh);
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index eeb1b1e1cf..0ed425bc22 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -26,6 +26,7 @@
+ #include &quot;internal/cryptlib.h&quot;
+ #include &quot;internal/property.h&quot;
+ #include &quot;internal/nelem.h&quot;
++#include &quot;internal/param_build.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/provider_ctx.h&quot;
+@@ -125,65 +126,80 @@ static OSSL_PARAM core_params[] =
+ };
+ 
+ /*
+- * This routine is currently necessary as bn params are currently processed
+- * using BN_native2bn when raw data is received. This means we need to do
+- * magic to reverse the order of the bytes to match native format.
+- * The array of hexdata is to get around compilers that dont like
++ * Convert a string into a bignumber.
++ * The array of hex_data is used to get around compilers that dont like
+  * strings longer than 509 bytes,
+  */
+-static int rawnative_fromhex(const char *hex_data[],
+-                             unsigned char **native, size_t *nativelen)
++static int hextobn(const char *hex_data[], BIGNUM **bn)
+ {
+     int ret = 0;
+-    unsigned char *data = NULL;
+-    BIGNUM *bn = NULL;
+-    int i, slen, datalen, sz;
++    int i, slen;
+     char *str = NULL;
+ 
++    /* Get the total length of the strings */
+     for (slen = 0, i = 0; hex_data[i] != NULL; ++i)
+         slen += strlen(hex_data[i]);
++
++    /* Add 1 for the string terminator */
+     str = OPENSSL_zalloc(slen + 1);
+     if (str == NULL)
+         return 0;
++
++    /* join the strings together into 1 buffer */
+     for (i = 0; hex_data[i] != NULL; ++i)
+         strcat(str, hex_data[i]);
+ 
+-    if (BN_hex2bn(&amp;bn, str) &lt;= 0)
+-        return 0;
++    if (BN_hex2bn(bn, str) &lt;= 0)
++        goto err;
++    ret = 1;
++err:
++    OPENSSL_free(str);
++    return ret;
++}
+ 
+-    datalen = slen / 2;
+-    data = (unsigned char *)str; /* reuse the str buffer */
++static int hextobin(const char *hex_data[], unsigned char **out, size_t *len)
++{
++    int ret = 0, sz;
++    BIGNUM *bn = NULL;
++    unsigned char *buf = NULL;
+ 
+-    sz = BN_bn2nativepad(bn, data, datalen);
+-    if (sz &lt;= 0)
++    if (!hextobn(hex_data, &amp;bn))
++        return 0;
++    sz = BN_num_bytes(bn);
++    buf = OPENSSL_zalloc(sz);
++    if (buf == NULL)
++        goto err;
++    if (BN_bn2binpad(bn, buf, sz) &lt;= 0)
+         goto err;
++
++    *out = buf;
++    *len = sz;
++    buf = NULL; /* Set to NULL so it is not freed */
+     ret = 1;
+-    *native = data;
+-    *nativelen = datalen;
+-    data = NULL; /* so it does not get freed */
+ err:
++    OPENSSL_free(buf);
+     BN_free(bn);
+-    OPENSSL_free(data);
+     return ret;
+ }
+ 
+-/* TODO(3.0): To be removed */
+-static int dummy_evp_call(void *provctx)
++#ifndef OPENSSL_NO_DSA
++static int dsa_key_signature_test(OPENSSL_CTX *libctx)
+ {
+-    OPENSSL_CTX *libctx = PROV_LIBRARY_CONTEXT_OF(provctx);
+-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+-    EVP_MD *sha256 = EVP_MD_fetch(libctx, &quot;SHA256&quot;, NULL);
+-    EVP_KDF *kdf = EVP_KDF_fetch(libctx, OSSL_KDF_NAME_PBKDF2, NULL);
++    int ret = 0;
++    BIGNUM *p = NULL, *q = NULL, *g = NULL;
++    BIGNUM *pub = NULL, *priv = NULL;
++    OSSL_PARAM *params = NULL, *params_sig = NULL;
++    OSSL_PARAM_BLD bld;
+     EVP_PKEY_CTX *sctx = NULL, *kctx = NULL;
+     EVP_PKEY *pkey = NULL;
+-    OSSL_PARAM *p;
+-    OSSL_PARAM params[16];
+     unsigned char sig[64];
+-    size_t siglen, sigdgstlen;
+-    unsigned char *dsa_p = NULL, *dsa_q = NULL, *dsa_g = NULL;
+-    unsigned char *dsa_pub = NULL, *dsa_priv = NULL;
+-    size_t dsa_p_len, dsa_q_len, dsa_g_len, dsa_pub_len, dsa_priv_len;
++    size_t siglen;
+ 
++    static const unsigned char dgst[SHA256_DIGEST_LENGTH] = {
++        0x7f, 0x83, 0xb1, 0x65, 0x7f, 0xf1, 0xfc, 0x53, 0xb9, 0x2d, 0xc1, 0x81,
++        0x48, 0xa1, 0xd6, 0x5d, 0xfc, 0x2d, 0x4b, 0x1f, 0xa3, 0xd6, 0x77, 0x28,
++        0x4a, 0xdd, 0xd2, 0x00, 0x12, 0x6d, 0x90, 0x69
++    };
+     /* dsa 2048 */
+     static const char *dsa_p_hex[] = {
+         &quot;a29b8872ce8b8423b7d5d21d4b02f57e03e9e6b8a258dc16611ba098ab543415&quot;
+@@ -226,14 +242,237 @@ static int dummy_evp_call(void *provctx)
+         &quot;6ccaeef6d73b4e80f11c17b8e9627c036635bac39423505e407e5cb7&quot;,
+         NULL
+     };
+-    char msg[] = &quot;Hello World!&quot;;
+-    const unsigned char exptd[] = {
+-        0x7f, 0x83, 0xb1, 0x65, 0x7f, 0xf1, 0xfc, 0x53, 0xb9, 0x2d, 0xc1, 0x81,
+-        0x48, 0xa1, 0xd6, 0x5d, 0xfc, 0x2d, 0x4b, 0x1f, 0xa3, 0xd6, 0x77, 0x28,
+-        0x4a, 0xdd, 0xd2, 0x00, 0x12, 0x6d, 0x90, 0x69
++
++    if (!hextobn(dsa_p_hex, &amp;p)
++        || !hextobn(dsa_q_hex, &amp;q)
++        || !hextobn(dsa_g_hex, &amp;g)
++        || !hextobn(dsa_pub_hex, &amp;pub)
++        || !hextobn(dsa_priv_hex, &amp;priv))
++        goto err;
++
++    ossl_param_bld_init(&amp;bld);
++    if (!ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_P, p)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_Q, q)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_G, g)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_DSA_PUB_KEY, pub)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_DSA_PRIV_KEY, priv))
++        goto err;
++    params = ossl_param_bld_to_param(&amp;bld);
++
++    /* Create a EVP_PKEY_CTX to load the DSA key into */
++    kctx = EVP_PKEY_CTX_new_from_name(libctx, SN_dsa, &quot;&quot;);
++    if (kctx == NULL || params == NULL)
++        goto err;
++    if (EVP_PKEY_key_fromdata_init(kctx) &lt;= 0
++        || EVP_PKEY_fromdata(kctx, &amp;pkey, params) &lt;= 0)
++        goto err;
++
++    /* Create a EVP_PKEY_CTX to use for the signing operation */
++    sctx = EVP_PKEY_CTX_new_from_pkey(libctx, pkey);
++    if (sctx == NULL
++        || EVP_PKEY_sign_init(sctx) &lt;= 0)
++        goto err;
++
++    /* set signature parameters */
++    ossl_param_bld_init(&amp;bld);
++    if (!ossl_param_bld_push_utf8_string(&amp;bld, OSSL_SIGNATURE_PARAM_DIGEST,
++                                         SN_sha256,strlen(SN_sha256) + 1)
++        || !ossl_param_bld_push_size_t(&amp;bld, OSSL_SIGNATURE_PARAM_DIGEST_SIZE,
++                                       SHA256_DIGEST_LENGTH))
++        goto err;
++    params_sig = ossl_param_bld_to_param(&amp;bld);
++    if (EVP_PKEY_CTX_set_params(sctx, params_sig) &lt;= 0)
++        goto err;
++
++    if (EVP_PKEY_sign(sctx, sig, &amp;siglen, dgst, sizeof(dgst)) &lt;= 0
++        || EVP_PKEY_verify_init(sctx) &lt;= 0
++        || EVP_PKEY_verify(sctx, sig, siglen, dgst, sizeof(dgst)) &lt;= 0)
++        goto err;
++    ret = 1;
++err:
++    ossl_param_bld_free(params);
++    ossl_param_bld_free(params_sig);
++    BN_free(p);
++    BN_free(q);
++    BN_free(g);
++    BN_free(pub);
++    BN_free(priv);
++    EVP_PKEY_free(pkey);
++    EVP_PKEY_CTX_free(kctx);
++    EVP_PKEY_CTX_free(sctx);
++    return ret;
++}
++#endif /* OPENSSL_NO_DSA */
++
++#ifndef OPENSSL_NO_DH
++static int dh_key_exchange_test(OPENSSL_CTX *libctx)
++{
++    int ret = 0;
++    BIGNUM *p = NULL, *q = NULL, *g = NULL;
++    BIGNUM *pub = NULL, *priv = NULL, *pub_peer = NULL;
++    unsigned char *kat_secret = NULL;
++    EVP_PKEY_CTX *kactx = NULL, *dctx = NULL;
++    EVP_PKEY *pkey = NULL, *peerkey = NULL;
++    OSSL_PARAM *params = NULL;
++    OSSL_PARAM *params_peer = NULL;
++    unsigned char secret[256];
++    size_t secret_len, kat_secret_len = 0;
++    OSSL_PARAM_BLD bld;
++
++    /* DH KAT */
++    static const char *dh_p_hex[] = {
++        &quot;dcca1511b2313225f52116e1542789e001f0425bccc7f366f7406407f1c9fa8b&quot;
++        &quot;e610f1778bb170be39dbb76f85bf24ce6880adb7629f7c6d015e61d43fa3ee4d&quot;
++        &quot;e185f2cfd041ffde9d418407e15138bb021daeb35f762d1782acc658d32bd4b0&quot;
++        &quot;232c927dd38fa097b3d1859fa8acafb98f066608fc644ec7ddb6f08599f92ac1&quot;,
++        &quot;b59825da8432077def695646063c20823c9507ab6f0176d4730d990dbbe6361c&quot;
++        &quot;d8b2b94d3d2f329b82099bd661f42950f403df3ede62a33188b02798ba823f44&quot;
++        &quot;b946fe9df677a0c5a1238eaa97b70f80da8cac88e092b1127060ffbf45579994&quot;
++        &quot;011dc2faa5e7f6c76245e1cc312231c17d1ca6b19007ef0db99f9cb60e1d5f69&quot;,
++        NULL
++    };
++    static const char *dh_q_hex[] = {
++        &quot;898b226717ef039e603e82e5c7afe48374ac5f625c54f1ea11acb57d&quot;,
++        NULL
++    };
++    static const char *dh_g_hex[] = {
++        &quot;5ef7b88f2df60139351dfbfe1266805fdf356cdfd13a4da0050c7ede&quot;
++        &quot;246df59f6abf96ade5f2b28ffe88d6bce7f7894a3d535fc82126ddd4&quot;
++        &quot;24872e16b838df8c51e9016f889c7c203e98a8b631f9c72563d38a49&quot;
++        &quot;589a0753d358e783318cefd9677c7b2dbb77d6dce2a1963795ca64b9&quot;,
++        &quot;2d1c9aac6d0e8d431de5e50060dff78689c9eca1c1248c16ed09c7ad&quot;,
++        &quot;412a17406d2b525aa1cabb237b9734ec7b8ce3fae02f29c5efed30d6&quot;
++        &quot;9187da109c2c9fe2aadbb0c22af54c616655000c431c6b4a379763b0&quot;
++        &quot;a91658efc84e8b06358c8b4f213710fd10172cf39b830c2dd84a0c8a&quot;
++        &quot;b82516ecab995fa4215e023e4ecf8074c39d6c88b70d1ee4e96fdc20&quot;,
++        &quot;ea115c32&quot;,
++        NULL
+     };
+-    unsigned int dgstlen = 0;
++    static const char *dh_priv_hex[] = {
++        &quot;1433e0b5a917b60a3023f2f8aa2c2d70d2968aba9aeac81540b8fce6&quot;,
++        NULL
++    };
++    static const char *dh_pub_hex[] = {
++        &quot;95dd338d29e5710492b918317b72a36936e1951a2ee5a5591699c048&quot;
++        &quot;6d0d4f9bdd6d5a3f6b98890c62b37652d36e712111e68a7355372506&quot;
++        &quot;99efe330537391fbc2c548bc5ac3e5b23386c3eef5eb43c099d70a52&quot;
++        &quot;02687e83964248fca91f40908e8fb3319315f6d2606d7f7cd52cc6e7&quot;,
++        &quot;c5843afb22519cf0f0f9d3a0a4e8c88899efede7364351fb6a363ee7&quot;
++        &quot;17e5445adab4c931a6483997b87dad83677e4d1d3a7775e0f6d00fdf&quot;
++        &quot;73c7ad801e665a0e5a796d0a0380a19fa182efc8a04f5e4db90d1a86&quot;
++        &quot;37f95db16436bdc8f3fc096c4ff7f234be8fef479ac4b0dc4b77263e&quot;,
++        &quot;07d9959de0f1bf3f0ae3d9d50e4b89c99e3ea1217343dd8c6581acc4&quot;
++        &quot;959c91d3&quot;,
++        NULL
++    };
++    static const char *dh_peer_pub_hex[] = {
++        &quot;1fc1da341d1a846a96b7be24340f877dd010aa0356d5ad58aae9c7b0&quot;
++        &quot;8f749a32235110b5d88eb5dbfa978d27ecc530f02d3114005b64b1c0&quot;
++        &quot;e024cb8ae21698bca9e60d42808622f181c56e1de7a96e6efee9d665&quot;
++        &quot;67e91b977042c7e3d0448f05fb77f522b9bfc8d33cc3c31ed3b31f0f&quot;,
++        &quot;ecb6db4f6ea311e77afdbcd47aee1bb150f216873578fb96468e8f9f&quot;
++        &quot;3de8efbfce75624b1df05322a34f1463e839e8984c4ad0a96e1ac842&quot;
++        &quot;e5318cc23c062a8ca171b8d575980dde7fc56f1536523820d43192bf&quot;
++        &quot;d51e8e228978aca5b94472f339caeb9931b42be301268bc99789c9b2&quot;,
++        &quot;5571c3c0e4cb3f007f1a511cbb53c8519cdd1302abca6c0f34f96739&quot;
++        &quot;f17ff48b&quot;,
++        NULL
++    };
++    static const char *dh_secret_exptd_hex[] = {
++        &quot;08ff33bb2ecff49a7d4a7912aeb1bb6ab511641b4a76770c8cc1bcc2&quot;
++        &quot;33343dfe700d11813d2c9ed23b211ca9e8786921edca283c68b16153&quot;
++        &quot;fa01e91ab82c90ddab4a95816770a98710e14c92ab83b6e46e1e426e&quot;
++        &quot;e852430d6187daa3720a6bcd73235c6b0f941f3364f50420551a4bfe&quot;,
++        &quot;afe2bc438505a59a4a40daca7a895a73db575c74c13a23ad8832957d&quot;
++        &quot;582d38f0a6165fb0d7e9b8799e42fd3220e332e98185a0c9429757b2&quot;
++        &quot;d0d02c17dbaa1ff6ed93d7e73e241eaed90caf394d2bc6570f18c81f&quot;
++        &quot;2be5d01a2ca99ff142b5d963f9f500325e7556f95849b3ffc7479486&quot;,
++        &quot;be1d4596a3106bd5cb4f61c57ec5f100fb7a0c82a10b82526a97d1d9&quot;
++        &quot;7d98eaf6&quot;,
++        NULL
++    };
++
++    if (!hextobn(dh_p_hex, &amp;p)
++        || !hextobn(dh_q_hex, &amp;q)
++        || !hextobn(dh_g_hex, &amp;g)
++        || !hextobn(dh_pub_hex, &amp;pub)
++        || !hextobn(dh_priv_hex, &amp;priv)
++        || !hextobn(dh_peer_pub_hex, &amp;pub_peer)
++        || !hextobin(dh_secret_exptd_hex, &amp;kat_secret, &amp;kat_secret_len))
++        goto err;
++
++    ossl_param_bld_init(&amp;bld);
++    if (!ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_P, p)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_Q, q)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_G, g)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_DH_PUB_KEY, pub)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_DH_PRIV_KEY, priv))
++        goto err;
++    params = ossl_param_bld_to_param(&amp;bld);
++
++    ossl_param_bld_init(&amp;bld);
++    if (!ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_P, p)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_Q, q)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_FFC_G, g)
++        || !ossl_param_bld_push_BN(&amp;bld, OSSL_PKEY_PARAM_DH_PUB_KEY, pub_peer))
++        goto err;
++
++    params_peer = ossl_param_bld_to_param(&amp;bld);
++    if (params == NULL || params_peer == NULL)
++        goto err;
++
++    /* Create a EVP_PKEY_CTX to load the DH keys into */
++    kactx = EVP_PKEY_CTX_new_from_name(libctx, &quot;DH&quot;, &quot;&quot;);
++    if (kactx == NULL)
++        goto err;
++    if (EVP_PKEY_key_fromdata_init(kactx) &lt;= 0
++        || EVP_PKEY_fromdata(kactx, &amp;pkey, params) &lt;= 0)
++        goto err;
++    if (EVP_PKEY_key_fromdata_init(kactx) &lt;= 0
++        || EVP_PKEY_fromdata(kactx, &amp;peerkey, params_peer) &lt;= 0)
++        goto err;
++
++    /* Create a EVP_PKEY_CTX to perform key derivation */
++    dctx = EVP_PKEY_CTX_new_from_pkey(libctx, pkey);
++    if (dctx == NULL)
++        goto err;
++
++    if (EVP_PKEY_derive_init(dctx) &lt;= 0
++        || EVP_PKEY_derive_set_peer(dctx, peerkey) &lt;= 0
++        || EVP_PKEY_derive(dctx, secret, &amp;secret_len) &lt;= 0)
++        goto err;
++
++    if (secret_len != kat_secret_len
++        || memcmp(secret, kat_secret, secret_len) != 0)
++        goto err;
++    ret = 1;
++err:
++    ossl_param_bld_free(params_peer);
++    ossl_param_bld_free(params);
++    BN_free(p);
++    BN_free(q);
++    BN_free(g);
++    BN_free(pub);
++    BN_free(priv);
++    BN_free(pub_peer);
++    OPENSSL_free(kat_secret);
++    EVP_PKEY_free(pkey);
++    EVP_PKEY_free(peerkey);
++    EVP_PKEY_CTX_free(kactx);
++    EVP_PKEY_CTX_free(dctx);
++    return ret;
++}
++#endif /* OPENSSL_NO_DH */
++
++/* TODO(3.0): To be removed */
++static int dummy_evp_call(void *provctx)
++{
++    OPENSSL_CTX *libctx = PROV_LIBRARY_CONTEXT_OF(provctx);
++    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
++    EVP_MD *sha256 = EVP_MD_fetch(libctx, &quot;SHA256&quot;, NULL);
++    EVP_KDF *kdf = EVP_KDF_fetch(libctx, OSSL_KDF_NAME_PBKDF2, NULL);
+     unsigned char dgst[SHA256_DIGEST_LENGTH];
++    unsigned int dgstlen;
+     int ret = 0;
+     BN_CTX *bnctx = NULL;
+     BIGNUM *a = NULL, *b = NULL;
+@@ -243,6 +482,13 @@ static int dummy_evp_call(void *provctx)
+     EC_KEY *key = NULL;
+ #endif
+ 
++    static const char msg[] = &quot;Hello World!&quot;;
++    static const unsigned char exptd[] = {
++        0x7f, 0x83, 0xb1, 0x65, 0x7f, 0xf1, 0xfc, 0x53, 0xb9, 0x2d, 0xc1, 0x81,
++        0x48, 0xa1, 0xd6, 0x5d, 0xfc, 0x2d, 0x4b, 0x1f, 0xa3, 0xd6, 0x77, 0x28,
++        0x4a, 0xdd, 0xd2, 0x00, 0x12, 0x6d, 0x90, 0x69
++    };
++
+     if (ctx == NULL || sha256 == NULL || drbg == NULL || kdf == NULL)
+         goto err;
+ 
+@@ -284,54 +530,17 @@ static int dummy_evp_call(void *provctx)
+     if (!EC_KEY_generate_key(key))
+         goto err;
+ #endif
+-    if (!rawnative_fromhex(dsa_p_hex, &amp;dsa_p, &amp;dsa_p_len)
+-            || !rawnative_fromhex(dsa_q_hex, &amp;dsa_q, &amp;dsa_q_len)
+-            || !rawnative_fromhex(dsa_g_hex, &amp;dsa_g, &amp;dsa_g_len)
+-            || !rawnative_fromhex(dsa_pub_hex, &amp;dsa_pub, &amp;dsa_pub_len)
+-            || !rawnative_fromhex(dsa_priv_hex, &amp;dsa_priv, &amp;dsa_priv_len))
+-        goto err;
+-
+-    p = params;
+-    *p++ = OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_FFC_P, dsa_p, dsa_p_len);
+-    *p++ = OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_FFC_Q, dsa_q, dsa_q_len);
+-    *p++ = OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_FFC_G, dsa_g, dsa_g_len);
+-    *p++ = OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_DSA_PUB_KEY,
+-                                   dsa_pub, dsa_pub_len);
+-    *p++ = OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_DSA_PRIV_KEY,
+-                                   dsa_priv, dsa_priv_len);
+-    *p = OSSL_PARAM_construct_end();
+-
+-    kctx = EVP_PKEY_CTX_new_from_name(libctx, SN_dsa, &quot;&quot;);
+-    if (kctx == NULL)
+-        goto err;
+-    if (EVP_PKEY_key_fromdata_init(kctx) &lt;= 0
+-            || EVP_PKEY_fromdata(kctx, &amp;pkey, params) &lt;= 0)
+-        goto err;
+ 
+-    sctx = EVP_PKEY_CTX_new_from_pkey(libctx, pkey);
+-    if (sctx == NULL)
+-        goto err;;
+-
+-    if (EVP_PKEY_sign_init(sctx) &lt;= 0)
++#ifndef OPENSSL_NO_DSA
++    if (!dsa_key_signature_test(libctx))
+         goto err;
++#endif
+ 
+-    /* set signature parameters */
+-    sigdgstlen = SHA256_DIGEST_LENGTH;
+-    p = params;
+-    *p++ = OSSL_PARAM_construct_utf8_string(OSSL_SIGNATURE_PARAM_DIGEST,
+-                                            SN_sha256,
+-                                            strlen(SN_sha256) + 1);
+-
+-    *p++ = OSSL_PARAM_construct_size_t(OSSL_SIGNATURE_PARAM_DIGEST_SIZE,
+-                                       &amp;sigdgstlen);
+-    *p = OSSL_PARAM_construct_end();
+-    if (EVP_PKEY_CTX_set_params(sctx, params) &lt;= 0)
++#ifndef OPENSSL_NO_DH
++    if (!dh_key_exchange_test(libctx))
+         goto err;
++#endif /* OPENSSL_NO_DH */
+ 
+-    if (EVP_PKEY_sign(sctx, sig, &amp;siglen, dgst, sizeof(dgst)) &lt;= 0
+-            || EVP_PKEY_verify_init(sctx) &lt;= 0
+-            || EVP_PKEY_verify(sctx, sig, siglen, dgst, sizeof(dgst)) &lt;= 0)
+-        goto err;
+     ret = 1;
+  err:
+     BN_CTX_end(bnctx);
+@@ -344,14 +553,6 @@ static int dummy_evp_call(void *provctx)
+ #ifndef OPENSSL_NO_EC
+     EC_KEY_free(key);
+ #endif
+-    OPENSSL_free(dsa_p);
+-    OPENSSL_free(dsa_q);
+-    OPENSSL_free(dsa_g);
+-    OPENSSL_free(dsa_pub);
+-    OPENSSL_free(dsa_priv);
+-    EVP_PKEY_free(pkey);
+-    EVP_PKEY_CTX_free(kctx);
+-    EVP_PKEY_CTX_free(sctx);
+     return ret;
+ }
+ 
+@@ -588,6 +789,13 @@ static const OSSL_ALGORITHM fips_kdfs[] = {
+     { NULL, NULL, NULL }
+ };
+ 
++static const OSSL_ALGORITHM fips_keyexch[] = {
++#ifndef OPENSSL_NO_DH
++    { &quot;DH:dhKeyAgreement&quot;, &quot;fips=yes&quot;, dh_keyexch_functions },
++#endif
++    { NULL, NULL, NULL }
++};
++
+ static const OSSL_ALGORITHM fips_signature[] = {
+ #ifndef OPENSSL_NO_DSA
+     { &quot;DSA:dsaEncryption&quot;, &quot;fips=yes&quot;, dsa_signature_functions },
+@@ -596,6 +804,9 @@ static const OSSL_ALGORITHM fips_signature[] = {
+ };
+ 
+ static const OSSL_ALGORITHM fips_keymgmt[] = {
++#ifndef OPENSSL_NO_DH
++    { &quot;DH:dhKeyAgreement&quot;, &quot;fips=yes&quot;, dh_keymgmt_functions },
++#endif
+ #ifndef OPENSSL_NO_DSA
+     { &quot;DSA&quot;, &quot;fips=yes&quot;, dsa_keymgmt_functions },
+ #endif
+@@ -619,6 +830,8 @@ static const OSSL_ALGORITHM *fips_query(OSSL_PROVIDER *prov,
+         return fips_kdfs;
+     case OSSL_OP_KEYMGMT:
+         return fips_keymgmt;
++    case OSSL_OP_KEYEXCH:
++        return fips_keyexch;
+     case OSSL_OP_SIGNATURE:
+         return fips_signature;
+     }
+diff --git a/providers/implementations/exchange/dh_exch.c b/providers/implementations/exchange/dh_exch.c
+index 1b16a83245..94c232965f 100644
+--- a/providers/implementations/exchange/dh_exch.c
++++ b/providers/implementations/exchange/dh_exch.c
+@@ -13,6 +13,8 @@
+ #include &lt;openssl/dh.h&gt;
+ #include &lt;openssl/params.h&gt;
+ #include &quot;prov/implementations.h&quot;
++#include &quot;prov/provider_ctx.h&quot;
++#include &quot;crypto/dh.h&quot;
+ 
+ static OSSL_OP_keyexch_newctx_fn dh_newctx;
+ static OSSL_OP_keyexch_init_fn dh_init;
+@@ -30,6 +32,7 @@ static OSSL_OP_keyexch_settable_ctx_params_fn dh_settable_ctx_params;
+  */
+ 
+ typedef struct {
++    OPENSSL_CTX *libctx;
+     DH *dh;
+     DH *dhpeer;
+     unsigned int pad : 1;
+@@ -37,7 +40,12 @@ typedef struct {
+ 
+ static void *dh_newctx(void *provctx)
+ {
+-    return OPENSSL_zalloc(sizeof(PROV_DH_CTX));
++    PROV_DH_CTX *pdhctx = OPENSSL_zalloc(sizeof(PROV_DH_CTX));
++
++    if (pdhctx == NULL)
++        return NULL;
++    pdhctx-&gt;libctx = PROV_LIBRARY_CONTEXT_OF(provctx);
++    return pdhctx;
+ }
+ 
+ static int dh_init(void *vpdhctx, void *vdh)
+@@ -83,8 +91,10 @@ static int dh_derive(void *vpdhctx, unsigned char *secret, size_t *secretlen,
+         return 0;
+ 
+     DH_get0_key(pdhctx-&gt;dhpeer, &amp;pub_key, NULL);
+-    ret = (pdhctx-&gt;pad) ? DH_compute_key_padded(secret, pub_key, pdhctx-&gt;dh)
+-                        : DH_compute_key(secret, pub_key, pdhctx-&gt;dh);
++    if (pdhctx-&gt;pad)
++        ret = dh_compute_key_padded(pdhctx-&gt;libctx, secret, pub_key, pdhctx-&gt;dh);
++    else
++        ret = dh_compute_key(pdhctx-&gt;libctx, secret, pub_key, pdhctx-&gt;dh);
+     if (ret &lt;= 0)
+         return 0;
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027195.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027200.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27197">[ date ]</a>
+              <a href="thread.html#27197">[ thread ]</a>
+              <a href="subject.html#27197">[ subject ]</a>
+              <a href="author.html#27197">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

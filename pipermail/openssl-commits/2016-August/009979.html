@@ -1,0 +1,418 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471815284.908745.26366.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009973.html">
+   <LINK REL="Next"  HREF="009988.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471815284.908745.26366.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Sun Aug 21 21:34:44 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009973.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009988.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9979">[ date ]</a>
+              <a href="thread.html#9979">[ thread ]</a>
+              <a href="subject.html#9979">[ subject ]</a>
+              <a href="author.html#9979">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e6ed2b9108830b23cda5632a4940b7f718f58676 (commit)
+       via  c1a7dcbe16c6bff38390db1964b76c16b6802c7d (commit)
+      from  2e929e538caee6be857ae78ed4e03404857a074a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e6ed2b9108830b23cda5632a4940b7f718f58676
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sun Aug 21 23:31:21 2016 +0200
+
+    Add test/bio_enc_test.c.
+    
+    RT#4628
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit c1a7dcbe16c6bff38390db1964b76c16b6802c7d
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sun Aug 21 23:30:37 2016 +0200
+
+    evp/bio_enc.c: refine non-overlapping logic.
+    
+    RT#4628
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/bio_enc.c                               |  69 ++++++----
+ test/bio_enc_test.c                                | 140 +++++++++++++++++++++
+ test/build.info                                    |   6 +-
+ .../{01-test_sanity.t =&gt; 90-test_bio_enc.t}        |   2 +-
+ 4 files changed, 188 insertions(+), 29 deletions(-)
+ create mode 100644 test/bio_enc_test.c
+ copy test/recipes/{01-test_sanity.t =&gt; 90-test_bio_enc.t} (86%)
+
+diff --git a/crypto/evp/bio_enc.c b/crypto/evp/bio_enc.c
+index 47d0384..e3aaadb 100644
+--- a/crypto/evp/bio_enc.c
++++ b/crypto/evp/bio_enc.c
+@@ -27,7 +27,8 @@ static int enc_new(BIO *h);
+ static int enc_free(BIO *data);
+ static long enc_callback_ctrl(BIO *h, int cmd, bio_info_cb *fps);
+ #define ENC_BLOCK_SIZE  (1024*4)
+-#define BUF_OFFSET      (EVP_MAX_BLOCK_LENGTH*2)
++#define ENC_MIN_CHUNK   (256)
++#define BUF_OFFSET      (ENC_MIN_CHUNK + EVP_MAX_BLOCK_LENGTH)
+ 
+ typedef struct enc_struct {
+     int buf_len;
+@@ -36,11 +37,12 @@ typedef struct enc_struct {
+     int finished;
+     int ok;                     /* bad decrypt */
+     EVP_CIPHER_CTX *cipher;
++    unsigned char *read_start, *read_end;
+     /*
+      * buf is larger than ENC_BLOCK_SIZE because EVP_DecryptUpdate can return
+      * up to a block more data than is presented to it
+      */
+-    unsigned char buf[ENC_BLOCK_SIZE + BUF_OFFSET + 2];
++    unsigned char buf[BUF_OFFSET + ENC_BLOCK_SIZE];
+ } BIO_ENC_CTX;
+ 
+ static const BIO_METHOD methods_enc = {
+@@ -75,6 +77,7 @@ static int enc_new(BIO *bi)
+     }
+     ctx-&gt;cont = 1;
+     ctx-&gt;ok = 1;
++    ctx-&gt;read_end = ctx-&gt;read_start = &amp;(ctx-&gt;buf[BUF_OFFSET]);
+     BIO_set_data(bi, ctx);
+     BIO_set_init(bi, 1);
+ 
+@@ -102,7 +105,7 @@ static int enc_free(BIO *a)
+ 
+ static int enc_read(BIO *b, char *out, int outl)
+ {
+-    int ret = 0, i;
++    int ret = 0, i, blocksize;
+     BIO_ENC_CTX *ctx;
+     BIO *next;
+ 
+@@ -130,27 +133,24 @@ static int enc_read(BIO *b, char *out, int outl)
+         }
+     }
+ 
++    blocksize = EVP_CIPHER_CTX_block_size(ctx-&gt;cipher);
++    if (blocksize == 1)
++        blocksize = 0;
++
+     /*
+      * At this point, we have room of outl bytes and an empty buffer, so we
+      * should read in some more.
+      */
+ 
+     while (outl &gt; 0) {
+-        int buf_len;
+-
+         if (ctx-&gt;cont &lt;= 0)
+             break;
+ 
+-        buf_len = outl + EVP_MAX_BLOCK_LENGTH - 1;
+-        buf_len -= buf_len % EVP_MAX_BLOCK_LENGTH;
+-        if (buf_len &gt; ENC_BLOCK_SIZE) {
+-            buf_len = ENC_BLOCK_SIZE;
++        if (ctx-&gt;read_start == ctx-&gt;read_end) { /* time to read more data */
++            ctx-&gt;read_end = ctx-&gt;read_start = &amp;(ctx-&gt;buf[BUF_OFFSET]);
++            ctx-&gt;read_end += BIO_read(next, ctx-&gt;read_start, ENC_BLOCK_SIZE);
+         }
+-
+-        /*
+-         * read in at IV offset, read the EVP_Cipher documentation about why
+-         */
+-        i = BIO_read(next, &amp;(ctx-&gt;buf[BUF_OFFSET]), buf_len);
++        i = ctx-&gt;read_end - ctx-&gt;read_start;
+ 
+         if (i &lt;= 0) {
+             /* Should be continue next time we are called? */
+@@ -164,26 +164,41 @@ static int enc_read(BIO *b, char *out, int outl)
+                 ret = (ret == 0) ? i : ret;
+                 break;
+             }
+-        } else if (outl &gt;= EVP_MAX_BLOCK_LENGTH) {
+-            if (!EVP_CipherUpdate(ctx-&gt;cipher,
+-                                  (unsigned char *)out, &amp;buf_len,
+-                                  &amp;(ctx-&gt;buf[BUF_OFFSET]), i)) {
+-                BIO_clear_retry_flags(b);
+-                return 0;
+-            }
+-            ret += buf_len;
+-            outl -= buf_len;
+-            out += buf_len;
+-
+-            continue;
+         } else {
++            if (outl &gt; ENC_MIN_CHUNK) {
++                /*
++                 * Depending on flags block cipher decrypt can write
++                 * one extra block and then back off, i.e. output buffer
++                 * has to accommodate extra block...
++                 */
++                int j = outl - blocksize, buf_len;
++
++                if (!EVP_CipherUpdate(ctx-&gt;cipher,
++                                      (unsigned char *)out, &amp;buf_len,
++                                      ctx-&gt;read_start, i &gt; j ? j : i)) {
++                    BIO_clear_retry_flags(b);
++                    return 0;
++                }
++                ret += buf_len;
++                out += buf_len;
++                outl -= buf_len;
++
++                if ((i -= j) &lt;= 0) {
++                    ctx-&gt;read_start = ctx-&gt;read_end;
++                    continue;
++                }
++                ctx-&gt;read_start += j;
++            }
++            if (i &gt; ENC_MIN_CHUNK)
++                i = ENC_MIN_CHUNK;
+             if (!EVP_CipherUpdate(ctx-&gt;cipher,
+                                   ctx-&gt;buf, &amp;ctx-&gt;buf_len,
+-                                  &amp;(ctx-&gt;buf[BUF_OFFSET]), i)) {
++                                  ctx-&gt;read_start, i)) {
+                 BIO_clear_retry_flags(b);
+                 ctx-&gt;ok = 0;
+                 return 0;
+             }
++            ctx-&gt;read_start += i;
+             ctx-&gt;cont = 1;
+             /*
+              * Note: it is possible for EVP_CipherUpdate to decrypt zero
+diff --git a/test/bio_enc_test.c b/test/bio_enc_test.c
+new file mode 100644
+index 0000000..ce55318
+--- /dev/null
++++ b/test/bio_enc_test.c
+@@ -0,0 +1,140 @@
++/*
++ * Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &lt;openssl/bio.h&gt;
++
++int main()
++{
++    BIO *b;
++    static const unsigned char key[16] = { 0 };
++    static unsigned char inp[1024] = { 0 };
++    unsigned char out[1024], ref[1024];
++    int i, lref, len;
++
++    b = BIO_new(BIO_f_cipher());
++    if (!BIO_set_cipher(b, EVP_camellia_128_ctr(), key, NULL, 0))
++        return -1;
++    BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++    lref = BIO_read(b, inp, sizeof(inp));
++    BIO_free_all(b);
++
++    /*
++     * Exercise CBC cipher
++     */
++
++    /* reference output for single-chunk operation */
++    b = BIO_new(BIO_f_cipher());
++    if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++        return -1;
++    BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++    lref = BIO_read(b, ref, sizeof(ref));
++    BIO_free_all(b);
++
++    /* perform split operations and compare to reference */
++    for (i = 1; i &lt; lref; i++) {
++        b = BIO_new(BIO_f_cipher());
++        if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++             return -1;
++        BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++        memset(out, 0, sizeof(out));
++        out[i] = ~ref[i];
++        len = BIO_read(b, out, i);
++        /* check for overstep */
++        if (out[i] != (unsigned char)~ref[i]) {
++            fprintf(stderr, &quot;CBC output overstep@%d\n&quot;, i);
++            return 1;
++        }
++        len += BIO_read(b, out + len, sizeof(out) - len);
++        BIO_free_all(b);
++
++        if (len != lref || memcmp(out, ref, len)) {
++            fprintf(stderr, &quot;CBC output mismatch@%d\n&quot;, i);
++            return 2;
++        }
++    }
++
++    /* perform small-chunk operations and compare to reference */
++    for (i = 1; i &lt; lref / 2; i++) {
++        int delta;
++
++        b = BIO_new(BIO_f_cipher());
++        if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++             return -1;
++        BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++        memset(out, 0, sizeof(out));
++        for (len = 0; (delta = BIO_read(b, out + len, i)); ) {
++            len += delta;
++        }
++        BIO_free_all(b);
++
++        if (len != lref || memcmp(out, ref, len)) {
++            fprintf(stderr, &quot;CBC output mismatch@%d\n&quot;, i);
++            return 3;
++        }
++    }
++
++    /*
++     * Exercise CTR cipher
++     */
++
++    /* reference output for single-chunk operation */
++    b = BIO_new(BIO_f_cipher());
++    if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++         return -1;
++    BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++    lref = BIO_read(b, ref, sizeof(ref));
++    BIO_free_all(b);
++
++    /* perform split operations and compare to reference */
++    for (i = 1; i &lt; lref; i++) {
++        b = BIO_new(BIO_f_cipher());
++        if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++             return -1;
++        BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++        memset(out, 0, sizeof(out));
++        out[i] = ~ref[i];
++        len = BIO_read(b, out, i);
++        /* check for overstep */
++        if (out[i] != (unsigned char)~ref[i]) {
++            fprintf(stderr, &quot;CTR output overstep@%d\n&quot;, i);
++            return 4;
++        }
++        len += BIO_read(b, out + len, sizeof(out) - len);
++        BIO_free_all(b);
++
++        if (len != lref || memcmp(out, ref, len)) {
++            fprintf(stderr, &quot;CTR output mismatch@%d\n&quot;, i);
++            return 5;
++        }
++    }
++
++    /* perform small-chunk operations and compare to reference */
++    for (i = 1; i &lt; lref / 2; i++) {
++        int delta;
++
++        b = BIO_new(BIO_f_cipher());
++        if (!BIO_set_cipher(b, EVP_aes_128_cbc(), key, NULL, 0))
++             return -1;
++        BIO_push(b, BIO_new_mem_buf(inp, sizeof(inp)));
++        memset(out, 0, sizeof(out));
++        for (len = 0; (delta = BIO_read(b, out + len, i)); ) {
++            len += delta;
++        }
++        BIO_free_all(b);
++
++        if (len != lref || memcmp(out, ref, len)) {
++            fprintf(stderr, &quot;CTR output mismatch@%d\n&quot;, i);
++            return 6;
++        }
++    }
++
++    return 0;
++}
+diff --git a/test/build.info b/test/build.info
+index ec450c2..b8fc431 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -16,7 +16,7 @@ IF[{- !$disabled{tests} -}]
+           packettest asynctest secmemtest srptest memleaktest \
+           dtlsv1listentest ct_test threadstest afalgtest d2i_test \
+           ssl_test_ctx_test ssl_test x509aux cipherlist_test asynciotest \
+-          bioprinttest sslapitest dtlstest
++          bioprinttest sslapitest dtlstest bio_enc_test
+ 
+   SOURCE[aborttest]=aborttest.c
+   INCLUDE[aborttest]=../include
+@@ -270,6 +270,10 @@ IF[{- !$disabled{tests} -}]
+   SOURCE[dtlstest]=dtlstest.c ssltestlib.c testutil.c
+   INCLUDE[dtlstest]=../include .
+   DEPEND[dtlstest]=../libcrypto ../libssl
++
++  SOURCE[bio_enc_test]=bio_enc_test.c
++  INCLUDE[bio_enc_test]=../include
++  DEPEND[bio_enc_test]=../libcrypto
+ ENDIF
+ 
+ {-
+diff --git a/test/recipes/01-test_sanity.t b/test/recipes/90-test_bio_enc.t
+similarity index 86%
+copy from test/recipes/01-test_sanity.t
+copy to test/recipes/90-test_bio_enc.t
+index f01466d..aa7e42a 100644
+--- a/test/recipes/01-test_sanity.t
++++ b/test/recipes/90-test_bio_enc.t
+@@ -9,4 +9,4 @@
+ 
+ use OpenSSL::Test::Simple;
+ 
+-simple_test(&quot;test_sanity&quot;, &quot;sanitytest&quot;);
++simple_test(&quot;test_bio_enc&quot;, &quot;bio_enc_test&quot;, &quot;bio_enc&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009973.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009988.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9979">[ date ]</a>
+              <a href="thread.html#9979">[ thread ]</a>
+              <a href="subject.html#9979">[ subject ]</a>
+              <a href="author.html#9979">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

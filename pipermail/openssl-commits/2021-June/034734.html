@@ -1,0 +1,261 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623850394.952203.20580.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034733.html">
+   <LINK REL="Next"  HREF="034735.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623850394.952203.20580.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Jun 16 13:33:14 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034733.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034735.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34734">[ date ]</a>
+              <a href="thread.html#34734">[ thread ]</a>
+              <a href="subject.html#34734">[ subject ]</a>
+              <a href="author.html#34734">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  eefdb8e013fa9d0881566b41291c5725a77b332a (commit)
+      from  6882652e65d39310c98ba506ceb55a87c702d419 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit eefdb8e013fa9d0881566b41291c5725a77b332a
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Tue Jun 15 13:00:38 2021 +0200
+
+    X509_digest_sig(): Improve default hash for EdDSA and allow to return the chosen default
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15762">https://github.com/openssl/openssl/pull/15762</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/lib/cmp_mock_srv.c   |  2 +-
+ crypto/cmp/cmp_msg.c      |  7 ++++---
+ crypto/x509/x_all.c       | 40 ++++++++++++++++++++++++++++++++--------
+ doc/man3/X509_digest.pod  | 29 +++++++++++++++++++----------
+ include/openssl/x509.h.in |  3 ++-
+ 5 files changed, 58 insertions(+), 23 deletions(-)
+
+diff --git a/apps/lib/cmp_mock_srv.c b/apps/lib/cmp_mock_srv.c
+index 1caaa2f0eb..669e695fdc 100644
+--- a/apps/lib/cmp_mock_srv.c
++++ b/apps/lib/cmp_mock_srv.c
+@@ -347,7 +347,7 @@ static int process_certConf(OSSL_CMP_SRV_CTX *srv_ctx,
+         return 0;
+     }
+ 
+-    if ((digest = X509_digest_sig(ctx-&gt;certOut)) == NULL)
++    if ((digest = X509_digest_sig(ctx-&gt;certOut, NULL, NULL)) == NULL)
+         return 0;
+     if (ASN1_OCTET_STRING_cmp(certHash, digest) != 0) {
+         ASN1_OCTET_STRING_free(digest);
+diff --git a/crypto/cmp/cmp_msg.c b/crypto/cmp/cmp_msg.c
+index b625147b6e..cfe96f516d 100644
+--- a/crypto/cmp/cmp_msg.c
++++ b/crypto/cmp/cmp_msg.c
+@@ -810,10 +810,11 @@ OSSL_CMP_MSG *ossl_cmp_certConf_new(OSSL_CMP_CTX *ctx, int fail_info,
+     if (!ASN1_INTEGER_set(certStatus-&gt;certReqId, OSSL_CMP_CERTREQID))
+         goto err;
+     /*
+-     * the hash of the certificate, using the same hash algorithm
+-     * as is used to create and verify the certificate signature
++     * The hash of the certificate, using the same hash algorithm
++     * as is used to create and verify the certificate signature.
++     * If not available, a default hash algorithm is used.
+      */
+-    if ((certHash = X509_digest_sig(ctx-&gt;newCert)) == NULL)
++    if ((certHash = X509_digest_sig(ctx-&gt;newCert, NULL, NULL)) == NULL)
+         goto err;
+ 
+     if (!ossl_cmp_certstatus_set0_certHash(certStatus, certHash))
+diff --git a/crypto/x509/x_all.c b/crypto/x509/x_all.c
+index a0ad56bca4..87d5ce97e8 100644
+--- a/crypto/x509/x_all.c
++++ b/crypto/x509/x_all.c
+@@ -434,13 +434,20 @@ int X509_digest(const X509 *cert, const EVP_MD *md, unsigned char *data,
+ }
+ 
+ /* calculate cert digest using the same hash algorithm as in its signature */
+-ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert)
++ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert,
++                                   EVP_MD **md_used, int *md_is_fallback)
+ {
+     unsigned int len;
+     unsigned char hash[EVP_MAX_MD_SIZE];
+     int mdnid, pknid;
+     EVP_MD *md = NULL;
+-    ASN1_OCTET_STRING *new = NULL;
++    const char *md_name;
++    ASN1_OCTET_STRING *new;
++
++    if (md_used != NULL)
++        *md_used = NULL;
++    if (md_is_fallback != NULL)
++        *md_is_fallback = 0;
+ 
+     if (cert == NULL) {
+         ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+@@ -474,10 +481,23 @@ ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert)
+                 /* Error code from fetch is sufficient */
+                 return NULL;
+         } else if (pknid != NID_undef) {
+-            /* Default to SHA-256 for known algorithms without a digest */
+-            if ((md = EVP_MD_fetch(cert-&gt;libctx, &quot;SHA256&quot;,
++            /* A known algorithm, but without a digest */
++            switch (pknid) {
++            case NID_ED25519: /* Follow CMS default given in RFC8419 */
++                md_name = &quot;SHA512&quot;;
++                break;
++            case NID_ED448: /* Follow CMS default given in RFC8419 */
++                md_name = &quot;SHAKE256&quot;;
++                break;
++            default: /* Fall back to SHA-256 */
++                md_name = &quot;SHA256&quot;;
++                break;
++            }
++            if ((md = EVP_MD_fetch(cert-&gt;libctx, md_name,
+                                    cert-&gt;propq)) == NULL)
+                 return NULL;
++            if (md_is_fallback != NULL)
++                *md_is_fallback = 1;
+         } else {
+             /* A completely unknown algorithm */
+             ERR_raise(ERR_LIB_X509, X509_R_UNSUPPORTED_ALGORITHM);
+@@ -492,13 +512,17 @@ ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert)
+     if (!X509_digest(cert, md, hash, &amp;len)
+             || (new = ASN1_OCTET_STRING_new()) == NULL)
+         goto err;
+-    if (!(ASN1_OCTET_STRING_set(new, hash, len))) {
+-        ASN1_OCTET_STRING_free(new);
+-        new = NULL;
++    if ((ASN1_OCTET_STRING_set(new, hash, len))) {
++        if (md_used != NULL)
++            *md_used = md;
++        else
++            EVP_MD_free(md);
++        return new;
+     }
++    ASN1_OCTET_STRING_free(new);
+  err:
+     EVP_MD_free(md);
+-    return new;
++    return NULL;
+ }
+ 
+ int X509_CRL_digest(const X509_CRL *data, const EVP_MD *type,
+diff --git a/doc/man3/X509_digest.pod b/doc/man3/X509_digest.pod
+index 5d6167934d..4928e98169 100644
+--- a/doc/man3/X509_digest.pod
++++ b/doc/man3/X509_digest.pod
+@@ -17,7 +17,8 @@ PKCS7_ISSUER_AND_SERIAL_digest
+ 
+  int X509_digest(const X509 *data, const EVP_MD *type, unsigned char *md,
+                  unsigned int *len);
+- ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert);
++ ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert,
++                                    EVP_MD **md_used, int *md_is_fallback);
+ 
+  int X509_CRL_digest(const X509_CRL *data, const EVP_MD *type, unsigned char *md,
+                      unsigned int *len);
+@@ -39,21 +40,29 @@ PKCS7_ISSUER_AND_SERIAL_digest
+ 
+ =head1 DESCRIPTION
+ 
+-X509_digest_sig() calculates a digest of the given certificate
+-using the same hash algorithm as in its signature with a fallback to B&lt;SHA-256&gt;
+-for algorithms where the digest is an integral part of the signature algorithm
+-such as with B&lt;EdDSA&gt; signatures.
++X509_digest_sig() calculates a digest of the given certificate I&lt;cert&gt;
++using the same hash algorithm as in its signature, if the digest
++is an integral part of the certificate signature algorithm identifier.
++Otherwise, a fallback hash algorithm is determined as follows:
++SHA512 if the signature alorithm is ED25519,
++SHAKE256 if it is ED448, otherwise SHA256.
++The output parmeters are assigned as follows.
++Unless I&lt;md_used&gt; is NULL, the hash algorithm used is provided
++in I&lt;*md_used&gt; and must be freed by the caller (if it is not NULL).
++Unless I&lt;md_is_fallback&gt; is NULL,
++the I&lt;*md_is_fallback&gt; is set to 1 if the hash algorithm used is a fallback,
++otherwise to 0.
+ 
+ X509_pubkey_digest() returns a digest of the DER representation of the public
+-key in the specified X509 B&lt;data&gt; object.
++key in the specified X509 I&lt;data&gt; object.
+ 
+ All other functions described here return a digest of the DER representation
+-of their entire B&lt;data&gt; objects.
++of their entire I&lt;data&gt; objects.
+ 
+-The B&lt;type&gt; parameter specifies the digest to
+-be used, such as EVP_sha1(). The B&lt;md&gt; is a pointer to the buffer where the
++The I&lt;type&gt; parameter specifies the digest to
++be used, such as EVP_sha1(). The I&lt;md&gt; is a pointer to the buffer where the
+ digest will be copied and is assumed to be large enough; the constant
+-B&lt;EVP_MAX_MD_SIZE&gt; is suggested. The B&lt;len&gt; parameter, if not NULL, points
++B&lt;EVP_MAX_MD_SIZE&gt; is suggested. The I&lt;len&gt; parameter, if not NULL, points
+ to a place where the digest size will be stored.
+ 
+ =head1 RETURN VALUES
+diff --git a/include/openssl/x509.h.in b/include/openssl/x509.h.in
+index 39aae063f6..b4efbb55dd 100644
+--- a/include/openssl/x509.h.in
++++ b/include/openssl/x509.h.in
+@@ -346,7 +346,8 @@ int X509_pubkey_digest(const X509 *data, const EVP_MD *type,
+                        unsigned char *md, unsigned int *len);
+ int X509_digest(const X509 *data, const EVP_MD *type,
+                 unsigned char *md, unsigned int *len);
+-ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert);
++ASN1_OCTET_STRING *X509_digest_sig(const X509 *cert,
++                                   EVP_MD **md_used, int *md_is_fallback);
+ int X509_CRL_digest(const X509_CRL *data, const EVP_MD *type,
+                     unsigned char *md, unsigned int *len);
+ int X509_REQ_digest(const X509_REQ *data, const EVP_MD *type,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034733.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034735.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34734">[ date ]</a>
+              <a href="thread.html#34734">[ thread ]</a>
+              <a href="subject.html#34734">[ subject ]</a>
+              <a href="author.html#34734">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

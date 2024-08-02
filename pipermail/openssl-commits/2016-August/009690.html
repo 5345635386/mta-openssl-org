@@ -1,0 +1,239 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471274128.005955.13638.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009681.html">
+   <LINK REL="Next"  HREF="009691.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471274128.005955.13638.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Mon Aug 15 15:15:28 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009681.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009691.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9690">[ date ]</a>
+              <a href="thread.html#9690">[ thread ]</a>
+              <a href="subject.html#9690">[ subject ]</a>
+              <a href="author.html#9690">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0a699a0723bcc689c07c8110da0fff7f9c2356a4 (commit)
+      from  0818dbadf32d193973d84a0736c099166777c071 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0a699a0723bcc689c07c8110da0fff7f9c2356a4
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Mon Aug 15 14:07:33 2016 +0100
+
+    Fix no-ec
+    
+    Fix no-ec builds by having separate functions to create keys based on
+    an existing EVP_PKEY and a curve id.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_lib.c             | 57 +++++++++++++++++++++++++++++-------------------
+ ssl/ssl_locl.h           |  3 ++-
+ ssl/statem/statem_clnt.c |  4 ++--
+ ssl/statem/statem_srvr.c |  4 ++--
+ 4 files changed, 40 insertions(+), 28 deletions(-)
+
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index f1363ca..eea75a3 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -3982,41 +3982,51 @@ int ssl_generate_master_secret(SSL *s, unsigned char *pms, size_t pmslen,
+     return s-&gt;session-&gt;master_key_length &gt;= 0;
+ }
+ 
+-/* Generate a private key from parameters or a curve ID */
+-EVP_PKEY *ssl_generate_pkey(EVP_PKEY *pm, int id)
++/* Generate a private key from parameters */
++EVP_PKEY *ssl_generate_pkey(EVP_PKEY *pm)
+ {
+     EVP_PKEY_CTX *pctx = NULL;
+     EVP_PKEY *pkey = NULL;
+-    int nid;
+-    if (pm != NULL) {
+-        pctx = EVP_PKEY_CTX_new(pm, NULL);
++
++    if (pm == NULL)
++        return NULL;
++    pctx = EVP_PKEY_CTX_new(pm, NULL);
++    if (pctx == NULL)
++        goto err;
++    if (EVP_PKEY_keygen_init(pctx) &lt;= 0)
++        goto err;
++    if (EVP_PKEY_keygen(pctx, &amp;pkey) &lt;= 0) {
++        EVP_PKEY_free(pkey);
++        pkey = NULL;
++    }
++
++    err:
++    EVP_PKEY_CTX_free(pctx);
++    return pkey;
++}
++#ifndef OPENSSL_NO_EC
++/* Generate a private key a curve ID */
++EVP_PKEY *ssl_generate_pkey_curve(int id)
++{
++    EVP_PKEY_CTX *pctx = NULL;
++    EVP_PKEY *pkey = NULL;
++    unsigned int curve_flags;
++    int nid = tls1_ec_curve_id2nid(id, &amp;curve_flags);
++
++    if (nid == 0)
++        goto err;
++    if ((curve_flags &amp; TLS_CURVE_TYPE) == TLS_CURVE_CUSTOM) {
++        pctx = EVP_PKEY_CTX_new_id(nid, NULL);
+         nid = 0;
+     } else {
+-        unsigned int curve_flags;
+-        nid = tls1_ec_curve_id2nid(id, &amp;curve_flags);
+-        if (nid == 0)
+-            goto err;
+-        /*
+-         * Generate a new key for this curve.
+-         * Should not be called if EC is disabled: if it is it will
+-         * fail with an unknown algorithm error.
+-         */
+-        if ((curve_flags &amp; TLS_CURVE_TYPE) == TLS_CURVE_CUSTOM) {
+-            pctx = EVP_PKEY_CTX_new_id(nid, NULL);
+-            nid = 0;
+-        } else {
+-            pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+-        }
++        pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+     }
+     if (pctx == NULL)
+         goto err;
+     if (EVP_PKEY_keygen_init(pctx) &lt;= 0)
+         goto err;
+-#ifndef OPENSSL_NO_EC
+     if (nid != 0 &amp;&amp; EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, nid) &lt;= 0)
+         goto err;
+-#endif
+-
+     if (EVP_PKEY_keygen(pctx, &amp;pkey) &lt;= 0) {
+         EVP_PKEY_free(pkey);
+         pkey = NULL;
+@@ -4026,6 +4036,7 @@ EVP_PKEY *ssl_generate_pkey(EVP_PKEY *pm, int id)
+     EVP_PKEY_CTX_free(pctx);
+     return pkey;
+ }
++#endif
+ /* Derive premaster or master secret for ECDH/DH */
+ int ssl_derive(SSL *s, EVP_PKEY *privkey, EVP_PKEY *pubkey)
+ {
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 3c230d1..8566760 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -1857,7 +1857,7 @@ void ssl_load_ciphers(void);
+ __owur int ssl_fill_hello_random(SSL *s, int server, unsigned char *field, int len);
+ __owur int ssl_generate_master_secret(SSL *s, unsigned char *pms, size_t pmslen,
+                                       int free_pms);
+-__owur EVP_PKEY *ssl_generate_pkey(EVP_PKEY *pm, int nid);
++__owur EVP_PKEY *ssl_generate_pkey(EVP_PKEY *pm);
+ __owur int ssl_derive(SSL *s, EVP_PKEY *privkey, EVP_PKEY *pubkey);
+ __owur EVP_PKEY *ssl_dh_to_pkey(DH *dh);
+ 
+@@ -2002,6 +2002,7 @@ __owur int tls1_set_curves(unsigned char **pext, size_t *pextlen,
+ __owur int tls1_set_curves_list(unsigned char **pext, size_t *pextlen,
+                          const char *str);
+ __owur int tls1_check_ec_tmp_key(SSL *s, unsigned long id);
++__owur EVP_PKEY *ssl_generate_pkey_curve(int id);
+ #  endif                        /* OPENSSL_NO_EC */
+ 
+ __owur int tls1_shared_list(SSL *s,
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 6f4c8ff..338a23b 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -2250,7 +2250,7 @@ static int tls_construct_cke_dhe(SSL *s, unsigned char **p, int *len, int *al)
+         SSLerr(SSL_F_TLS_CONSTRUCT_CKE_DHE, ERR_R_INTERNAL_ERROR);
+         return 0;
+     }
+-    ckey = ssl_generate_pkey(skey, NID_undef);
++    ckey = ssl_generate_pkey(skey);
+     dh_clnt = EVP_PKEY_get0_DH(ckey);
+ 
+     if (dh_clnt == NULL || ssl_derive(s, ckey, skey) == 0) {
+@@ -2288,7 +2288,7 @@ static int tls_construct_cke_ecdhe(SSL *s, unsigned char **p, int *len, int *al)
+         return 0;
+     }
+ 
+-    ckey = ssl_generate_pkey(skey, NID_undef);
++    ckey = ssl_generate_pkey(skey);
+ 
+     if (ssl_derive(s, ckey, skey) == 0) {
+         SSLerr(SSL_F_TLS_CONSTRUCT_CKE_ECDHE, ERR_R_EVP_LIB);
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index a5fe752..d662163 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -1703,7 +1703,7 @@ int tls_construct_server_key_exchange(SSL *s)
+             goto err;
+         }
+ 
+-        s-&gt;s3-&gt;tmp.pkey = ssl_generate_pkey(pkdhp, NID_undef);
++        s-&gt;s3-&gt;tmp.pkey = ssl_generate_pkey(pkdhp);
+ 
+         if (s-&gt;s3-&gt;tmp.pkey == NULL) {
+             SSLerr(SSL_F_TLS_CONSTRUCT_SERVER_KEY_EXCHANGE, ERR_R_EVP_LIB);
+@@ -1737,7 +1737,7 @@ int tls_construct_server_key_exchange(SSL *s)
+                    SSL_R_UNSUPPORTED_ELLIPTIC_CURVE);
+             goto err;
+         }
+-        s-&gt;s3-&gt;tmp.pkey = ssl_generate_pkey(NULL, curve_id);
++        s-&gt;s3-&gt;tmp.pkey = ssl_generate_pkey_curve(curve_id);
+         /* Generate a new key for this curve */
+         if (s-&gt;s3-&gt;tmp.pkey == NULL) {
+             al = SSL_AD_INTERNAL_ERROR;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009681.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009691.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9690">[ date ]</a>
+              <a href="thread.html#9690">[ thread ]</a>
+              <a href="subject.html#9690">[ subject ]</a>
+              <a href="author.html#9690">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

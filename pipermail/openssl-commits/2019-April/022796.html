@@ -1,0 +1,355 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1555057008.858907.16022.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022788.html">
+   <LINK REL="Next"  HREF="022799.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1555057008.858907.16022.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Fri Apr 12 08:16:48 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022788.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="022799.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22796">[ date ]</a>
+              <a href="thread.html#22796">[ thread ]</a>
+              <a href="subject.html#22796">[ subject ]</a>
+              <a href="author.html#22796">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  65175163247fe0f56c894c9ac7baf93f4386cebe (commit)
+      from  5173cdde7d758824e6a07f2a6c6808b254602e11 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 65175163247fe0f56c894c9ac7baf93f4386cebe
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Fri Apr 12 18:16:20 2019 +1000
+
+    Add prediction resistance capability to the DRBG reseeding process.
+    
+    Refer to NIST SP 800-90C section 5.4 &quot;Prediction Resistance.l&quot;
+    
+    This requires the seed sources to be approved as entropy sources, after
+    which they should be considered live sources as per section 5.3.2 &quot;Live
+    Entropy Source Availability.&quot;
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8647">https://github.com/openssl/openssl/pull/8647</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES                              |  4 ++
+ crypto/rand/rand_lib.c               | 12 ------
+ doc/man3/RAND_DRBG_generate.pod      | 14 ++++---
+ doc/man3/RAND_DRBG_reseed.pod        | 14 ++++++-
+ doc/man3/RAND_DRBG_set_callbacks.pod |  9 ++---
+ doc/man7/RAND_DRBG.pod               |  7 ++--
+ test/drbgtest.c                      | 78 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 110 insertions(+), 28 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index e70e42b..11c80b7 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -9,8 +9,12 @@
+ 
+  Changes between 1.1.1 and 3.0.0 [xx XXX xxxx]
+ 
++  *) Add prediction resistance to the DRBG reseeding process.
++     [Paul Dale]
++
+   *) Limit the number of blocks in a data unit for AES-XTS to 2^20 as
+      mandated by IEEE Std 1619-2018.
++     [Paul Dale]
+ 
+   *) Added newline escaping functionality to a filename when using openssl dgst.
+      This output format is to replicate the output format found in the '*sum'
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index a298b75..2b77960 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -183,17 +183,6 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+         }
+ 
+     } else {
+-        if (prediction_resistance) {
+-            /*
+-             * We don't have any entropy sources that comply with the NIST
+-             * standard to provide prediction resistance (see NIST SP 800-90C,
+-             * Section 5.4).
+-             */
+-            RANDerr(RAND_F_RAND_DRBG_GET_ENTROPY,
+-                    RAND_R_PREDICTION_RESISTANCE_NOT_SUPPORTED);
+-            goto err;
+-        }
+-
+         /* Get entropy by polling system entropy sources. */
+         entropy_available = rand_pool_acquire_entropy(pool);
+     }
+@@ -203,7 +192,6 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+         *pout = rand_pool_detach(pool);
+     }
+ 
+- err:
+     if (drbg-&gt;seed_pool == NULL)
+         rand_pool_free(pool);
+     return ret;
+diff --git a/doc/man3/RAND_DRBG_generate.pod b/doc/man3/RAND_DRBG_generate.pod
+index 0066c86..09903f8 100644
+--- a/doc/man3/RAND_DRBG_generate.pod
++++ b/doc/man3/RAND_DRBG_generate.pod
+@@ -29,7 +29,9 @@ number of generate requests (I&lt;reseed interval&gt;) or the maximum timespan
+ (I&lt;reseed time interval&gt;) since its last seeding have been reached.
+ If this is the case, the DRBG reseeds automatically.
+ Additionally, an immediate reseeding can be requested by setting the
+-B&lt;prediction_resistance&gt; flag to 1. See NOTES section for more details.
++B&lt;prediction_resistance&gt; flag to 1.
++Requesting prediction resistance is a relative expensive operation.
++See NOTES section for more details.
+ 
+ The caller can optionally provide additional data to be used for reseeding
+ by passing a pointer B&lt;adin&gt; to a buffer of length B&lt;adinlen&gt;.
+@@ -59,16 +61,16 @@ If necessary, they can be changed using L&lt;RAND_DRBG_set_reseed_interval(3)&gt;
+ and L&lt;RAND_DRBG_set_reseed_time_interval(3)&gt;, respectively.
+ 
+ A request for prediction resistance can only be satisfied by pulling fresh
+-entropy from one of the approved entropy sources listed in section 5.5.2 of
+-[NIST SP 800-90C].
+-Since the default DRBG implementation does not have access to such an approved
+-entropy source, a request for prediction resistance will always fail.
+-In other words, prediction resistance is currently not supported yet by the DRBG.
++entropy from a live entropy source (section 5.5.2 of [NIST SP 800-90C]).
++It is up to the user to ensure that a live entropy source is configured
++and is being used.
+ 
+ =head1 HISTORY
+ 
+ The RAND_DRBG functions were added in OpenSSL 1.1.1.
+ 
++Prediction resistance is supported from OpenSSL 3.0.0.
++
+ =head1 SEE ALSO
+ 
+ L&lt;RAND_bytes(3)&gt;,
+diff --git a/doc/man3/RAND_DRBG_reseed.pod b/doc/man3/RAND_DRBG_reseed.pod
+index ca08a39..c4d2671 100644
+--- a/doc/man3/RAND_DRBG_reseed.pod
++++ b/doc/man3/RAND_DRBG_reseed.pod
+@@ -13,7 +13,8 @@ RAND_DRBG_set_reseed_defaults
+  #include &lt;openssl/rand_drbg.h&gt;
+ 
+  int RAND_DRBG_reseed(RAND_DRBG *drbg,
+-                      const unsigned char *adin, size_t adinlen);
++                      const unsigned char *adin, size_t adinlen,
++                      int prediction_resistance);
+ 
+  int RAND_DRBG_set_reseed_interval(RAND_DRBG *drbg,
+                                    unsigned int interval);
+@@ -37,6 +38,10 @@ and mixing in the specified additional data provided in the buffer B&lt;adin&gt;
+ of length B&lt;adinlen&gt;.
+ The additional data can be omitted by setting B&lt;adin&gt; to NULL and B&lt;adinlen&gt;
+ to 0.
++An immediate reseeding can be requested by setting the
++B&lt;prediction_resistance&gt; flag to 1.
++Requesting prediction resistance is a relative expensive operation.
++See NOTES section for more details.
+ 
+ RAND_DRBG_set_reseed_interval()
+ sets the reseed interval of the B&lt;drbg&gt;, which is the maximum allowed number
+@@ -88,10 +93,17 @@ To ensure that they are applied to the global and thread-local DRBG instances
+ RAND_DRBG_set_reseed_defaults() before creating any thread and before calling any
+  cryptographic routines that obtain random data directly or indirectly.
+ 
++A request for prediction resistance can only be satisfied by pulling fresh
++entropy from a live entropy source (section 5.5.2 of [NIST SP 800-90C]).
++It is up to the user to ensure that a live entropy source is configured
++and is being used.
++
+ =head1 HISTORY
+ 
+ The RAND_DRBG functions were added in OpenSSL 1.1.1.
+ 
++Prediction resistance is supported from OpenSSL 3.0.0.
++
+ =head1 SEE ALSO
+ 
+ L&lt;RAND_DRBG_generate(3)&gt;,
+diff --git a/doc/man3/RAND_DRBG_set_callbacks.pod b/doc/man3/RAND_DRBG_set_callbacks.pod
+index 9a1d157..4734b07 100644
+--- a/doc/man3/RAND_DRBG_set_callbacks.pod
++++ b/doc/man3/RAND_DRBG_set_callbacks.pod
+@@ -104,12 +104,9 @@ contents safely before freeing it, in order not to leave sensitive information
+ about the DRBG's state in memory.
+ 
+ A request for prediction resistance can only be satisfied by pulling fresh
+-entropy from one of the approved entropy sources listed in section 5.5.2 of
+-[NIST SP 800-90C].
+-Since the default implementation of the get_entropy callback does not have access
+-to such an approved entropy source, a request for prediction resistance will
+-always fail.
+-In other words, prediction resistance is currently not supported yet by the DRBG.
++entropy from a live entropy source (section 5.5.2 of [NIST SP 800-90C]).
++It is up to the user to ensure that a live entropy source is configured
++and is being used.
+ 
+ The derivation function is disabled during initialization by calling the
+ RAND_DRBG_set() function with the RAND_DRBG_FLAG_CTR_NO_DF flag.
+diff --git a/doc/man7/RAND_DRBG.pod b/doc/man7/RAND_DRBG.pod
+index f3fa605..48d4ace 100644
+--- a/doc/man7/RAND_DRBG.pod
++++ b/doc/man7/RAND_DRBG.pod
+@@ -192,9 +192,10 @@ I&lt;prediction resistance&gt; parameter to 1 when calling L&lt;RAND_DRBG_generate(3)&gt;.
+ The document [NIST SP 800-90C] describes prediction resistance requests
+ in detail and imposes strict conditions on the entropy sources that are
+ approved for providing prediction resistance.
+-Since the default DRBG implementation does not have access to such an approved
+-entropy source, a request for prediction resistance will currently always fail.
+-In other words, prediction resistance is currently not supported yet by the DRBG.
++A request for prediction resistance can only be satisfied by pulling fresh
++entropy from a live entropy source (section 5.5.2 of [NIST SP 800-90C]).
++It is up to the user to ensure that a live entropy source is configured
++and is being used.
+ 
+ 
+ For the three shared DRBGs (and only for these) there is another way to
+diff --git a/test/drbgtest.c b/test/drbgtest.c
+index ca45a8f..bf4c723 100644
+--- a/test/drbgtest.c
++++ b/test/drbgtest.c
+@@ -1012,6 +1012,83 @@ static int test_rand_add(void)
+     return 1;
+ }
+ 
++static int test_rand_drbg_prediction_resistance(void)
++{
++    RAND_DRBG *m = NULL, *i = NULL, *s = NULL;
++    unsigned char buf1[51], buf2[sizeof(buf1)];
++    int ret = 0, mreseed, ireseed, sreseed;
++
++    /* Initialise a three long DRBG chain */
++    if (!TEST_ptr(m = RAND_DRBG_new(0, 0, NULL))
++        || !TEST_true(disable_crngt(m))
++        || !TEST_true(RAND_DRBG_instantiate(m, NULL, 0))
++        || !TEST_ptr(i = RAND_DRBG_new(0, 0, m))
++        || !TEST_true(RAND_DRBG_instantiate(i, NULL, 0))
++        || !TEST_ptr(s = RAND_DRBG_new(0, 0, i))
++        || !TEST_true(RAND_DRBG_instantiate(s, NULL, 0)))
++        goto err;
++
++    /* During a normal reseed, only the slave DRBG should be reseed */
++    mreseed = ++m-&gt;reseed_prop_counter;
++    ireseed = ++i-&gt;reseed_prop_counter;
++    sreseed = s-&gt;reseed_prop_counter;
++    if (!TEST_true(RAND_DRBG_reseed(s, NULL, 0, 0))
++        || !TEST_int_eq(m-&gt;reseed_prop_counter, mreseed)
++        || !TEST_int_eq(i-&gt;reseed_prop_counter, ireseed)
++        || !TEST_int_gt(s-&gt;reseed_prop_counter, sreseed))
++        goto err;
++
++    /*
++     * When prediction resistance is requested, the request should be
++     * propagated to the master, so that the entire DRBG chain reseeds.
++     */
++    sreseed = s-&gt;reseed_prop_counter;
++    if (!TEST_true(RAND_DRBG_reseed(s, NULL, 0, 1))
++        || !TEST_int_gt(m-&gt;reseed_prop_counter, mreseed)
++        || !TEST_int_gt(i-&gt;reseed_prop_counter, ireseed)
++        || !TEST_int_gt(s-&gt;reseed_prop_counter, sreseed))
++        goto err;
++
++    /* During a normal generate, only the slave DRBG should be reseed */
++    mreseed = ++m-&gt;reseed_prop_counter;
++    ireseed = ++i-&gt;reseed_prop_counter;
++    sreseed = s-&gt;reseed_prop_counter;
++    if (!TEST_true(RAND_DRBG_generate(s, buf1, sizeof(buf1), 0, NULL, 0))
++        || !TEST_int_eq(m-&gt;reseed_prop_counter, mreseed)
++        || !TEST_int_eq(i-&gt;reseed_prop_counter, ireseed)
++        || !TEST_int_gt(s-&gt;reseed_prop_counter, sreseed))
++        goto err;
++
++    /*
++     * When a prediction resistant generate is requested, the request
++     * should be propagated to the master, reseeding the entire DRBG chain.
++     */
++    sreseed = s-&gt;reseed_prop_counter;
++    if (!TEST_true(RAND_DRBG_generate(s, buf2, sizeof(buf2), 1, NULL, 0))
++        || !TEST_int_gt(m-&gt;reseed_prop_counter, mreseed)
++        || !TEST_int_gt(i-&gt;reseed_prop_counter, ireseed)
++        || !TEST_int_gt(s-&gt;reseed_prop_counter, sreseed)
++        || !TEST_mem_ne(buf1, sizeof(buf1), buf2, sizeof(buf2)))
++        goto err;
++
++    /* Verify that a normal reseed still only reseeds the slave DRBG */
++    mreseed = ++m-&gt;reseed_prop_counter;
++    ireseed = ++i-&gt;reseed_prop_counter;
++    sreseed = s-&gt;reseed_prop_counter;
++    if (!TEST_true(RAND_DRBG_reseed(s, NULL, 0, 0))
++        || !TEST_int_eq(m-&gt;reseed_prop_counter, mreseed)
++        || !TEST_int_eq(i-&gt;reseed_prop_counter, ireseed)
++        || !TEST_int_gt(s-&gt;reseed_prop_counter, sreseed))
++        goto err;
++
++    ret = 1;
++err:
++    RAND_DRBG_free(s);
++    RAND_DRBG_free(i);
++    RAND_DRBG_free(m);
++    return ret;
++}
++
+ static int test_multi_set(void)
+ {
+     int rv = 0;
+@@ -1252,6 +1329,7 @@ int setup_tests(void)
+     ADD_TEST(test_rand_drbg_reseed);
+     ADD_TEST(test_rand_seed);
+     ADD_TEST(test_rand_add);
++    ADD_TEST(test_rand_drbg_prediction_resistance);
+     ADD_TEST(test_multi_set);
+     ADD_TEST(test_set_defaults);
+ #if defined(OPENSSL_THREADS)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022788.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="022799.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22796">[ date ]</a>
+              <a href="thread.html#22796">[ thread ]</a>
+              <a href="subject.html#22796">[ subject ]</a>
+              <a href="author.html#22796">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

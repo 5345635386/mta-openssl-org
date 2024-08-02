@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1568453439.120334.4698.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025118.html">
+   <LINK REL="Next"  HREF="025125.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1568453439.120334.4698.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Sat Sep 14 09:30:39 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025118.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="025125.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25120">[ date ]</a>
+              <a href="thread.html#25120">[ thread ]</a>
+              <a href="subject.html#25120">[ subject ]</a>
+              <a href="author.html#25120">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f3f3318a25e62f471a69e1e8dd117bf30191da20 (commit)
+      from  7b6b194b5281649ad5c50ecead0f3725d2d2a6a0 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f3f3318a25e62f471a69e1e8dd117bf30191da20
+Author: Andreas Kretschmer &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">andreas.kretschmer at siemens.com</A>&gt;
+Date:   Thu Sep 5 13:21:03 2019 +0200
+
+    fix CRMF symmetric key handling
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9774">https://github.com/openssl/openssl/pull/9774</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/crmf/crmf_lib.c | 39 ++++++++++++++++++++++++---------------
+ 1 file changed, 24 insertions(+), 15 deletions(-)
+
+diff --git a/crypto/crmf/crmf_lib.c b/crypto/crmf/crmf_lib.c
+index e519c50677..2974341446 100644
+--- a/crypto/crmf/crmf_lib.c
++++ b/crypto/crmf/crmf_lib.c
+@@ -29,6 +29,7 @@
+ #include &lt;openssl/asn1t.h&gt;
+ 
+ #include &quot;crmf_int.h&quot;
++#include &quot;internal/constant_time_locl.h&quot;
+ 
+ /* explicit #includes not strictly needed since implied by the above: */
+ #include &lt;openssl/crmf.h&gt;
+@@ -654,7 +655,9 @@ X509 *OSSL_CRMF_ENCRYPTEDVALUE_get1_encCert(OSSL_CRMF_ENCRYPTEDVALUE *ecert,
+     X509 *cert = NULL; /* decrypted certificate */
+     EVP_CIPHER_CTX *evp_ctx = NULL; /* context for symmetric encryption */
+     unsigned char *ek = NULL; /* decrypted symmetric encryption key */
++    size_t eksize = 0; /* size of decrypted symmetric encryption key */
+     const EVP_CIPHER *cipher = NULL; /* used cipher */
++    int cikeysize = 0; /* key size from cipher */
+     unsigned char *iv = NULL; /* initial vector for symmetric encryption */
+     unsigned char *outbuf = NULL; /* decryption output buffer */
+     const unsigned char *p = NULL; /* needed for decoding ASN1 */
+@@ -673,18 +676,31 @@ X509 *OSSL_CRMF_ENCRYPTEDVALUE_get1_encCert(OSSL_CRMF_ENCRYPTEDVALUE *ecert,
+                 CRMF_R_UNSUPPORTED_CIPHER);
+         return NULL;
+     }
+-
++    /* select symmetric cipher based on algorithm given in message */
++    if ((cipher = EVP_get_cipherbynid(symmAlg)) == NULL) {
++        CRMFerr(CRMF_F_OSSL_CRMF_ENCRYPTEDVALUE_GET1_ENCCERT,
++                CRMF_R_UNSUPPORTED_CIPHER);
++        goto end;
++    }
++    cikeysize = EVP_CIPHER_key_length(cipher);
+     /* first the symmetric key needs to be decrypted */
+     pkctx = EVP_PKEY_CTX_new(pkey, NULL);
+     if (pkctx != NULL &amp;&amp; EVP_PKEY_decrypt_init(pkctx)) {
+         ASN1_BIT_STRING *encKey = ecert-&gt;encSymmKey;
+-        size_t eksize = 0;
++        size_t failure;
++        int retval;
+ 
+-        if (EVP_PKEY_decrypt(pkctx, NULL, &amp;eksize, encKey-&gt;data, encKey-&gt;length)
+-                &lt;= 0
+-                || (ek = OPENSSL_malloc(eksize)) == NULL
+-                || EVP_PKEY_decrypt(pkctx, ek, &amp;eksize, encKey-&gt;data,
+-                                    encKey-&gt;length) &lt;= 0) {
++        if (EVP_PKEY_decrypt(pkctx, NULL, &amp;eksize,
++                             encKey-&gt;data, encKey-&gt;length) &lt;= 0
++                || (ek = OPENSSL_malloc(eksize)) == NULL)
++            goto oom;
++        retval = EVP_PKEY_decrypt(pkctx, ek, &amp;eksize,
++                                  encKey-&gt;data, encKey-&gt;length);
++        ERR_clear_error(); /* error state may have sensitive information */
++        failure = ~constant_time_is_zero_s(constant_time_msb(retval)
++                                           | constant_time_is_zero(retval));
++        failure |= ~constant_time_eq_s(eksize, (size_t)cikeysize);
++        if (failure) {
+             CRMFerr(CRMF_F_OSSL_CRMF_ENCRYPTEDVALUE_GET1_ENCCERT,
+                     CRMF_R_ERROR_DECRYPTING_SYMMETRIC_KEY);
+             goto end;
+@@ -692,13 +708,6 @@ X509 *OSSL_CRMF_ENCRYPTEDVALUE_get1_encCert(OSSL_CRMF_ENCRYPTEDVALUE *ecert,
+     } else {
+         goto oom;
+     }
+-
+-    /* select symmetric cipher based on algorithm given in message */
+-    if ((cipher = EVP_get_cipherbynid(symmAlg)) == NULL) {
+-        CRMFerr(CRMF_F_OSSL_CRMF_ENCRYPTEDVALUE_GET1_ENCCERT,
+-                CRMF_R_UNSUPPORTED_CIPHER);
+-        goto end;
+-    }
+     if ((iv = OPENSSL_malloc(EVP_CIPHER_iv_length(cipher))) == NULL)
+         goto oom;
+     if (ASN1_TYPE_get_octetstring(ecert-&gt;symmAlg-&gt;parameter, iv,
+@@ -743,7 +752,7 @@ X509 *OSSL_CRMF_ENCRYPTEDVALUE_get1_encCert(OSSL_CRMF_ENCRYPTEDVALUE *ecert,
+     EVP_PKEY_CTX_free(pkctx);
+     OPENSSL_free(outbuf);
+     EVP_CIPHER_CTX_free(evp_ctx);
+-    OPENSSL_free(ek);
++    OPENSSL_clear_free(ek, eksize);
+     OPENSSL_free(iv);
+     return cert;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025118.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="025125.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25120">[ date ]</a>
+              <a href="thread.html#25120">[ thread ]</a>
+              <a href="subject.html#25120">[ subject ]</a>
+              <a href="author.html#25120">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

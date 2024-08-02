@@ -1,0 +1,183 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583703896.589773.15790.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027827.html">
+   <LINK REL="Next"  HREF="027833.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583703896.589773.15790.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sun Mar  8 21:44:56 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027827.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027833.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27832">[ date ]</a>
+              <a href="thread.html#27832">[ thread ]</a>
+              <a href="subject.html#27832">[ subject ]</a>
+              <a href="author.html#27832">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c339c702f6043fabd09904044f967e71629bc40f (commit)
+      from  d462b5ff21e9fcdef98447c8f8d8c694b1e79602 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c339c702f6043fabd09904044f967e71629bc40f
+Author: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at roeckx.be</A>&gt;
+Date:   Sun Feb 16 14:44:06 2020 +0100
+
+    Improve small block cipher performance
+    
+    Avoid function calls we don't need to do.
+    
+    In 1.1.1 we have:
+    aes-128-cbc     572267.80k   681197.08k   715430.74k   720508.59k   722359.64k   723004.07k
+    
+    Current master:
+    aes-128-cbc     460663.70k   631125.66k   701283.58k   719794.52k   724732.59k   726668.63k
+    
+    new:
+    aes-128-cbc     582057.64k   684288.62k   715721.90k   724856.15k   717578.24k   727176.53k
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11102">https://github.com/openssl/openssl/pull/11102</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/implementations/ciphers/cipher_aes_ocb.c     |  9 +++++++--
+ providers/implementations/ciphers/ciphercommon.c       |  9 +++++++--
+ providers/implementations/ciphers/ciphercommon_block.c | 17 +++++++----------
+ 3 files changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/providers/implementations/ciphers/cipher_aes_ocb.c b/providers/implementations/ciphers/cipher_aes_ocb.c
+index 2f85604a87..3d4863ea03 100644
+--- a/providers/implementations/ciphers/cipher_aes_ocb.c
++++ b/providers/implementations/ciphers/cipher_aes_ocb.c
+@@ -150,9 +150,14 @@ static int aes_ocb_block_update_internal(PROV_AES_OCB_CTX *ctx,
+                                          size_t outsize, const unsigned char *in,
+                                          size_t inl, OSSL_ocb_cipher_fn ciph)
+ {
+-    size_t nextblocks = fillblock(buf, bufsz, AES_BLOCK_SIZE, &amp;in, &amp;inl);
++    size_t nextblocks;
+     size_t outlint = 0;
+ 
++    if (bufsz != 0)
++        nextblocks = fillblock(buf, bufsz, AES_BLOCK_SIZE, &amp;in, &amp;inl);
++    else
++        nextblocks = inl &amp; ~(AES_BLOCK_SIZE-1);
++
+     if (*bufsz == AES_BLOCK_SIZE) {
+         if (outsize &lt; AES_BLOCK_SIZE) {
+             ERR_raise(ERR_LIB_PROV, PROV_R_OUTPUT_BUFFER_TOO_SMALL);
+@@ -179,7 +184,7 @@ static int aes_ocb_block_update_internal(PROV_AES_OCB_CTX *ctx,
+         in += nextblocks;
+         inl -= nextblocks;
+     }
+-    if (!trailingdata(buf, bufsz, AES_BLOCK_SIZE, &amp;in, &amp;inl)) {
++    if (inl != 0 &amp;&amp; !trailingdata(buf, bufsz, AES_BLOCK_SIZE, &amp;in, &amp;inl)) {
+         /* PROVerr already called */
+         return 0;
+     }
+diff --git a/providers/implementations/ciphers/ciphercommon.c b/providers/implementations/ciphers/ciphercommon.c
+index 967622cf64..33afa57585 100644
+--- a/providers/implementations/ciphers/ciphercommon.c
++++ b/providers/implementations/ciphers/ciphercommon.c
+@@ -176,7 +176,12 @@ int cipher_generic_block_update(void *vctx, unsigned char *out, size_t *outl,
+     size_t outlint = 0;
+     PROV_CIPHER_CTX *ctx = (PROV_CIPHER_CTX *)vctx;
+     size_t blksz = ctx-&gt;blocksize;
+-    size_t nextblocks = fillblock(ctx-&gt;buf, &amp;ctx-&gt;bufsz, blksz, &amp;in, &amp;inl);
++    size_t nextblocks;
++
++    if (ctx-&gt;bufsz != 0)
++        nextblocks = fillblock(ctx-&gt;buf, &amp;ctx-&gt;bufsz, blksz, &amp;in, &amp;inl);
++    else
++        nextblocks = inl &amp; ~(blksz-1);
+ 
+     /*
+      * If we're decrypting and we end an update on a block boundary we hold
+@@ -218,7 +223,7 @@ int cipher_generic_block_update(void *vctx, unsigned char *out, size_t *outl,
+         in += nextblocks;
+         inl -= nextblocks;
+     }
+-    if (!trailingdata(ctx-&gt;buf, &amp;ctx-&gt;bufsz, blksz, &amp;in, &amp;inl)) {
++    if (inl != 0 &amp;&amp; !trailingdata(ctx-&gt;buf, &amp;ctx-&gt;bufsz, blksz, &amp;in, &amp;inl)) {
+         /* ERR_raise already called */
+         return 0;
+     }
+diff --git a/providers/implementations/ciphers/ciphercommon_block.c b/providers/implementations/ciphers/ciphercommon_block.c
+index eff94842ed..ee54f481c6 100644
+--- a/providers/implementations/ciphers/ciphercommon_block.c
++++ b/providers/implementations/ciphers/ciphercommon_block.c
+@@ -35,20 +35,17 @@ size_t fillblock(unsigned char *buf, size_t *buflen, size_t blocksize,
+                  const unsigned char **in, size_t *inlen)
+ {
+     size_t blockmask = ~(blocksize - 1);
++    size_t bufremain = blocksize - *buflen;
+ 
+     assert(*buflen &lt;= blocksize);
+     assert(blocksize &gt; 0 &amp;&amp; (blocksize &amp; (blocksize - 1)) == 0);
+ 
+-    if (*buflen != blocksize &amp;&amp; (*buflen != 0 || *inlen &lt; blocksize)) {
+-        size_t bufremain = blocksize - *buflen;
+-
+-        if (*inlen &lt; bufremain)
+-            bufremain = *inlen;
+-        memcpy(buf + *buflen, *in, bufremain);
+-        *in += bufremain;
+-        *inlen -= bufremain;
+-        *buflen += bufremain;
+-    }
++    if (*inlen &lt; bufremain)
++        bufremain = *inlen;
++    memcpy(buf + *buflen, *in, bufremain);
++    *in += bufremain;
++    *inlen -= bufremain;
++    *buflen += bufremain;
+ 
+     return *inlen &amp; blockmask;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027827.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027833.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27832">[ date ]</a>
+              <a href="thread.html#27832">[ thread ]</a>
+              <a href="subject.html#27832">[ subject ]</a>
+              <a href="author.html#27832">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

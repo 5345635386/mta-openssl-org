@@ -1,0 +1,312 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623850693.424111.19308.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034734.html">
+   <LINK REL="Next"  HREF="034736.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623850693.424111.19308.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Jun 16 13:38:13 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034734.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034736.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34735">[ date ]</a>
+              <a href="thread.html#34735">[ thread ]</a>
+              <a href="subject.html#34735">[ subject ]</a>
+              <a href="author.html#34735">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ab9d67efa4c2a4ee6787430a447de675cb78c8e2 (commit)
+      from  eefdb8e013fa9d0881566b41291c5725a77b332a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ab9d67efa4c2a4ee6787430a447de675cb78c8e2
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Sat Jun 12 17:43:15 2021 +0200
+
+    HTTP client: fix use of OSSL_HTTP_adapt_proxy(), which is needed also in cmp.c
+    
+    For this reason, export this function, which allows removing http_local.h
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15764">https://github.com/openssl/openssl/pull/15764</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/cmp.c                       | 10 ++++------
+ crypto/http/http_client.c        |  4 +---
+ crypto/http/http_lib.c           |  9 +++------
+ crypto/http/http_local.h         | 18 ------------------
+ crypto/ocsp/ocsp_http.c          |  1 -
+ doc/man3/OSSL_HTTP_parse_url.pod | 22 ++++++++++++++++++++++
+ include/openssl/http.h           |  2 ++
+ util/libcrypto.num               |  1 +
+ 8 files changed, 33 insertions(+), 34 deletions(-)
+ delete mode 100644 crypto/http/http_local.h
+
+diff --git a/apps/cmp.c b/apps/cmp.c
+index dfd2981425..7c9256ccb5 100644
+--- a/apps/cmp.c
++++ b/apps/cmp.c
+@@ -1765,8 +1765,7 @@ static int setup_client_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+     int portnum, ssl;
+     char server_buf[200] = { '\0' };
+     char proxy_buf[200] = { '\0' };
+-    char *proxy_host = NULL;
+-    char *proxy_port_str = NULL;
++    const char *proxy_host = NULL;
+ 
+     if (opt_server == NULL) {
+         CMP_err(&quot;missing -server option&quot;);
+@@ -1795,8 +1794,9 @@ static int setup_client_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+                        opt_tls_used ? &quot;s&quot; : &quot;&quot;, host, port,
+                        *used_path == '/' ? used_path + 1 : used_path);
+ 
+-    if (opt_proxy != NULL)
+-        (void)BIO_snprintf(proxy_buf, sizeof(proxy_buf), &quot; via %s&quot;, opt_proxy);
++    proxy_host = OSSL_HTTP_adapt_proxy(opt_proxy, opt_no_proxy, host, ssl);
++    if (proxy_host != NULL)
++        (void)BIO_snprintf(proxy_buf, sizeof(proxy_buf), &quot; via %s&quot;, proxy_host);
+ 
+     if (!transform_opts())
+         goto err;
+@@ -1902,8 +1902,6 @@ static int setup_client_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+     OPENSSL_free(host);
+     OPENSSL_free(port);
+     OPENSSL_free(path);
+-    OPENSSL_free(proxy_host);
+-    OPENSSL_free(proxy_port_str);
+     return ret;
+  oom:
+     CMP_err(&quot;out of memory&quot;);
+diff --git a/crypto/http/http_client.c b/crypto/http/http_client.c
+index 03c42ab38e..648b02255f 100644
+--- a/crypto/http/http_client.c
++++ b/crypto/http/http_client.c
+@@ -23,8 +23,6 @@
+ #include &quot;internal/sockets.h&quot;
+ #include &quot;internal/cryptlib.h&quot; /* for ossl_assert() */
+ 
+-#include &quot;http_local.h&quot;
+-
+ #define HTTP_PREFIX &quot;HTTP/&quot;
+ #define HTTP_VERSION_PATT &quot;1.&quot; /* allow 1.x */
+ #define HTTP_PREFIX_VERSION HTTP_PREFIX&quot;&quot;HTTP_VERSION_PATT
+@@ -897,7 +895,7 @@ OSSL_HTTP_REQ_CTX *OSSL_HTTP_open(const char *server, const char *port,
+             port = NULL;
+         if (port == NULL &amp;&amp; strchr(server, ':') == NULL)
+             port = use_ssl ? OSSL_HTTPS_PORT : OSSL_HTTP_PORT;
+-        proxy = ossl_http_adapt_proxy(proxy, no_proxy, server, use_ssl);
++        proxy = OSSL_HTTP_adapt_proxy(proxy, no_proxy, server, use_ssl);
+         if (proxy != NULL
+             &amp;&amp; !OSSL_HTTP_parse_url(proxy, NULL /* use_ssl */, NULL /* user */,
+                                     &amp;proxy_host, &amp;proxy_port, NULL /* num */,
+diff --git a/crypto/http/http_lib.c b/crypto/http/http_lib.c
+index 2aa0736ac5..bd9c096b98 100644
+--- a/crypto/http/http_lib.c
++++ b/crypto/http/http_lib.c
+@@ -15,8 +15,6 @@
+ #include &lt;openssl/err.h&gt;
+ #include &quot;internal/cryptlib.h&quot; /* for ossl_assert() */
+ 
+-#include &quot;http_local.h&quot;
+-
+ static void init_pstring(char **pstr)
+ {
+     if (pstr != NULL) {
+@@ -241,7 +239,7 @@ int OSSL_HTTP_parse_url(const char *url, int *pssl, char **puser, char **phost,
+ }
+ 
+ /* Respect no_proxy, taking default value from environment variable(s) */
+-int ossl_http_use_proxy(const char *no_proxy, const char *server)
++static int use_proxy(const char *no_proxy, const char *server)
+ {
+     size_t sl;
+     const char *found = NULL;
+@@ -269,7 +267,7 @@ int ossl_http_use_proxy(const char *no_proxy, const char *server)
+ }
+ 
+ /* Take default value from environment variable(s), respect no_proxy */
+-const char *ossl_http_adapt_proxy(const char *proxy, const char *no_proxy,
++const char *OSSL_HTTP_adapt_proxy(const char *proxy, const char *no_proxy,
+                                   const char *server, int use_ssl)
+ {
+     /*
+@@ -282,8 +280,7 @@ const char *ossl_http_adapt_proxy(const char *proxy, const char *no_proxy,
+         proxy = getenv(use_ssl ? OPENSSL_HTTP_PROXY :
+                        OPENSSL_HTTPS_PROXY);
+ 
+-    if (proxy == NULL || *proxy == '\0'
+-            || !ossl_http_use_proxy(no_proxy, server))
++    if (proxy == NULL || *proxy == '\0' || !use_proxy(no_proxy, server))
+         return NULL;
+     return proxy;
+ }
+diff --git a/crypto/http/http_local.h b/crypto/http/http_local.h
+deleted file mode 100644
+index 16f7f7c8a5..0000000000
+--- a/crypto/http/http_local.h
++++ /dev/null
+@@ -1,18 +0,0 @@
+-/*
+- * Copyright 2007-2021 The OpenSSL Project Authors. All Rights Reserved.
+- * Copyright Siemens AG 2018-2020
+- *
+- * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+- * this file except in compliance with the License.  You can obtain a copy
+- * in the file LICENSE in the source distribution or at
+- * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+- */
+-
+-#ifndef OSSL_CRYPTO_HTTP_LOCAL_H
+-# define OSSL_CRYPTO_HTTP_LOCAL_H
+-
+-int ossl_http_use_proxy(const char *no_proxy, const char *server);
+-const char *ossl_http_adapt_proxy(const char *proxy, const char *no_proxy,
+-                                  const char *server, int use_ssl);
+-
+-#endif /* !defined(OSSL_CRYPTO_HTTP_LOCAL_H) */
+diff --git a/crypto/ocsp/ocsp_http.c b/crypto/ocsp/ocsp_http.c
+index f19047aa08..28166d3a17 100644
+--- a/crypto/ocsp/ocsp_http.c
++++ b/crypto/ocsp/ocsp_http.c
+@@ -9,7 +9,6 @@
+ 
+ #include &lt;openssl/ocsp.h&gt;
+ #include &lt;openssl/http.h&gt;
+-#include &quot;../http/http_local.h&quot;
+ 
+ #ifndef OPENSSL_NO_OCSP
+ 
+diff --git a/doc/man3/OSSL_HTTP_parse_url.pod b/doc/man3/OSSL_HTTP_parse_url.pod
+index 559ff1dd08..5c253414ac 100644
+--- a/doc/man3/OSSL_HTTP_parse_url.pod
++++ b/doc/man3/OSSL_HTTP_parse_url.pod
+@@ -2,6 +2,7 @@
+ 
+ =head1 NAME
+ 
++OSSL_HTTP_adapt_proxy,
+ OSSL_parse_url,
+ OSSL_HTTP_parse_url,
+ OCSP_parse_url
+@@ -11,6 +12,9 @@ OCSP_parse_url
+ 
+  #include &lt;openssl/http.h&gt;
+ 
++ const char *OSSL_HTTP_adapt_proxy(const char *proxy, const char *no_proxy,
++                                   const char *server, int use_ssl);
++
+  int OSSL_parse_url(const char *url, char **pscheme, char **puser, char **phost,
+                     char **pport, int *pport_num,
+                     char **ppath, char **pquery, char **pfrag);
+@@ -28,6 +32,19 @@ L&lt;openssl_user_macros(7)&gt;:
+ 
+ =head1 DESCRIPTION
+ 
++OSSL_HTTP_adapt_proxy() takes an optional proxy hostname I&lt;proxy&gt;
++and returns it transformed according to the optional I&lt;no_proxy&gt; parameter,
++I&lt;server&gt;, I&lt;use_ssl&gt;, and the applicable environment variable, as follows.
++If I&lt;proxy&gt; is NULL, take any default value from the C&lt;http_proxy&gt;
++environment variable, or from C&lt;https_proxy&gt; if I&lt;use_ssl&gt; is nonzero.
++If this still does not yield a proxy hostname,
++take any further default value from the C&lt;HTTP_PROXY&gt;
++environment variable, or from C&lt;HTTPS_PROXY&gt; if I&lt;use_ssl&gt; is nonzero.
++If I&lt;no_proxy&gt; is NULL, take any default exclusion value from the C&lt;no_proxy&gt;
++environment variable, or else from C&lt;NO_PROXY&gt;.
++Return the determined proxy hostname unless the exclusion contains I&lt;server&gt;.
++Otherwise return NULL.
++
+ OSSL_parse_url() parses its input string I&lt;url&gt; as a URL of the form
+ C&lt;[<A HREF="scheme://">scheme://</A>][userinfo@]host[:port][/path][?query][#fragment]&gt; and splits it up
+ into scheme, userinfo, host, port, path, query, and fragment components.
+@@ -61,6 +78,10 @@ OSSL_HTTP_parse_url(url, ssl, NULL, host, port, NULL, path, NULL, NULL).
+ 
+ =head1 RETURN VALUES
+ 
++OSSL_HTTP_adapt_proxy() returns NULL if no proxy is to be used,
++otherwise a constant proxy hostname string,
++which is either the proxy name handed in or an environment variable value.
++
+ OSSL_parse_url(), OSSL_HTTP_parse_url(), and OCSP_parse_url()
+ return 1 on success, 0 on error.
+ 
+@@ -70,6 +91,7 @@ L&lt;OSSL_HTTP_transfer(3)&gt;
+ 
+ =head1 HISTORY
+ 
++OSSL_HTTP_adapt_proxy(),
+ OSSL_parse_url() and OSSL_HTTP_parse_url() were added in OpenSSL 3.0.
+ OCSP_parse_url() was deprecated in OpenSSL 3.0.
+ 
+diff --git a/include/openssl/http.h b/include/openssl/http.h
+index fb05280f87..f7ab214265 100644
+--- a/include/openssl/http.h
++++ b/include/openssl/http.h
+@@ -100,6 +100,8 @@ int OSSL_parse_url(const char *url, char **pscheme, char **puser, char **phost,
+ int OSSL_HTTP_parse_url(const char *url, int *pssl, char **puser, char **phost,
+                         char **pport, int *pport_num,
+                         char **ppath, char **pquery, char **pfrag);
++const char *OSSL_HTTP_adapt_proxy(const char *proxy, const char *no_proxy,
++                                  const char *server, int use_ssl);
+ 
+ # ifdef  __cplusplus
+ }
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index aecbbbb2a8..73e84ff08e 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4873,6 +4873,7 @@ BIO_socket_wait                         ?	3_0_0	EXIST::FUNCTION:SOCK
+ BIO_wait                                ?	3_0_0	EXIST::FUNCTION:
+ BIO_do_connect_retry                    ?	3_0_0	EXIST::FUNCTION:
+ OSSL_parse_url                          ?	3_0_0	EXIST::FUNCTION:
++OSSL_HTTP_adapt_proxy                   ?	3_0_0	EXIST::FUNCTION:
+ OSSL_HTTP_REQ_CTX_get_resp_len          ?	3_0_0	EXIST::FUNCTION:
+ OSSL_HTTP_REQ_CTX_set_expected          ?	3_0_0	EXIST::FUNCTION:
+ OSSL_HTTP_is_alive                      ?	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034734.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034736.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34735">[ date ]</a>
+              <a href="thread.html#34735">[ thread ]</a>
+              <a href="subject.html#34735">[ subject ]</a>
+              <a href="author.html#34735">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,222 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1564638169.473745.24727.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024244.html">
+   <LINK REL="Next"  HREF="024251.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1564638169.473745.24727.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Thu Aug  1 05:42:49 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024244.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024251.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24249">[ date ]</a>
+              <a href="thread.html#24249">[ thread ]</a>
+              <a href="subject.html#24249">[ subject ]</a>
+              <a href="author.html#24249">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e2e5abe47af60260e9a4247597e64a4e9d266a7a (commit)
+       via  f06cf3c4149c271d498764c2a071cb68b3d9a431 (commit)
+      from  59b2cb2638dda3e07385ad36a41f0e141b36987b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e2e5abe47af60260e9a4247597e64a4e9d266a7a
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Wed Jul 31 19:31:45 2019 +1000
+
+    Prevent an infinite recursion when the query cache is flushed.
+    
+    The problem being that the &quot;requires flush&quot; flag was being cleared after the
+    the flush.  The fix is to clear it before.  This is a problem because the
+    cache flushing called RAND_bytes and if the DRBG hadn't been created yet, it
+    would be queried and added to the cache causing the flush code to repeat.
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9477">https://github.com/openssl/openssl/pull/9477</A>)
+
+commit f06cf3c4149c271d498764c2a071cb68b3d9a431
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Wed Jul 31 19:31:21 2019 +1000
+
+    The query cache has been updated to not depend on RAND_bytes being available.
+    
+    The alternative is to use a fast and small xorshift
+    random number generator.  The stochastic flushing doesn't require good
+    random numbers, just enough variety to avoid causing problems.
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9477">https://github.com/openssl/openssl/pull/9477</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/property/property.c | 71 +++++++++++++++++++++++++---------------------
+ 1 file changed, 39 insertions(+), 32 deletions(-)
+
+diff --git a/crypto/property/property.c b/crypto/property/property.c
+index 4c328ffbd8..cab2ab243e 100644
+--- a/crypto/property/property.c
++++ b/crypto/property/property.c
+@@ -58,9 +58,9 @@ struct ossl_method_store_st {
+ };
+ 
+ typedef struct {
+-    OSSL_METHOD_STORE *store;
+     LHASH_OF(QUERY) *cache;
+     size_t nelem;
++    uint32_t seed;
+ } IMPL_CACHE_FLUSH;
+ 
+ DEFINE_SPARSE_ARRAY_OF(ALGORITHM);
+@@ -376,37 +376,40 @@ IMPLEMENT_LHASH_DOALL_ARG(QUERY, IMPL_CACHE_FLUSH);
+ /*
+  * Flush an element from the query cache (perhaps).
+  *
+- * In order to avoid taking a write lock to keep accurate LRU information or
+- * using atomic operations to approximate similar, the procedure used here
+- * is to stochastically flush approximately half the cache.  Since generating
+- * random numbers is relatively expensive, we produce them in blocks and
+- * consume them as we go, saving generated bits between generations of flushes.
++ * In order to avoid taking a write lock or using atomic operations
++ * to keep accurate least recently used (LRU) or least frequently used
++ * (LFU) information, the procedure used here is to stochastically
++ * flush approximately half the cache.
+  *
+- * This procedure isn't ideal, LRU would be better.  However, in normal
+- * operation, reaching a full cache would be quite unexpected.  It means
+- * that no steady state of algorithm queries has been reached.  I.e. it is most
+- * likely an attack of some form.  A suboptimal clearance strategy that doesn't
+- * degrade performance of the normal case is preferable to a more refined
+- * approach that imposes a performance impact.
++ * This procedure isn't ideal, LRU or LFU would be better.  However,
++ * in normal operation, reaching a full cache would be unexpected.
++ * It means that no steady state of algorithm queries has been reached.
++ * That is, it is most likely an attack of some form.  A suboptimal clearance
++ * strategy that doesn't degrade performance of the normal case is
++ * preferable to a more refined approach that imposes a performance
++ * impact.
+  */
+ static void impl_cache_flush_cache(QUERY *c, IMPL_CACHE_FLUSH *state)
+ {
+-#if !defined(FIPS_MODE)
+-/* TODO(3.0): No RAND_bytes yet in FIPS module. Add this back when available */
+-    OSSL_METHOD_STORE *store = state-&gt;store;
+-    unsigned int n;
+-
+-    if (store-&gt;nbits == 0) {
+-        if (!RAND_bytes(store-&gt;rand_bits, sizeof(store-&gt;rand_bits)))
+-            return;
+-        store-&gt;nbits = sizeof(store-&gt;rand_bits) * 8;
+-    }
+-    n = --store-&gt;nbits;
+-    if ((store-&gt;rand_bits[n &gt;&gt; 3] &amp; (1 &lt;&lt; (n &amp; 7))) != 0)
++    uint32_t n;
++
++    /*
++     * Implement the 32 bit xorshift as suggested by George Marsaglia in:
++     *      <A HREF="https://doi.org/10.18637/jss.v008.i14">https://doi.org/10.18637/jss.v008.i14</A>
++     *
++     * This is a very fast PRNG so there is no need to extract bits one at a
++     * time and use the entire value each time.
++     */
++    n = state-&gt;seed;
++    n ^= n &lt;&lt; 13;
++    n ^= n &gt;&gt; 17;
++    n ^= n &lt;&lt; 5;
++    state-&gt;seed = n;
++
++    if ((n &amp; 1) != 0)
+         OPENSSL_free(lh_QUERY_delete(state-&gt;cache, c));
+     else
+         state-&gt;nelem++;
+-#endif /* !defined(FIPS_MODE) */
+ }
+ 
+ static void impl_cache_flush_one_alg(ossl_uintmax_t idx, ALGORITHM *alg,
+@@ -424,9 +427,10 @@ static void ossl_method_cache_flush_some(OSSL_METHOD_STORE *store)
+     IMPL_CACHE_FLUSH state;
+ 
+     state.nelem = 0;
+-    state.store = store;
+-    ossl_sa_ALGORITHM_doall_arg(store-&gt;algs, &amp;impl_cache_flush_one_alg, &amp;state);
++    if ((state.seed = OPENSSL_rdtsc()) == 0)
++        state.seed = 1;
+     store-&gt;need_flush = 0;
++    ossl_sa_ALGORITHM_doall_arg(store-&gt;algs, &amp;impl_cache_flush_one_alg, &amp;state);
+     store-&gt;nelem = state.nelem;
+ }
+ 
+@@ -480,7 +484,8 @@ int ossl_method_store_cache_set(OSSL_METHOD_STORE *store, int nid,
+ 
+     if (method == NULL) {
+         elem.query = prop_query;
+-        lh_QUERY_delete(alg-&gt;cache, &amp;elem);
++        if (lh_QUERY_delete(alg-&gt;cache, &amp;elem) != NULL)
++            store-&gt;nelem--;
+         ossl_property_unlock(store);
+         return 1;
+     }
+@@ -489,11 +494,13 @@ int ossl_method_store_cache_set(OSSL_METHOD_STORE *store, int nid,
+         p-&gt;query = p-&gt;body;
+         p-&gt;method = method;
+         memcpy((char *)p-&gt;query, prop_query, len + 1);
+-        if ((old = lh_QUERY_insert(alg-&gt;cache, p)) != NULL)
++        if ((old = lh_QUERY_insert(alg-&gt;cache, p)) != NULL) {
+             OPENSSL_free(old);
+-        if (old != NULL || !lh_QUERY_error(alg-&gt;cache)) {
+-            store-&gt;nelem++;
+-            if (store-&gt;nelem &gt;= IMPL_CACHE_FLUSH_THRESHOLD)
++            ossl_property_unlock(store);
++            return 1;
++        }
++        if (!lh_QUERY_error(alg-&gt;cache)) {
++            if (++store-&gt;nelem &gt;= IMPL_CACHE_FLUSH_THRESHOLD)
+                 store-&gt;need_flush = 1;
+             ossl_property_unlock(store);
+             return 1;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024244.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024251.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24249">[ date ]</a>
+              <a href="thread.html#24249">[ thread ]</a>
+              <a href="subject.html#24249">[ subject ]</a>
+              <a href="author.html#24249">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

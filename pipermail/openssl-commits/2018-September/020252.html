@@ -1,0 +1,221 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1537460983.666154.29874.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020247.html">
+   <LINK REL="Next"  HREF="020263.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>matthias.st.pierre at ncp-e.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1537460983.666154.29874.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">matthias.st.pierre at ncp-e.com
+       </A><BR>
+    <I>Thu Sep 20 16:29:43 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020247.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="020263.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20252">[ date ]</a>
+              <a href="thread.html#20252">[ thread ]</a>
+              <a href="subject.html#20252">[ subject ]</a>
+              <a href="author.html#20252">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  f58001c35f39c50cb4aabcbc234d871ac740c179 (commit)
+      from  79951b1d4e219f60e474a589f21fc3b38023e8a8 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f58001c35f39c50cb4aabcbc234d871ac740c179
+Author: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+Date:   Mon Sep 17 17:50:54 2018 +0200
+
+    drbg_get_entropy: force a reseed before calling ssleay_rand_bytes()
+    
+    Fixes #7240
+    
+    In FIPS mode, the default FIPS DRBG uses the drbg_get_entropy()
+    callback to reseed itself, which is provided by the wrapping
+    libcrypto library. This callback in turn uses ssleay_rand_bytes()
+    to generate random bytes.
+    
+    Now ssleay_rand_bytes() calls RAND_poll() once on first call to
+    seed itself, but RAND_poll() is never called again (unless the
+    application calls RAND_poll() explicitely). This implies that
+    whenever the DRBG reseeds itself (which happens every 2^14
+    generate requests) this happens without obtaining fresh random
+    data from the operating system's entropy sources.
+    
+    This patch forces a reseed from system entropy sources on every
+    call to drbg_get_entropy(). In contrary to the automatic reseeding
+    of the DRBG in master, this reseeding does not break applications
+    running in a chroot() environment (see c7504aeb640a), because the
+    SSLEAY PRNG does not maintain an error state. (It does not even
+    check the return value of RAND_poll() on its instantiation.)
+    
+    In the worst case, if no random device is available for reseeding,
+    no fresh entropy will be added to the SSLEAY PRNG but it will happily
+    continue to generate random bytes as 'entropy' input for the DRBG's
+    reseeding, which is just as good (or bad) as before this patch.
+    
+    To prevent ssleay_rand_bytes_from_system() (and hence RAND_poll())
+    from being called twice during instantiation, a separate
+    drbg_get_nonce() callback has been introduced, which is identical
+    with the previous implementation of drbg_get_entropy().
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    Reviewed-by: Ben Kaduk &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kaduk at mit.edu</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/7259">https://github.com/openssl/openssl/pull/7259</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/md_rand.c  | 12 ++++++++++++
+ crypto/rand/rand_lcl.h |  2 +-
+ crypto/rand/rand_lib.c | 22 ++++++++++++++++++++--
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/rand/md_rand.c b/crypto/rand/md_rand.c
+index a7af9f9..abca70f 100644
+--- a/crypto/rand/md_rand.c
++++ b/crypto/rand/md_rand.c
+@@ -555,6 +555,18 @@ int ssleay_rand_bytes(unsigned char *buf, int num, int pseudo, int lock)
+     return (0);
+ }
+ 
++/*
++ * Returns ssleay_rand_bytes(), enforcing a reseeding from the
++ * system entropy sources using RAND_poll() before generating
++`* the random bytes.
++ */
++
++int ssleay_rand_bytes_from_system(unsigned char *buf, int num)
++{
++    initialized = 0;
++    return ssleay_rand_bytes(buf, num, 0, 0);
++}
++
+ static int ssleay_rand_nopseudo_bytes(unsigned char *buf, int num)
+ {
+     return ssleay_rand_bytes(buf, num, 0, 1);
+diff --git a/crypto/rand/rand_lcl.h b/crypto/rand/rand_lcl.h
+index f9fda3e..10ccdf0 100644
+--- a/crypto/rand/rand_lcl.h
++++ b/crypto/rand/rand_lcl.h
+@@ -154,5 +154,5 @@
+ # endif
+ 
+ int ssleay_rand_bytes(unsigned char *buf, int num, int pseudo, int lock);
+-
++int ssleay_rand_bytes_from_system(unsigned char *buf, int num);
+ #endif
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 88a78d3..6094c83 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -185,7 +185,7 @@ int RAND_status(void)
+ 
+ /*
+  * Entropy gatherer: use standard OpenSSL PRNG to seed (this will gather
+- * entropy internally through RAND_poll().
++ * entropy internally through RAND_poll()).
+  */
+ 
+ static size_t drbg_get_entropy(DRBG_CTX *ctx, unsigned char **pout,
+@@ -196,6 +196,24 @@ static size_t drbg_get_entropy(DRBG_CTX *ctx, unsigned char **pout,
+     *pout = OPENSSL_malloc(min_len);
+     if (!*pout)
+         return 0;
++
++    /* Enforces a reseed of the SSLEAY PRNG before generating random bytes */
++    if (ssleay_rand_bytes_from_system(*pout, min_len) &lt;= 0) {
++        OPENSSL_free(*pout);
++        *pout = NULL;
++        return 0;
++    }
++    return min_len;
++}
++
++static size_t drbg_get_nonce(DRBG_CTX *ctx, unsigned char **pout,
++                               int entropy, size_t min_len, size_t max_len)
++{
++    /* Round up request to multiple of block size */
++    min_len = ((min_len + 19) / 20) * 20;
++    *pout = OPENSSL_malloc(min_len);
++    if (!*pout)
++        return 0;
+     if (ssleay_rand_bytes(*pout, min_len, 0, 0) &lt;= 0) {
+         OPENSSL_free(*pout);
+         *pout = NULL;
+@@ -281,7 +299,7 @@ int RAND_init_fips(void)
+ 
+     FIPS_drbg_set_callbacks(dctx,
+                             drbg_get_entropy, drbg_free_entropy, 20,
+-                            drbg_get_entropy, drbg_free_entropy);
++                            drbg_get_nonce, drbg_free_entropy);
+     FIPS_drbg_set_rand_callbacks(dctx, drbg_get_adin, 0,
+                                  drbg_rand_seed, drbg_rand_add);
+     /* Personalisation string: a string followed by date time vector */
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020247.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="020263.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20252">[ date ]</a>
+              <a href="thread.html#20252">[ thread ]</a>
+              <a href="subject.html#20252">[ subject ]</a>
+              <a href="author.html#20252">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

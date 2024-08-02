@@ -1,0 +1,366 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1470322346.191428.329.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009477.html">
+   <LINK REL="Next"  HREF="009479.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1470322346.191428.329.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Aug  4 14:52:26 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009477.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009479.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9478">[ date ]</a>
+              <a href="thread.html#9478">[ thread ]</a>
+              <a href="subject.html#9478">[ subject ]</a>
+              <a href="author.html#9478">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5fc2c6896d5050735c7d99dc80275c72fc58c49c (commit)
+       via  fda27673477b3667b96ff7156671d40ea8f283e8 (commit)
+      from  262ee9a2c205515b9a3afcde126bea866aa55d6a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5fc2c6896d5050735c7d99dc80275c72fc58c49c
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Aug 3 21:45:06 2016 +0200
+
+    VSI submission: make the VMS version of RAND_poll() faster and more secure
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit fda27673477b3667b96ff7156671d40ea8f283e8
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Aug 3 21:33:31 2016 +0200
+
+    VSI submisson: make better use of item lists in o_time.c
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/o_time.c        |  73 +++++++++++++++++++++--------
+ crypto/rand/rand_vms.c | 122 +++++++++++++++++++++++++++++--------------------
+ 2 files changed, 128 insertions(+), 67 deletions(-)
+ mode change 100644 =&gt; 100755 crypto/o_time.c
+
+diff --git a/crypto/o_time.c b/crypto/o_time.c
+old mode 100644
+new mode 100755
+index b73fe1f..e785525
+--- a/crypto/o_time.c
++++ b/crypto/o_time.c
+@@ -24,7 +24,28 @@
+ #  include &lt;descrip.h&gt;
+ #  include &lt;stdlib.h&gt;
+ # endif                         /* ndef VMS_GMTIME_OK */
+-#endif
++
++
++/*
++ * Needed to pick up the correct definitions and declarations in some of the
++ * DEC C Header Files (*.H).
++ */
++# define __NEW_STARLET 1
++
++# if (defined(__alpha) || defined(__ia64))
++#  include &lt;iledef.h&gt;
++# else
++
++/* VAX */
++typedef struct _ile3 {          /* Copied from ILEDEF.H for Alpha   */
++#  pragma __nomember_alignment
++    unsigned short int ile3$w_length;        /* Length of buffer in bytes */
++    unsigned short int ile3$w_code;          /* Item code value */
++    void *ile3$ps_bufaddr;                   /* Buffer address */
++    unsigned short int *ile3$ps_retlen_addr; /* Address of word for returned length */
++} ILE3;
++# endif   /* alpha || ia64    */
++#endif    /* OPENSSL_SYS_VMS  */
+ 
+ struct tm *OPENSSL_gmtime(const time_t *timer, struct tm *result)
+ {
+@@ -51,26 +72,42 @@ struct tm *OPENSSL_gmtime(const time_t *timer, struct tm *result)
+         static $DESCRIPTOR(lognam, &quot;SYS$TIMEZONE_DIFFERENTIAL&quot;);
+         char logvalue[256];
+         unsigned int reslen = 0;
+-        struct {
+-            short buflen;
+-            short code;
+-            void *bufaddr;
+-            unsigned int *reslen;
+-        } itemlist[] = {
+-            {
+-                0, LNM$_STRING, 0, 0
+-            },
+-            {
+-                0, 0, 0, 0
+-            },
+-        };
++# if __INITIAL_POINTER_SIZE == 64
++        ILEB_64 itemlist[2], *pitem;
++# else
++        ILE3 itemlist[2], *pitem;
++# endif
+         int status;
+         time_t t;
+ 
++
++        /*
++         * Setup an itemlist for the call to $TRNLNM - Translate Logical Name.
++         */
++        pitem = itemlist;
++
++# if __INITIAL_POINTER_SIZE == 64
++        pitem-&gt;ileb_64$w_mbo = 1;
++        pitem-&gt;ileb_64$w_code = LNM$_STRING;
++        pitem-&gt;ileb_64$l_mbmo = -1;
++        pitem-&gt;ileb_64$q_length = sizeof (logvalue);
++        pitem-&gt;ileb_64$pq_bufaddr = logvalue;
++        pitem-&gt;ileb_64$pq_retlen_addr = (unsigned __int64 *) &reslen;
++        pitem++;
++        /* Last item of the item list is null terminated */
++        pitem-&gt;ileb_64$q_length = pitem-&gt;ileb_64$w_code = 0;
++# else
++        pitem-&gt;ile3$w_length = sizeof (logvalue);
++        pitem-&gt;ile3$w_code = LNM$_STRING;
++        pitem-&gt;ile3$ps_bufaddr = logvalue;
++        pitem-&gt;ile3$ps_retlen_addr = (unsigned short int *) &reslen;
++        pitem++;
++        /* Last item of the item list is null terminated */
++        pitem-&gt;ile3$w_length = pitem-&gt;ile3$w_code = 0;
++# endif
++
++
+         /* Get the value for SYS$TIMEZONE_DIFFERENTIAL */
+-        itemlist[0].buflen = sizeof(logvalue);
+-        itemlist[0].bufaddr = logvalue;
+-        itemlist[0].reslen = &reslen;
+         status = sys$trnlnm(0, &amp;tabnam, &amp;lognam, 0, itemlist);
+         if (!(status &amp; 1))
+             return NULL;
+@@ -78,7 +115,7 @@ struct tm *OPENSSL_gmtime(const time_t *timer, struct tm *result)
+ 
+         t = *timer;
+ 
+-/* The following is extracted from the DEC C header time.h */
++        /* The following is extracted from the DEC C header time.h */
+         /*
+          **  Beginning in OpenVMS Version 7.0 mktime, time, ctime, strftime
+          **  have two implementations.  One implementation is provided
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index ae6f17d..9c462dd 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -7,15 +7,21 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
++/*
++ * Modified by VMS Software, Inc (2016)
++ *    Eliminate looping through all processes (performance)
++ *    Add additional randomizations using rand() function
++ */
++
+ #include &lt;openssl/rand.h&gt;
+ #include &quot;rand_lcl.h&quot;
+ 
+ #if defined(OPENSSL_SYS_VMS)
+-
+ # include &lt;descrip.h&gt;
+ # include &lt;jpidef.h&gt;
+ # include &lt;ssdef.h&gt;
+ # include &lt;starlet.h&gt;
++# include &lt;efndef&gt;
+ # ifdef __DECC
+ #  pragma message disable DOLLARID
+ # endif
+@@ -33,76 +39,94 @@
+ # endif                         /* __INITIAL_POINTER_SIZE == 64 [else] */
+ 
+ static struct items_data_st {
+-    short length, code;         /* length is amount of bytes */
++    short length, code;         /* length is number of bytes */
+ } items_data[] = {
+-    {
+-        4, JPI$_BUFIO
+-    },
+-    {
+-        4, JPI$_CPUTIM
+-    },
+-    {
+-        4, JPI$_DIRIO
+-    },
+-    {
+-        8, JPI$_LOGINTIM
+-    },
+-    {
+-        4, JPI$_PAGEFLTS
+-    },
+-    {
+-        4, JPI$_PID
+-    },
+-    {
+-        4, JPI$_WSSIZE
+-    },
+-    {
+-        0, 0
+-    }
++    {4, JPI$_BUFIO},
++    {4, JPI$_CPUTIM},
++    {4, JPI$_DIRIO},
++    {4, JPI$_IMAGECOUNT},
++    {8, JPI$_LAST_LOGIN_I},
++    {8, JPI$_LOGINTIM},
++    {4, JPI$_PAGEFLTS},
++    {4, JPI$_PID},
++    {4, JPI$_PPGCNT},
++    {4, JPI$_WSPEAK},
++    {4, JPI$_FINALEXC},
++    {0, 0}                      /* zero terminated */
+ };
+ 
+ int RAND_poll(void)
+ {
+-    long pid, iosb[2];
+-    int status = 0;
++
++    /* determine the number of items in the JPI array */
++
++    struct items_data_st item_entry;
++    int item_entry_count = sizeof(items_data)/sizeof(item_entry);
++
++    /* Create the JPI itemlist array to hold item_data content */
++
+     struct {
+         short length, code;
+-        long *buffer;
++        int *buffer;
+         int *retlen;
+-    } item[32], *pitem;
+-    unsigned char data_buffer[256];
+-    short total_length = 0;
++    } item[item_entry_count], *pitem; /* number of entries in items_data */
++
+     struct items_data_st *pitems_data;
++    int data_buffer[(item_entry_count*2)+4]; /* 8 bytes per entry max */
++    int iosb[2];
++    int sys_time[2];
++    int *ptr;
++    int i, j ;
++    int tmp_length   = 0;
++    int total_length = 0;
+ 
+     pitems_data = items_data;
+     pitem = item;
+ 
+-    /* Setup */
+-    while (pitems_data-&gt;length &amp;&amp; (total_length + pitems_data-&gt;length &lt;= 256)) {
++
++    /* Setup itemlist for GETJPI */
++    while (pitems_data-&gt;length) {
+         pitem-&gt;length = pitems_data-&gt;length;
+-        pitem-&gt;code = pitems_data-&gt;code;
+-        pitem-&gt;buffer = (long *)&amp;data_buffer[total_length];
++        pitem-&gt;code   = pitems_data-&gt;code;
++        pitem-&gt;buffer = &amp;data_buffer[total_length];
+         pitem-&gt;retlen = 0;
+-        total_length += pitems_data-&gt;length;
++        /* total_length is in longwords */
++        total_length += pitems_data-&gt;length/4;
+         pitems_data++;
+         pitem ++;
+     }
+     pitem-&gt;length = pitem-&gt;code = 0;
+ 
+-    /*
+-     * Scan through all the processes in the system and add entropy with
+-     * results from the processes that were possible to look at.
+-     * However, view the information as only half trustable.
+-     */
+-    pid = -1;                   /* search context */
+-    while ((status = sys$getjpiw(0, &amp;pid, 0, item, iosb, 0, 0))
+-           != SS$_NOMOREPROC) {
+-        if (status == SS$_NORMAL) {
+-            RAND_add((PTR_T) data_buffer, total_length, total_length / 2);
++    /* Fill data_buffer with various info bits from this process */
++    /* and twist that data to seed the SSL random number init    */
++
++    if (sys$getjpiw(EFN$C_ENF, NULL, NULL, item, &amp;iosb, 0, 0) == SS$_NORMAL) {
++        for (i = 0; i &lt; total_length; i++) {
++            sys$gettim((struct _generic_64 *)&amp;sys_time[0]);
++            srand(sys_time[0] * data_buffer[0] * data_buffer[1] + i);
++
++            if (i == (total_length - 1)) { /* for JPI$_FINALEXC */
++                ptr = &amp;data_buffer[i];
++                for (j = 0; j &lt; 4; j++) {
++                    data_buffer[i + j] = ptr[j];
++                    /* OK to use rand() just to scramble the seed */
++                    data_buffer[i + j] ^= (sys_time[0] ^ rand());
++                    tmp_length++;
++                }
++            } else {
++                /* OK to use rand() just to scramble the seed */
++                data_buffer[i] ^= (sys_time[0] ^ rand());
++            }
+         }
++
++        total_length += (tmp_length - 1);
++
++        /* size of seed is total_length*4 bytes (64bytes) */
++        RAND_add((PTR_T) data_buffer, total_length*4, total_length * 2);
++    } else {
++        return 0;
+     }
+-    sys$gettim(iosb);
+-    RAND_add((PTR_T) iosb, sizeof(iosb), sizeof(iosb) / 2);
++
+     return 1;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009477.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009479.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9478">[ date ]</a>
+              <a href="thread.html#9478">[ thread ]</a>
+              <a href="subject.html#9478">[ subject ]</a>
+              <a href="author.html#9478">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

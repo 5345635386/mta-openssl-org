@@ -1,0 +1,244 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1618213761.018335.19560.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033821.html">
+   <LINK REL="Next"  HREF="033827.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1618213761.018335.19560.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Mon Apr 12 07:49:21 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033821.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033827.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33822">[ date ]</a>
+              <a href="thread.html#33822">[ thread ]</a>
+              <a href="subject.html#33822">[ subject ]</a>
+              <a href="author.html#33822">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  4ec4b063e0d4cc3d58c709e309b1ec5a9aea3379 (commit)
+      from  3f883c7c835ff577a6df37e238956c5b9016dc93 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 4ec4b063e0d4cc3d58c709e309b1ec5a9aea3379
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Fri Apr 9 12:01:16 2021 +0200
+
+    Always reset IV for CBC, OFB, and CFB mode on cipher context reinit
+    
+    This is necessary to keep compatibility with 1.1.1 implementation
+    of the CBC, OFB, and CFB mode ciphers.
+    
+    Fixes #14704
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14811">https://github.com/openssl/openssl/pull/14811</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/implementations/ciphers/ciphercommon.c |  7 ++++
+ test/evp_extra_test.c                            | 51 ++++++++++++++++++------
+ 2 files changed, 46 insertions(+), 12 deletions(-)
+
+diff --git a/providers/implementations/ciphers/ciphercommon.c b/providers/implementations/ciphers/ciphercommon.c
+index 53ecbc9012..2019699cc2 100644
+--- a/providers/implementations/ciphers/ciphercommon.c
++++ b/providers/implementations/ciphers/ciphercommon.c
+@@ -191,6 +191,13 @@ static int cipher_generic_init_internal(PROV_CIPHER_CTX *ctx,
+         if (!ossl_cipher_generic_initiv(ctx, iv, ivlen))
+             return 0;
+     }
++    if (iv == NULL &amp;&amp; ctx-&gt;iv_set
++        &amp;&amp; (ctx-&gt;mode == EVP_CIPH_CBC_MODE
++            || ctx-&gt;mode == EVP_CIPH_CFB_MODE
++            || ctx-&gt;mode == EVP_CIPH_OFB_MODE))
++        /* reset IV for these modes to keep compatibility with 1.1.1 */
++        memcpy(ctx-&gt;iv, ctx-&gt;oiv, ctx-&gt;ivlen);
++
+     if (key != NULL) {
+         if (ctx-&gt;variable_keylength == 0) {
+             if (keylen != ctx-&gt;keylen) {
+diff --git a/test/evp_extra_test.c b/test/evp_extra_test.c
+index 75eeb72667..afba7ea75b 100644
+--- a/test/evp_extra_test.c
++++ b/test/evp_extra_test.c
+@@ -2446,6 +2446,8 @@ static int test_evp_iv(int idx)
+ 
+     unsigned char ofb_state[16] = {0x76, 0xe6, 0x66, 0x61, 0xd0, 0x8a, 0xe4, 0x64,
+                                    0xdd, 0x66, 0xbf, 0x00, 0xf0, 0xe3, 0x6f, 0xfd};
++    unsigned char cfb_state[16] = {0x77, 0xe4, 0x65, 0x65, 0xd5, 0x8c, 0xe3, 0x6c,
++                                   0xd4, 0x6c, 0xb4, 0x0c, 0xfd, 0xed, 0x60, 0xed};
+     unsigned char gcm_state[12] = {0x57, 0x71, 0x7d, 0xad, 0xdb, 0x9b,
+                                    0x98, 0x82, 0x5a, 0x55, 0x91, 0x81};
+     unsigned char ccm_state[7] = {0x57, 0x71, 0x7d, 0xad, 0xdb, 0x9b, 0x98};
+@@ -2456,56 +2458,69 @@ static int test_evp_iv(int idx)
+     int len = sizeof(ciphertext);
+     size_t ivlen, ref_len;
+     const EVP_CIPHER *type = NULL;
++    int iv_reset = 0;
+ 
+-    if (nullprov != NULL &amp;&amp; idx &lt; 5)
++    if (nullprov != NULL &amp;&amp; idx &lt; 6)
+         return TEST_skip(&quot;Test does not support a non-default library context&quot;);
+ 
+     switch(idx) {
+     case 0:
+         type = EVP_aes_128_cbc();
+         /* FALLTHROUGH */
+-    case 5:
++    case 6:
+         type = (type != NULL) ? type :
+                                 EVP_CIPHER_fetch(testctx, &quot;aes-128-cbc&quot;, testpropq);
+         ref_iv = cbc_state;
+         ref_len = sizeof(cbc_state);
++        iv_reset = 1;
+         break;
+     case 1:
+         type = EVP_aes_128_ofb();
+         /* FALLTHROUGH */
+-    case 6:
++    case 7:
+         type = (type != NULL) ? type :
+                                 EVP_CIPHER_fetch(testctx, &quot;aes-128-ofb&quot;, testpropq);
+         ref_iv = ofb_state;
+         ref_len = sizeof(ofb_state);
++        iv_reset = 1;
+         break;
+     case 2:
++        type = EVP_aes_128_cfb();
++        /* FALLTHROUGH */
++    case 8:
++        type = (type != NULL) ? type :
++                                EVP_CIPHER_fetch(testctx, &quot;aes-128-cfb&quot;, testpropq);
++        ref_iv = cfb_state;
++        ref_len = sizeof(cfb_state);
++        iv_reset = 1;
++        break;
++    case 3:
+         type = EVP_aes_128_gcm();
+         /* FALLTHROUGH */
+-    case 7:
++    case 9:
+         type = (type != NULL) ? type :
+                                 EVP_CIPHER_fetch(testctx, &quot;aes-128-gcm&quot;, testpropq);
+         ref_iv = gcm_state;
+         ref_len = sizeof(gcm_state);
+         break;
+-    case 3:
++    case 4:
+         type = EVP_aes_128_ccm();
+         /* FALLTHROUGH */
+-    case 8:
++    case 10:
+         type = (type != NULL) ? type :
+                                 EVP_CIPHER_fetch(testctx, &quot;aes-128-ccm&quot;, testpropq);
+         ref_iv = ccm_state;
+         ref_len = sizeof(ccm_state);
+         break;
+ #ifdef OPENSSL_NO_OCB
+-    case 4:
+-    case 9:
++    case 5:
++    case 11:
+         return 1;
+ #else
+-    case 4:
++    case 5:
+         type = EVP_aes_128_ocb();
+         /* FALLTHROUGH */
+-    case 9:
++    case 11:
+         type = (type != NULL) ? type :
+                                 EVP_CIPHER_fetch(testctx, &quot;aes-128-ocb&quot;, testpropq);
+         ref_iv = ocb_state;
+@@ -2530,10 +2545,22 @@ static int test_evp_iv(int idx)
+             || !TEST_mem_eq(ref_iv, ref_len, iv, ivlen))
+         goto err;
+ 
++    /* CBC, OFB, and CFB modes: the updated iv must be reset after reinit */
++    if (!TEST_true(EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, NULL))
++        || !TEST_true(EVP_CIPHER_CTX_get_updated_iv(ctx, iv, sizeof(iv))))
++        goto err;
++    if (iv_reset) {
++        if (!TEST_mem_eq(init_iv, ivlen, iv, ivlen))
++            goto err;
++    } else {
++        if (!TEST_mem_eq(ref_iv, ivlen, iv, ivlen))
++            goto err;
++    }
++
+     ret = 1;
+ err:
+     EVP_CIPHER_CTX_free(ctx);
+-    if (idx &gt;= 5)
++    if (idx &gt;= 6)
+         EVP_CIPHER_free((EVP_CIPHER *)type);
+     return ret;
+ }
+@@ -2782,7 +2809,7 @@ int setup_tests(void)
+     ADD_ALL_TESTS(test_pkey_ctx_fail_without_provider, 2);
+ 
+     ADD_TEST(test_rand_agglomeration);
+-    ADD_ALL_TESTS(test_evp_iv, 10);
++    ADD_ALL_TESTS(test_evp_iv, 12);
+     ADD_TEST(test_EVP_rsa_pss_with_keygen_bits);
+ #ifndef OPENSSL_NO_EC
+     ADD_ALL_TESTS(test_ecpub, OSSL_NELEM(ecpub_nids));
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033821.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033827.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33822">[ date ]</a>
+              <a href="thread.html#33822">[ thread ]</a>
+              <a href="subject.html#33822">[ subject ]</a>
+              <a href="author.html#33822">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,435 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1520522878.628300.8767.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018402.html">
+   <LINK REL="Next"  HREF="018405.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1520522878.628300.8767.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Thu Mar  8 15:27:58 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018402.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018405.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18403">[ date ]</a>
+              <a href="thread.html#18403">[ thread ]</a>
+              <a href="subject.html#18403">[ subject ]</a>
+              <a href="author.html#18403">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  082193ef2b25cf16ec51af9dc9f0ee890beb38b9 (commit)
+      from  83918ad6fddf33acc43aadcc40f08be22ff39482 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 082193ef2b25cf16ec51af9dc9f0ee890beb38b9
+Author: Bryan Donlan &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bdonlan at amazon.com</A>&gt;
+Date:   Wed Mar 7 16:01:06 2018 -0500
+
+    Fix issues in ia32 RDRAND asm leading to reduced entropy
+    
+    This patch fixes two issues in the ia32 RDRAND assembly code that result in a
+    (possibly significant) loss of entropy.
+    
+    The first, less significant, issue is that, by returning success as 0 from
+    OPENSSL_ia32_rdrand() and OPENSSL_ia32_rdseed(), a subtle bias was introduced.
+    Specifically, because the assembly routine copied the remaining number of
+    retries over the result when RDRAND/RDSEED returned 'successful but zero', a
+    bias towards values 1-8 (primarily 8) was introduced.
+    
+    The second, more worrying issue was that, due to a mixup in registers, when a
+    buffer that was not size 0 or 1 mod 8 was passed to OPENSSL_ia32_rdrand_bytes
+    or OPENSSL_ia32_rdseed_bytes, the last (n mod 8) bytes were all the same value.
+    This issue impacts only the 64-bit variant of the assembly.
+    
+    This change fixes both issues by first eliminating the only use of
+    OPENSSL_ia32_rdrand, replacing it with OPENSSL_ia32_rdrand_bytes, and fixes the
+    register mixup in OPENSSL_ia32_rdrand_bytes. It also adds a sanity test for
+    OPENSSL_ia32_rdrand_bytes and OPENSSL_ia32_rdseed_bytes to help catch problems
+    of this nature in the future.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5342">https://github.com/openssl/openssl/pull/5342</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/engine/eng_rdrand.c                         |  23 +---
+ crypto/x86_64cpuid.pl                              |  20 +---
+ crypto/x86cpuid.pl                                 |  15 +--
+ test/build.info                                    |   7 +-
+ test/rdrand_sanitytest.c                           | 125 +++++++++++++++++++++
+ ...3-test_internal_curve448.t =&gt; 06-test-rdrand.t} |  17 +--
+ 6 files changed, 151 insertions(+), 56 deletions(-)
+ create mode 100644 test/rdrand_sanitytest.c
+ copy test/recipes/{03-test_internal_curve448.t =&gt; 06-test-rdrand.t} (60%)
+
+diff --git a/crypto/engine/eng_rdrand.c b/crypto/engine/eng_rdrand.c
+index 7be64e3..261e5de 100644
+--- a/crypto/engine/eng_rdrand.c
++++ b/crypto/engine/eng_rdrand.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2011-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2011-2018 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -20,28 +20,15 @@
+      defined(__x86_64) || defined(__x86_64__) || \
+      defined(_M_AMD64) || defined (_M_X64)) &amp;&amp; defined(OPENSSL_CPUID_OBJ)
+ 
+-size_t OPENSSL_ia32_rdrand(void);
++size_t OPENSSL_ia32_rdrand_bytes(unsigned char *buf, size_t len);
+ 
+ static int get_random_bytes(unsigned char *buf, int num)
+ {
+-    size_t rnd;
+-
+-    while (num &gt;= (int)sizeof(size_t)) {
+-        if ((rnd = OPENSSL_ia32_rdrand()) == 0)
+-            return 0;
+-
+-        *((size_t *)buf) = rnd;
+-        buf += sizeof(size_t);
+-        num -= sizeof(size_t);
+-    }
+-    if (num) {
+-        if ((rnd = OPENSSL_ia32_rdrand()) == 0)
+-            return 0;
+-
+-        memcpy(buf, &amp;rnd, num);
++    if (num &lt; 0) {
++        return 0;
+     }
+ 
+-    return 1;
++    return (size_t)num == OPENSSL_ia32_rdrand_bytes(buf, (size_t)num);
+ }
+ 
+ static int random_status(void)
+diff --git a/crypto/x86_64cpuid.pl b/crypto/x86_64cpuid.pl
+index 0a88c7a..513d005 100644
+--- a/crypto/x86_64cpuid.pl
++++ b/crypto/x86_64cpuid.pl
+@@ -1,5 +1,5 @@
+ #! /usr/bin/env perl
+-# Copyright 2005-2016 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright 2005-2018 The OpenSSL Project Authors. All Rights Reserved.
+ #
+ # Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -434,21 +434,6 @@ ___
+ sub gen_random {
+ my $rdop = shift;
+ print&lt;&lt;___;
+-.globl	OPENSSL_ia32_${rdop}
+-.type	OPENSSL_ia32_${rdop},\@abi-omnipotent
+-.align	16
+-OPENSSL_ia32_${rdop}:
+-	mov	\$8,%ecx
+-.Loop_${rdop}:
+-	${rdop}	%rax
+-	jc	.Lbreak_${rdop}
+-	loop	.Loop_${rdop}
+-.Lbreak_${rdop}:
+-	cmp	\$0,%rax
+-	cmove	%rcx,%rax
+-	ret
+-.size	OPENSSL_ia32_${rdop},.-OPENSSL_ia32_${rdop}
+-
+ .globl	OPENSSL_ia32_${rdop}_bytes
+ .type	OPENSSL_ia32_${rdop}_bytes,\@abi-omnipotent
+ .align	16
+@@ -482,11 +467,12 @@ OPENSSL_ia32_${rdop}_bytes:
+ 	mov	%r10b,($arg1)
+ 	lea	1($arg1),$arg1
+ 	inc	%rax
+-	shr	\$8,%r8
++	shr	\$8,%r10
+ 	dec	$arg2
+ 	jnz	.Ltail_${rdop}_bytes
+ 
+ .Ldone_${rdop}_bytes:
++	xor	%r10,%r10	# Clear sensitive data from register
+ 	ret
+ .size	OPENSSL_ia32_${rdop}_bytes,.-OPENSSL_ia32_${rdop}_bytes
+ ___
+diff --git a/crypto/x86cpuid.pl b/crypto/x86cpuid.pl
+index 08c129a..d43dda4 100644
+--- a/crypto/x86cpuid.pl
++++ b/crypto/x86cpuid.pl
+@@ -1,5 +1,5 @@
+ #! /usr/bin/env perl
+-# Copyright 2004-2016 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright 2004-2018 The OpenSSL Project Authors. All Rights Reserved.
+ #
+ # Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -453,18 +453,6 @@ my $max = &quot;ebp&quot;;
+ 
+ sub gen_random {
+ my $rdop = shift;
+-&amp;function_begin_B(&quot;OPENSSL_ia32_${rdop}&quot;);
+-	&amp;mov	(&quot;ecx&quot;,8);
+-&amp;set_label(&quot;loop&quot;);
+-	&amp;${rdop}(&quot;eax&quot;);
+-	&amp;jc	(&amp;label(&quot;break&quot;));
+-	&amp;loop	(&amp;label(&quot;loop&quot;));
+-&amp;set_label(&quot;break&quot;);
+-	&amp;cmp	(&quot;eax&quot;,0);
+-	&amp;cmove	(&quot;eax&quot;,&quot;ecx&quot;);
+-	&amp;ret	();
+-&amp;function_end_B(&quot;OPENSSL_ia32_${rdop}&quot;);
+-
+ &amp;function_begin_B(&quot;OPENSSL_ia32_${rdop}_bytes&quot;);
+ 	&amp;push	(&quot;edi&quot;);
+ 	&amp;push	(&quot;ebx&quot;);
+@@ -502,6 +490,7 @@ my $rdop = shift;
+ 	&amp;jnz	(&amp;label(&quot;tail&quot;));
+ 
+ &amp;set_label(&quot;done&quot;);
++	&amp;xor	(&quot;edx&quot;,&quot;edx&quot;);		# Clear random value from registers
+ 	&amp;pop	(&quot;ebx&quot;);
+ 	&amp;pop	(&quot;edi&quot;);
+ 	&amp;ret	();
+diff --git a/test/build.info b/test/build.info
+index 30424dc..9fcaa7d 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -405,7 +405,8 @@ INCLUDE_MAIN___test_libtestutil_OLB = /INCLUDE=MAIN
+   # names with the DLL import libraries.
+   IF[{- $disabled{shared} || $target{build_scheme}-&gt;[1] ne 'windows' -}]
+     PROGRAMS_NO_INST=asn1_internal_test modes_internal_test x509_internal_test \
+-                     tls13encryptiontest wpackettest ctype_internal_test
++                     tls13encryptiontest wpackettest ctype_internal_test \
++                     rdrand_sanitytest
+     IF[{- !$disabled{poly1305} -}]
+       PROGRAMS_NO_INST=poly1305_internal_test
+     ENDIF
+@@ -465,6 +466,10 @@ INCLUDE_MAIN___test_libtestutil_OLB = /INCLUDE=MAIN
+     SOURCE[curve448_internal_test]=curve448_internal_test.c
+     INCLUDE[curve448_internal_test]=.. ../include ../crypto/ec/curve448
+     DEPEND[curve448_internal_test]=../libcrypto.a libtestutil.a
++
++    SOURCE[rdrand_sanitytest]=rdrand_sanitytest.c
++    INCLUDE[rdrand_sanitytest]=../include
++    DEPEND[rdrand_sanitytest]=../libcrypto.a libtestutil.a
+   ENDIF
+ 
+   IF[{- !$disabled{mdc2} -}]
+diff --git a/test/rdrand_sanitytest.c b/test/rdrand_sanitytest.c
+new file mode 100644
+index 0000000..21d5139
+--- /dev/null
++++ b/test/rdrand_sanitytest.c
+@@ -0,0 +1,125 @@
++/*
++ * Copyright 2018-2018 The OpenSSL Project Authors. All Rights Reserved.
++ * 
++ * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &quot;testutil.h&quot;
++#include &lt;openssl/opensslconf.h&gt;
++
++#if (defined(__i386)   || defined(__i386__)   || defined(_M_IX86) || \
++     defined(__x86_64) || defined(__x86_64__) || \
++     defined(_M_AMD64) || defined (_M_X64)) &amp;&amp; defined(OPENSSL_CPUID_OBJ)
++
++size_t OPENSSL_ia32_rdrand_bytes(unsigned char *buf, size_t len);
++size_t OPENSSL_ia32_rdseed_bytes(unsigned char *buf, size_t len);
++
++void OPENSSL_cpuid_setup();
++
++extern unsigned int OPENSSL_ia32cap_P[4];
++
++static int sanity_check_bytes(size_t (*rng)(unsigned char *, size_t), 
++    int rounds, int min_failures, int max_retries, int max_zero_words)
++{
++    int testresult = 0;
++    unsigned char prior[31] = {0}, buf[31] = {0}, check[7];
++    int failures = 0, zero_words = 0;
++
++    int i;
++    for (i = 0; i &lt; rounds; i++) {
++        size_t generated = 0;
++
++        int retry;
++        for (retry = 0; retry &lt; max_retries; retry++) {
++            generated = rng(buf, sizeof(buf));
++            if (generated == sizeof(buf))
++                break;
++            failures++;
++        }
++
++        /*-
++         * Verify that we don't have too many unexpected runs of zeroes,
++         * implying that we might be accidentally using the 32-bit RDRAND
++         * instead of the 64-bit one on 64-bit systems.
++         */
++        size_t j;
++        for (j = 0; j &lt; sizeof(buf) - 1; j++) {
++            if (buf[j] == 0 &amp;&amp; buf[j+1] == 0) {
++                zero_words++;
++            }
++        }
++
++        if (!TEST_int_eq(generated, sizeof(buf)))
++            goto end;
++        if (!TEST_false(!memcmp(prior, buf, sizeof(buf))))
++            goto end;
++
++        /* Verify that the last 7 bytes of buf aren't all the same value */
++        unsigned char *tail = &amp;buf[sizeof(buf) - sizeof(check)];
++        memset(check, tail[0], 7);
++        if (!TEST_false(!memcmp(check, tail, sizeof(check))))
++            goto end;
++
++        /* Save the result and make sure it's different next time */
++        memcpy(prior, buf, sizeof(buf));
++    }
++
++    if (!TEST_int_le(zero_words, max_zero_words))
++        goto end;
++
++    if (!TEST_int_ge(failures, min_failures))
++        goto end;
++
++    testresult = 1;
++end:
++    return testresult;
++}
++
++static int sanity_check_rdrand_bytes()
++{
++    return sanity_check_bytes(OPENSSL_ia32_rdrand_bytes, 1000, 0, 10, 10);
++}
++
++static int sanity_check_rdseed_bytes()
++{
++    /*-
++     * RDSEED may take many retries to succeed; note that this is effectively
++     * multiplied by the 8x retry loop in asm, and failure probabilities are
++     * increased by the fact that we need either 4 or 8 samples depending on
++     * the platform.
++     */
++    return sanity_check_bytes(OPENSSL_ia32_rdseed_bytes, 1000, 1, 10000, 10);
++}
++
++int setup_tests() {
++    OPENSSL_cpuid_setup();
++
++    int have_rdseed = (OPENSSL_ia32cap_P[2] &amp; (1 &lt;&lt; 18)) != 0;
++    int have_rdrand = (OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; (62 - 32))) != 0;
++
++    if (have_rdrand) {
++        ADD_TEST(sanity_check_rdrand_bytes);
++    }
++
++    if (have_rdseed) {
++        ADD_TEST(sanity_check_rdseed_bytes);
++    }
++
++    return 1;
++}
++
++
++#else
++
++int setup_tests()
++{
++    return 1;
++}
++
++#endif
+diff --git a/test/recipes/03-test_internal_curve448.t b/test/recipes/06-test-rdrand.t
+similarity index 60%
+copy from test/recipes/03-test_internal_curve448.t
+copy to test/recipes/06-test-rdrand.t
+index fb41a6b..07ee7c8 100644
+--- a/test/recipes/03-test_internal_curve448.t
++++ b/test/recipes/06-test-rdrand.t
+@@ -1,22 +1,25 @@
+-#! /usr/bin/env perl
+-# Copyright 2015-2018 The OpenSSL Project Authors. All Rights Reserved.
+-#
++#! /usr/bin/perl
++
++# Copyright 2018-2018 The OpenSSL Project Authors. All Rights Reserved.
++# 
+ # Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+ # in the file LICENSE in the source distribution or at
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ 
+ use strict;
++
+ use OpenSSL::Test;              # get 'plan'
+ use OpenSSL::Test::Simple;
+ use OpenSSL::Test::Utils;
+ 
+-setup(&quot;test_internal_curve448&quot;);
++setup(&quot;test_rdrand_sanity&quot;);
+ 
+ plan skip_all =&gt; &quot;This test is unsupported in a shared library build on Windows&quot;
+     if $^O eq 'MSWin32' &amp;&amp; !disabled(&quot;shared&quot;);
+ 
+-plan skip_all =&gt; &quot;This test is unsupported in a no-ec build&quot;
+-    if disabled(&quot;ec&quot;);
++# We also need static builds to be enabled even on linux
++plan skip_all =&gt; &quot;This test is unsupported if static builds are not enabled&quot;
++    if disabled(&quot;static&quot;);
+ 
+-simple_test(&quot;test_internal_curve448&quot;, &quot;curve448_internal_test&quot;);
++simple_test(&quot;test_rdrand_sanity&quot;, &quot;rdrand_sanitytest&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018402.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018405.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18403">[ date ]</a>
+              <a href="thread.html#18403">[ thread ]</a>
+              <a href="subject.html#18403">[ subject ]</a>
+              <a href="author.html#18403">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

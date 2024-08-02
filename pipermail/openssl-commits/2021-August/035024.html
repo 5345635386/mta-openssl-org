@@ -1,0 +1,247 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1628119305.560164.350.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035023.html">
+   <LINK REL="Next"  HREF="035025.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1628119305.560164.350.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Wed Aug  4 23:21:45 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035023.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="035025.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35024">[ date ]</a>
+              <a href="thread.html#35024">[ thread ]</a>
+              <a href="subject.html#35024">[ subject ]</a>
+              <a href="author.html#35024">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6b9d3b7c5ee63757c7bfb6f3761fb9ea35ac64a5 (commit)
+       via  b5c4dc6ce50b7fcf1b51721a61e1a827d1eb05a3 (commit)
+      from  421953effea12b1ce6e2953786a83acc426b2622 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6b9d3b7c5ee63757c7bfb6f3761fb9ea35ac64a5
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Tue Aug 3 18:00:02 2021 +0200
+
+    Add oid_section to sysdefault.cnf to test adding new oids
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16210">https://github.com/openssl/openssl/pull/16210</A>)
+
+commit b5c4dc6ce50b7fcf1b51721a61e1a827d1eb05a3
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Tue Aug 3 17:29:04 2021 +0200
+
+    Prevent recursive call of OPENSSL_INIT_LOAD_CONFIG
+    
+    If objects are added in a config file the OPENSSL_INIT_LOAD_CONFIG
+    will be called recursively which results in hang in RUN_ONCE.
+    
+    Fixes #16186
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16210">https://github.com/openssl/openssl/pull/16210</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/init.c       | 41 +++++++++++++++++++++++++++--------------
+ test/sysdefault.cnf |  4 ++++
+ 2 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/crypto/init.c b/crypto/init.c
+index 552a4fa66c..6a27d1a8e4 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -44,6 +44,7 @@ struct ossl_init_stop_st {
+ 
+ static OPENSSL_INIT_STOP *stop_handlers = NULL;
+ static CRYPTO_RWLOCK *init_lock = NULL;
++static CRYPTO_THREAD_LOCAL in_init_config_local;
+ 
+ static CRYPTO_ONCE base = CRYPTO_ONCE_STATIC_INIT;
+ static int base_inited = 0;
+@@ -61,7 +62,10 @@ DEFINE_RUN_ONCE_STATIC(ossl_init_base)
+     OPENSSL_cpuid_setup();
+ 
+     if (!ossl_init_thread())
+-        return 0;
++        goto err;
++
++    if (!CRYPTO_THREAD_init_local(&amp;in_init_config_local, NULL))
++        goto err;
+ 
+     base_inited = 1;
+     return 1;
+@@ -366,6 +370,8 @@ void OPENSSL_cleanup(void)
+     CRYPTO_THREAD_lock_free(init_lock);
+     init_lock = NULL;
+ 
++    CRYPTO_THREAD_cleanup_local(&amp;in_init_config_local);
++
+     /*
+      * We assume we are single-threaded for this function, i.e. no race
+      * conditions for the various &quot;*_inited&quot; vars below.
+@@ -566,22 +572,29 @@ int OPENSSL_init_crypto(uint64_t opts, const OPENSSL_INIT_SETTINGS *settings)
+         return 0;
+ 
+     if (opts &amp; OPENSSL_INIT_LOAD_CONFIG) {
+-        int ret;
++        int loading = CRYPTO_THREAD_get_local(&amp;in_init_config_local) != NULL;
+ 
+-        if (settings == NULL) {
+-            ret = RUN_ONCE(&amp;config, ossl_init_config);
+-        } else {
+-            if (!CRYPTO_THREAD_write_lock(init_lock))
++        /* If called recursively from OBJ_ calls, just skip it. */
++        if (!loading) {
++            int ret;
++
++            if (!CRYPTO_THREAD_set_local(&amp;in_init_config_local, (void *)-1))
++                return 0;
++            if (settings == NULL) {
++                ret = RUN_ONCE(&amp;config, ossl_init_config);
++            } else {
++                if (!CRYPTO_THREAD_write_lock(init_lock))
++                    return 0;
++                conf_settings = settings;
++                ret = RUN_ONCE_ALT(&amp;config, ossl_init_config_settings,
++                                   ossl_init_config);
++                conf_settings = NULL;
++                CRYPTO_THREAD_unlock(init_lock);
++            }
++
++            if (ret &lt;= 0)
+                 return 0;
+-            conf_settings = settings;
+-            ret = RUN_ONCE_ALT(&amp;config, ossl_init_config_settings,
+-                               ossl_init_config);
+-            conf_settings = NULL;
+-            CRYPTO_THREAD_unlock(init_lock);
+         }
+-
+-        if (ret &lt;= 0)
+-            return 0;
+     }
+ 
+     if ((opts &amp; OPENSSL_INIT_ASYNC)
+diff --git a/test/sysdefault.cnf b/test/sysdefault.cnf
+index 0094831608..20712b5bda 100644
+--- a/test/sysdefault.cnf
++++ b/test/sysdefault.cnf
+@@ -8,6 +8,10 @@ openssl_conf = default_conf
+ [ default_conf ]
+ 
+ ssl_conf = ssl_sect
++oid_section = oid_sect
++
++[oid_sect]
++new-sig-oid = 1.1.1.1.1.1.1.1.1.1.1.1.1.1
+ 
+ [ssl_sect]
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035023.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="035025.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35024">[ date ]</a>
+              <a href="thread.html#35024">[ thread ]</a>
+              <a href="subject.html#35024">[ subject ]</a>
+              <a href="author.html#35024">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

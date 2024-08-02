@@ -1,0 +1,208 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1461367723.288916.10436.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006330.html">
+   <LINK REL="Next"  HREF="006601.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1461367723.288916.10436.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">steve at openssl.org
+       </A><BR>
+    <I>Fri Apr 22 23:28:43 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006330.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="006601.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6596">[ date ]</a>
+              <a href="thread.html#6596">[ thread ]</a>
+              <a href="subject.html#6596">[ subject ]</a>
+              <a href="author.html#6596">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  f32774087f7b3db1f789688368d16d917757421e (commit)
+      from  9676402c3a6657781a65836c716066d3d39ee54f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f32774087f7b3db1f789688368d16d917757421e
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Mon Apr 11 13:57:20 2016 +0100
+
+    Harden ASN.1 BIO handling of large amounts of data.
+    
+    If the ASN.1 BIO is presented with a large length field read it in
+    chunks of increasing size checking for EOF on each read. This prevents
+    small files allocating excessive amounts of data.
+    
+    CVE-2016-2109
+    
+    Thanks to Brian Carpenter for reporting this issue.
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+    (cherry picked from commit c62981390d6cf9e3d612c489b8b77c2913b25807)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/a_d2i_fp.c | 36 ++++++++++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/crypto/asn1/a_d2i_fp.c b/crypto/asn1/a_d2i_fp.c
+index a1864b4..51b6f24 100644
+--- a/crypto/asn1/a_d2i_fp.c
++++ b/crypto/asn1/a_d2i_fp.c
+@@ -141,6 +141,7 @@ void *ASN1_item_d2i_fp(const ASN1_ITEM *it, FILE *in, void *x)
+ #endif
+ 
+ #define HEADER_SIZE   8
++#define ASN1_CHUNK_INITIAL_SIZE (16 * 1024)
+ static int asn1_d2i_read_bio(BIO *in, BUF_MEM **pb)
+ {
+     BUF_MEM *b;
+@@ -217,29 +218,44 @@ static int asn1_d2i_read_bio(BIO *in, BUF_MEM **pb)
+             /* suck in c.slen bytes of data */
+             want = c.slen;
+             if (want &gt; (len - off)) {
++                size_t chunk_max = ASN1_CHUNK_INITIAL_SIZE;
++
+                 want -= (len - off);
+                 if (want &gt; INT_MAX /* BIO_read takes an int length */  ||
+                     len + want &lt; len) {
+                     ASN1err(ASN1_F_ASN1_D2I_READ_BIO, ASN1_R_TOO_LONG);
+                     goto err;
+                 }
+-                if (!BUF_MEM_grow_clean(b, len + want)) {
+-                    ASN1err(ASN1_F_ASN1_D2I_READ_BIO, ERR_R_MALLOC_FAILURE);
+-                    goto err;
+-                }
+                 while (want &gt; 0) {
+-                    i = BIO_read(in, &amp;(b-&gt;data[len]), want);
+-                    if (i &lt;= 0) {
+-                        ASN1err(ASN1_F_ASN1_D2I_READ_BIO,
+-                                ASN1_R_NOT_ENOUGH_DATA);
++                    /*
++                     * Read content in chunks of increasing size
++                     * so we can return an error for EOF without
++                     * having to allocate the entire content length
++                     * in one go.
++                     */
++                    size_t chunk = want &gt; chunk_max ? chunk_max : want;
++
++                    if (!BUF_MEM_grow_clean(b, len + chunk)) {
++                        ASN1err(ASN1_F_ASN1_D2I_READ_BIO, ERR_R_MALLOC_FAILURE);
+                         goto err;
+                     }
++                    want -= chunk;
++                    while (chunk &gt; 0) {
++                        i = BIO_read(in, &amp;(b-&gt;data[len]), chunk);
++                        if (i &lt;= 0) {
++                            ASN1err(ASN1_F_ASN1_D2I_READ_BIO,
++                                    ASN1_R_NOT_ENOUGH_DATA);
++                            goto err;
++                        }
+                     /*
+                      * This can't overflow because |len+want| didn't
+                      * overflow.
+                      */
+-                    len += i;
+-                    want -= i;
++                        len += i;
++                        chunk -= i;
++                    }
++                    if (chunk_max &lt; INT_MAX/2)
++                        chunk_max *= 2;
+                 }
+             }
+             if (off + c.slen &lt; off) {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006330.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="006601.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6596">[ date ]</a>
+              <a href="thread.html#6596">[ thread ]</a>
+              <a href="subject.html#6596">[ subject ]</a>
+              <a href="author.html#6596">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

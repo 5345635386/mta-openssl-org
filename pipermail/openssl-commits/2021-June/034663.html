@@ -1,0 +1,149 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623313675.387890.14529.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034662.html">
+   <LINK REL="Next"  HREF="034664.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623313675.387890.14529.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Thu Jun 10 08:27:55 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034662.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034664.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34663">[ date ]</a>
+              <a href="thread.html#34663">[ thread ]</a>
+              <a href="subject.html#34663">[ subject ]</a>
+              <a href="author.html#34663">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  de5a0198b22c36884fd36021d9e4f589b939674f (commit)
+      from  5a9dbfc58ab280ec426ed013f5aed5a5660b938a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit de5a0198b22c36884fd36021d9e4f589b939674f
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Mon Jun 7 16:56:20 2021 +0200
+
+    Fix use after free in OSSL_HTTP_REQ_CTX_set1_req()
+    
+    Fixes #15647
+    
+    Reviewed-by: David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">david.von.oheimb at siemens.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15648">https://github.com/openssl/openssl/pull/15648</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/http/http_client.c | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/http/http_client.c b/crypto/http/http_client.c
+index e7e0183b59..79fe9ccd41 100644
+--- a/crypto/http/http_client.c
++++ b/crypto/http/http_client.c
+@@ -126,7 +126,8 @@ void OSSL_HTTP_REQ_CTX_free(OSSL_HTTP_REQ_CTX *rctx)
+     if (rctx-&gt;free_wbio)
+         BIO_free_all(rctx-&gt;wbio);
+     /* do not free rctx-&gt;rbio */
+-    BIO_free(rctx-&gt;mem); /* this may indirectly call ERR_clear_error() */
++    BIO_free(rctx-&gt;mem);
++    BIO_free(rctx-&gt;req);
+     OPENSSL_free(rctx-&gt;buf);
+     OPENSSL_free(rctx-&gt;proxy);
+     OPENSSL_free(rctx-&gt;server);
+@@ -260,8 +261,8 @@ int OSSL_HTTP_REQ_CTX_set_expected(OSSL_HTTP_REQ_CTX *rctx,
+     return 1;
+ }
+ 
+-static int set_content(OSSL_HTTP_REQ_CTX *rctx,
+-                       const char *content_type, BIO *req)
++static int set1_content(OSSL_HTTP_REQ_CTX *rctx,
++                        const char *content_type, BIO *req)
+ {
+     long req_len;
+ 
+@@ -285,10 +286,16 @@ static int set_content(OSSL_HTTP_REQ_CTX *rctx,
+             &amp;&amp; BIO_printf(rctx-&gt;mem, &quot;Content-Type: %s\r\n&quot;, content_type) &lt;= 0)
+         return 0;
+ 
+-    rctx-&gt;req = req;
+-    if ((req_len = BIO_ctrl(req, BIO_CTRL_INFO, 0, NULL)) &lt;= 0)
+-        return 1; /* streaming BIO may not support querying size */
+-    return BIO_printf(rctx-&gt;mem, &quot;Content-Length: %ld\r\n&quot;, req_len) &gt; 0;
++    /* streaming BIO may not support querying size */
++    if ((req_len = BIO_ctrl(req, BIO_CTRL_INFO, 0, NULL)) &lt;= 0
++        || BIO_printf(rctx-&gt;mem, &quot;Content-Length: %ld\r\n&quot;, req_len) &gt; 0) {
++        if (!BIO_up_ref(req))
++            return 0;
++        BIO_free(rctx-&gt;req);
++        rctx-&gt;req = req;
++        return 1;
++    }
++    return 0;
+ }
+ 
+ int OSSL_HTTP_REQ_CTX_set1_req(OSSL_HTTP_REQ_CTX *rctx, const char *content_type,
+@@ -303,7 +310,7 @@ int OSSL_HTTP_REQ_CTX_set1_req(OSSL_HTTP_REQ_CTX *rctx, const char *content_type
+     }
+ 
+     res = (mem = ASN1_item_i2d_mem_bio(it, req)) != NULL
+-        &amp;&amp; set_content(rctx, content_type, mem);
++        &amp;&amp; set1_content(rctx, content_type, mem);
+     BIO_free(mem);
+     return res;
+ }
+@@ -965,7 +972,7 @@ int OSSL_HTTP_set_request(OSSL_HTTP_REQ_CTX *rctx, const char *path,
+         &amp;&amp; add1_headers(rctx, headers, rctx-&gt;server)
+         &amp;&amp; OSSL_HTTP_REQ_CTX_set_expected(rctx, expected_content_type,
+                                           expect_asn1, timeout, keep_alive)
+-        &amp;&amp; set_content(rctx, content_type, req);
++        &amp;&amp; set1_content(rctx, content_type, req);
+ }
+ 
+ /*-
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034662.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034664.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34663">[ date ]</a>
+              <a href="thread.html#34663">[ thread ]</a>
+              <a href="subject.html#34663">[ subject ]</a>
+              <a href="author.html#34663">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1615291754.255719.11670.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033369.html">
+   <LINK REL="Next"  HREF="033371.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1615291754.255719.11670.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Tue Mar  9 12:09:14 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033369.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033371.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33370">[ date ]</a>
+              <a href="thread.html#33370">[ thread ]</a>
+              <a href="subject.html#33370">[ subject ]</a>
+              <a href="author.html#33370">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e5499a3cac1e823c3e0697e8667e952317b70cc8 (commit)
+      from  4c52ee1dbfa1913a14968f395cc9900ed9beee5e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e5499a3cac1e823c3e0697e8667e952317b70cc8
+Author: Alistair Francis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alistair.francis at wdc.com</A>&gt;
+Date:   Thu Mar 4 12:10:11 2021 -0500
+
+    Fixup support for io_pgetevents_time64 syscall
+    
+    This is a fixup for the original commit 5b5e2985f355c8e99c196d9ce5d02c15bebadfbc
+    &quot;Add support for io_pgetevents_time64 syscall&quot; that didn't correctly
+    work for 32-bit architecutres with a 64-bit time_t that aren't RISC-V.
+    
+    For a full discussion of the issue see:
+    <A HREF="https://github.com/openssl/openssl/commit/5b5e2985f355c8e99c196d9ce5d02c15bebadfbc">https://github.com/openssl/openssl/commit/5b5e2985f355c8e99c196d9ce5d02c15bebadfbc</A>
+    
+    Signed-off-by: Alistair Francis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alistair.francis at wdc.com</A>&gt;
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14432">https://github.com/openssl/openssl/pull/14432</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ engines/e_afalg.c | 55 ++++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 42 insertions(+), 13 deletions(-)
+
+diff --git a/engines/e_afalg.c b/engines/e_afalg.c
+index 9480d7c24b..4e9d67db2d 100644
+--- a/engines/e_afalg.c
++++ b/engines/e_afalg.c
+@@ -124,27 +124,56 @@ static ossl_inline int io_read(aio_context_t ctx, long n, struct iocb **iocb)
+     return syscall(__NR_io_submit, ctx, n, iocb);
+ }
+ 
++/* A version of 'struct timespec' with 32-bit time_t and nanoseconds.  */
++struct __timespec32
++{
++  __kernel_long_t tv_sec;
++  __kernel_long_t tv_nsec;
++};
++
+ static ossl_inline int io_getevents(aio_context_t ctx, long min, long max,
+                                struct io_event *events,
+                                struct timespec *timeout)
+ {
++#if defined(__NR_io_pgetevents_time64)
++    /* Check if we are a 32-bit architecture with a 64-bit time_t */
++    if (sizeof(*timeout) != sizeof(struct __timespec32)) {
++        int ret = syscall(__NR_io_pgetevents_time64, ctx, min, max, events,
++                          timeout, NULL);
++        if (ret == 0 || errno != ENOSYS)
++            return ret;
++    }
++#endif
++
+ #if defined(__NR_io_getevents)
+-    return syscall(__NR_io_getevents, ctx, min, max, events, timeout);
+-#elif defined(__NR_io_pgetevents_time64)
+-    /* Let's only support the 64 suffix syscalls for 64-bit time_t.
+-     * This simplifies the code for us as we don't need to use a 64-bit
+-     * version of timespec with a 32-bit time_t and handle converting
+-     * between 64-bit and 32-bit times and check for overflows.
+-     */
+-    if (sizeof(timeout-&gt;tv_sec) == 8)
+-        return syscall(__NR_io_pgetevents_time64, ctx, min, max, events, timeout, NULL);
++    if (sizeof(*timeout) == sizeof(struct __timespec32))
++        /*
++         * time_t matches our architecture length, we can just use
++         * __NR_io_getevents
++         */
++        return syscall(__NR_io_getevents, ctx, min, max, events, timeout);
+     else {
+-        errno = ENOSYS;
+-        return -1;
++        /*
++         * We don't have __NR_io_pgetevents_time64, but we are using a
++         * 64-bit time_t on a 32-bit architecture. If we can fit the
++         * timeout value in a 32-bit time_t, then let's do that
++         * and then use the __NR_io_getevents syscall.
++         */
++        if (timeout &amp;&amp; timeout-&gt;tv_sec == (long)timeout-&gt;tv_sec) {
++            struct __timespec32 ts32;
++
++            ts32.tv_sec = (__kernel_long_t) timeout-&gt;tv_sec;
++            ts32.tv_nsec = (__kernel_long_t) timeout-&gt;tv_nsec;
++
++            return syscall(__NR_io_getevents, ctx, min, max, events, ts32);
++        } else {
++            return syscall(__NR_io_getevents, ctx, min, max, events, NULL);
++        }
+     }
+-#else
+-# error &quot;We require either the io_getevents syscall or __NR_io_pgetevents_time64.&quot;
+ #endif
++
++    errno = ENOSYS;
++    return -1;
+ }
+ 
+ static void afalg_waitfd_cleanup(ASYNC_WAIT_CTX *ctx, const void *key,
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033369.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033371.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33370">[ date ]</a>
+              <a href="thread.html#33370">[ thread ]</a>
+              <a href="subject.html#33370">[ subject ]</a>
+              <a href="author.html#33370">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

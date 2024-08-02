@@ -1,0 +1,350 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1509540011.177181.23139.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016777.html">
+   <LINK REL="Next"  HREF="016781.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1509540011.177181.23139.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">matt at openssl.org
+       </A><BR>
+    <I>Wed Nov  1 12:40:11 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016777.html">[openssl-commits] Build completed: openssl master.13890
+</A></li>
+        <LI>Next message: <A HREF="016781.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16778">[ date ]</a>
+              <a href="thread.html#16778">[ thread ]</a>
+              <a href="subject.html#16778">[ subject ]</a>
+              <a href="author.html#16778">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  a92ca561bc91f4ebd2f53578e82058efcde61aed (commit)
+      from  217534323ec4917c754fb454bf77b6d2ff551e23 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a92ca561bc91f4ebd2f53578e82058efcde61aed
+Author: David Benjamin &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">davidben at google.com</A>&gt;
+Date:   Mon Oct 23 19:13:05 2017 -0400
+
+    Fix weak digest in TLS 1.2 with SNI.
+    
+    1ce95f19601bbc6bfd24092c76c8f8105124e857 was incomplete and did not
+    handle the case when SSL_set_SSL_CTX was called from the cert_cb
+    callback rather than the SNI callback. The consequence is any server
+    using OpenSSL 1.0.2 and the cert_cb callback for SNI only ever signs a
+    weak digest, SHA-1, even when connecting to clients which use secure
+    ones.
+    
+    Fix this and add regression tests for both this and the original issue.
+    
+    Fixes #4554.
+    
+    Reviewed-by: Emilia K&#228;sper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4577">https://github.com/openssl/openssl/pull/4577</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c |  4 ++++
+ ssl/ssltest.c | 71 +++++++++++++++++++++++++++++++++++++++++++++++++++--------
+ test/testssl  |  9 ++++++++
+ 3 files changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index 8466da0..3539f4b 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -3180,6 +3180,7 @@ SSL_CTX *SSL_set_SSL_CTX(SSL *ssl, SSL_CTX *ctx)
+ #endif
+     ssl-&gt;cert = ssl_cert_dup(ctx-&gt;cert);
+     if (ocert) {
++        int i;
+         /* Preserve any already negotiated parameters */
+         if (ssl-&gt;server) {
+             ssl-&gt;cert-&gt;peer_sigalgs = ocert-&gt;peer_sigalgs;
+@@ -3189,6 +3190,9 @@ SSL_CTX *SSL_set_SSL_CTX(SSL *ssl, SSL_CTX *ctx)
+             ssl-&gt;cert-&gt;ciphers_rawlen = ocert-&gt;ciphers_rawlen;
+             ocert-&gt;ciphers_raw = NULL;
+         }
++        for (i = 0; i &lt; SSL_PKEY_NUM; i++) {
++            ssl-&gt;cert-&gt;pkeys[i].digest = ocert-&gt;pkeys[i].digest;
++        }
+ #ifndef OPENSSL_NO_TLSEXT
+         ssl-&gt;cert-&gt;alpn_proposed = ocert-&gt;alpn_proposed;
+         ssl-&gt;cert-&gt;alpn_proposed_len = ocert-&gt;alpn_proposed_len;
+diff --git a/ssl/ssltest.c b/ssl/ssltest.c
+index b75cac6..2d6141c 100644
+--- a/ssl/ssltest.c
++++ b/ssl/ssltest.c
+@@ -315,6 +315,9 @@ static int s_ticket1 = 0;
+ static int s_ticket2 = 0;
+ static int c_ticket = 0;
+ static int ticket_expect = -1;
++static int sni_in_cert_cb = 0;
++static const char *client_sigalgs = NULL;
++static const char *server_digest_expect = NULL;
+ 
+ static int servername_cb(SSL *s, int *ad, void *arg)
+ {
+@@ -355,6 +358,11 @@ static int verify_servername(SSL *client, SSL *server)
+         BIO_printf(bio_stdout, &quot;Servername: context is unknown\n&quot;);
+     return -1;
+ }
++static int cert_cb(SSL *ssl, void *arg)
++{
++    int unused;
++    return servername_cb(ssl, &amp;unused, NULL) != SSL_TLSEXT_ERR_ALERT_FATAL;
++}
+ 
+ static int verify_ticket(SSL* ssl)
+ {
+@@ -371,6 +379,20 @@ static int verify_ticket(SSL* ssl)
+     return -1;
+ }
+ 
++static int verify_server_digest(SSL* ssl)
++{
++    int nid = NID_undef;
++
++    if (server_digest_expect == NULL)
++        return 0;
++    SSL_get_peer_signature_nid(ssl, &amp;nid);
++    if (strcmp(server_digest_expect, OBJ_nid2sn(nid)) == 0)
++        return 1;
++    BIO_printf(bio_stdout, &quot;Expected server digest %s, got %s.\n&quot;,
++               server_digest_expect, OBJ_nid2sn(nid));
++    return -1;
++}
++
+ /*-
+  * next_protos_parse parses a comma separated list of strings into a string
+  * in a format suitable for passing to SSL_CTX_set_next_protos_advertised.
+@@ -831,6 +853,7 @@ static void sv_usage(void)
+ #endif
+ #ifndef OPENSSL_NO_TLS1
+     fprintf(stderr, &quot; -tls1         - use TLSv1\n&quot;);
++    fprintf(stderr, &quot; -tls12        - use TLSv1.2\n&quot;);
+ #endif
+ #ifndef OPENSSL_NO_DTLS
+     fprintf(stderr, &quot; -dtls1        - use DTLSv1\n&quot;);
+@@ -884,6 +907,9 @@ static void sv_usage(void)
+     fprintf(stderr, &quot; -c_ticket &lt;yes|no&gt;         - enable/disable session tickets on the client\n&quot;);
+     fprintf(stderr, &quot; -ticket_expect &lt;yes|no&gt;    - indicate that the client should (or should not) have a ticket\n&quot;);
+ #endif
++    fprintf(stderr, &quot; -sni_in_cert_cb           - have the server handle SNI in the certificate callback\n&quot;);
++    fprintf(stderr, &quot; -client_sigalgs arg       - the signature algorithms to configure on the client\n&quot;);
++    fprintf(stderr, &quot; -server_digest_expect arg - the expected server signing digest\n&quot;);
+ }
+ 
+ static void print_details(SSL *c_ssl, const char *prefix)
+@@ -1010,7 +1036,7 @@ int main(int argc, char *argv[])
+     int badop = 0;
+     int bio_pair = 0;
+     int force = 0;
+-    int dtls1 = 0, dtls12 = 0, tls1 = 0, ssl2 = 0, ssl3 = 0, ret = 1;
++    int dtls1 = 0, dtls12 = 0, tls1 = 0, tls12 = 0, ssl2 = 0, ssl3 = 0, ret = 1;
+     int client_auth = 0;
+     int server_auth = 0, i;
+     struct app_verify_arg app_verify_arg =
+@@ -1164,6 +1190,11 @@ int main(int argc, char *argv[])
+             no_protocol = 1;
+ #endif
+             tls1 = 1;
++        } else if (strcmp(*argv, &quot;-tls12&quot;) == 0) {
++#ifdef OPENSSL_NO_TLS1
++            no_protocol = 1;
++#endif
++            tls12 = 1;
+         } else if (strcmp(*argv, &quot;-ssl3&quot;) == 0) {
+ #ifdef OPENSSL_NO_SSL3_METHOD
+             no_protocol = 1;
+@@ -1343,6 +1374,16 @@ int main(int argc, char *argv[])
+             else if (strcmp(*argv, &quot;no&quot;) == 0)
+                 ticket_expect = 0;
+ #endif
++        } else if (strcmp(*argv, &quot;-sni_in_cert_cb&quot;) == 0) {
++            sni_in_cert_cb = 1;
++        } else if (strcmp(*argv, &quot;-client_sigalgs&quot;) == 0) {
++            if (--argc &lt; 1)
++                goto bad;
++            client_sigalgs = *(++argv);
++        } else if (strcmp(*argv, &quot;-server_digest_expect&quot;) == 0) {
++            if (--argc &lt; 1)
++                goto bad;
++            server_digest_expect = *(++argv);
+         } else {
+             fprintf(stderr, &quot;unknown option %s\n&quot;, *argv);
+             badop = 1;
+@@ -1373,9 +1414,9 @@ int main(int argc, char *argv[])
+         goto end;
+     }
+ 
+-    if (ssl2 + ssl3 + tls1 + dtls1 + dtls12 &gt; 1) {
+-        fprintf(stderr, &quot;At most one of -ssl2, -ssl3, -tls1, -dtls1 or -dtls12 should &quot;
+-                &quot;be requested.\n&quot;);
++    if (ssl2 + ssl3 + tls1 + tls12 + dtls1 + dtls12 &gt; 1) {
++        fprintf(stderr, &quot;At most one of -ssl2, -ssl3, -tls1, -tls12, -dtls1 or &quot;
++                &quot;-dtls12 should be requested.\n&quot;);
+         EXIT(1);
+     }
+ 
+@@ -1391,10 +1432,11 @@ int main(int argc, char *argv[])
+         goto end;
+     }
+ 
+-    if (!ssl2 &amp;&amp; !ssl3 &amp;&amp; !tls1 &amp;&amp; !dtls1 &amp;&amp; !dtls12 &amp;&amp; number &gt; 1 &amp;&amp; !reuse &amp;&amp; !force) {
++    if (!ssl2 &amp;&amp; !ssl3 &amp;&amp; !tls1 &amp;&amp; !tls12 &amp;&amp; !dtls1 &amp;&amp; !dtls12 &amp;&amp; number &gt; 1
++            &amp;&amp; !reuse &amp;&amp; !force) {
+         fprintf(stderr, &quot;This case cannot work.  Use -f to perform &quot;
+                 &quot;the test anyway (and\n-d to see what happens), &quot;
+-                &quot;or add one of ssl2, -ssl3, -tls1, -dtls1, -dtls12, -reuse\n&quot;
++                &quot;or add one of ssl2, -ssl3, -tls1, -tls12, -dtls1, -dtls12, -reuse\n&quot;
+                 &quot;to avoid protocol mismatch.\n&quot;);
+         EXIT(1);
+     }
+@@ -1458,7 +1500,7 @@ int main(int argc, char *argv[])
+ #endif
+ 
+     /*
+-     * At this point, ssl2/ssl3/tls1 is only set if the protocol is
++     * At this point, ssl2/ssl3/tls1/tls12 is only set if the protocol is
+      * available. (Otherwise we exit early.) However the compiler doesn't
+      * know this, so we ifdef.
+      */
+@@ -1482,6 +1524,8 @@ int main(int argc, char *argv[])
+ #ifndef OPENSSL_NO_TLS1
+     if (tls1)
+         meth = TLSv1_method();
++    else if (tls12)
++        meth = TLSv1_2_method();
+     else
+ #endif
+         meth = SSLv23_method();
+@@ -1778,8 +1822,12 @@ int main(int argc, char *argv[])
+         OPENSSL_free(alpn);
+     }
+ 
+-    if (sn_server1 || sn_server2)
+-        SSL_CTX_set_tlsext_servername_callback(s_ctx, servername_cb);
++    if (sn_server1 || sn_server2) {
++        if (sni_in_cert_cb)
++            SSL_CTX_set_cert_cb(s_ctx, cert_cb, NULL);
++        else
++            SSL_CTX_set_tlsext_servername_callback(s_ctx, servername_cb);
++    }
+ 
+ #ifndef OPENSSL_NO_TLSEXT
+     if (s_ticket1 == 0)
+@@ -1799,6 +1847,9 @@ int main(int argc, char *argv[])
+         SSL_CTX_set_options(c_ctx, SSL_OP_NO_TICKET);
+ #endif
+ 
++    if (client_sigalgs != NULL)
++        SSL_CTX_set1_sigalgs_list(c_ctx, client_sigalgs);
++
+     c_ssl = SSL_new(c_ctx);
+     s_ssl = SSL_new(s_ctx);
+ 
+@@ -1864,6 +1915,8 @@ int main(int argc, char *argv[])
+         ret = 1;
+     if (verify_ticket(c_ssl) &lt; 0)
+         ret = 1;
++    if (verify_server_digest(c_ssl) &lt; 0)
++        ret = 1;
+ 
+     SSL_free(s_ssl);
+     SSL_free(c_ssl);
+diff --git a/test/testssl b/test/testssl
+index d7dda6e..21bc4d8 100644
+--- a/test/testssl
++++ b/test/testssl
+@@ -292,6 +292,15 @@ if [ -z &quot;$extra&quot; -a `uname -m` = &quot;x86_64&quot; ]; then
+   $ssltest -cipher AES128-SHA256 -bytes 8m	|| exit 1
+ fi
+ 
++#############################################################################
++# Signature algorithms + SNI
++
++$ssltest -tls12 -sn_client server1 -sn_server1 server1 -sn_server2 server2 -sn_expect1 -client_sigalgs RSA+SHA256 -server_digest_expect SHA256 || exit 1
++$ssltest -tls12 -sn_client server1 -sn_server1 server1 -sn_server2 server2 -sn_expect1 -client_sigalgs RSA+SHA256 -server_digest_expect SHA256 -sni_in_cert_cb || exit 1
++# Switching SSL_CTX on SNI must not break signature algorithm negotiation.
++$ssltest -tls12 -sn_client server2 -sn_server1 server1 -sn_server2 server2 -sn_expect2 -client_sigalgs RSA+SHA256 -server_digest_expect SHA256 || exit 1
++$ssltest -tls12 -sn_client server2 -sn_server1 server1 -sn_server2 server2 -sn_expect2 -client_sigalgs RSA+SHA256 -server_digest_expect SHA256 -sni_in_cert_cb || exit 1
++
+ 
+ $ssltest -bio_pair -sn_client alice -sn_server1 alice -sn_server2 bob -s_ticket1 no -s_ticket2 no -c_ticket no -ticket_expect no || exit 1
+ $ssltest -bio_pair -sn_client alice -sn_server1 alice -sn_server2 bob -s_ticket1 no -s_ticket2 no -c_ticket yes -ticket_expect no || exit 1
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016777.html">[openssl-commits] Build completed: openssl master.13890
+</A></li>
+	<LI>Next message: <A HREF="016781.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16778">[ date ]</a>
+              <a href="thread.html#16778">[ thread ]</a>
+              <a href="subject.html#16778">[ subject ]</a>
+              <a href="author.html#16778">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522266392.945767.27147.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018801.html">
+   <LINK REL="Next"  HREF="018806.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522266392.945767.27147.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Mar 28 19:46:32 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018801.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018806.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18804">[ date ]</a>
+              <a href="thread.html#18804">[ thread ]</a>
+              <a href="subject.html#18804">[ subject ]</a>
+              <a href="author.html#18804">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c6d38183d6754b0a7b90527d085a500680e7d2ea (commit)
+      from  92565101ca7bc1587ff1d87f9efa8aa1cfbe62f7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c6d38183d6754b0a7b90527d085a500680e7d2ea
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Wed Mar 28 15:34:16 2018 -0400
+
+    Rewrite the X509-&gt;alert mapping code
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5780">https://github.com/openssl/openssl/pull/5780</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_locl.h           |   2 +-
+ ssl/statem/statem_clnt.c |   2 +-
+ ssl/statem/statem_lib.c  | 124 ++++++++++++++++++++++-------------------------
+ ssl/statem/statem_srvr.c |   2 +-
+ 4 files changed, 62 insertions(+), 68 deletions(-)
+
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 1c3ee35..a9ef6c3 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -2262,7 +2262,7 @@ __owur int ssl_get_server_cert_serverinfo(SSL *s,
+                                           size_t *serverinfo_length);
+ void ssl_set_masks(SSL *s);
+ __owur STACK_OF(SSL_CIPHER) *ssl_get_ciphers_by_id(SSL *s);
+-__owur int ssl_verify_alarm_type(long type);
++__owur int ssl_x509err2alert(int type);
+ void ssl_sort_cipher_list(void);
+ int ssl_load_ciphers(void);
+ __owur int ssl_fill_hello_random(SSL *s, int server, unsigned char *field,
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 29db4bc..91b986f 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1898,7 +1898,7 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+      * set. The *documented* interface remains the same.
+      */
+     if (s-&gt;verify_mode != SSL_VERIFY_NONE &amp;&amp; i &lt;= 0) {
+-        SSLfatal(s, ssl_verify_alarm_type(s-&gt;verify_result),
++        SSLfatal(s, ssl_x509err2alert(s-&gt;verify_result),
+                  SSL_F_TLS_PROCESS_SERVER_CERTIFICATE,
+                  SSL_R_CERTIFICATE_VERIFY_FAILED);
+         goto err;
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index 190050c..44c9c2c 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -19,6 +19,14 @@
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/x509.h&gt;
+ 
++/*
++ * Map error codes to TLS/SSL alart types.
++ */
++typedef struct x509err2alert_st {
++    int x509err;
++    int alert;
++} X509ERR2ALERT;
++
+ /* Fixed value used in the ServerHello random field to identify an HRR */
+ const unsigned char hrrrandom[] = {
+     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02,
+@@ -1277,73 +1285,59 @@ int tls_get_message_body(SSL *s, size_t *len)
+     return 1;
+ }
+ 
+-int ssl_verify_alarm_type(long type)
++static const X509ERR2ALERT x509table[] = {
++    {X509_V_ERR_APPLICATION_VERIFICATION, SSL_AD_HANDSHAKE_FAILURE},
++    {X509_V_ERR_CA_KEY_TOO_SMALL, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CA_MD_TOO_WEAK, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CERT_CHAIN_TOO_LONG, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_CERT_HAS_EXPIRED, SSL_AD_CERTIFICATE_EXPIRED},
++    {X509_V_ERR_CERT_NOT_YET_VALID, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CERT_REJECTED, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CERT_REVOKED, SSL_AD_CERTIFICATE_REVOKED},
++    {X509_V_ERR_CERT_SIGNATURE_FAILURE, SSL_AD_DECRYPT_ERROR},
++    {X509_V_ERR_CERT_UNTRUSTED, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CRL_HAS_EXPIRED, SSL_AD_CERTIFICATE_EXPIRED},
++    {X509_V_ERR_CRL_NOT_YET_VALID, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_CRL_SIGNATURE_FAILURE, SSL_AD_DECRYPT_ERROR},
++    {X509_V_ERR_DANE_NO_MATCH, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_EE_KEY_TOO_SMALL, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_EMAIL_MISMATCH, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_HOSTNAME_MISMATCH, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_INVALID_CA, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_INVALID_CALL, SSL_AD_INTERNAL_ERROR},
++    {X509_V_ERR_INVALID_PURPOSE, SSL_AD_UNSUPPORTED_CERTIFICATE},
++    {X509_V_ERR_IP_ADDRESS_MISMATCH, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_OUT_OF_MEM, SSL_AD_INTERNAL_ERROR},
++    {X509_V_ERR_PATH_LENGTH_EXCEEDED, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_STORE_LOOKUP, SSL_AD_INTERNAL_ERROR},
++    {X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE, SSL_AD_BAD_CERTIFICATE},
++    {X509_V_ERR_UNABLE_TO_GET_CRL, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE, SSL_AD_UNKNOWN_CA},
++    {X509_V_ERR_UNSPECIFIED, SSL_AD_INTERNAL_ERROR},
++
++    /* Last entry; return this if we don't find the value above. */
++    {X509_V_OK, SSL_AD_CERTIFICATE_UNKNOWN}
++};
++
++int ssl_x509err2alert(int x509err)
+ {
+-    int al;
++    const X509ERR2ALERT *tp;
+ 
+-    switch (type) {
+-    case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+-    case X509_V_ERR_UNABLE_TO_GET_CRL:
+-    case X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER:
+-        al = SSL_AD_UNKNOWN_CA;
+-        break;
+-    case X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE:
+-    case X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE:
+-    case X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY:
+-    case X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD:
+-    case X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD:
+-    case X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD:
+-    case X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD:
+-    case X509_V_ERR_CERT_NOT_YET_VALID:
+-    case X509_V_ERR_CRL_NOT_YET_VALID:
+-    case X509_V_ERR_CERT_UNTRUSTED:
+-    case X509_V_ERR_CERT_REJECTED:
+-    case X509_V_ERR_HOSTNAME_MISMATCH:
+-    case X509_V_ERR_EMAIL_MISMATCH:
+-    case X509_V_ERR_IP_ADDRESS_MISMATCH:
+-    case X509_V_ERR_DANE_NO_MATCH:
+-    case X509_V_ERR_EE_KEY_TOO_SMALL:
+-    case X509_V_ERR_CA_KEY_TOO_SMALL:
+-    case X509_V_ERR_CA_MD_TOO_WEAK:
+-        al = SSL_AD_BAD_CERTIFICATE;
+-        break;
+-    case X509_V_ERR_CERT_SIGNATURE_FAILURE:
+-    case X509_V_ERR_CRL_SIGNATURE_FAILURE:
+-        al = SSL_AD_DECRYPT_ERROR;
+-        break;
+-    case X509_V_ERR_CERT_HAS_EXPIRED:
+-    case X509_V_ERR_CRL_HAS_EXPIRED:
+-        al = SSL_AD_CERTIFICATE_EXPIRED;
+-        break;
+-    case X509_V_ERR_CERT_REVOKED:
+-        al = SSL_AD_CERTIFICATE_REVOKED;
+-        break;
+-    case X509_V_ERR_UNSPECIFIED:
+-    case X509_V_ERR_OUT_OF_MEM:
+-    case X509_V_ERR_INVALID_CALL:
+-    case X509_V_ERR_STORE_LOOKUP:
+-        al = SSL_AD_INTERNAL_ERROR;
+-        break;
+-    case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT:
+-    case X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN:
+-    case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY:
+-    case X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE:
+-    case X509_V_ERR_CERT_CHAIN_TOO_LONG:
+-    case X509_V_ERR_PATH_LENGTH_EXCEEDED:
+-    case X509_V_ERR_INVALID_CA:
+-        al = SSL_AD_UNKNOWN_CA;
+-        break;
+-    case X509_V_ERR_APPLICATION_VERIFICATION:
+-        al = SSL_AD_HANDSHAKE_FAILURE;
+-        break;
+-    case X509_V_ERR_INVALID_PURPOSE:
+-        al = SSL_AD_UNSUPPORTED_CERTIFICATE;
+-        break;
+-    default:
+-        al = SSL_AD_CERTIFICATE_UNKNOWN;
+-        break;
+-    }
+-    return al;
++    for (tp = x509table; tp-&gt;x509err != X509_V_OK; ++tp)
++        if (tp-&gt;x509err == x509err)
++            break;
++    return tp-&gt;alert;
+ }
+ 
+ int ssl_allow_compression(SSL *s)
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index 1313847..c0c406d 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -3563,7 +3563,7 @@ MSG_PROCESS_RETURN tls_process_client_certificate(SSL *s, PACKET *pkt)
+         EVP_PKEY *pkey;
+         i = ssl_verify_cert_chain(s, sk);
+         if (i &lt;= 0) {
+-            SSLfatal(s, ssl_verify_alarm_type(s-&gt;verify_result),
++            SSLfatal(s, ssl_x509err2alert(s-&gt;verify_result),
+                      SSL_F_TLS_PROCESS_CLIENT_CERTIFICATE,
+                      SSL_R_CERTIFICATE_VERIFY_FAILED);
+             goto err;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018801.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018806.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18804">[ date ]</a>
+              <a href="thread.html#18804">[ thread ]</a>
+              <a href="subject.html#18804">[ subject ]</a>
+              <a href="author.html#18804">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

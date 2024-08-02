@@ -1,0 +1,215 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1540560963.576102.21912.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020531.html">
+   <LINK REL="Next"  HREF="020535.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>bernd.edlinger at hotmail.de</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1540560963.576102.21912.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">bernd.edlinger at hotmail.de
+       </A><BR>
+    <I>Fri Oct 26 13:36:03 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020531.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="020535.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20534">[ date ]</a>
+              <a href="thread.html#20534">[ thread ]</a>
+              <a href="subject.html#20534">[ subject ]</a>
+              <a href="author.html#20534">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a83dc59afa2e0207180d7218efed19b20d48de95 (commit)
+      from  f1358634af5b84be22cb20fff3dcb613f5f8c978 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a83dc59afa2e0207180d7218efed19b20d48de95
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Sun Oct 14 12:35:19 2018 +0200
+
+    Fix data race in RAND_DRBG_generate
+    
+    Fixes #7394
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/7399">https://github.com/openssl/openssl/pull/7399</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/drbg_lib.c | 41 +++++++++++++++++++++++++----------------
+ crypto/rand/rand_lcl.h |  4 +++-
+ crypto/rand/rand_lib.c |  2 ++
+ 3 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/crypto/rand/drbg_lib.c b/crypto/rand/drbg_lib.c
+index 9d920cb..ec4aa69 100644
+--- a/crypto/rand/drbg_lib.c
++++ b/crypto/rand/drbg_lib.c
+@@ -374,6 +374,13 @@ int RAND_DRBG_instantiate(RAND_DRBG *drbg,
+         max_entropylen += drbg-&gt;max_noncelen;
+     }
+ 
++    drbg-&gt;reseed_next_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
++    if (drbg-&gt;reseed_next_counter) {
++        drbg-&gt;reseed_next_counter++;
++        if(!drbg-&gt;reseed_next_counter)
++            drbg-&gt;reseed_next_counter = 1;
++    }
++
+     if (drbg-&gt;get_entropy != NULL)
+         entropylen = drbg-&gt;get_entropy(drbg, &amp;entropy, min_entropy,
+                                        min_entropylen, max_entropylen, 0);
+@@ -401,12 +408,7 @@ int RAND_DRBG_instantiate(RAND_DRBG *drbg,
+     drbg-&gt;state = DRBG_READY;
+     drbg-&gt;reseed_gen_counter = 1;
+     drbg-&gt;reseed_time = time(NULL);
+-    if (drbg-&gt;reseed_prop_counter &gt; 0) {
+-        if (drbg-&gt;parent == NULL)
+-            drbg-&gt;reseed_prop_counter++;
+-        else
+-            drbg-&gt;reseed_prop_counter = drbg-&gt;parent-&gt;reseed_prop_counter;
+-    }
++    tsan_store(&amp;drbg-&gt;reseed_prop_counter, drbg-&gt;reseed_next_counter);
+ 
+  end:
+     if (entropy != NULL &amp;&amp; drbg-&gt;cleanup_entropy != NULL)
+@@ -498,6 +500,14 @@ int RAND_DRBG_reseed(RAND_DRBG *drbg,
+     }
+ 
+     drbg-&gt;state = DRBG_ERROR;
++
++    drbg-&gt;reseed_next_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
++    if (drbg-&gt;reseed_next_counter) {
++        drbg-&gt;reseed_next_counter++;
++        if(!drbg-&gt;reseed_next_counter)
++            drbg-&gt;reseed_next_counter = 1;
++    }
++
+     if (drbg-&gt;get_entropy != NULL)
+         entropylen = drbg-&gt;get_entropy(drbg, &amp;entropy, drbg-&gt;strength,
+                                        drbg-&gt;min_entropylen,
+@@ -515,12 +525,7 @@ int RAND_DRBG_reseed(RAND_DRBG *drbg,
+     drbg-&gt;state = DRBG_READY;
+     drbg-&gt;reseed_gen_counter = 1;
+     drbg-&gt;reseed_time = time(NULL);
+-    if (drbg-&gt;reseed_prop_counter &gt; 0) {
+-        if (drbg-&gt;parent == NULL)
+-            drbg-&gt;reseed_prop_counter++;
+-        else
+-            drbg-&gt;reseed_prop_counter = drbg-&gt;parent-&gt;reseed_prop_counter;
+-    }
++    tsan_store(&amp;drbg-&gt;reseed_prop_counter, drbg-&gt;reseed_next_counter);
+ 
+  end:
+     if (entropy != NULL &amp;&amp; drbg-&gt;cleanup_entropy != NULL)
+@@ -691,8 +696,11 @@ int RAND_DRBG_generate(RAND_DRBG *drbg, unsigned char *out, size_t outlen,
+             || now - drbg-&gt;reseed_time &gt;= drbg-&gt;reseed_time_interval)
+             reseed_required = 1;
+     }
+-    if (drbg-&gt;reseed_prop_counter &gt; 0 &amp;&amp; drbg-&gt;parent != NULL) {
+-        if (drbg-&gt;reseed_prop_counter != drbg-&gt;parent-&gt;reseed_prop_counter)
++    if (drbg-&gt;parent != NULL) {
++        unsigned int reseed_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
++        if (reseed_counter &gt; 0
++                &amp;&amp; tsan_load(&amp;drbg-&gt;parent-&gt;reseed_prop_counter)
++                   != reseed_counter)
+             reseed_required = 1;
+     }
+ 
+@@ -764,7 +772,8 @@ int RAND_DRBG_set_callbacks(RAND_DRBG *drbg,
+                             RAND_DRBG_get_nonce_fn get_nonce,
+                             RAND_DRBG_cleanup_nonce_fn cleanup_nonce)
+ {
+-    if (drbg-&gt;state != DRBG_UNINITIALISED)
++    if (drbg-&gt;state != DRBG_UNINITIALISED
++            || drbg-&gt;parent != NULL)
+         return 0;
+     drbg-&gt;get_entropy = get_entropy;
+     drbg-&gt;cleanup_entropy = cleanup_entropy;
+@@ -942,7 +951,7 @@ static RAND_DRBG *drbg_setup(RAND_DRBG *parent, int drbg_type)
+         goto err;
+ 
+     /* enable seed propagation */
+-    drbg-&gt;reseed_prop_counter = 1;
++    tsan_store(&amp;drbg-&gt;reseed_prop_counter, 1);
+ 
+     /*
+      * Ignore instantiation error to support just-in-time instantiation.
+diff --git a/crypto/rand/rand_lcl.h b/crypto/rand/rand_lcl.h
+index 9004809..8abca4c 100644
+--- a/crypto/rand/rand_lcl.h
++++ b/crypto/rand/rand_lcl.h
+@@ -16,6 +16,7 @@
+ # include &lt;openssl/hmac.h&gt;
+ # include &lt;openssl/ec.h&gt;
+ # include &lt;openssl/rand_drbg.h&gt;
++# include &quot;internal/tsan_assist.h&quot;
+ 
+ # include &quot;internal/numbers.h&quot;
+ 
+@@ -258,7 +259,8 @@ struct rand_drbg_st {
+      * is added by RAND_add() or RAND_seed() will have an immediate effect on
+      * the output of RAND_bytes() resp. RAND_priv_bytes().
+      */
+-    unsigned int reseed_prop_counter;
++    TSAN_QUALIFIER unsigned int reseed_prop_counter;
++    unsigned int reseed_next_counter;
+ 
+     size_t seedlen;
+     DRBG_STATUS state;
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 29d93a8..440c19c 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -174,6 +174,8 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+                                    prediction_resistance,
+                                    NULL, 0) != 0)
+                 bytes = bytes_needed;
++            drbg-&gt;reseed_next_counter
++                = tsan_load(&amp;drbg-&gt;parent-&gt;reseed_prop_counter);
+             rand_drbg_unlock(drbg-&gt;parent);
+ 
+             rand_pool_add_end(pool, bytes, 8 * bytes);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020531.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="020535.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20534">[ date ]</a>
+              <a href="thread.html#20534">[ thread ]</a>
+              <a href="subject.html#20534">[ subject ]</a>
+              <a href="author.html#20534">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

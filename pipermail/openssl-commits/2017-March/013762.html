@@ -1,0 +1,281 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  tls1.3-draft-18 update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20tls1.3-draft-18%20update&In-Reply-To=%3C1490091150.495214.17383.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013760.html">
+   <LINK REL="Next"  HREF="013765.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  tls1.3-draft-18 update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20tls1.3-draft-18%20update&In-Reply-To=%3C1490091150.495214.17383.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  tls1.3-draft-18 update">matt at openssl.org
+       </A><BR>
+    <I>Tue Mar 21 10:12:30 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013760.html">[openssl-commits] Still Failing: openssl/openssl#9630 (master -	9ea6d56)
+</A></li>
+        <LI>Next message: <A HREF="013765.html">[openssl-commits] Still Failing: openssl/openssl#9635 (master -	1763ab1)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13762">[ date ]</a>
+              <a href="thread.html#13762">[ thread ]</a>
+              <a href="subject.html#13762">[ subject ]</a>
+              <a href="author.html#13762">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch tls1.3-draft-18 has been updated
+       via  05a2feb6841c786b24a104943b2765ef8bc7a61f (commit)
+       via  2c7e64564cf7ab00c099d4f398ae9e53698b68f6 (commit)
+      from  7baabf45c424c135ecfafc6b3bb7ea1d225fbfda (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 05a2feb6841c786b24a104943b2765ef8bc7a61f
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Mar 20 18:21:54 2017 +0000
+
+    Add a test for resumption after HRR
+    
+    Make sure we actually test resumption where an HRR has occurred.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2996">https://github.com/openssl/openssl/pull/2996</A>)
+    (cherry picked from commit 1763ab10291eec361d8e56519582d710158e1e8e)
+
+commit 2c7e64564cf7ab00c099d4f398ae9e53698b68f6
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Mar 20 18:03:34 2017 +0000
+
+    Fix resumption after HRR
+    
+    Commit 6b1bb98fa moved the processing of ClientHello extensions into the
+    state machine post-processing stage. After processing s-&gt;init_num is reset
+    to 0, so by post-processing we cannot rely on its value. Unfortunately we
+    were using it to handle the PSK extension. This causes the handshake to
+    fail.
+    
+    We were using init_num to figure out the length of ClientHello2 so we can
+    remove it from the handshake_buffer. The handshake_buffer holds the
+    transcript of all the messages sent so far. For PSK processing though we
+    only want to add in a partial ClientHello2. This commit changes things so
+    we just work out where ClientHello2 starts, working forward from the
+    beginning of handshake_buffer.
+    
+    Fixes #2983
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2996">https://github.com/openssl/openssl/pull/2996</A>)
+    (cherry picked from commit 77815a026cbedbb7b9a89558612f69e6294fe1ea)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/extensions.c            | 11 +++++++++--
+ test/ssl-tests/protocol_version.pm | 21 ++++++++++++++++++++-
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/ssl/statem/extensions.c b/ssl/statem/extensions.c
+index 0ab1f04..8550dfe 100644
+--- a/ssl/statem/extensions.c
++++ b/ssl/statem/extensions.c
+@@ -1191,11 +1191,18 @@ int tls_psk_do_binder(SSL *s, const EVP_MD *md, const unsigned char *msgstart,
+          * ClientHello - which we don't want - so we need to take that bit off.
+          */
+         if (s-&gt;server) {
+-            if (hdatalen &lt; s-&gt;init_num + SSL3_HM_HEADER_LENGTH) {
++            PACKET hashprefix, msg;
++
++            /* Find how many bytes are left after the first two messages */
++            if (!PACKET_buf_init(&amp;hashprefix, hdata, hdatalen)
++                    || !PACKET_forward(&amp;hashprefix, 1)
++                    || !PACKET_get_length_prefixed_3(&amp;hashprefix, &amp;msg)
++                    || !PACKET_forward(&amp;hashprefix, 1)
++                    || !PACKET_get_length_prefixed_3(&amp;hashprefix, &amp;msg)) {
+                 SSLerr(SSL_F_TLS_PSK_DO_BINDER, ERR_R_INTERNAL_ERROR);
+                 goto err;
+             }
+-            hdatalen -= s-&gt;init_num + SSL3_HM_HEADER_LENGTH;
++            hdatalen -= PACKET_remaining(&amp;hashprefix);
+         }
+ 
+         if (EVP_DigestUpdate(mctx, hdata, hdatalen) &lt;= 0) {
+diff --git a/test/ssl-tests/protocol_version.pm b/test/ssl-tests/protocol_version.pm
+index cc39c75..7c28bcf 100644
+--- a/test/ssl-tests/protocol_version.pm
++++ b/test/ssl-tests/protocol_version.pm
+@@ -17,7 +17,7 @@ use warnings;
+ use List::Util qw/max min/;
+ 
+ use OpenSSL::Test;
+-use OpenSSL::Test::Utils qw/anydisabled alldisabled/;
++use OpenSSL::Test::Utils qw/anydisabled alldisabled disabled/;
+ setup(&quot;no_test_here&quot;);
+ 
+ my @tls_protocols = (&quot;SSLv3&quot;, &quot;TLSv1&quot;, &quot;TLSv1.1&quot;, &quot;TLSv1.2&quot;, &quot;TLSv1.3&quot;);
+@@ -203,6 +203,25 @@ sub generate_resumption_tests {
+         }
+     }
+ 
++    if (!disabled(&quot;tls1_3&quot;) &amp;&amp; !$dtls) {
++        push @client_tests, {
++            &quot;name&quot; =&gt; &quot;resumption-with-hrr&quot;,
++            &quot;client&quot; =&gt; {
++            },
++            &quot;server&quot; =&gt; {
++                &quot;Curves&quot; =&gt; &quot;P-256&quot;
++            },
++            &quot;resume_client&quot; =&gt; {
++            },
++            &quot;test&quot; =&gt; {
++                &quot;ExpectedProtocol&quot; =&gt; &quot;TLSv1.3&quot;,
++                &quot;Method&quot; =&gt; &quot;TLS&quot;,
++                &quot;HandshakeMode&quot; =&gt; &quot;Resume&quot;,
++                &quot;ResumptionExpected&quot; =&gt; &quot;Yes&quot;,
++            }
++        };
++    }
++
+     return (@server_tests, @client_tests);
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013760.html">[openssl-commits] Still Failing: openssl/openssl#9630 (master -	9ea6d56)
+</A></li>
+	<LI>Next message: <A HREF="013765.html">[openssl-commits] Still Failing: openssl/openssl#9635 (master -	1763ab1)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13762">[ date ]</a>
+              <a href="thread.html#13762">[ thread ]</a>
+              <a href="subject.html#13762">[ subject ]</a>
+              <a href="author.html#13762">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

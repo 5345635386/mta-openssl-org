@@ -1,0 +1,574 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1582330993.791466.30986.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027629.html">
+   <LINK REL="Next"  HREF="027655.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1582330993.791466.30986.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sat Feb 22 00:23:13 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027629.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027655.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27630">[ date ]</a>
+              <a href="thread.html#27630">[ thread ]</a>
+              <a href="subject.html#27630">[ subject ]</a>
+              <a href="author.html#27630">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3f7ce7f1029c01c2c4d00e14ffc9630d26f485a4 (commit)
+      from  8e90e3d53665854d76d6d46491b38f0e2a802428 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3f7ce7f1029c01c2c4d00e14ffc9630d26f485a4
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 12 14:28:50 2020 +0100
+
+    Refactor evp_pkey_make_provided() to do legacy to provider export
+    
+    Previously, evp-keymgmt_util_export_to_provider() took care of all
+    kinds of exports of EVP_PKEYs to provider side keys, be it from its
+    legacy key or from another provider side key.  This works most of the
+    times, but there may be cases where the caller wants to be a bit more
+    in control of what sort of export happens when.
+    
+    Also, when it's time to remove all legacy stuff, that job will be much
+    easier if we have a better separation between legacy support and
+    support of provided stuff, as far as we can take it.
+    
+    This changes moves the support of legacy key to provider side key
+    export from evp-keymgmt_util_export_to_provider() to
+    evp_pkey_make_provided(), and makes sure the latter is called from all
+    EVP_PKEY functions that handle legacy stuff.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11074">https://github.com/openssl/openssl/pull/11074</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_fetch.c                             |   2 +-
+ crypto/evp/evp_local.h                             |   4 +-
+ crypto/evp/exchange.c                              |  12 +-
+ crypto/evp/keymgmt_lib.c                           | 145 +++++++++++----------
+ crypto/evp/p_lib.c                                 | 106 ++++++++++++++-
+ .../man3/evp_keymgmt_util_export_to_provider.pod   |  16 +--
+ doc/internal/man3/evp_pkey_make_provided.pod       |   8 ++
+ include/crypto/evp.h                               |   4 +
+ test/keymgmt_internal_test.c                       |   2 +-
+ 9 files changed, 209 insertions(+), 90 deletions(-)
+
+diff --git a/crypto/evp/evp_fetch.c b/crypto/evp/evp_fetch.c
+index 5bf825d62b..da7f33e95e 100644
+--- a/crypto/evp/evp_fetch.c
++++ b/crypto/evp/evp_fetch.c
+@@ -373,7 +373,7 @@ void evp_generic_do_all(OPENSSL_CTX *libctx, int operation_id,
+     ossl_algorithm_do_all(libctx, operation_id, NULL, do_one, &amp;data);
+ }
+ 
+-const char *evp_first_name(OSSL_PROVIDER *prov, int name_id)
++const char *evp_first_name(const OSSL_PROVIDER *prov, int name_id)
+ {
+     OPENSSL_CTX *libctx = ossl_provider_library_context(prov);
+     OSSL_NAMEMAP *namemap = ossl_namemap_stored(libctx);
+diff --git a/crypto/evp/evp_local.h b/crypto/evp/evp_local.h
+index ca1239dfdd..9b4ab29fda 100644
+--- a/crypto/evp/evp_local.h
++++ b/crypto/evp/evp_local.h
+@@ -267,12 +267,10 @@ OSSL_PARAM *evp_pkey_to_param(EVP_PKEY *pkey, size_t *sz);
+ void evp_pkey_ctx_free_old_ops(EVP_PKEY_CTX *ctx);
+ 
+ /* OSSL_PROVIDER * is only used to get the library context */
+-const char *evp_first_name(OSSL_PROVIDER *prov, int name_id);
++const char *evp_first_name(const OSSL_PROVIDER *prov, int name_id);
+ int evp_is_a(OSSL_PROVIDER *prov, int number,
+              const char *legacy_name, const char *name);
+ void evp_names_do_all(OSSL_PROVIDER *prov, int number,
+                       void (*fn)(const char *name, void *data),
+                       void *data);
+ int evp_cipher_cache_constants(EVP_CIPHER *cipher);
+-void *evp_pkey_make_provided(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+-                             EVP_KEYMGMT **keymgmt, const char *propquery);
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index 901081d062..142a820651 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -309,8 +309,12 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+         return -2;
+     }
+ 
+-    provkey = evp_keymgmt_util_export_to_provider(peer, ctx-&gt;keymgmt);
+-    /* If export failed, legacy may be able to pick it up */
++    provkey = evp_pkey_make_provided(peer, ctx-&gt;libctx, &amp;ctx-&gt;keymgmt,
++                                     ctx-&gt;propquery);
++    /*
++     * If making the key provided wasn't possible, legacy may be able to pick
++     * it up
++     */
+     if (provkey == NULL)
+         goto legacy;
+     return ctx-&gt;op.kex.exchange-&gt;set_peer(ctx-&gt;op.kex.exchprovctx, provkey);
+@@ -319,6 +323,10 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ #ifdef FIPS_MODE
+     return ret;
+ #else
++    /*
++     * TODO(3.0) investigate the case where the operation is deemed legacy,
++     * but the given peer key is provider only.
++     */
+     if (ctx-&gt;pmeth == NULL
+         || !(ctx-&gt;pmeth-&gt;derive != NULL
+              || ctx-&gt;pmeth-&gt;encrypt != NULL
+diff --git a/crypto/evp/keymgmt_lib.c b/crypto/evp/keymgmt_lib.c
+index 812bdcb560..cb30405166 100644
+--- a/crypto/evp/keymgmt_lib.c
++++ b/crypto/evp/keymgmt_lib.c
+@@ -16,6 +16,18 @@
+ #include &quot;internal/provider.h&quot;
+ #include &quot;evp_local.h&quot;
+ 
++/*
++ * match_type() checks if two EVP_KEYMGMT are matching key types.  This
++ * function assumes that the caller has made all the necessary NULL checks.
++ */
++static int match_type(const EVP_KEYMGMT *keymgmt1, const EVP_KEYMGMT *keymgmt2)
++{
++    const OSSL_PROVIDER *prov2 = EVP_KEYMGMT_provider(keymgmt2);
++    const char *name2 = evp_first_name(prov2, EVP_KEYMGMT_number(keymgmt2));
++
++    return EVP_KEYMGMT_is_a(keymgmt1, name2);
++}
++
+ struct import_data_st {
+     EVP_KEYMGMT *keymgmt;
+     void *keydata;
+@@ -34,92 +46,72 @@ static int try_import(const OSSL_PARAM params[], void *arg)
+ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+ {
+     void *keydata = NULL;
++    struct import_data_st import_data;
+     size_t i, j;
+ 
+-    /*
+-     * If there is an underlying legacy key and it has changed, invalidate
+-     * the cache of provider keys.
+-     */
+-    if (pk-&gt;pkey.ptr != NULL) {
+-        /*
+-         * If there is no dirty counter, this key can't be used with
+-         * providers.
+-         */
+-        if (pk-&gt;ameth-&gt;dirty_cnt == NULL)
+-            return NULL;
++    /* Export to where? */
++    if (keymgmt == NULL)
++        return NULL;
+ 
+-        if (pk-&gt;ameth-&gt;dirty_cnt(pk) != pk-&gt;dirty_cnt_copy)
+-            evp_keymgmt_util_clear_pkey_cache(pk);
+-    }
++    /* If we have an unassigned key, give up */
++    if (pk-&gt;pkeys[0].keymgmt == NULL)
++        return NULL;
+ 
+     /*
+      * See if we have exported to this provider already.
+      * If we have, return immediately.
+      */
+-    for (i = 0;
+-         i &lt; OSSL_NELEM(pk-&gt;pkeys) &amp;&amp; pk-&gt;pkeys[i].keymgmt != NULL;
+-         i++) {
+-        if (keymgmt == pk-&gt;pkeys[i].keymgmt)
+-            return pk-&gt;pkeys[i].keydata;
+-    }
++    i = evp_keymgmt_util_find_pkey_cache_index(pk, keymgmt);
++
++    /* If we're already exported to the given keymgmt, no more to do */
++    if (keymgmt == pk-&gt;pkeys[i].keymgmt)
++        return pk-&gt;pkeys[i].keydata;
+ 
++    /*
++     * Make sure that the type of the keymgmt to export to matches the type
++     * of already cached keymgmt
++     */
++    if (!ossl_assert(match_type(pk-&gt;pkeys[0].keymgmt, keymgmt)))
++        return NULL;
++
++    /* Create space to import data into */
+     if ((keydata = evp_keymgmt_newdata(keymgmt)) == NULL)
+         return NULL;
+ 
+-    if (pk-&gt;pkey.ptr != NULL) {
+-        /* There is a legacy key, try to export that one to the provider */
++    /*
++     * We look at the already cached provider keys, and import from the
++     * first that supports it (i.e. use its export function), and export
++     * the imported data to the new provider.
++     */
++
++    /* Setup for the export callback */
++    import_data.keydata = keydata;
++    import_data.keymgmt = keymgmt;
++    import_data.selection = OSSL_KEYMGMT_SELECT_ALL;
++
++    for (j = 0; j &lt; i &amp;&amp; pk-&gt;pkeys[j].keymgmt != NULL; j++) {
++        EVP_KEYMGMT *exp_keymgmt = pk-&gt;pkeys[j].keymgmt;
++        void *exp_keydata = pk-&gt;pkeys[j].keydata;
+ 
+         /*
+-         * If the legacy key doesn't have an export function or the export
+-         * function fails, give up
++         * TODO(3.0) consider an evp_keymgmt_export() return value that
++         * indicates that the method is unsupported.
+          */
+-        if (pk-&gt;ameth-&gt;export_to == NULL
+-            || !pk-&gt;ameth-&gt;export_to(pk, keydata, keymgmt)) {
+-            evp_keymgmt_freedata(keymgmt, keydata);
+-            return NULL;
+-        }
++        if (exp_keymgmt-&gt;export == NULL)
++            continue;
+ 
+-        /* Synchronize the dirty count */
+-        pk-&gt;dirty_cnt_copy = pk-&gt;ameth-&gt;dirty_cnt(pk);
+-    } else {
+         /*
+-         * Here, there is no legacy key, so we look at the already cached
+-         * provider keys, and import from the first that supports it
+-         * (i.e. use its export function), and export the imported data to
+-         * the new provider.
++         * The export function calls the callback (try_import), which does
++         * the import for us.  If successful, we're done.
+          */
++        if (evp_keymgmt_export(exp_keymgmt, exp_keydata,
++                               OSSL_KEYMGMT_SELECT_ALL,
++                               &amp;try_import, &amp;import_data))
++            break;
+ 
+-        /* Setup for the export callback */
+-        struct import_data_st import_data;
+-
+-        import_data.keydata = keydata;
+-        import_data.keymgmt = keymgmt;
+-        import_data.selection = OSSL_KEYMGMT_SELECT_ALL;
+-
+-        for (j = 0; j &lt; i &amp;&amp; pk-&gt;pkeys[j].keymgmt != NULL; j++) {
+-            EVP_KEYMGMT *exp_keymgmt = pk-&gt;pkeys[i].keymgmt;
+-            void *exp_keydata = pk-&gt;pkeys[i].keydata;
+-
+-            /*
+-             * TODO(3.0) consider an evp_keymgmt_export() return value that
+-             * indicates that the method is unsupported.
+-             */
+-            if (exp_keymgmt-&gt;export == NULL)
+-                continue;
+-
+-            /*
+-             * The export function calls the callback (try_import), which
+-             * does the import for us.  If successful, we're done.
+-             */
+-            if (evp_keymgmt_export(exp_keymgmt, exp_keydata,
+-                                   OSSL_KEYMGMT_SELECT_ALL,
+-                                   &amp;try_import, &amp;import_data))
+-                break;
+-
+-            /* If there was an error, bail out */
+-            evp_keymgmt_freedata(keymgmt, keydata);
+-            return NULL;
+-        }
++        /* If there was an error, bail out */
++        evp_keymgmt_freedata(keymgmt, keydata);
++        return NULL;
+     }
+ 
+     /*
+@@ -137,12 +129,10 @@ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
+ 
+ void evp_keymgmt_util_clear_pkey_cache(EVP_PKEY *pk)
+ {
+-    size_t i;
++    size_t i, end = OSSL_NELEM(pk-&gt;pkeys);
+ 
+     if (pk != NULL) {
+-        for (i = 0;
+-             i &lt; OSSL_NELEM(pk-&gt;pkeys) &amp;&amp; pk-&gt;pkeys[i].keymgmt != NULL;
+-             i++) {
++        for (i = 0; i &lt; end &amp;&amp; pk-&gt;pkeys[i].keymgmt != NULL; i++) {
+             EVP_KEYMGMT *keymgmt = pk-&gt;pkeys[i].keymgmt;
+             void *keydata = pk-&gt;pkeys[i].keydata;
+ 
+@@ -158,6 +148,19 @@ void evp_keymgmt_util_clear_pkey_cache(EVP_PKEY *pk)
+     }
+ }
+ 
++size_t evp_keymgmt_util_find_pkey_cache_index(EVP_PKEY *pk,
++                                              EVP_KEYMGMT *keymgmt)
++{
++    size_t i, end = OSSL_NELEM(pk-&gt;pkeys);
++
++    for (i = 0; i &lt; end &amp;&amp; pk-&gt;pkeys[i].keymgmt != NULL; i++) {
++        if (keymgmt == pk-&gt;pkeys[i].keymgmt)
++            break;
++    }
++
++    return i;
++}
++
+ void evp_keymgmt_util_cache_pkey(EVP_PKEY *pk, size_t index,
+                                  EVP_KEYMGMT *keymgmt, void *keydata)
+ {
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 98e0704347..2ffddf5d0a 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -932,6 +932,55 @@ void *evp_pkey_make_provided(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+         *keymgmt = NULL;
+     }
+ 
++#ifndef FIPS_MODE
++    /*
++     * If there is an underlying legacy key and it has changed, invalidate
++     * the cache of provider keys.
++     */
++    if (pk-&gt;pkey.ptr != NULL) {
++        EVP_KEYMGMT *legacy_keymgmt = NULL;
++
++        /*
++         * If there is no dirty counter, this key can't be used with
++         * providers.
++         */
++        if (pk-&gt;ameth-&gt;dirty_cnt == NULL)
++            goto end;
++
++        /*
++         * If no keymgmt was given by the caller, we set it to the first
++         * that's cached, to become the keymgmt to re-export to if needed,
++         * or to have a token keymgmt to return on success.  Further checks
++         * are done further down.
++         *
++         * We need to carefully save the pointer somewhere other than in
++         * tmp_keymgmt, so the EVP_KEYMGMT_up_ref() below doesn't mistakenly
++         * increment the reference counter of a keymgmt given by the caller.
++         */
++        if (tmp_keymgmt == NULL)
++            legacy_keymgmt = pk-&gt;pkeys[0].keymgmt;
++
++        /*
++         * If the dirty counter changed since last time, we make sure to
++         * hold on to the keymgmt we just got (if we got one), then clear
++         * the cache.
++         */
++        if (pk-&gt;ameth-&gt;dirty_cnt(pk) != pk-&gt;dirty_cnt_copy) {
++            if (legacy_keymgmt != NULL &amp;&amp; !EVP_KEYMGMT_up_ref(legacy_keymgmt))
++                goto end;
++            evp_keymgmt_util_clear_pkey_cache(pk);
++        }
++
++        /*
++         * |legacy_keymgmt| was only given a value if |tmp_keymgmt| is
++         * NULL.
++         */
++        if (legacy_keymgmt != NULL)
++            tmp_keymgmt = legacy_keymgmt;
++    }
++#endif
++
++    /* If no keymgmt was given or found, get a default keymgmt */
+     if (tmp_keymgmt == NULL) {
+         EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_pkey(libctx, pk, propquery);
+ 
+@@ -941,10 +990,61 @@ void *evp_pkey_make_provided(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+         EVP_PKEY_CTX_free(ctx);
+     }
+ 
+-    if (tmp_keymgmt != NULL)
+-        keydata =
+-            evp_keymgmt_util_export_to_provider(pk, tmp_keymgmt);
++    if (tmp_keymgmt == NULL)
++        goto end;
+ 
++#ifndef FIPS_MODE
++    if (pk-&gt;pkey.ptr != NULL) {
++        size_t i;
++
++        /*
++         * Find our keymgmt in the cache.  If it's present, it means that
++         * export has already been done.  We take token copies of the
++         * cached pointers, to have token success values to return.
++         *
++         * TODO(3.0) Right now, we assume we have ample space.  We will
++         * have to think about a cache aging scheme, though, if |i| indexes
++         * outside the array.
++         */
++        i = evp_keymgmt_util_find_pkey_cache_index(pk, tmp_keymgmt);
++        if (!ossl_assert(i &lt; OSSL_NELEM(pk-&gt;pkeys)))
++            goto end;
++        if (pk-&gt;pkeys[i].keymgmt != NULL) {
++            keydata = pk-&gt;pkeys[i].keydata;
++            goto end;
++        }
++
++        /*
++         * If we still don't have a keymgmt at this point, or the legacy
++         * key doesn't have an export function, just bail out.
++         */
++        if (pk-&gt;ameth-&gt;export_to == NULL)
++            goto end;
++
++        /* Make sure that the keymgmt key type matches the legacy NID */
++        if (!ossl_assert(EVP_KEYMGMT_is_a(tmp_keymgmt, OBJ_nid2sn(pk-&gt;type))))
++            goto end;
++
++        if ((keydata = evp_keymgmt_newdata(tmp_keymgmt)) == NULL)
++            goto end;
++
++        if (!pk-&gt;ameth-&gt;export_to(pk, keydata, tmp_keymgmt)) {
++            evp_keymgmt_freedata(tmp_keymgmt, keydata);
++            keydata = NULL;
++            goto end;
++        }
++
++        evp_keymgmt_util_cache_pkey(pk, i, tmp_keymgmt, keydata);
++
++        /* Synchronize the dirty count */
++        pk-&gt;dirty_cnt_copy = pk-&gt;ameth-&gt;dirty_cnt(pk);
++        goto end;
++    }
++#endif  /* FIPS_MODE */
++
++    keydata = evp_keymgmt_util_export_to_provider(pk, tmp_keymgmt);
++
++ end:
+     /*
+      * If nothing was exported, |tmp_keymgmt| might point at a freed
+      * EVP_KEYMGMT, so we clear it to be safe.  It shouldn't be useful for
+diff --git a/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod b/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
+index 38e71334c8..2c8b7b2f24 100644
+--- a/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
++++ b/doc/internal/man3/evp_keymgmt_util_export_to_provider.pod
+@@ -21,17 +21,15 @@ evp_keymgmt_util_fromdata
+ 
+ =head1 DESCRIPTION
+ 
+-evp_keymgmt_util_export_to_provider() exports the key material from
+-the given key I&lt;pk&gt; to a provider via a B&lt;EVP_KEYMGMT&gt; interface, if
+-this hasn't already been done.
++evp_keymgmt_util_export_to_provider() exports cached key material
++(provider side key material) from the given key I&lt;pk&gt; to a provider
++via a B&lt;EVP_KEYMGMT&gt; interface, if this hasn't already been done.
+ It maintains a cache of provider key references in I&lt;pk&gt; to keep track
+-of all such exports.
++of all provider side keys.
+ 
+-If I&lt;pk&gt; has an assigned legacy key, a check is done to see if any of
+-its key material has changed since last export, i.e. the legacy key's
+-is_dirty() method returns 1.
+-If it has, the cache of already exported keys is cleared, and a new
+-export is made with the new key material.
++To export a legacy key, use L&lt;evp_pkey_make_provided(3)&gt; instead, as
++this function deals purely with provider side keys and will not care
++to look at any legacy key.
+ 
+ evp_keymgmt_util_clear_pkey_cache() can be used to explicitly clear
+ the cache of provider key references.
+diff --git a/doc/internal/man3/evp_pkey_make_provided.pod b/doc/internal/man3/evp_pkey_make_provided.pod
+index 12cbe0c365..3eb17e707b 100644
+--- a/doc/internal/man3/evp_pkey_make_provided.pod
++++ b/doc/internal/man3/evp_pkey_make_provided.pod
+@@ -24,6 +24,14 @@ fetch an B&lt;EVP_KEYMGMT&gt; implicitly, using I&lt;propquery&gt; as property query string.
+ As output from this function, I&lt;*keymgmt&gt; will be assigned the B&lt;EVP_KEYMGMT&gt;
+ that was used, if the export was successful, otherwise it will be assigned NULL.
+ 
++If I&lt;pk&gt; has an assigned legacy key, a check is done to see if any of
++its key material has changed since last export, by comparing the
++result of the legacy key's dirty_cnt() method with a copy of that
++result from last time evp_pkey_make_provided() was run with this
++B&lt;EVP_PKEY&gt;.
++If it has, the cache of already exported keys is cleared, and a new
++export is made with the new legacy key material.
++
+ =head1 RETURN VALUES
+ 
+ evp_pkey_make_provided() returns the provider key data that was exported if
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 0f5e86b28e..1724a12c7c 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -574,11 +574,15 @@ void openssl_add_all_ciphers_int(void);
+ void openssl_add_all_digests_int(void);
+ void evp_cleanup_int(void);
+ void evp_app_cleanup_int(void);
++void *evp_pkey_make_provided(EVP_PKEY *pk, OPENSSL_CTX *libctx,
++                             EVP_KEYMGMT **keymgmt, const char *propquery);
+ 
+ /*
+  * KEYMGMT utility functions
+  */
+ void *evp_keymgmt_util_export_to_provider(EVP_PKEY *pk, EVP_KEYMGMT *keymgmt);
++size_t evp_keymgmt_util_find_pkey_cache_index(EVP_PKEY *pk,
++                                              EVP_KEYMGMT *keymgmt);
+ void evp_keymgmt_util_clear_pkey_cache(EVP_PKEY *pk);
+ void evp_keymgmt_util_cache_pkey(EVP_PKEY *pk, size_t index,
+                                  EVP_KEYMGMT *keymgmt, void *keydata);
+diff --git a/test/keymgmt_internal_test.c b/test/keymgmt_internal_test.c
+index ad2e1deb5c..77a4afa490 100644
+--- a/test/keymgmt_internal_test.c
++++ b/test/keymgmt_internal_test.c
+@@ -207,7 +207,7 @@ static int test_pass_rsa(FIXTURE *fixture)
+         || !TEST_ptr_ne(km1, km2))
+         goto err;
+ 
+-    if (!TEST_ptr(evp_keymgmt_util_export_to_provider(pk, km1))
++    if (!TEST_ptr(evp_pkey_make_provided(pk, NULL, &amp;km1, NULL))
+         || !TEST_ptr(provkey = evp_keymgmt_util_export_to_provider(pk, km2)))
+         goto err;
+ 
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027629.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027655.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27630">[ date ]</a>
+              <a href="thread.html#27630">[ thread ]</a>
+              <a href="subject.html#27630">[ subject ]</a>
+              <a href="author.html#27630">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

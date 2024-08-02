@@ -1,0 +1,177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1453298483.539958.3365.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003032.html">
+   <LINK REL="Next"  HREF="003036.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1453298483.539958.3365.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Jan 20 14:01:23 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003032.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="003036.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3034">[ date ]</a>
+              <a href="thread.html#3034">[ thread ]</a>
+              <a href="subject.html#3034">[ subject ]</a>
+              <a href="author.html#3034">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7bb196a71adef8440b6152b6174651a9c25588f1 (commit)
+      from  3aeb93486588e7dd01379c50b8fd496d55cf8858 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7bb196a71adef8440b6152b6174651a9c25588f1
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Dec 7 16:50:38 2015 +0000
+
+    Handle SSL_shutdown while in init more appropriately
+    
+    Calling SSL_shutdown while in init previously gave a &quot;1&quot; response, meaning
+    everything was successfully closed down (even though it wasn't). Better is
+    to send our close_notify, but fail when trying to receive one.
+    
+    The problem with doing a shutdown while in the middle of a handshake is
+    that once our close_notify is sent we shouldn't really do anything else
+    (including process handshake/CCS messages) until we've received a
+    close_notify back from the peer. However the peer might send a CCS before
+    acting on our close_notify - so we won't be able to read it because we're
+    not acting on CCS messages!
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ include/openssl/ssl.h |  2 ++
+ ssl/s3_lib.c          | 15 +++++++++++++++
+ ssl/ssl_err.c         |  2 ++
+ ssl/ssl_lib.c         |  5 +----
+ 4 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 3152348..d26b4af 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1992,6 +1992,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_SSL3_SETUP_KEY_BLOCK                       157
+ # define SSL_F_SSL3_SETUP_READ_BUFFER                     156
+ # define SSL_F_SSL3_SETUP_WRITE_BUFFER                    291
++# define SSL_F_SSL3_SHUTDOWN                              396
+ # define SSL_F_SSL3_WRITE_BYTES                           158
+ # define SSL_F_SSL3_WRITE_PENDING                         159
+ # define SSL_F_SSL_ACCEPT                                 390
+@@ -2344,6 +2345,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING           345
+ # define SSL_R_SERVERHELLO_TLSEXT                         275
+ # define SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED           277
++# define SSL_R_SHUTDOWN_WHILE_IN_INIT                     407
+ # define SSL_R_SIGNATURE_ALGORITHMS_ERROR                 360
+ # define SSL_R_SIGNATURE_FOR_NON_SIGNING_CERTIFICATE      220
+ # define SSL_R_SRP_A_CALC                                 361
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index 4b2f196..28204bc 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -4328,6 +4328,21 @@ int ssl3_shutdown(SSL *s)
+             return (ret);
+         }
+     } else if (!(s-&gt;shutdown &amp; SSL_RECEIVED_SHUTDOWN)) {
++        if (SSL_in_init(s)) {
++            /*
++             * We can't shutdown properly if we are in the middle of a
++             * handshake. Doing so is problematic because the peer may send a
++             * CCS before it acts on our close_notify. However we should not
++             * continue to process received handshake messages or CCS once our
++             * close_notify has been sent. Therefore any close_notify from
++             * the peer will be unreadable because we have not moved to the next
++             * cipher state. Its best just to avoid this can-of-worms. Return
++             * an error if we are wanting to wait for a close_notify from the
++             * peer and we are in init.
++             */
++            SSLerr(SSL_F_SSL3_SHUTDOWN, SSL_R_SHUTDOWN_WHILE_IN_INIT);
++            return -1;
++        }
+         /*
+          * If we are waiting for a close from our peer, we are closed
+          */
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index 2abd015..a112ad4 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -128,6 +128,7 @@ static ERR_STRING_DATA SSL_str_functs[] = {
+     {ERR_FUNC(SSL_F_SSL3_SETUP_KEY_BLOCK), &quot;ssl3_setup_key_block&quot;},
+     {ERR_FUNC(SSL_F_SSL3_SETUP_READ_BUFFER), &quot;ssl3_setup_read_buffer&quot;},
+     {ERR_FUNC(SSL_F_SSL3_SETUP_WRITE_BUFFER), &quot;ssl3_setup_write_buffer&quot;},
++    {ERR_FUNC(SSL_F_SSL3_SHUTDOWN), &quot;ssl3_shutdown&quot;},
+     {ERR_FUNC(SSL_F_SSL3_WRITE_BYTES), &quot;ssl3_write_bytes&quot;},
+     {ERR_FUNC(SSL_F_SSL3_WRITE_PENDING), &quot;ssl3_write_pending&quot;},
+     {ERR_FUNC(SSL_F_SSL_ACCEPT), &quot;SSL_accept&quot;},
+@@ -577,6 +578,7 @@ static ERR_STRING_DATA SSL_str_reasons[] = {
+     {ERR_REASON(SSL_R_SERVERHELLO_TLSEXT), &quot;serverhello tlsext&quot;},
+     {ERR_REASON(SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED),
+      &quot;session id context uninitialized&quot;},
++    {ERR_REASON(SSL_R_SHUTDOWN_WHILE_IN_INIT), &quot;shutdown while in init&quot;},
+     {ERR_REASON(SSL_R_SIGNATURE_ALGORITHMS_ERROR),
+      &quot;signature algorithms error&quot;},
+     {ERR_REASON(SSL_R_SIGNATURE_FOR_NON_SIGNING_CERTIFICATE),
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index e922e3f..fe9749e 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -1564,10 +1564,7 @@ int SSL_shutdown(SSL *s)
+         return -1;
+     }
+ 
+-    if (!SSL_in_init(s))
+-        return (s-&gt;method-&gt;ssl_shutdown(s));
+-    else
+-        return (1);
++    return s-&gt;method-&gt;ssl_shutdown(s);
+ }
+ 
+ int SSL_renegotiate(SSL *s)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003032.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="003036.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3034">[ date ]</a>
+              <a href="thread.html#3034">[ thread ]</a>
+              <a href="subject.html#3034">[ subject ]</a>
+              <a href="author.html#3034">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

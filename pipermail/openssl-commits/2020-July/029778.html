@@ -1,0 +1,415 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595416591.368277.3719.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029777.html">
+   <LINK REL="Next"  HREF="029789.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1595416591.368277.3719.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Wed Jul 22 11:16:31 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029777.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029789.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29778">[ date ]</a>
+              <a href="thread.html#29778">[ thread ]</a>
+              <a href="subject.html#29778">[ subject ]</a>
+              <a href="author.html#29778">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dcb71e1c21ad46bc9258d388b98156ae48de0af4 (commit)
+      from  7b9f218838ad93ab6b8dd9cd4545703839ec037a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dcb71e1c21ad46bc9258d388b98156ae48de0af4
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Tue Jul 21 10:51:33 2020 +1000
+
+    Cleanup fips provider init
+    
+    Removed dummy evp_test
+    Changed all algorithm properties to use fips=yes (except for RAND_TEST) (This changes the DRBG and ECX settings)
+    Removed unused includes.
+    Added TODO(3.0) for issue(s) that need to be resolved.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12498">https://github.com/openssl/openssl/pull/12498</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ providers/fips/fipsprov.c | 213 +++++++++++++---------------------------------
+ 1 file changed, 59 insertions(+), 154 deletions(-)
+
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index c91ad1c6d7..77cd75fcdf 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -7,27 +7,13 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-#include &lt;string.h&gt;
+-#include &lt;stdio.h&gt;
+-#include &lt;openssl/core.h&gt;
+ #include &lt;openssl/core_dispatch.h&gt;
+ #include &lt;openssl/core_names.h&gt;
+ #include &lt;openssl/params.h&gt;
+-#include &lt;openssl/err.h&gt;
+-#include &lt;openssl/evp.h&gt;
+-#include &lt;openssl/kdf.h&gt;
+-
+-/* TODO(3.0): Needed for dummy_evp_call(). To be removed */
+-#include &lt;openssl/sha.h&gt;
+-#include &lt;openssl/rand_drbg.h&gt;
+-#include &lt;openssl/ec.h&gt;
++#include &lt;openssl/obj_mac.h&gt; /* NIDs used by ossl_prov_util_nid_to_name() */
+ #include &lt;openssl/fips_names.h&gt;
+-
++#include &lt;openssl/rand_drbg.h&gt; /* OPENSSL_CTX_get0_public_drbg() */
+ #include &quot;internal/cryptlib.h&quot;
+-#include &quot;internal/property.h&quot;
+-#include &quot;internal/nelem.h&quot;
+-#include &quot;openssl/param_build.h&quot;
+-#include &quot;crypto/evp.h&quot;
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/provider_ctx.h&quot;
+ #include &quot;prov/providercommon.h&quot;
+@@ -35,6 +21,9 @@
+ #include &quot;prov/provider_util.h&quot;
+ #include &quot;self_test.h&quot;
+ 
++static const char FIPS_DEFAULT_PROPERTIES[] = &quot;provider=fips,fips=yes&quot;;
++static const char FIPS_UNAPPROVED_PROPERTIES[] = &quot;provider=fips,fips=no&quot;;
++
+ /*
+  * Forward declarations to ensure that interface functions are correctly
+  * defined.
+@@ -44,7 +33,7 @@ static OSSL_FUNC_provider_gettable_params_fn fips_gettable_params;
+ static OSSL_FUNC_provider_get_params_fn fips_get_params;
+ static OSSL_FUNC_provider_query_operation_fn fips_query;
+ 
+-#define ALGC(NAMES, FUNC, CHECK) { { NAMES, &quot;provider=fips,fips=yes&quot;, FUNC }, CHECK }
++#define ALGC(NAMES, FUNC, CHECK) { { NAMES, FIPS_DEFAULT_PROPERTIES, FUNC }, CHECK }
+ #define ALG(NAMES, FUNC) ALGC(NAMES, FUNC, NULL)
+ 
+ extern OSSL_FUNC_core_thread_start_fn *c_thread_start;
+@@ -137,87 +126,6 @@ static OSSL_PARAM core_params[] =
+     OSSL_PARAM_END
+ };
+ 
+-/* TODO(3.0): To be removed */
+-static int dummy_evp_call(OPENSSL_CTX *libctx)
+-{
+-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+-    EVP_MD *sha256 = EVP_MD_fetch(libctx, &quot;SHA256&quot;, NULL);
+-    EVP_KDF *kdf = EVP_KDF_fetch(libctx, OSSL_KDF_NAME_PBKDF2, NULL);
+-    unsigned char dgst[SHA256_DIGEST_LENGTH];
+-    unsigned int dgstlen;
+-    int ret = 0;
+-    BN_CTX *bnctx = NULL;
+-    BIGNUM *a = NULL, *b = NULL;
+-    unsigned char randbuf[128];
+-    RAND_DRBG *drbg = OPENSSL_CTX_get0_public_drbg(libctx);
+-#ifndef OPENSSL_NO_EC
+-    EC_KEY *key = NULL;
+-#endif
+-
+-    static const char msg[] = &quot;Hello World!&quot;;
+-    static const unsigned char exptd[] = {
+-        0x7f, 0x83, 0xb1, 0x65, 0x7f, 0xf1, 0xfc, 0x53, 0xb9, 0x2d, 0xc1, 0x81,
+-        0x48, 0xa1, 0xd6, 0x5d, 0xfc, 0x2d, 0x4b, 0x1f, 0xa3, 0xd6, 0x77, 0x28,
+-        0x4a, 0xdd, 0xd2, 0x00, 0x12, 0x6d, 0x90, 0x69
+-    };
+-
+-    if (ctx == NULL || sha256 == NULL || drbg == NULL || kdf == NULL)
+-        goto err;
+-
+-    if (!EVP_DigestInit_ex(ctx, sha256, NULL))
+-        goto err;
+-    if (!EVP_DigestUpdate(ctx, msg, sizeof(msg) - 1))
+-        goto err;
+-    if (!EVP_DigestFinal(ctx, dgst, &amp;dgstlen))
+-        goto err;
+-    if (dgstlen != sizeof(exptd) || memcmp(dgst, exptd, sizeof(exptd)) != 0)
+-        goto err;
+-
+-    bnctx = BN_CTX_new_ex(libctx);
+-    if (bnctx == NULL)
+-        goto err;
+-    BN_CTX_start(bnctx);
+-    a = BN_CTX_get(bnctx);
+-    b = BN_CTX_get(bnctx);
+-    if (b == NULL)
+-        goto err;
+-    BN_zero(a);
+-    if (!BN_one(b)
+-        || !BN_add(a, a, b)
+-        || BN_cmp(a, b) != 0)
+-        goto err;
+-
+-    if (RAND_DRBG_bytes(drbg, randbuf, sizeof(randbuf)) &lt;= 0)
+-        goto err;
+-
+-    if (!BN_rand_ex(a, 256, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY, bnctx))
+-        goto err;
+-
+-#ifndef OPENSSL_NO_EC
+-    /* Do some dummy EC calls */
+-    key = EC_KEY_new_by_curve_name_with_libctx(libctx, NULL, NID_X9_62_prime256v1);
+-    if (key == NULL)
+-        goto err;
+-
+-    if (!EC_KEY_generate_key(key))
+-        goto err;
+-#endif
+-
+-    ret = 1;
+- err:
+-    BN_CTX_end(bnctx);
+-    BN_CTX_free(bnctx);
+-
+-    EVP_KDF_free(kdf);
+-    EVP_MD_CTX_free(ctx);
+-    EVP_MD_free(sha256);
+-
+-#ifndef OPENSSL_NO_EC
+-    EC_KEY_free(key);
+-#endif
+-    return ret;
+-}
+-
+ static const OSSL_PARAM *fips_gettable_params(void *provctx)
+ {
+     return fips_param_types;
+@@ -241,6 +149,7 @@ static int fips_get_params(void *provctx, OSSL_PARAM params[])
+ }
+ 
+ /* FIPS specific version of the function of the same name in provlib.c */
++/* TODO(3.0) - Is this function needed ? */
+ const char *ossl_prov_util_nid_to_name(int nid)
+ {
+     /* We don't have OBJ_nid2n() in FIPS_MODULE so we have an explicit list */
+@@ -362,32 +271,32 @@ const char *ossl_prov_util_nid_to_name(int nid)
+  */
+ static const OSSL_ALGORITHM fips_digests[] = {
+     /* Our primary name:NiST name[:our older names] */
+-    { &quot;SHA1:SHA-1&quot;, &quot;provider=fips,fips=yes&quot;, sha1_functions },
+-    { &quot;SHA2-224:SHA-224:SHA224&quot;, &quot;provider=fips,fips=yes&quot;, sha224_functions },
+-    { &quot;SHA2-256:SHA-256:SHA256&quot;, &quot;provider=fips,fips=yes&quot;, sha256_functions },
+-    { &quot;SHA2-384:SHA-384:SHA384&quot;, &quot;provider=fips,fips=yes&quot;, sha384_functions },
+-    { &quot;SHA2-512:SHA-512:SHA512&quot;, &quot;provider=fips,fips=yes&quot;, sha512_functions },
+-    { &quot;SHA2-512/224:SHA-512/224:SHA512-224&quot;, &quot;provider=fips,fips=yes&quot;,
++    { &quot;SHA1:SHA-1&quot;, FIPS_DEFAULT_PROPERTIES, sha1_functions },
++    { &quot;SHA2-224:SHA-224:SHA224&quot;, FIPS_DEFAULT_PROPERTIES, sha224_functions },
++    { &quot;SHA2-256:SHA-256:SHA256&quot;, FIPS_DEFAULT_PROPERTIES, sha256_functions },
++    { &quot;SHA2-384:SHA-384:SHA384&quot;, FIPS_DEFAULT_PROPERTIES, sha384_functions },
++    { &quot;SHA2-512:SHA-512:SHA512&quot;, FIPS_DEFAULT_PROPERTIES, sha512_functions },
++    { &quot;SHA2-512/224:SHA-512/224:SHA512-224&quot;, FIPS_DEFAULT_PROPERTIES,
+       sha512_224_functions },
+-    { &quot;SHA2-512/256:SHA-512/256:SHA512-256&quot;, &quot;provider=fips,fips=yes&quot;,
++    { &quot;SHA2-512/256:SHA-512/256:SHA512-256&quot;, FIPS_DEFAULT_PROPERTIES,
+       sha512_256_functions },
+ 
+     /* We agree with NIST here, so one name only */
+-    { &quot;SHA3-224&quot;, &quot;provider=fips,fips=yes&quot;, sha3_224_functions },
+-    { &quot;SHA3-256&quot;, &quot;provider=fips,fips=yes&quot;, sha3_256_functions },
+-    { &quot;SHA3-384&quot;, &quot;provider=fips,fips=yes&quot;, sha3_384_functions },
+-    { &quot;SHA3-512&quot;, &quot;provider=fips,fips=yes&quot;, sha3_512_functions },
++    { &quot;SHA3-224&quot;, FIPS_DEFAULT_PROPERTIES, sha3_224_functions },
++    { &quot;SHA3-256&quot;, FIPS_DEFAULT_PROPERTIES, sha3_256_functions },
++    { &quot;SHA3-384&quot;, FIPS_DEFAULT_PROPERTIES, sha3_384_functions },
++    { &quot;SHA3-512&quot;, FIPS_DEFAULT_PROPERTIES, sha3_512_functions },
+ 
+-    { &quot;SHAKE-128:SHAKE128&quot;, &quot;provider=fips,fips=yes&quot;, shake_128_functions },
+-    { &quot;SHAKE-256:SHAKE256&quot;, &quot;provider=fips,fips=yes&quot;, shake_256_functions },
++    { &quot;SHAKE-128:SHAKE128&quot;, FIPS_DEFAULT_PROPERTIES, shake_128_functions },
++    { &quot;SHAKE-256:SHAKE256&quot;, FIPS_DEFAULT_PROPERTIES, shake_256_functions },
+ 
+     /*
+      * KECCAK-KMAC-128 and KECCAK-KMAC-256 as hashes are mostly useful for
+      * KMAC128 and KMAC256.
+      */
+-    { &quot;KECCAK-KMAC-128:KECCAK-KMAC128&quot;, &quot;provider=fips,fips=yes&quot;,
++    { &quot;KECCAK-KMAC-128:KECCAK-KMAC128&quot;, FIPS_DEFAULT_PROPERTIES,
+       keccak_kmac_128_functions },
+-    { &quot;KECCAK-KMAC-256:KECCAK-KMAC256&quot;, &quot;provider=fips,fips=yes&quot;,
++    { &quot;KECCAK-KMAC-256:KECCAK-KMAC256&quot;, FIPS_DEFAULT_PROPERTIES,
+       keccak_kmac_256_functions },
+     { NULL, NULL, NULL }
+ };
+@@ -453,80 +362,80 @@ static OSSL_ALGORITHM exported_fips_ciphers[OSSL_NELEM(fips_ciphers)];
+ 
+ static const OSSL_ALGORITHM fips_macs[] = {
+ #ifndef OPENSSL_NO_CMAC
+-    { &quot;CMAC&quot;, &quot;provider=fips,fips=yes&quot;, cmac_functions },
++    { &quot;CMAC&quot;, FIPS_DEFAULT_PROPERTIES, cmac_functions },
+ #endif
+-    { &quot;GMAC&quot;, &quot;provider=fips,fips=yes&quot;, gmac_functions },
+-    { &quot;HMAC&quot;, &quot;provider=fips,fips=yes&quot;, hmac_functions },
+-    { &quot;KMAC-128:KMAC128&quot;, &quot;provider=fips,fips=yes&quot;, kmac128_functions },
+-    { &quot;KMAC-256:KMAC256&quot;, &quot;provider=fips,fips=yes&quot;, kmac256_functions },
++    { &quot;GMAC&quot;, FIPS_DEFAULT_PROPERTIES, gmac_functions },
++    { &quot;HMAC&quot;, FIPS_DEFAULT_PROPERTIES, hmac_functions },
++    { &quot;KMAC-128:KMAC128&quot;, FIPS_DEFAULT_PROPERTIES, kmac128_functions },
++    { &quot;KMAC-256:KMAC256&quot;, FIPS_DEFAULT_PROPERTIES, kmac256_functions },
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_kdfs[] = {
+-    { &quot;HKDF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_hkdf_functions },
+-    { &quot;SSKDF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_sskdf_functions },
+-    { &quot;PBKDF2&quot;, &quot;provider=fips,fips=yes&quot;, kdf_pbkdf2_functions },
+-    { &quot;SSHKDF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_sshkdf_functions },
+-    { &quot;X963KDF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_x963_kdf_functions },
+-    { &quot;TLS1-PRF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_tls1_prf_functions },
+-    { &quot;KBKDF&quot;, &quot;provider=fips,fips=yes&quot;, kdf_kbkdf_functions },
++    { &quot;HKDF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_hkdf_functions },
++    { &quot;SSKDF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_sskdf_functions },
++    { &quot;PBKDF2&quot;, FIPS_DEFAULT_PROPERTIES, kdf_pbkdf2_functions },
++    { &quot;SSHKDF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_sshkdf_functions },
++    { &quot;X963KDF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_x963_kdf_functions },
++    { &quot;TLS1-PRF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_tls1_prf_functions },
++    { &quot;KBKDF&quot;, FIPS_DEFAULT_PROPERTIES, kdf_kbkdf_functions },
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_rands[] = {
+-    { &quot;CTR-DRBG&quot;, &quot;provider=fips&quot;, drbg_ctr_functions },
+-    { &quot;HASH-DRBG&quot;, &quot;provider=fips&quot;, drbg_hash_functions },
+-    { &quot;HMAC-DRBG&quot;, &quot;provider=fips&quot;, drbg_hmac_functions },
+-    { &quot;TEST-RAND&quot;, &quot;provider=fips&quot;, test_rng_functions },
++    { &quot;CTR-DRBG&quot;, FIPS_DEFAULT_PROPERTIES, drbg_ctr_functions },
++    { &quot;HASH-DRBG&quot;, FIPS_DEFAULT_PROPERTIES, drbg_hash_functions },
++    { &quot;HMAC-DRBG&quot;, FIPS_DEFAULT_PROPERTIES, drbg_hmac_functions },
++    { &quot;TEST-RAND&quot;, FIPS_UNAPPROVED_PROPERTIES, test_rng_functions },
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_keyexch[] = {
+ #ifndef OPENSSL_NO_DH
+-    { &quot;DH:dhKeyAgreement&quot;, &quot;provider=fips,fips=yes&quot;, dh_keyexch_functions },
++    { &quot;DH:dhKeyAgreement&quot;, FIPS_DEFAULT_PROPERTIES, dh_keyexch_functions },
+ #endif
+ #ifndef OPENSSL_NO_EC
+-    { &quot;ECDH&quot;, &quot;provider=fips,fips=yes&quot;, ecdh_keyexch_functions },
+-    { &quot;X25519&quot;, &quot;provider=fips,fips=no&quot;, x25519_keyexch_functions },
+-    { &quot;X448&quot;, &quot;provider=fips,fips=no&quot;, x448_keyexch_functions },
++    { &quot;ECDH&quot;, FIPS_DEFAULT_PROPERTIES, ecdh_keyexch_functions },
++    { &quot;X25519&quot;, FIPS_DEFAULT_PROPERTIES, x25519_keyexch_functions },
++    { &quot;X448&quot;, FIPS_DEFAULT_PROPERTIES, x448_keyexch_functions },
+ #endif
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_signature[] = {
+ #ifndef OPENSSL_NO_DSA
+-    { &quot;DSA:dsaEncryption&quot;, &quot;provider=fips,fips=yes&quot;, dsa_signature_functions },
++    { &quot;DSA:dsaEncryption&quot;, FIPS_DEFAULT_PROPERTIES, dsa_signature_functions },
+ #endif
+-    { &quot;RSA:rsaEncryption&quot;, &quot;provider=fips,fips=yes&quot;, rsa_signature_functions },
++    { &quot;RSA:rsaEncryption&quot;, FIPS_DEFAULT_PROPERTIES, rsa_signature_functions },
+ #ifndef OPENSSL_NO_EC
+-    { &quot;ED25519&quot;, &quot;provider=fips,fips=no&quot;, ed25519_signature_functions },
+-    { &quot;ED448&quot;, &quot;provider=fips,fips=no&quot;, ed448_signature_functions },
+-    { &quot;ECDSA&quot;, &quot;provider=fips,fips=yes&quot;, ecdsa_signature_functions },
++    { &quot;ED25519&quot;, FIPS_DEFAULT_PROPERTIES, ed25519_signature_functions },
++    { &quot;ED448&quot;, FIPS_DEFAULT_PROPERTIES, ed448_signature_functions },
++    { &quot;ECDSA&quot;, FIPS_DEFAULT_PROPERTIES, ecdsa_signature_functions },
+ #endif
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_asym_cipher[] = {
+-    { &quot;RSA:rsaEncryption&quot;, &quot;provider=fips,fips=yes&quot;, rsa_asym_cipher_functions },
++    { &quot;RSA:rsaEncryption&quot;, FIPS_DEFAULT_PROPERTIES, rsa_asym_cipher_functions },
+     { NULL, NULL, NULL }
+ };
+ 
+ static const OSSL_ALGORITHM fips_keymgmt[] = {
+ #ifndef OPENSSL_NO_DH
+-    { &quot;DH:dhKeyAgreement&quot;, &quot;provider=fips,fips=yes&quot;, dh_keymgmt_functions },
++    { &quot;DH:dhKeyAgreement&quot;, FIPS_DEFAULT_PROPERTIES, dh_keymgmt_functions },
+ #endif
+ #ifndef OPENSSL_NO_DSA
+-    { &quot;DSA&quot;, &quot;provider=fips,fips=yes&quot;, dsa_keymgmt_functions },
++    { &quot;DSA&quot;, FIPS_DEFAULT_PROPERTIES, dsa_keymgmt_functions },
+ #endif
+-    { &quot;RSA:rsaEncryption&quot;, &quot;provider=fips,fips=yes&quot;, rsa_keymgmt_functions },
+-    { &quot;RSA-PSS:RSASSA-PSS&quot;, &quot;provider=fips,fips=yes&quot;,
++    { &quot;RSA:rsaEncryption&quot;, FIPS_DEFAULT_PROPERTIES, rsa_keymgmt_functions },
++    { &quot;RSA-PSS:RSASSA-PSS&quot;, FIPS_DEFAULT_PROPERTIES,
+       rsapss_keymgmt_functions },
+ #ifndef OPENSSL_NO_EC
+-    { &quot;EC:id-ecPublicKey&quot;, &quot;provider=fips,fips=yes&quot;, ec_keymgmt_functions },
+-    { &quot;X25519&quot;, &quot;provider=fips,fips=no&quot;, x25519_keymgmt_functions },
+-    { &quot;X448&quot;, &quot;provider=fips,fips=no&quot;, x448_keymgmt_functions },
+-    { &quot;ED25519&quot;, &quot;provider=fips,fips=no&quot;, ed25519_keymgmt_functions },
+-    { &quot;ED448&quot;, &quot;provider=fips,fips=no&quot;, ed448_keymgmt_functions },
++    { &quot;EC:id-ecPublicKey&quot;, FIPS_DEFAULT_PROPERTIES, ec_keymgmt_functions },
++    { &quot;X25519&quot;, FIPS_DEFAULT_PROPERTIES, x25519_keymgmt_functions },
++    { &quot;X448&quot;, FIPS_DEFAULT_PROPERTIES, x448_keymgmt_functions },
++    { &quot;ED25519&quot;, FIPS_DEFAULT_PROPERTIES, ed25519_keymgmt_functions },
++    { &quot;ED448&quot;, FIPS_DEFAULT_PROPERTIES, ed448_keymgmt_functions },
+ #endif
+     { NULL, NULL, NULL }
+ };
+@@ -732,12 +641,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+         goto err;
+     }
+ 
+-    /*
+-     * TODO(3.0): Remove me. This is just a dummy call to demonstrate making
+-     * EVP calls from within the FIPS module.
+-     */
+-    if (!dummy_evp_call(libctx))
+-        goto err;
++    /* TODO(3.0): Tests will hang if this is removed */
++    (void)OPENSSL_CTX_get0_public_drbg(libctx);
+ 
+     *out = fips_dispatch_table;
+     return 1;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029777.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029789.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29778">[ date ]</a>
+              <a href="thread.html#29778">[ thread ]</a>
+              <a href="subject.html#29778">[ subject ]</a>
+              <a href="author.html#29778">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

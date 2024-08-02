@@ -1,0 +1,425 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583961421.350524.5066.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027873.html">
+   <LINK REL="Next"  HREF="027881.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583961421.350524.5066.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Wed Mar 11 21:17:01 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027873.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027881.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27876">[ date ]</a>
+              <a href="thread.html#27876">[ thread ]</a>
+              <a href="subject.html#27876">[ subject ]</a>
+              <a href="author.html#27876">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a173cc9c388cbe8105f78ba5a8fdfbf20a35be1a (commit)
+      from  0e6f62e3e1c4cdaa8e3bda7d459f978541dfb1fe (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a173cc9c388cbe8105f78ba5a8fdfbf20a35be1a
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu Jan 16 17:18:26 2020 +1000
+
+    Add EC key validation to default provider
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10861">https://github.com/openssl/openssl/pull/10861</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_check.c                         |  19 ++--
+ crypto/ec/ec_key.c                           | 152 ++++++++++++++++++---------
+ crypto/ec/ec_lib.c                           |   5 +
+ include/crypto/ec.h                          |   4 +
+ providers/implementations/keymgmt/ec_kmgmt.c |  33 +++++-
+ 5 files changed, 156 insertions(+), 57 deletions(-)
+
+diff --git a/crypto/ec/ec_check.c b/crypto/ec/ec_check.c
+index bb39177d64..1283d8404f 100644
+--- a/crypto/ec/ec_check.c
++++ b/crypto/ec/ec_check.c
+@@ -20,26 +20,27 @@ int EC_GROUP_check_named_curve(const EC_GROUP *group, int nist_only,
+                                BN_CTX *ctx)
+ {
+     int nid = NID_undef;
+-#ifndef FIPS_MODE
+     BN_CTX *new_ctx = NULL;
+ 
++    if (group == NULL) {
++        ECerr(0, ERR_R_PASSED_NULL_PARAMETER);
++        goto err;
++    }
++
+     if (ctx == NULL) {
+-        ctx = new_ctx = BN_CTX_new();
++        ctx = new_ctx = BN_CTX_new_ex(NULL);
+         if (ctx == NULL) {
+-            ECerr(EC_F_EC_GROUP_CHECK_NAMED_CURVE, ERR_R_MALLOC_FAILURE);
+-            goto err;
++            ECerr(0, ERR_R_MALLOC_FAILURE);
++            return NID_undef;
+         }
+     }
+-#endif
+ 
+     nid = ec_curve_nid_from_params(group, ctx);
+     if (nid &gt; 0 &amp;&amp; nist_only &amp;&amp; EC_curve_nid2nist(nid) == NULL)
+         nid = NID_undef;
+ 
+-#ifndef FIPS_MODE
+- err:
+-    BN_CTX_free(ctx);
+-#endif
++err:
++    BN_CTX_free(new_ctx);
+     return nid;
+ }
+ 
+diff --git a/crypto/ec/ec_key.c b/crypto/ec/ec_key.c
+index 18b544b9d3..ae3e974231 100644
+--- a/crypto/ec/ec_key.c
++++ b/crypto/ec/ec_key.c
+@@ -419,93 +419,151 @@ err:
+ 
+ /*
+  * ECC Key validation as specified in SP800-56A R3.
+- *    Section 5.6.2.3.3 ECC Full Public-Key Validation
+- *    Section 5.6.2.1.2 Owner Assurance of Private-Key Validity
+- *    Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency
+- * NOTES:
+- *    Before calling this method in fips mode, there should be an assurance that
+- *    an approved elliptic-curve group is used.
+- * Returns 1 if the key is valid, otherwise it returns 0.
++ * Section 5.6.2.3.3 ECC Full Public-Key Validation.
+  */
+-int ec_key_simple_check_key(const EC_KEY *eckey)
++int ec_key_public_check(const EC_KEY *eckey, BN_CTX *ctx)
+ {
+-    int ok = 0;
+-    BN_CTX *ctx = NULL;
+-    const BIGNUM *order = NULL;
++    int ret = 0;
+     EC_POINT *point = NULL;
++    const BIGNUM *order = NULL;
+ 
+     if (eckey == NULL || eckey-&gt;group == NULL || eckey-&gt;pub_key == NULL) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, ERR_R_PASSED_NULL_PARAMETER);
++        ECerr(0, ERR_R_PASSED_NULL_PARAMETER);
+         return 0;
+     }
+ 
+     /* 5.6.2.3.3 (Step 1): Q != infinity */
+     if (EC_POINT_is_at_infinity(eckey-&gt;group, eckey-&gt;pub_key)) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_POINT_AT_INFINITY);
+-        goto err;
++        ECerr(0, EC_R_POINT_AT_INFINITY);
++        return 0;
+     }
+ 
+-    if ((ctx = BN_CTX_new_ex(eckey-&gt;libctx)) == NULL)
+-        goto err;
+-
+-    if ((point = EC_POINT_new(eckey-&gt;group)) == NULL)
+-        goto err;
++    point = EC_POINT_new(eckey-&gt;group);
++    if (point == NULL)
++        return 0;
+ 
+     /* 5.6.2.3.3 (Step 2) Test if the public key is in range */
+     if (!ec_key_public_range_check(ctx, eckey)) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_COORDINATES_OUT_OF_RANGE);
++        ECerr(0, EC_R_COORDINATES_OUT_OF_RANGE);
+         goto err;
+     }
+ 
+     /* 5.6.2.3.3 (Step 3) is the pub_key on the elliptic curve */
+     if (EC_POINT_is_on_curve(eckey-&gt;group, eckey-&gt;pub_key, ctx) &lt;= 0) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_POINT_IS_NOT_ON_CURVE);
++        ECerr(0, EC_R_POINT_IS_NOT_ON_CURVE);
+         goto err;
+     }
+ 
+     order = eckey-&gt;group-&gt;order;
+     if (BN_is_zero(order)) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_INVALID_GROUP_ORDER);
++        ECerr(0, EC_R_INVALID_GROUP_ORDER);
+         goto err;
+     }
+     /* 5.6.2.3.3 (Step 4) : pub_key * order is the point at infinity. */
+     if (!EC_POINT_mul(eckey-&gt;group, point, NULL, eckey-&gt;pub_key, order, ctx)) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, ERR_R_EC_LIB);
++        ECerr(0, ERR_R_EC_LIB);
+         goto err;
+     }
+     if (!EC_POINT_is_at_infinity(eckey-&gt;group, point)) {
+-        ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_WRONG_ORDER);
++        ECerr(0, EC_R_WRONG_ORDER);
++        goto err;
++    }
++    ret = 1;
++err:
++    EC_POINT_free(point);
++    return ret;
++}
++
++/*
++ * ECC Key validation as specified in SP800-56A R3.
++ * Section 5.6.2.1.2 Owner Assurance of Private-Key Validity
++ * The private key is in the range [1, order-1]
++ */
++int ec_key_private_check(const EC_KEY *eckey)
++{
++    if (eckey == NULL || eckey-&gt;group == NULL || eckey-&gt;priv_key == NULL) {
++        ECerr(0, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    if (BN_cmp(eckey-&gt;priv_key, BN_value_one()) &lt; 0
++        || BN_cmp(eckey-&gt;priv_key, eckey-&gt;group-&gt;order) &gt;= 0) {
++        ECerr(0, EC_R_INVALID_PRIVATE_KEY);
++        return 0;
++    }
++    return 1;
++}
++
++/*
++ * ECC Key validation as specified in SP800-56A R3.
++ * Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency (b)
++ * Check if generator * priv_key = pub_key
++ */
++int ec_key_pairwise_check(const EC_KEY *eckey, BN_CTX *ctx)
++{
++    int ret = 0;
++    EC_POINT *point = NULL;
++
++    if (eckey == NULL
++       || eckey-&gt;group == NULL
++       || eckey-&gt;pub_key == NULL
++       || eckey-&gt;priv_key == NULL) {
++        ECerr(0, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++
++    point = EC_POINT_new(eckey-&gt;group);
++    if (point == NULL)
++        goto err;
++
++
++    if (!EC_POINT_mul(eckey-&gt;group, point, eckey-&gt;priv_key, NULL, NULL, ctx)) {
++        ECerr(0, ERR_R_EC_LIB);
++        goto err;
++    }
++    if (EC_POINT_cmp(eckey-&gt;group, point, eckey-&gt;pub_key, ctx) != 0) {
++        ECerr(0, EC_R_INVALID_PRIVATE_KEY);
+         goto err;
+     }
++    ret = 1;
++err:
++    EC_POINT_free(point);
++    return ret;
++}
++
++
++/*
++ * ECC Key validation as specified in SP800-56A R3.
++ *    Section 5.6.2.3.3 ECC Full Public-Key Validation
++ *    Section 5.6.2.1.2 Owner Assurance of Private-Key Validity
++ *    Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency
++ * NOTES:
++ *    Before calling this method in fips mode, there should be an assurance that
++ *    an approved elliptic-curve group is used.
++ * Returns 1 if the key is valid, otherwise it returns 0.
++ */
++int ec_key_simple_check_key(const EC_KEY *eckey)
++{
++    int ok = 0;
++    BN_CTX *ctx = NULL;
++
++    if (eckey == NULL) {
++        ECerr(0, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++    if ((ctx = BN_CTX_new_ex(eckey-&gt;libctx)) == NULL)
++        return 0;
++
++    if (!ec_key_public_check(eckey, ctx))
++        goto err;
+ 
+     if (eckey-&gt;priv_key != NULL) {
+-        /*
+-         * 5.6.2.1.2 Owner Assurance of Private-Key Validity
+-         * The private key is in the range [1, order-1]
+-         */
+-        if (BN_cmp(eckey-&gt;priv_key, BN_value_one()) &lt; 0
+-                || BN_cmp(eckey-&gt;priv_key, order) &gt;= 0) {
+-            ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_WRONG_ORDER);
++        if (!ec_key_private_check(eckey)
++            || !ec_key_pairwise_check(eckey, ctx))
+             goto err;
+-        }
+-        /*
+-         * Section 5.6.2.1.4 Owner Assurance of Pair-wise Consistency (b)
+-         * Check if generator * priv_key = pub_key
+-         */
+-        if (!EC_POINT_mul(eckey-&gt;group, point, eckey-&gt;priv_key,
+-                          NULL, NULL, ctx)) {
+-            ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, ERR_R_EC_LIB);
+-            goto err;
+-        }
+-        if (EC_POINT_cmp(eckey-&gt;group, point, eckey-&gt;pub_key, ctx) != 0) {
+-            ECerr(EC_F_EC_KEY_SIMPLE_CHECK_KEY, EC_R_INVALID_PRIVATE_KEY);
+-            goto err;
+-        }
+     }
+     ok = 1;
+- err:
++err:
+     BN_CTX_free(ctx);
+-    EC_POINT_free(point);
+     return ok;
+ }
+ 
+diff --git a/crypto/ec/ec_lib.c b/crypto/ec/ec_lib.c
+index 078d8b35fa..e66a501a0e 100644
+--- a/crypto/ec/ec_lib.c
++++ b/crypto/ec/ec_lib.c
+@@ -1261,3 +1261,8 @@ int ec_point_blind_coordinates(const EC_GROUP *group, EC_POINT *p, BN_CTX *ctx)
+ 
+     return group-&gt;meth-&gt;blind_coordinates(group, p, ctx);
+ }
++
++OPENSSL_CTX *ec_key_get_libctx(const EC_KEY *eckey)
++{
++    return eckey-&gt;libctx;
++}
+diff --git a/include/crypto/ec.h b/include/crypto/ec.h
+index c4f7d2e778..9ebf45d0f4 100644
+--- a/include/crypto/ec.h
++++ b/include/crypto/ec.h
+@@ -50,5 +50,9 @@ int ecdh_KDF_X9_63(unsigned char *out, size_t outlen,
+                    const EVP_MD *md);
+ 
+ int ec_generate_key(OPENSSL_CTX *libctx, EC_KEY *eckey, int pairwise_test);
++int ec_key_public_check(const EC_KEY *eckey, BN_CTX *ctx);
++int ec_key_private_check(const EC_KEY *eckey);
++int ec_key_pairwise_check(const EC_KEY *eckey, BN_CTX *ctx);
++OPENSSL_CTX *ec_key_get_libctx(const EC_KEY *eckey);
+ # endif /* OPENSSL_NO_EC */
+ #endif
+diff --git a/providers/implementations/keymgmt/ec_kmgmt.c b/providers/implementations/keymgmt/ec_kmgmt.c
+index 107ab1b594..2db23cd489 100644
+--- a/providers/implementations/keymgmt/ec_kmgmt.c
++++ b/providers/implementations/keymgmt/ec_kmgmt.c
+@@ -16,10 +16,10 @@
+ #include &lt;openssl/core_numbers.h&gt;
+ #include &lt;openssl/core_names.h&gt;
+ #include &lt;openssl/bn.h&gt;
+-#include &lt;openssl/ec.h&gt;
+ #include &lt;openssl/objects.h&gt;
+ #include &lt;openssl/params.h&gt;
+ #include &quot;crypto/bn.h&quot;
++#include &quot;crypto/ec.h&quot;
+ #include &quot;internal/param_build.h&quot;
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;prov/providercommon.h&quot;
+@@ -32,6 +32,7 @@ static OSSL_OP_keymgmt_set_params_fn ec_set_params;
+ static OSSL_OP_keymgmt_settable_params_fn ec_settable_params;
+ static OSSL_OP_keymgmt_has_fn ec_has;
+ static OSSL_OP_keymgmt_match_fn ec_match;
++static OSSL_OP_keymgmt_validate_fn ec_validate;
+ static OSSL_OP_keymgmt_import_fn ec_import;
+ static OSSL_OP_keymgmt_import_types_fn ec_import_types;
+ static OSSL_OP_keymgmt_export_fn ec_export;
+@@ -730,6 +731,35 @@ int ec_set_params(void *key, const OSSL_PARAM params[])
+     return 1;
+ }
+ 
++static
++int ec_validate(void *keydata, int selection)
++{
++    EC_KEY *eck = keydata;
++    int ok = 0;
++    BN_CTX *ctx = BN_CTX_new_ex(ec_key_get_libctx(eck));
++
++    if (ctx == NULL)
++        return 0;
++
++    if ((selection &amp; EC_POSSIBLE_SELECTIONS) != 0)
++        ok = 1;
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS) != 0)
++        ok = ok &amp;&amp; EC_GROUP_check(EC_KEY_get0_group(eck), ctx);
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0)
++        ok = ok &amp;&amp; ec_key_public_check(eck, ctx);
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0)
++        ok = ok &amp;&amp; ec_key_private_check(eck);
++
++    if ((selection &amp; OSSL_KEYMGMT_SELECT_KEYPAIR) == OSSL_KEYMGMT_SELECT_KEYPAIR)
++        ok = ok &amp;&amp; ec_key_pairwise_check(eck, ctx);
++
++    BN_CTX_free(ctx);
++    return ok;
++}
++
+ const OSSL_DISPATCH ec_keymgmt_functions[] = {
+     { OSSL_FUNC_KEYMGMT_NEW, (void (*)(void))ec_newdata },
+     { OSSL_FUNC_KEYMGMT_FREE, (void (*)(void))ec_freedata },
+@@ -739,6 +769,7 @@ const OSSL_DISPATCH ec_keymgmt_functions[] = {
+     { OSSL_FUNC_KEYMGMT_SETTABLE_PARAMS, (void (*) (void))ec_settable_params },
+     { OSSL_FUNC_KEYMGMT_HAS, (void (*)(void))ec_has },
+     { OSSL_FUNC_KEYMGMT_MATCH, (void (*)(void))ec_match },
++    { OSSL_FUNC_KEYMGMT_VALIDATE, (void (*)(void))ec_validate },
+     { OSSL_FUNC_KEYMGMT_IMPORT, (void (*)(void))ec_import },
+     { OSSL_FUNC_KEYMGMT_IMPORT_TYPES, (void (*)(void))ec_import_types },
+     { OSSL_FUNC_KEYMGMT_EXPORT, (void (*)(void))ec_export },
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027873.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027881.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27876">[ date ]</a>
+              <a href="thread.html#27876">[ thread ]</a>
+              <a href="subject.html#27876">[ subject ]</a>
+              <a href="author.html#27876">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

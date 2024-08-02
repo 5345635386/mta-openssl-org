@@ -1,0 +1,165 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1464792343.182138.28869.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007712.html">
+   <LINK REL="Next"  HREF="007717.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1464792343.182138.28869.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Jun  1 14:45:43 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007712.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007717.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7715">[ date ]</a>
+              <a href="thread.html#7715">[ thread ]</a>
+              <a href="subject.html#7715">[ subject ]</a>
+              <a href="author.html#7715">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0f91e1dff4ab2e7c25bbae5a48dfabbd1a4eae3c (commit)
+      from  f83b85fb0f46f7a3e92651f1e5eb7b1081fb8650 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0f91e1dff4ab2e7c25bbae5a48dfabbd1a4eae3c
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Sun May 29 14:11:44 2016 -0400
+
+    Fix some RAND bugs
+    
+    RT2630 -- segfault for int overlow
+    RT2877 -- check return values in apps/rand
+    Update CHANGES file for previous &quot;windows rand&quot; changes.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES               |  5 +++++
+ apps/rand.c           | 16 ++++++++++------
+ crypto/rand/md_rand.c |  6 +++---
+ 3 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index 541efc3..c64d677 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -4,6 +4,11 @@
+ 
+  Changes between 1.0.2h and 1.1.0  [xx XXX 2016]
+ 
++  *) Windows RAND implementation was simplified to only get entropy by
++     calling CryptGenRandom(). Various other RAND-related tickets
++     were also closed.
++     [Joseph Wylie Yandle, Rich Salz]
++
+   *) The stack and lhash API's were renamed to start with OPENSSL_SK_
+      and OPENSSL_LH_, respectively.  The old names are available
+      with API compatibility.  They new names are now completely documented.
+diff --git a/apps/rand.c b/apps/rand.c
+index 89a23a2..d60f1ec 100644
+--- a/apps/rand.c
++++ b/apps/rand.c
+@@ -105,22 +105,26 @@ int rand_main(int argc, char **argv)
+         r = RAND_bytes(buf, chunk);
+         if (r &lt;= 0)
+             goto end;
+-        if (format != FORMAT_TEXT) /* hex */
+-            BIO_write(out, buf, chunk);
+-        else {
++        if (format != FORMAT_TEXT) {
++            if (BIO_write(out, buf, chunk) != chunk)
++                goto end;
++        } else {
+             for (i = 0; i &lt; chunk; i++)
+-                BIO_printf(out, &quot;%02x&quot;, buf[i]);
++                if (BIO_printf(out, &quot;%02x&quot;, buf[i]) != 2)
++                    goto end;
+         }
+         num -= chunk;
+     }
+     if (format == FORMAT_TEXT)
+         BIO_puts(out, &quot;\n&quot;);
+-    (void)BIO_flush(out);
++    if (BIO_flush(out) &lt;= 0 || !app_RAND_write_file(NULL))
++        goto end;
+ 
+-    app_RAND_write_file(NULL);
+     ret = 0;
+ 
+  end:
++    if (ret != 0)
++        ERR_print_errors(bio_err);
+     BIO_free_all(out);
+     return (ret);
+ }
+diff --git a/crypto/rand/md_rand.c b/crypto/rand/md_rand.c
+index 4b874e3..137851f 100644
+--- a/crypto/rand/md_rand.c
++++ b/crypto/rand/md_rand.c
+@@ -38,7 +38,7 @@
+ /* #define PREDICT      1 */
+ 
+ #define STATE_SIZE      1023
+-static int state_num = 0, state_index = 0;
++static size_t state_num = 0, state_index = 0;
+ static unsigned char state[STATE_SIZE + MD_DIGEST_LENGTH];
+ static unsigned char md[MD_DIGEST_LENGTH];
+ static long md_count[2] = { 0, 0 };
+@@ -268,8 +268,8 @@ static int rand_seed(const void *buf, int num)
+ static int rand_bytes(unsigned char *buf, int num, int pseudo)
+ {
+     static volatile int stirred_pool = 0;
+-    int i, j, k, st_num, st_idx;
+-    int num_ceil;
++    int i, j, k;
++    size_t num_ceil, st_idx, st_num;
+     int ok;
+     long md_c[2];
+     unsigned char local_md[MD_DIGEST_LENGTH];
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007712.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007717.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7715">[ date ]</a>
+              <a href="thread.html#7715">[ thread ]</a>
+              <a href="subject.html#7715">[ subject ]</a>
+              <a href="author.html#7715">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,270 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1475184509.461081.28848.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010881.html">
+   <LINK REL="Next"  HREF="010281.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1475184509.461081.28848.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Sep 29 21:28:29 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010881.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="010281.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10889">[ date ]</a>
+              <a href="thread.html#10889">[ thread ]</a>
+              <a href="subject.html#10889">[ subject ]</a>
+              <a href="author.html#10889">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a00d75e1b21bc5c49817610b172bae440f526622 (commit)
+       via  b36017fe5f2ee0a2cbc1028d842a183e0ac22da7 (commit)
+      from  cc59ad1073c49cbb173708d7377df06ad3786f4c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a00d75e1b21bc5c49817610b172bae440f526622
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Sep 29 18:00:37 2016 +0100
+
+    Convert NewSessionTicket construction to WPACKET
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit b36017fe5f2ee0a2cbc1028d842a183e0ac22da7
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Sep 29 18:00:01 2016 +0100
+
+    Fix an error in packet_locl.h
+    
+    A convenience macro was using the wrong underlying function.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/packet_locl.h        |   2 +-
+ ssl/statem/statem_srvr.c | 109 ++++++++++++++++++++++-------------------------
+ 2 files changed, 52 insertions(+), 59 deletions(-)
+
+diff --git a/ssl/packet_locl.h b/ssl/packet_locl.h
+index 517c12d..55e41bb 100644
+--- a/ssl/packet_locl.h
++++ b/ssl/packet_locl.h
+@@ -758,7 +758,7 @@ int WPACKET_put_bytes__(WPACKET *pkt, unsigned int val, size_t bytes);
+ #define WPACKET_put_bytes_u24(pkt, val) \
+     WPACKET_put_bytes__((pkt), (val), 3)
+ #define WPACKET_put_bytes_u32(pkt, val) \
+-    WPACKET_sub_allocate_bytes__((pkt), (val), 4)
++    WPACKET_put_bytes__((pkt), (val), 4)
+ 
+ /* Set a maximum size that we will not allow the WPACKET to grow beyond */
+ int WPACKET_set_max_size(WPACKET *pkt, size_t maxsize);
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index 3fbc4ad..c7d77ae 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -2956,15 +2956,17 @@ int tls_construct_new_session_ticket(SSL *s)
+     unsigned char *senc = NULL;
+     EVP_CIPHER_CTX *ctx = NULL;
+     HMAC_CTX *hctx = NULL;
+-    unsigned char *p, *macstart;
++    unsigned char *p, *encdata1, *encdata2, *macdata1, *macdata2;
+     const unsigned char *const_p;
+-    int len, slen_full, slen;
++    int len, slen_full, slen, lenfinal;
+     SSL_SESSION *sess;
+     unsigned int hlen;
+     SSL_CTX *tctx = s-&gt;initial_ctx;
+     unsigned char iv[EVP_MAX_IV_LENGTH];
+     unsigned char key_name[TLSEXT_KEYNAME_LENGTH];
+     int iv_len;
++    size_t macoffset, macendoffset;
++    WPACKET pkt;
+ 
+     /* get session encoding length */
+     slen_full = i2d_SSL_SESSION(s-&gt;session, NULL);
+@@ -2982,6 +2984,12 @@ int tls_construct_new_session_ticket(SSL *s)
+         return 0;
+     }
+ 
++    if (!WPACKET_init(&amp;pkt, s-&gt;init_buf)
++            || !ssl_set_handshake_header2(s, &amp;pkt, SSL3_MT_NEWSESSION_TICKET)) {
++        SSLerr(SSL_F_TLS_CONSTRUCT_NEW_SESSION_TICKET, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++
+     ctx = EVP_CIPHER_CTX_new();
+     hctx = HMAC_CTX_new();
+     if (ctx == NULL || hctx == NULL) {
+@@ -3014,21 +3022,6 @@ int tls_construct_new_session_ticket(SSL *s)
+     }
+     SSL_SESSION_free(sess);
+ 
+-    /*-
+-     * Grow buffer if need be: the length calculation is as
+-     * follows handshake_header_length +
+-     * 4 (ticket lifetime hint) + 2 (ticket length) +
+-     * sizeof(keyname) + max_iv_len (iv length) +
+-     * max_enc_block_size (max encrypted session * length) +
+-     * max_md_size (HMAC) + session_length.
+-     */
+-    if (!BUF_MEM_grow(s-&gt;init_buf,
+-                      SSL_HM_HEADER_LENGTH(s) + 6 + sizeof(key_name) +
+-                      EVP_MAX_IV_LENGTH + EVP_MAX_BLOCK_LENGTH +
+-                      EVP_MAX_MD_SIZE + slen))
+-        goto err;
+-
+-    p = ssl_handshake_start(s);
+     /*
+      * Initialize HMAC and cipher contexts. If callback present it does
+      * all the work otherwise use generated values from parent ctx.
+@@ -3039,11 +3032,15 @@ int tls_construct_new_session_ticket(SSL *s)
+                                              hctx, 1);
+ 
+         if (ret == 0) {
+-            l2n(0, p);          /* timeout */
+-            s2n(0, p);          /* length */
+-            if (!ssl_set_handshake_header
+-                (s, SSL3_MT_NEWSESSION_TICKET, p - ssl_handshake_start(s)))
++
++            /* Put timeout and length */
++            if (!WPACKET_put_bytes_u32(&amp;pkt, 0)
++                    || !WPACKET_put_bytes_u16(&amp;pkt, 0)
++                    || !ssl_close_construct_packet(s, &amp;pkt)) {
++                SSLerr(SSL_F_TLS_CONSTRUCT_NEW_SESSION_TICKET,
++                       ERR_R_INTERNAL_ERROR);
+                 goto err;
++            }
+             OPENSSL_free(senc);
+             EVP_CIPHER_CTX_free(ctx);
+             HMAC_CTX_free(hctx);
+@@ -3074,44 +3071,38 @@ int tls_construct_new_session_ticket(SSL *s)
+      * for resumed session (for simplicity), and guess that tickets for
+      * new sessions will live as long as their sessions.
+      */
+-    l2n(s-&gt;hit ? 0 : s-&gt;session-&gt;timeout, p);
+-
+-    /* Skip ticket length for now */
+-    p += 2;
+-    /* Output key name */
+-    macstart = p;
+-    memcpy(p, key_name, sizeof(key_name));
+-    p += sizeof(key_name);
+-    /* output IV */
+-    memcpy(p, iv, iv_len);
+-    p += iv_len;
+-    /* Encrypt session data */
+-    if (!EVP_EncryptUpdate(ctx, p, &amp;len, senc, slen))
+-        goto err;
+-    p += len;
+-    if (!EVP_EncryptFinal(ctx, p, &amp;len))
+-        goto err;
+-    p += len;
+-
+-    if (!HMAC_Update(hctx, macstart, p - macstart))
+-        goto err;
+-    if (!HMAC_Final(hctx, p, &amp;hlen))
+-        goto err;
+-
+-    EVP_CIPHER_CTX_free(ctx);
+-    HMAC_CTX_free(hctx);
+-    ctx = NULL;
+-    hctx = NULL;
+-
+-    p += hlen;
+-    /* Now write out lengths: p points to end of data written */
+-    /* Total length */
+-    len = p - ssl_handshake_start(s);
+-    /* Skip ticket lifetime hint */
+-    p = ssl_handshake_start(s) + 4;
+-    s2n(len - 6, p);
+-    if (!ssl_set_handshake_header(s, SSL3_MT_NEWSESSION_TICKET, len))
++    if (!WPACKET_put_bytes_u32(&amp;pkt, s-&gt;hit ? 0 : s-&gt;session-&gt;timeout)
++               /* Now the actual ticket data */
++            || !WPACKET_start_sub_packet_u16(&amp;pkt)
++            || !WPACKET_get_total_written(&amp;pkt, &amp;macoffset)
++               /* Output key name */
++            || !WPACKET_memcpy(&amp;pkt, key_name, sizeof(key_name))
++               /* output IV */
++            || !WPACKET_memcpy(&amp;pkt, iv, iv_len)
++            || !WPACKET_reserve_bytes(&amp;pkt, slen + EVP_MAX_BLOCK_LENGTH,
++                                      &amp;encdata1)
++               /* Encrypt session data */
++            || !EVP_EncryptUpdate(ctx, encdata1, &amp;len, senc, slen)
++            || !WPACKET_allocate_bytes(&amp;pkt, len, &amp;encdata2)
++            || encdata1 != encdata2
++            || !EVP_EncryptFinal(ctx, encdata1 + len, &amp;lenfinal)
++            || !WPACKET_allocate_bytes(&amp;pkt, lenfinal, &amp;encdata2)
++            || encdata1 + len != encdata2
++            || len + lenfinal &gt; slen + EVP_MAX_BLOCK_LENGTH
++            || !WPACKET_get_total_written(&amp;pkt, &amp;macendoffset)
++            || !HMAC_Update(hctx,
++                            (unsigned char *)s-&gt;init_buf-&gt;data + macoffset,
++                            macendoffset - macoffset)
++            || !WPACKET_reserve_bytes(&amp;pkt, EVP_MAX_MD_SIZE, &amp;macdata1)
++            || !HMAC_Final(hctx, macdata1, &amp;hlen)
++            || hlen &gt; EVP_MAX_MD_SIZE
++            || !WPACKET_allocate_bytes(&amp;pkt, hlen, &amp;macdata2)
++            || macdata1 != macdata2
++            || !WPACKET_close(&amp;pkt)
++            || !ssl_close_construct_packet(s, &amp;pkt)) {
++        SSLerr(SSL_F_TLS_CONSTRUCT_NEW_SESSION_TICKET, ERR_R_INTERNAL_ERROR);
+         goto err;
++    }
+     OPENSSL_free(senc);
+ 
+     return 1;
+@@ -3119,7 +3110,9 @@ int tls_construct_new_session_ticket(SSL *s)
+     OPENSSL_free(senc);
+     EVP_CIPHER_CTX_free(ctx);
+     HMAC_CTX_free(hctx);
++    ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
+     ossl_statem_set_error(s);
++    WPACKET_cleanup(&amp;pkt);
+     return 0;
+ }
+ 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010881.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="010281.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10889">[ date ]</a>
+              <a href="thread.html#10889">[ thread ]</a>
+              <a href="subject.html#10889">[ subject ]</a>
+              <a href="author.html#10889">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

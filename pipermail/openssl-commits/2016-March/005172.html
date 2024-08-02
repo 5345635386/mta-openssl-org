@@ -1,0 +1,854 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457480925.393582.23481.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005169.html">
+   <LINK REL="Next"  HREF="005180.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457480925.393582.23481.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Tue Mar  8 23:48:45 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005169.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005180.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5172">[ date ]</a>
+              <a href="thread.html#5172">[ thread ]</a>
+              <a href="subject.html#5172">[ subject ]</a>
+              <a href="author.html#5172">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  16203f7b71bd343550f89f266eaf9fb9693f6148 (commit)
+      from  be1251f73def8169b98d53430b631df13d430dbc (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 16203f7b71bd343550f89f266eaf9fb9693f6148
+Author: Alessandro Ghedini &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alessandro at ghedini.me</A>&gt;
+Date:   Mon Feb 29 17:26:07 2016 +0000
+
+    Convert CRYPTO_LOCK_SSL_* to new multi-threading API
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ include/openssl/crypto.h |  7 -----
+ include/openssl/ssl.h    |  1 +
+ ssl/ssl_cert.c           | 59 +++++++++++++++++++-------------------
+ ssl/ssl_ciph.c           | 55 ++++++++++++++++--------------------
+ ssl/ssl_lib.c            | 62 ++++++++++++++++++++++++++--------------
+ ssl/ssl_locl.h           |  5 ++++
+ ssl/ssl_sess.c           | 73 ++++++++++++++++++++++++++++++++----------------
+ test/ssltest.c           | 25 +++++++++--------
+ util/libssl.num          |  1 +
+ 9 files changed, 166 insertions(+), 122 deletions(-)
+
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index cfda8bb..3f9ce2b 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -166,15 +166,8 @@ extern &quot;C&quot; {
+  */
+ 
+ # define CRYPTO_LOCK_X509_STORE          11
+-# define CRYPTO_LOCK_SSL_CTX             12
+-# define CRYPTO_LOCK_SSL_CERT            13
+-# define CRYPTO_LOCK_SSL_SESSION         14
+-# define CRYPTO_LOCK_SSL_SESS_CERT       15
+-# define CRYPTO_LOCK_SSL                 16
+-# define CRYPTO_LOCK_SSL_METHOD          17
+ # define CRYPTO_LOCK_RAND                18
+ # define CRYPTO_LOCK_RAND2               19
+-# define CRYPTO_LOCK_READDIR             24
+ # define CRYPTO_LOCK_RSA_BLINDING        25
+ # define CRYPTO_LOCK_DYNLOCK             29
+ # define CRYPTO_LOCK_ENGINE              30
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index be2ca2a..adfad4c 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1499,6 +1499,7 @@ int SSL_SESSION_print_fp(FILE *fp, const SSL_SESSION *ses);
+ # endif
+ int SSL_SESSION_print(BIO *fp, const SSL_SESSION *ses);
+ int SSL_SESSION_print_keylog(BIO *bp, const SSL_SESSION *x);
++int SSL_SESSION_up_ref(SSL_SESSION *ses);
+ void SSL_SESSION_free(SSL_SESSION *ses);
+ __owur int i2d_SSL_SESSION(SSL_SESSION *in, unsigned char **pp);
+ __owur int SSL_set_session(SSL *to, SSL_SESSION *session);
+diff --git a/ssl/ssl_cert.c b/ssl/ssl_cert.c
+index e804412..21cfb96 100644
+--- a/ssl/ssl_cert.c
++++ b/ssl/ssl_cert.c
+@@ -129,36 +129,27 @@
+ # include &lt;openssl/dh.h&gt;
+ #endif
+ #include &lt;openssl/bn.h&gt;
++#include &quot;internal/threads.h&quot;
+ #include &quot;ssl_locl.h&quot;
+ 
+ static int ssl_security_default_callback(SSL *s, SSL_CTX *ctx, int op,
+                                          int bits, int nid, void *other,
+                                          void *ex);
+ 
+-int SSL_get_ex_data_X509_STORE_CTX_idx(void)
+-{
+-    static volatile int ssl_x509_store_ctx_idx = -1;
+-    int got_write_lock = 0;
+-
+-    CRYPTO_r_lock(CRYPTO_LOCK_SSL_CTX);
++static CRYPTO_ONCE ssl_x509_store_ctx_once = CRYPTO_ONCE_STATIC_INIT;
++static volatile int ssl_x509_store_ctx_idx = -1;
+ 
+-    if (ssl_x509_store_ctx_idx &lt; 0) {
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL_CTX);
+-        CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
+-        got_write_lock = 1;
+-
+-        if (ssl_x509_store_ctx_idx &lt; 0) {
+-            ssl_x509_store_ctx_idx =
+-                X509_STORE_CTX_get_ex_new_index(0, &quot;SSL for verify callback&quot;,
++static void ssl_x509_store_ctx_init(void)
++{
++    ssl_x509_store_ctx_idx = X509_STORE_CTX_get_ex_new_index(0,
++                                                &quot;SSL for verify callback&quot;,
+                                                 NULL, NULL, NULL);
+-        }
+-    }
++}
+ 
+-    if (got_write_lock)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
+-    else
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL_CTX);
++int SSL_get_ex_data_X509_STORE_CTX_idx(void)
++{
+ 
++    CRYPTO_THREAD_run_once(&amp;ssl_x509_store_ctx_once, ssl_x509_store_ctx_init);
+     return ssl_x509_store_ctx_idx;
+ }
+ 
+@@ -168,7 +159,7 @@ CERT *ssl_cert_new(void)
+ 
+     if (ret == NULL) {
+         SSLerr(SSL_F_SSL_CERT_NEW, ERR_R_MALLOC_FAILURE);
+-        return (NULL);
++        return NULL;
+     }
+ 
+     ret-&gt;key = &amp;(ret-&gt;pkeys[SSL_PKEY_RSA_ENC]);
+@@ -176,7 +167,14 @@ CERT *ssl_cert_new(void)
+     ret-&gt;sec_cb = ssl_security_default_callback;
+     ret-&gt;sec_level = OPENSSL_TLS_SECURITY_LEVEL;
+     ret-&gt;sec_ex = NULL;
+-    return (ret);
++    ret-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ret-&gt;lock == NULL) {
++        SSLerr(SSL_F_SSL_CERT_NEW, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(ret);
++        return NULL;
++    }
++
++    return ret;
+ }
+ 
+ CERT *ssl_cert_dup(CERT *cert)
+@@ -186,11 +184,17 @@ CERT *ssl_cert_dup(CERT *cert)
+ 
+     if (ret == NULL) {
+         SSLerr(SSL_F_SSL_CERT_DUP, ERR_R_MALLOC_FAILURE);
+-        return (NULL);
++        return NULL;
+     }
+ 
+     ret-&gt;references = 1;
+     ret-&gt;key = &amp;ret-&gt;pkeys[cert-&gt;key - cert-&gt;pkeys];
++    ret-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ret == NULL) {
++        SSLerr(SSL_F_SSL_CERT_DUP, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(ret);
++        return NULL;
++    }
+ 
+ #ifndef OPENSSL_NO_DH
+     if (cert-&gt;dh_tmp != NULL) {
+@@ -297,7 +301,7 @@ CERT *ssl_cert_dup(CERT *cert)
+             goto err;
+     }
+ #endif
+-    return (ret);
++    return ret;
+ 
+  err:
+     ssl_cert_free(ret);
+@@ -333,7 +337,7 @@ void ssl_cert_free(CERT *c)
+     if (c == NULL)
+         return;
+ 
+-    i = CRYPTO_add(&amp;c-&gt;references, -1, CRYPTO_LOCK_SSL_CERT);
++    CRYPTO_atomic_add(&amp;c-&gt;references, -1, &amp;i, c-&gt;lock);
+     REF_PRINT_COUNT(&quot;CERT&quot;, c);
+     if (i &gt; 0)
+         return;
+@@ -355,6 +359,7 @@ void ssl_cert_free(CERT *c)
+ #ifndef OPENSSL_NO_PSK
+     OPENSSL_free(c-&gt;psk_identity_hint);
+ #endif
++    CRYPTO_THREAD_lock_free(c-&gt;lock);
+     OPENSSL_free(c);
+ }
+ 
+@@ -784,8 +789,6 @@ int SSL_add_dir_cert_subjects_to_stack(STACK_OF(X509_NAME) *stack,
+     const char *filename;
+     int ret = 0;
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_READDIR);
+-
+     /* Note that a side effect is that the CAs will be sorted by name */
+ 
+     while ((filename = OPENSSL_DIR_read(&amp;d, dir))) {
+@@ -820,7 +823,7 @@ int SSL_add_dir_cert_subjects_to_stack(STACK_OF(X509_NAME) *stack,
+  err:
+     if (d)
+         OPENSSL_DIR_end(&amp;d);
+-    CRYPTO_w_unlock(CRYPTO_LOCK_READDIR);
++
+     return ret;
+ }
+ 
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index b26e972..352bab9 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -147,6 +147,7 @@
+ #ifndef OPENSSL_NO_ENGINE
+ # include &lt;openssl/engine.h&gt;
+ #endif
++#include &quot;internal/threads.h&quot;
+ #include &quot;ssl_locl.h&quot;
+ 
+ #define SSL_ENC_DES_IDX         0
+@@ -213,6 +214,8 @@ static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX] = {
+ 
+ static STACK_OF(SSL_COMP) *ssl_comp_methods = NULL;
+ 
++static CRYPTO_ONCE ssl_load_builtin_comp_once = CRYPTO_ONCE_STATIC_INIT;
++
+ /*
+  * Constant SSL_MAX_DIGEST equal to size of digests array should be defined
+  * in the ssl_locl.h
+@@ -575,41 +578,31 @@ static int sk_comp_cmp(const SSL_COMP *const *a, const SSL_COMP *const *b)
+     return ((*a)-&gt;id - (*b)-&gt;id);
+ }
+ 
+-static void load_builtin_compressions(void)
++static void do_load_builtin_compressions(void)
+ {
+-    int got_write_lock = 0;
+-
+-    CRYPTO_r_lock(CRYPTO_LOCK_SSL);
+-    if (ssl_comp_methods == NULL) {
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL);
+-        CRYPTO_w_lock(CRYPTO_LOCK_SSL);
+-        got_write_lock = 1;
+-
+-        if (ssl_comp_methods == NULL) {
+-            SSL_COMP *comp = NULL;
+-            COMP_METHOD *method = COMP_zlib();
+-
+-            CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
+-            ssl_comp_methods = sk_SSL_COMP_new(sk_comp_cmp);
+-            if (COMP_get_type(method) != NID_undef
+-                &amp;&amp; ssl_comp_methods != NULL) {
+-                comp = OPENSSL_malloc(sizeof(*comp));
+-                if (comp != NULL) {
+-                    comp-&gt;method = method;
+-                    comp-&gt;id = SSL_COMP_ZLIB_IDX;
+-                    comp-&gt;name = COMP_get_name(method);
+-                    sk_SSL_COMP_push(ssl_comp_methods, comp);
+-                    sk_SSL_COMP_sort(ssl_comp_methods);
+-                }
+-            }
+-            CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
++    SSL_COMP *comp = NULL;
++    COMP_METHOD *method = COMP_zlib();
++
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_DISABLE);
++    ssl_comp_methods = sk_SSL_COMP_new(sk_comp_cmp);
++
++    if (COMP_get_type(method) != NID_undef &amp;&amp; ssl_comp_methods != NULL) {
++        comp = OPENSSL_malloc(sizeof(*comp));
++        if (comp != NULL) {
++            comp-&gt;method = method;
++            comp-&gt;id = SSL_COMP_ZLIB_IDX;
++            comp-&gt;name = COMP_get_name(method);
++            sk_SSL_COMP_push(ssl_comp_methods, comp);
++            sk_SSL_COMP_sort(ssl_comp_methods);
+         }
+     }
++    CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ENABLE);
++}
+ 
+-    if (got_write_lock)
+-        CRYPTO_w_unlock(CRYPTO_LOCK_SSL);
+-    else
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL);
++static void load_builtin_compressions(void)
++{
++    CRYPTO_THREAD_run_once(&amp;ssl_load_builtin_comp_once,
++                           do_load_builtin_compressions);
+ }
+ #endif
+ 
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index a1c8da8..75e8125 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -631,6 +631,13 @@ SSL *SSL_new(SSL_CTX *ctx)
+     if (s == NULL)
+         goto err;
+ 
++    s-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (s-&gt;lock == NULL) {
++        SSLerr(SSL_F_SSL_NEW, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(s);
++        return NULL;
++    }
++
+     RECORD_LAYER_init(&amp;s-&gt;rlayer, s);
+ 
+     s-&gt;options = ctx-&gt;options;
+@@ -677,7 +684,7 @@ SSL *SSL_new(SSL_CTX *ctx)
+     if (ctx-&gt;default_read_buf_len &gt; 0)
+         SSL_set_default_read_buffer_len(s, ctx-&gt;default_read_buf_len);
+ 
+-    CRYPTO_add(&amp;ctx-&gt;references, 1, CRYPTO_LOCK_SSL_CTX);
++    SSL_CTX_up_ref(ctx);
+     s-&gt;ctx = ctx;
+     s-&gt;tlsext_debug_cb = 0;
+     s-&gt;tlsext_debug_arg = NULL;
+@@ -688,7 +695,7 @@ SSL *SSL_new(SSL_CTX *ctx)
+     s-&gt;tlsext_ocsp_exts = NULL;
+     s-&gt;tlsext_ocsp_resp = NULL;
+     s-&gt;tlsext_ocsp_resplen = -1;
+-    CRYPTO_add(&amp;ctx-&gt;references, 1, CRYPTO_LOCK_SSL_CTX);
++    SSL_CTX_up_ref(ctx);
+     s-&gt;initial_ctx = ctx;
+ # ifndef OPENSSL_NO_EC
+     if (ctx-&gt;tlsext_ecpointformatlist) {
+@@ -755,16 +762,17 @@ SSL *SSL_new(SSL_CTX *ctx)
+         goto err;
+ #endif
+ 
+-    return (s);
++    return s;
+  err:
+     SSL_free(s);
+     SSLerr(SSL_F_SSL_NEW, ERR_R_MALLOC_FAILURE);
+-    return (NULL);
++    return NULL;
+ }
+ 
+ void SSL_up_ref(SSL *s)
+ {
+-    CRYPTO_add(&amp;s-&gt;references, 1, CRYPTO_LOCK_SSL);
++    int i;
++    CRYPTO_atomic_add(&amp;s-&gt;references, 1, &amp;i, s-&gt;lock);
+ }
+ 
+ int SSL_CTX_set_session_id_context(SSL_CTX *ctx, const unsigned char *sid_ctx,
+@@ -797,17 +805,17 @@ int SSL_set_session_id_context(SSL *ssl, const unsigned char *sid_ctx,
+ 
+ int SSL_CTX_set_generate_session_id(SSL_CTX *ctx, GEN_SESSION_CB cb)
+ {
+-    CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_write_lock(ctx-&gt;lock);
+     ctx-&gt;generate_session_id = cb;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_unlock(ctx-&gt;lock);
+     return 1;
+ }
+ 
+ int SSL_set_generate_session_id(SSL *ssl, GEN_SESSION_CB cb)
+ {
+-    CRYPTO_w_lock(CRYPTO_LOCK_SSL);
++    CRYPTO_THREAD_write_lock(ssl-&gt;lock);
+     ssl-&gt;generate_session_id = cb;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_SSL);
++    CRYPTO_THREAD_unlock(ssl-&gt;lock);
+     return 1;
+ }
+ 
+@@ -830,9 +838,9 @@ int SSL_has_matching_session_id(const SSL *ssl, const unsigned char *id,
+     r.session_id_length = id_len;
+     memcpy(r.session_id, id, id_len);
+ 
+-    CRYPTO_r_lock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_read_lock(ssl-&gt;ctx-&gt;lock);
+     p = lh_SSL_SESSION_retrieve(ssl-&gt;ctx-&gt;sessions, &amp;r);
+-    CRYPTO_r_unlock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_unlock(ssl-&gt;ctx-&gt;lock);
+     return (p != NULL);
+ }
+ 
+@@ -1009,7 +1017,7 @@ void SSL_free(SSL *s)
+     if (s == NULL)
+         return;
+ 
+-    i = CRYPTO_add(&amp;s-&gt;references, -1, CRYPTO_LOCK_SSL);
++    CRYPTO_atomic_add(&amp;s-&gt;references, -1, &amp;i, s-&gt;lock);
+     REF_PRINT_COUNT(&quot;SSL&quot;, s);
+     if (i &gt; 0)
+         return;
+@@ -1084,6 +1092,8 @@ void SSL_free(SSL *s)
+     sk_SRTP_PROTECTION_PROFILE_free(s-&gt;srtp_profiles);
+ #endif
+ 
++    CRYPTO_THREAD_lock_free(s-&gt;lock);
++
+     OPENSSL_free(s);
+ }
+ 
+@@ -1366,6 +1376,7 @@ STACK_OF(X509) *SSL_get_peer_cert_chain(const SSL *s)
+  */
+ int SSL_copy_session_id(SSL *t, const SSL *f)
+ {
++    int i;
+     /* Do we need to to SSL locking? */
+     if (!SSL_set_session(t, SSL_get_session(f))) {
+         return 0;
+@@ -1381,7 +1392,7 @@ int SSL_copy_session_id(SSL *t, const SSL *f)
+             return 0;
+     }
+ 
+-    CRYPTO_add(&amp;f-&gt;cert-&gt;references, 1, CRYPTO_LOCK_SSL_CERT);
++    CRYPTO_atomic_add(&amp;f-&gt;cert-&gt;references, 1, &amp;i, f-&gt;cert-&gt;lock);
+     ssl_cert_free(t-&gt;cert);
+     t-&gt;cert = f-&gt;cert;
+     if (!SSL_set_session_id_context(t, f-&gt;sid_ctx, f-&gt;sid_ctx_length)) {
+@@ -2369,6 +2380,12 @@ SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth)
+     /* We take the system default. */
+     ret-&gt;session_timeout = meth-&gt;get_timeout();
+     ret-&gt;references = 1;
++    ret-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ret-&gt;lock == NULL) {
++        SSLerr(SSL_F_SSL_CTX_NEW, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(ret);
++        return NULL;
++    }
+     ret-&gt;max_cert_list = SSL_MAX_CERT_LIST_DEFAULT;
+     ret-&gt;verify_mode = SSL_VERIFY_NONE;
+     if ((ret-&gt;cert = ssl_cert_new()) == NULL)
+@@ -2459,17 +2476,18 @@ SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth)
+      */
+     ret-&gt;options |= SSL_OP_NO_COMPRESSION;
+ 
+-    return (ret);
++    return ret;
+  err:
+     SSLerr(SSL_F_SSL_CTX_NEW, ERR_R_MALLOC_FAILURE);
+  err2:
+     SSL_CTX_free(ret);
+-    return (NULL);
++    return NULL;
+ }
+ 
+ void SSL_CTX_up_ref(SSL_CTX *ctx)
+ {
+-    CRYPTO_add(&amp;ctx-&gt;references, 1, CRYPTO_LOCK_SSL_CTX);
++    int i;
++    CRYPTO_atomic_add(&amp;ctx-&gt;references, 1, &amp;i, ctx-&gt;lock);
+ }
+ 
+ void SSL_CTX_free(SSL_CTX *a)
+@@ -2479,7 +2497,7 @@ void SSL_CTX_free(SSL_CTX *a)
+     if (a == NULL)
+         return;
+ 
+-    i = CRYPTO_add(&amp;a-&gt;references, -1, CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_atomic_add(&amp;a-&gt;references, -1, &amp;i, a-&gt;lock);
+     REF_PRINT_COUNT(&quot;SSL_CTX&quot;, a);
+     if (i &gt; 0)
+         return;
+@@ -2528,6 +2546,8 @@ void SSL_CTX_free(SSL_CTX *a)
+ #endif
+     OPENSSL_free(a-&gt;alpn_client_proto_list);
+ 
++    CRYPTO_THREAD_lock_free(a-&gt;lock);
++
+     OPENSSL_free(a);
+ }
+ 
+@@ -2833,7 +2853,7 @@ void ssl_update_cache(SSL *s, int mode)
+         &amp;&amp; ((i &amp; SSL_SESS_CACHE_NO_INTERNAL_STORE)
+             || SSL_CTX_add_session(s-&gt;session_ctx, s-&gt;session))
+         &amp;&amp; (s-&gt;session_ctx-&gt;new_session_cb != NULL)) {
+-        CRYPTO_add(&amp;s-&gt;session-&gt;references, 1, CRYPTO_LOCK_SSL_SESSION);
++        SSL_SESSION_up_ref(s-&gt;session);
+         if (!s-&gt;session_ctx-&gt;new_session_cb(s, s-&gt;session))
+             SSL_SESSION_free(s-&gt;session);
+     }
+@@ -3069,7 +3089,7 @@ SSL *SSL_dup(SSL *s)
+ 
+     /* If we're not quiescent, just up_ref! */
+     if (!SSL_in_init(s) || !SSL_in_before(s)) {
+-        CRYPTO_add(&amp;s-&gt;references, 1, CRYPTO_LOCK_SSL);
++        CRYPTO_atomic_add(&amp;s-&gt;references, 1, &amp;i, s-&gt;lock);
+         return s;
+     }
+ 
+@@ -3382,11 +3402,11 @@ SSL_CTX *SSL_set_SSL_CTX(SSL *ssl, SSL_CTX *ctx)
+         memcpy(&amp;ssl-&gt;sid_ctx, &amp;ctx-&gt;sid_ctx, sizeof(ssl-&gt;sid_ctx));
+     }
+ 
+-    CRYPTO_add(&amp;ctx-&gt;references, 1, CRYPTO_LOCK_SSL_CTX);
++    SSL_CTX_up_ref(ctx);
+     SSL_CTX_free(ssl-&gt;ctx); /* decrement reference count */
+     ssl-&gt;ctx = ctx;
+ 
+-    return (ssl-&gt;ctx);
++    return ssl-&gt;ctx;
+ }
+ 
+ int SSL_CTX_set_default_verify_paths(SSL_CTX *ctx)
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 4d816de..b9beca5 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -649,6 +649,7 @@ struct ssl_session_st {
+     char *srp_username;
+ # endif
+     uint32_t flags;
++    CRYPTO_RWLOCK *lock;
+ };
+ 
+ /* Extended master secret support */
+@@ -953,6 +954,7 @@ struct ssl_ctx_st {
+     size_t tlsext_ellipticcurvelist_length;
+     unsigned char *tlsext_ellipticcurvelist;
+ #  endif                        /* OPENSSL_NO_EC */
++    CRYPTO_RWLOCK *lock;
+ };
+ 
+ 
+@@ -1234,6 +1236,8 @@ struct ssl_st {
+     /* Async Job info */
+     ASYNC_JOB *job;
+     ASYNC_WAIT_CTX *waitctx;
++
++    CRYPTO_RWLOCK *lock;
+ };
+ 
+ 
+@@ -1642,6 +1646,7 @@ typedef struct cert_st {
+     char *psk_identity_hint;
+ #endif
+     int references;             /* &gt;1 only if SSL_copy_session_id is used */
++    CRYPTO_RWLOCK *lock;
+ } CERT;
+ 
+ /* Structure containing decoded values of signature algorithms extension */
+diff --git a/ssl/ssl_sess.c b/ssl/ssl_sess.c
+index 97f3ce2..ebeeba0 100644
+--- a/ssl/ssl_sess.c
++++ b/ssl/ssl_sess.c
+@@ -161,12 +161,12 @@ SSL_SESSION *SSL_get1_session(SSL *ssl)
+      * somebody doesn't free ssl-&gt;session between when we check it's non-null
+      * and when we up the reference count.
+      */
+-    CRYPTO_w_lock(CRYPTO_LOCK_SSL_SESSION);
++    CRYPTO_THREAD_read_lock(ssl-&gt;lock);
+     sess = ssl-&gt;session;
+     if (sess)
+-        sess-&gt;references++;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_SSL_SESSION);
+-    return (sess);
++        SSL_SESSION_up_ref(sess);
++    CRYPTO_THREAD_unlock(ssl-&gt;lock);
++    return sess;
+ }
+ 
+ int SSL_SESSION_set_ex_data(SSL_SESSION *s, int idx, void *arg)
+@@ -186,15 +186,23 @@ SSL_SESSION *SSL_SESSION_new(void)
+     ss = OPENSSL_zalloc(sizeof(*ss));
+     if (ss == NULL) {
+         SSLerr(SSL_F_SSL_SESSION_NEW, ERR_R_MALLOC_FAILURE);
+-        return (NULL);
++        return NULL;
+     }
+ 
+     ss-&gt;verify_result = 1;      /* avoid 0 (= X509_V_OK) just in case */
+     ss-&gt;references = 1;
+     ss-&gt;timeout = 60 * 5 + 4;   /* 5 minute timeout by default */
+     ss-&gt;time = (unsigned long)time(NULL);
++    ss-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (ss-&gt;lock == NULL) {
++        SSLerr(SSL_F_SSL_SESSION_NEW, ERR_R_MALLOC_FAILURE);
++        OPENSSL_free(ss);
++        return NULL;
++    }
++
+     CRYPTO_new_ex_data(CRYPTO_EX_INDEX_SSL_SESSION, ss, &amp;ss-&gt;ex_data);
+-    return (ss);
++
++    return ss;
+ }
+ 
+ /*
+@@ -237,6 +245,10 @@ SSL_SESSION *ssl_session_dup(SSL_SESSION *src, int ticket)
+ 
+     dest-&gt;references = 1;
+ 
++    dest-&gt;lock = CRYPTO_THREAD_lock_new();
++    if (dest-&gt;lock == NULL)
++        goto err;
++
+     if (src-&gt;peer != NULL)
+         X509_up_ref(src-&gt;peer);
+ 
+@@ -437,12 +449,14 @@ int ssl_get_new_session(SSL *s, int session)
+         }
+ 
+         /* Choose which callback will set the session ID */
+-        CRYPTO_r_lock(CRYPTO_LOCK_SSL_CTX);
++        CRYPTO_THREAD_read_lock(s-&gt;lock);
++        CRYPTO_THREAD_read_lock(s-&gt;session_ctx-&gt;lock);
+         if (s-&gt;generate_session_id)
+             cb = s-&gt;generate_session_id;
+         else if (s-&gt;session_ctx-&gt;generate_session_id)
+             cb = s-&gt;session_ctx-&gt;generate_session_id;
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL_CTX);
++        CRYPTO_THREAD_unlock(s-&gt;session_ctx-&gt;lock);
++        CRYPTO_THREAD_unlock(s-&gt;lock);
+         /* Choose a session ID */
+         tmp = ss-&gt;session_id_length;
+         if (!cb(s, ss-&gt;session_id, &amp;tmp)) {
+@@ -562,13 +576,13 @@ int ssl_get_prev_session(SSL *s, const PACKET *ext, const PACKET *session_id)
+             goto err;
+         }
+         data.session_id_length = local_len;
+-        CRYPTO_r_lock(CRYPTO_LOCK_SSL_CTX);
++        CRYPTO_THREAD_read_lock(s-&gt;session_ctx-&gt;lock);
+         ret = lh_SSL_SESSION_retrieve(s-&gt;session_ctx-&gt;sessions, &amp;data);
+         if (ret != NULL) {
+             /* don't allow other threads to steal it: */
+-            CRYPTO_add(&amp;ret-&gt;references, 1, CRYPTO_LOCK_SSL_SESSION);
++            SSL_SESSION_up_ref(ret);
+         }
+-        CRYPTO_r_unlock(CRYPTO_LOCK_SSL_CTX);
++        CRYPTO_THREAD_unlock(s-&gt;session_ctx-&gt;lock);
+         if (ret == NULL)
+             s-&gt;session_ctx-&gt;stats.sess_miss++;
+     }
+@@ -591,7 +605,7 @@ int ssl_get_prev_session(SSL *s, const PACKET *ext, const PACKET *session_id)
+              * thread-safe).
+              */
+             if (copy)
+-                CRYPTO_add(&amp;ret-&gt;references, 1, CRYPTO_LOCK_SSL_SESSION);
++                SSL_SESSION_up_ref(ret);
+ 
+             /*
+              * Add the externally cached session to the internal cache as
+@@ -714,12 +728,12 @@ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *c)
+      * it has two ways of access: each session is in a doubly linked list and
+      * an lhash
+      */
+-    CRYPTO_add(&amp;c-&gt;references, 1, CRYPTO_LOCK_SSL_SESSION);
++    SSL_SESSION_up_ref(c);
+     /*
+      * if session c is in already in cache, we take back the increment later
+      */
+ 
+-    CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_write_lock(ctx-&gt;lock);
+     s = lh_SSL_SESSION_insert(ctx-&gt;sessions, c);
+ 
+     /*
+@@ -769,8 +783,8 @@ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *c)
+             }
+         }
+     }
+-    CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
+-    return (ret);
++    CRYPTO_THREAD_unlock(ctx-&gt;lock);
++    return ret;
+ }
+ 
+ int SSL_CTX_remove_session(SSL_CTX *ctx, SSL_SESSION *c)
+@@ -785,7 +799,7 @@ static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck)
+ 
+     if ((c != NULL) &amp;&amp; (c-&gt;session_id_length != 0)) {
+         if (lck)
+-            CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
++            CRYPTO_THREAD_write_lock(ctx-&gt;lock);
+         if ((r = lh_SSL_SESSION_retrieve(ctx-&gt;sessions, c)) == c) {
+             ret = 1;
+             r = lh_SSL_SESSION_delete(ctx-&gt;sessions, c);
+@@ -793,7 +807,7 @@ static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck)
+         }
+ 
+         if (lck)
+-            CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
++            CRYPTO_THREAD_unlock(ctx-&gt;lock);
+ 
+         if (ret) {
+             r-&gt;not_resumable = 1;
+@@ -813,7 +827,7 @@ void SSL_SESSION_free(SSL_SESSION *ss)
+     if (ss == NULL)
+         return;
+ 
+-    i = CRYPTO_add(&amp;ss-&gt;references, -1, CRYPTO_LOCK_SSL_SESSION);
++    CRYPTO_atomic_add(&amp;ss-&gt;references, -1, &amp;i, ss-&gt;lock);
+     REF_PRINT_COUNT(&quot;SSL_SESSION&quot;, ss);
+     if (i &gt; 0)
+         return;
+@@ -841,9 +855,22 @@ void SSL_SESSION_free(SSL_SESSION *ss)
+ #ifndef OPENSSL_NO_SRP
+     OPENSSL_free(ss-&gt;srp_username);
+ #endif
++    CRYPTO_THREAD_lock_free(ss-&gt;lock);
+     OPENSSL_clear_free(ss, sizeof(*ss));
+ }
+ 
++int SSL_SESSION_up_ref(SSL_SESSION *ss)
++{
++    int i;
++
++    if (CRYPTO_atomic_add(&amp;ss-&gt;references, 1, &amp;i, ss-&gt;lock) &lt;= 0)
++        return 0;
++
++    REF_PRINT_COUNT(&quot;SSL_SESSION&quot;, ss);
++    REF_ASSERT_ISNT(i &lt; 2);
++    return ((i &gt; 1) ? 1 : 0);
++}
++
+ int SSL_set_session(SSL *s, SSL_SESSION *session)
+ {
+     int ret = 0;
+@@ -863,12 +890,10 @@ int SSL_set_session(SSL *s, SSL_SESSION *session)
+                 return (0);
+         }
+ 
+-        /* CRYPTO_w_lock(CRYPTO_LOCK_SSL); */
+-        CRYPTO_add(&amp;session-&gt;references, 1, CRYPTO_LOCK_SSL_SESSION);
++        SSL_SESSION_up_ref(session);
+         SSL_SESSION_free(s-&gt;session);
+         s-&gt;session = session;
+         s-&gt;verify_result = s-&gt;session-&gt;verify_result;
+-        /* CRYPTO_w_unlock(CRYPTO_LOCK_SSL); */
+         ret = 1;
+     } else {
+         SSL_SESSION_free(s-&gt;session);
+@@ -1056,12 +1081,12 @@ void SSL_CTX_flush_sessions(SSL_CTX *s, long t)
+     if (tp.cache == NULL)
+         return;
+     tp.time = t;
+-    CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_write_lock(s-&gt;lock);
+     i = CHECKED_LHASH_OF(SSL_SESSION, tp.cache)-&gt;down_load;
+     CHECKED_LHASH_OF(SSL_SESSION, tp.cache)-&gt;down_load = 0;
+     lh_SSL_SESSION_doall_TIMEOUT_PARAM(tp.cache, timeout_cb, &amp;tp);
+     CHECKED_LHASH_OF(SSL_SESSION, tp.cache)-&gt;down_load = i;
+-    CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
++    CRYPTO_THREAD_unlock(s-&gt;lock);
+ }
+ 
+ int ssl_clear_bad_session(SSL *s)
+diff --git a/test/ssltest.c b/test/ssltest.c
+index 2ca4d69..94aeebe 100644
+--- a/test/ssltest.c
++++ b/test/ssltest.c
+@@ -191,6 +191,7 @@
+ # include &lt;openssl/ct.h&gt;
+ #endif
+ 
++#include &quot;internal/threads.h&quot;
+ #include &quot;../ssl/ssl_locl.h&quot;
+ 
+ /*
+@@ -2949,19 +2950,21 @@ int doit(SSL *s_ssl, SSL *c_ssl, long count)
+     return (ret);
+ }
+ 
++static CRYPTO_ONCE proxy_auth_ex_data_once = CRYPTO_ONCE_STATIC_INIT;
++static volatile int proxy_auth_ex_data_idx = -1;
++
++static void do_get_proxy_auth_ex_data_idx(void)
++{
++    proxy_auth_ex_data_idx = X509_STORE_CTX_get_ex_new_index(0,
++                                                &quot;SSLtest for verify callback&quot;,
++                                                NULL, NULL, NULL);
++}
++
+ static int get_proxy_auth_ex_data_idx(void)
+ {
+-    static volatile int idx = -1;
+-    if (idx &lt; 0) {
+-        CRYPTO_w_lock(CRYPTO_LOCK_SSL_CTX);
+-        if (idx &lt; 0) {
+-            idx = X509_STORE_CTX_get_ex_new_index(0,
+-                                                  &quot;SSLtest for verify callback&quot;,
+-                                                  NULL, NULL, NULL);
+-        }
+-        CRYPTO_w_unlock(CRYPTO_LOCK_SSL_CTX);
+-    }
+-    return idx;
++    CRYPTO_THREAD_run_once(&amp;proxy_auth_ex_data_once,
++                           do_get_proxy_auth_ex_data_idx);
++    return proxy_auth_ex_data_idx;
+ }
+ 
+ static int verify_callback(int ok, X509_STORE_CTX *ctx)
+diff --git a/util/libssl.num b/util/libssl.num
+index 7ec5525..49c9c35 100644
+--- a/util/libssl.num
++++ b/util/libssl.num
+@@ -387,3 +387,4 @@ SSL_has_pending                         386	1_1_0	EXIST::FUNCTION:
+ SSL_CIPHER_get_auth_nid                 387	1_1_0	EXIST::FUNCTION:
+ SSL_CIPHER_get_kx_nid                   388	1_1_0	EXIST::FUNCTION:
+ SSL_CIPHER_is_aead                      389	1_1_0	EXIST::FUNCTION:
++SSL_SESSION_up_ref                      390	1_1_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005169.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005180.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5172">[ date ]</a>
+              <a href="thread.html#5172">[ thread ]</a>
+              <a href="subject.html#5172">[ subject ]</a>
+              <a href="author.html#5172">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

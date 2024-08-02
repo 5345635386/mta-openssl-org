@@ -1,0 +1,500 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1471860492.975038.2568.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009931.html">
+   <LINK REL="Next"  HREF="010039.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1471860492.975038.2568.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update">matt at openssl.org
+       </A><BR>
+    <I>Mon Aug 22 10:08:12 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009931.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="010039.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9997">[ date ]</a>
+              <a href="thread.html#9997">[ thread ]</a>
+              <a href="subject.html#9997">[ subject ]</a>
+              <a href="author.html#9997">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_1-stable has been updated
+       via  cfd40fd39e69f5e3c654ae8fbf9acb1d2a051144 (commit)
+       via  00a4c1421407b6ac796688871b0a49a179c694d9 (commit)
+      from  f3e01c8d85d98eab502d7aaaa734a1f9f0b8e375 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cfd40fd39e69f5e3c654ae8fbf9acb1d2a051144
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Jun 30 15:06:27 2016 +0100
+
+    Prevent DTLS Finished message injection
+    
+    Follow on from CVE-2016-2179
+    
+    The investigation and analysis of CVE-2016-2179 highlighted a related flaw.
+    
+    This commit fixes a security &quot;near miss&quot; in the buffered message handling
+    code. Ultimately this is not currently believed to be exploitable due to
+    the reasons outlined below, and therefore there is no CVE for this on its
+    own.
+    
+    The issue this commit fixes is a MITM attack where the attacker can inject
+    a Finished message into the handshake. In the description below it is
+    assumed that the attacker injects the Finished message for the server to
+    receive it. The attack could work equally well the other way around (i.e
+    where the client receives the injected Finished message).
+    
+    The MITM requires the following capabilities:
+    - The ability to manipulate the MTU that the client selects such that it
+    is small enough for the client to fragment Finished messages.
+    - The ability to selectively drop and modify records sent from the client
+    - The ability to inject its own records and send them to the server
+    
+    The MITM forces the client to select a small MTU such that the client
+    will fragment the Finished message. Ideally for the attacker the first
+    fragment will contain all but the last byte of the Finished message,
+    with the second fragment containing the final byte.
+    
+    During the handshake and prior to the client sending the CCS the MITM
+    injects a plaintext Finished message fragment to the server containing
+    all but the final byte of the Finished message. The message sequence
+    number should be the one expected to be used for the real Finished message.
+    
+    OpenSSL will recognise that the received fragment is for the future and
+    will buffer it for later use.
+    
+    After the client sends the CCS it then sends its own Finished message in
+    two fragments. The MITM causes the first of these fragments to be
+    dropped. The OpenSSL server will then receive the second of the fragments
+    and reassemble the complete Finished message consisting of the MITM
+    fragment and the final byte from the real client.
+    
+    The advantage to the attacker in injecting a Finished message is that
+    this provides the capability to modify other handshake messages (e.g.
+    the ClientHello) undetected. A difficulty for the attacker is knowing in
+    advance what impact any of those changes might have on the final byte of
+    the handshake hash that is going to be sent in the &quot;real&quot; Finished
+    message. In the worst case for the attacker this means that only 1 in
+    256 of such injection attempts will succeed.
+    
+    It may be possible in some situations for the attacker to improve this such
+    that all attempts succeed. For example if the handshake includes client
+    authentication then the final message flight sent by the client will
+    include a Certificate. Certificates are ASN.1 objects where the signed
+    portion is DER encoded. The non-signed portion could be BER encoded and so
+    the attacker could re-encode the certificate such that the hash for the
+    whole handshake comes to a different value. The certificate re-encoding
+    would not be detectable because only the non-signed portion is changed. As
+    this is the final flight of messages sent from the client the attacker
+    knows what the complete hanshake hash value will be that the client will
+    send - and therefore knows what the final byte will be. Through a process
+    of trial and error the attacker can re-encode the certificate until the
+    modified handhshake also has a hash with the same final byte. This means
+    that when the Finished message is verified by the server it will be
+    correct in all cases.
+    
+    In practice the MITM would need to be able to perform the same attack
+    against both the client and the server. If the attack is only performed
+    against the server (say) then the server will not detect the modified
+    handshake, but the client will and will abort the connection.
+    Fortunately, although OpenSSL is vulnerable to Finished message
+    injection, it is not vulnerable if *both* client and server are OpenSSL.
+    The reason is that OpenSSL has a hard &quot;floor&quot; for a minimum MTU size
+    that it will never go below. This minimum means that a Finished message
+    will never be sent in a fragmented form and therefore the MITM does not
+    have one of its pre-requisites. Therefore this could only be exploited
+    if using OpenSSL and some other DTLS peer that had its own and separate
+    Finished message injection flaw.
+    
+    The fix is to ensure buffered messages are cleared on epoch change.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit 00a4c1421407b6ac796688871b0a49a179c694d9
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Jun 30 13:17:08 2016 +0100
+
+    Fix DTLS buffered message DoS attack
+    
+    DTLS can handle out of order record delivery. Additionally since
+    handshake messages can be bigger than will fit into a single packet, the
+    messages can be fragmented across multiple records (as with normal TLS).
+    That means that the messages can arrive mixed up, and we have to
+    reassemble them. We keep a queue of buffered messages that are &quot;from the
+    future&quot;, i.e. messages we're not ready to deal with yet but have arrived
+    early. The messages held there may not be full yet - they could be one
+    or more fragments that are still in the process of being reassembled.
+    
+    The code assumes that we will eventually complete the reassembly and
+    when that occurs the complete message is removed from the queue at the
+    point that we need to use it.
+    
+    However, DTLS is also tolerant of packet loss. To get around that DTLS
+    messages can be retransmitted. If we receive a full (non-fragmented)
+    message from the peer after previously having received a fragment of
+    that message, then we ignore the message in the queue and just use the
+    non-fragmented version. At that point the queued message will never get
+    removed.
+    
+    Additionally the peer could send &quot;future&quot; messages that we never get to
+    in order to complete the handshake. Each message has a sequence number
+    (starting from 0). We will accept a message fragment for the current
+    message sequence number, or for any sequence up to 10 into the future.
+    However if the Finished message has a sequence number of 2, anything
+    greater than that in the queue is just left there.
+    
+    So, in those two ways we can end up with &quot;orphaned&quot; data in the queue
+    that will never get removed - except when the connection is closed. At
+    that point all the queues are flushed.
+    
+    An attacker could seek to exploit this by filling up the queues with
+    lots of large messages that are never going to be used in order to
+    attempt a DoS by memory exhaustion.
+    
+    I will assume that we are only concerned with servers here. It does not
+    seem reasonable to be concerned about a memory exhaustion attack on a
+    client. They are unlikely to process enough connections for this to be
+    an issue.
+    
+    A &quot;long&quot; handshake with many messages might be 5 messages long (in the
+    incoming direction), e.g. ClientHello, Certificate, ClientKeyExchange,
+    CertificateVerify, Finished. So this would be message sequence numbers 0
+    to 4. Additionally we can buffer up to 10 messages in the future.
+    Therefore the maximum number of messages that an attacker could send
+    that could get orphaned would typically be 15.
+    
+    The maximum size that a DTLS message is allowed to be is defined by
+    max_cert_list, which by default is 100k. Therefore the maximum amount of
+    &quot;orphaned&quot; memory per connection is 1500k.
+    
+    Message sequence numbers get reset after the Finished message, so
+    renegotiation will not extend the maximum number of messages that can be
+    orphaned per connection.
+    
+    As noted above, the queues do get cleared when the connection is closed.
+    Therefore in order to mount an effective attack, an attacker would have
+    to open many simultaneous connections.
+    
+    Issue reported by Quan Luo.
+    
+    CVE-2016-2179
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/d1_both.c  | 32 ++++++++++++++++----------------
+ ssl/d1_clnt.c  |  1 +
+ ssl/d1_lib.c   | 37 ++++++++++++++++++++++++++-----------
+ ssl/d1_pkt.c   |  6 ++++++
+ ssl/d1_srvr.c  |  3 ++-
+ ssl/ssl_locl.h |  3 ++-
+ 6 files changed, 53 insertions(+), 29 deletions(-)
+
+diff --git a/ssl/d1_both.c b/ssl/d1_both.c
+index 1614d88..ae292c4 100644
+--- a/ssl/d1_both.c
++++ b/ssl/d1_both.c
+@@ -614,11 +614,23 @@ static int dtls1_retrieve_buffered_fragment(SSL *s, long max, int *ok)
+     int al;
+ 
+     *ok = 0;
+-    item = pqueue_peek(s-&gt;d1-&gt;buffered_messages);
+-    if (item == NULL)
+-        return 0;
++    do {
++        item = pqueue_peek(s-&gt;d1-&gt;buffered_messages);
++        if (item == NULL)
++            return 0;
++
++        frag = (hm_fragment *)item-&gt;data;
++
++        if (frag-&gt;msg_header.seq &lt; s-&gt;d1-&gt;handshake_read_seq) {
++            /* This is a stale message that has been buffered so clear it */
++            pqueue_pop(s-&gt;d1-&gt;buffered_messages);
++            dtls1_hm_fragment_free(frag);
++            pitem_free(item);
++            item = NULL;
++            frag = NULL;
++        }
++    } while (item == NULL);
+ 
+-    frag = (hm_fragment *)item-&gt;data;
+ 
+     /* Don't return if reassembly still in progress */
+     if (frag-&gt;reassembly != NULL)
+@@ -1416,18 +1428,6 @@ dtls1_retransmit_message(SSL *s, unsigned short seq, unsigned long frag_off,
+     return ret;
+ }
+ 
+-/* call this function when the buffered messages are no longer needed */
+-void dtls1_clear_record_buffer(SSL *s)
+-{
+-    pitem *item;
+-
+-    for (item = pqueue_pop(s-&gt;d1-&gt;sent_messages);
+-         item != NULL; item = pqueue_pop(s-&gt;d1-&gt;sent_messages)) {
+-        dtls1_hm_fragment_free((hm_fragment *)item-&gt;data);
+-        pitem_free(item);
+-    }
+-}
+-
+ unsigned char *dtls1_set_message_header(SSL *s, unsigned char *p,
+                                         unsigned char mt, unsigned long len,
+                                         unsigned long frag_off,
+diff --git a/ssl/d1_clnt.c b/ssl/d1_clnt.c
+index eb371a2..e1f167b 100644
+--- a/ssl/d1_clnt.c
++++ b/ssl/d1_clnt.c
+@@ -751,6 +751,7 @@ int dtls1_connect(SSL *s)
+             /* done with handshaking */
+             s-&gt;d1-&gt;handshake_read_seq = 0;
+             s-&gt;d1-&gt;next_handshake_write_seq = 0;
++            dtls1_clear_received_buffer(s);
+             goto end;
+             /* break; */
+ 
+diff --git a/ssl/d1_lib.c b/ssl/d1_lib.c
+index 011d7b7..99984df 100644
+--- a/ssl/d1_lib.c
++++ b/ssl/d1_lib.c
+@@ -144,7 +144,6 @@ int dtls1_new(SSL *s)
+ static void dtls1_clear_queues(SSL *s)
+ {
+     pitem *item = NULL;
+-    hm_fragment *frag = NULL;
+     DTLS1_RECORD_DATA *rdata;
+ 
+     while ((item = pqueue_pop(s-&gt;d1-&gt;unprocessed_rcds.q)) != NULL) {
+@@ -165,28 +164,44 @@ static void dtls1_clear_queues(SSL *s)
+         pitem_free(item);
+     }
+ 
++    while ((item = pqueue_pop(s-&gt;d1-&gt;buffered_app_data.q)) != NULL) {
++        rdata = (DTLS1_RECORD_DATA *)item-&gt;data;
++        if (rdata-&gt;rbuf.buf) {
++            OPENSSL_free(rdata-&gt;rbuf.buf);
++        }
++        OPENSSL_free(item-&gt;data);
++        pitem_free(item);
++    }
++
++    dtls1_clear_received_buffer(s);
++    dtls1_clear_sent_buffer(s);
++}
++
++void dtls1_clear_received_buffer(SSL *s)
++{
++    pitem *item = NULL;
++    hm_fragment *frag = NULL;
++
+     while ((item = pqueue_pop(s-&gt;d1-&gt;buffered_messages)) != NULL) {
+         frag = (hm_fragment *)item-&gt;data;
+         dtls1_hm_fragment_free(frag);
+         pitem_free(item);
+     }
++}
++
++void dtls1_clear_sent_buffer(SSL *s)
++{
++    pitem *item = NULL;
++    hm_fragment *frag = NULL;
+ 
+     while ((item = pqueue_pop(s-&gt;d1-&gt;sent_messages)) != NULL) {
+         frag = (hm_fragment *)item-&gt;data;
+         dtls1_hm_fragment_free(frag);
+         pitem_free(item);
+     }
+-
+-    while ((item = pqueue_pop(s-&gt;d1-&gt;buffered_app_data.q)) != NULL) {
+-        rdata = (DTLS1_RECORD_DATA *)item-&gt;data;
+-        if (rdata-&gt;rbuf.buf) {
+-            OPENSSL_free(rdata-&gt;rbuf.buf);
+-        }
+-        OPENSSL_free(item-&gt;data);
+-        pitem_free(item);
+-    }
+ }
+ 
++
+ void dtls1_free(SSL *s)
+ {
+     ssl3_free(s);
+@@ -420,7 +435,7 @@ void dtls1_stop_timer(SSL *s)
+     BIO_ctrl(SSL_get_rbio(s), BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT, 0,
+              &amp;(s-&gt;d1-&gt;next_timeout));
+     /* Clear retransmission buffer */
+-    dtls1_clear_record_buffer(s);
++    dtls1_clear_sent_buffer(s);
+ }
+ 
+ int dtls1_check_timeout_num(SSL *s)
+diff --git a/ssl/d1_pkt.c b/ssl/d1_pkt.c
+index d3ceae0..086ee98 100644
+--- a/ssl/d1_pkt.c
++++ b/ssl/d1_pkt.c
+@@ -1950,6 +1950,12 @@ void dtls1_reset_seq_numbers(SSL *s, int rw)
+         s-&gt;d1-&gt;r_epoch++;
+         memcpy(&amp;(s-&gt;d1-&gt;bitmap), &amp;(s-&gt;d1-&gt;next_bitmap), sizeof(DTLS1_BITMAP));
+         memset(&amp;(s-&gt;d1-&gt;next_bitmap), 0x00, sizeof(DTLS1_BITMAP));
++
++        /*
++         * We must not use any buffered messages received from the previous
++         * epoch
++         */
++        dtls1_clear_received_buffer(s);
+     } else {
+         seq = s-&gt;s3-&gt;write_sequence;
+         memcpy(s-&gt;d1-&gt;last_write_sequence, seq,
+diff --git a/ssl/d1_srvr.c b/ssl/d1_srvr.c
+index 60af230..bc30433 100644
+--- a/ssl/d1_srvr.c
++++ b/ssl/d1_srvr.c
+@@ -295,7 +295,7 @@ int dtls1_accept(SSL *s)
+         case SSL3_ST_SW_HELLO_REQ_B:
+ 
+             s-&gt;shutdown = 0;
+-            dtls1_clear_record_buffer(s);
++            dtls1_clear_sent_buffer(s);
+             dtls1_start_timer(s);
+             ret = dtls1_send_hello_request(s);
+             if (ret &lt;= 0)
+@@ -866,6 +866,7 @@ int dtls1_accept(SSL *s)
+             /* next message is server hello */
+             s-&gt;d1-&gt;handshake_write_seq = 0;
+             s-&gt;d1-&gt;next_handshake_write_seq = 0;
++            dtls1_clear_received_buffer(s);
+             goto end;
+             /* break; */
+ 
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index d57b902..7b1fd1f 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -1026,7 +1026,8 @@ int dtls1_retransmit_message(SSL *s, unsigned short seq,
+                              unsigned long frag_off, int *found);
+ int dtls1_get_queue_priority(unsigned short seq, int is_ccs);
+ int dtls1_retransmit_buffered_messages(SSL *s);
+-void dtls1_clear_record_buffer(SSL *s);
++void dtls1_clear_received_buffer(SSL *s);
++void dtls1_clear_sent_buffer(SSL *s);
+ void dtls1_get_message_header(unsigned char *data,
+                               struct hm_header_st *msg_hdr);
+ void dtls1_get_ccs_header(unsigned char *data, struct ccs_header_st *ccs_hdr);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009931.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="010039.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9997">[ date ]</a>
+              <a href="thread.html#9997">[ thread ]</a>
+              <a href="subject.html#9997">[ subject ]</a>
+              <a href="author.html#9997">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,569 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522855280.245881.29788.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018891.html">
+   <LINK REL="Next"  HREF="018895.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522855280.245881.29788.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Apr  4 15:21:20 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018891.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018895.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18894">[ date ]</a>
+              <a href="thread.html#18894">[ thread ]</a>
+              <a href="subject.html#18894">[ subject ]</a>
+              <a href="author.html#18894">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a53b5be6a056e998fb119dbf035d1df68083a951 (commit)
+       via  034cb87b6c7758986b40692d1d5abdd2a7ba826e (commit)
+      from  d3f9268aa58507eb2d25fd0b49f54efdc098f4e6 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a53b5be6a056e998fb119dbf035d1df68083a951
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Apr 3 15:31:38 2018 +0100
+
+    Fix configuration of TLSv1.3 ciphersuites
+    
+    Configuration of TLSv1.3 ciphersuites wasn't working in some cases.
+    
+    Fixes #5740
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5855">https://github.com/openssl/openssl/pull/5855</A>)
+
+commit 034cb87b6c7758986b40692d1d5abdd2a7ba826e
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Apr 3 12:31:53 2018 +0100
+
+    Add some tests for configuring the TLSv1.3 ciphersuites
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5855">https://github.com/openssl/openssl/pull/5855</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_ciph.c        | 136 +++++++++++++++++++++++++++++++++++++++++++++++---
+ ssl/ssl_lib.c         |  93 ----------------------------------
+ ssl/ssl_locl.h        |   1 +
+ test/sslapitest.c     |  82 ++++++++++++++++++++++++++++++
+ test/sslcorrupttest.c |   6 +--
+ 5 files changed, 213 insertions(+), 105 deletions(-)
+
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index be728df..9011e42 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -15,6 +15,7 @@
+ #include &lt;openssl/comp.h&gt;
+ #include &lt;openssl/engine.h&gt;
+ #include &lt;openssl/crypto.h&gt;
++#include &lt;openssl/conf.h&gt;
+ #include &quot;internal/nelem.h&quot;
+ #include &quot;ssl_locl.h&quot;
+ #include &quot;internal/thread_once.h&quot;
+@@ -1274,6 +1275,131 @@ static int check_suiteb_cipher_list(const SSL_METHOD *meth, CERT *c,
+ }
+ #endif
+ 
++static int ciphersuite_cb(const char *elem, int len, void *arg)
++{
++    STACK_OF(SSL_CIPHER) *ciphersuites = (STACK_OF(SSL_CIPHER) *)arg;
++    const SSL_CIPHER *cipher;
++    /* Arbitrary sized temp buffer for the cipher name. Should be big enough */
++    char name[80];
++
++    if (len &gt; (int)(sizeof(name) - 1)) {
++        SSLerr(SSL_F_CIPHERSUITE_CB, SSL_R_NO_CIPHER_MATCH);
++        return 0;
++    }
++
++    memcpy(name, elem, len);
++    name[len] = '\0';
++
++    cipher = ssl3_get_cipher_by_std_name(name);
++    if (cipher == NULL) {
++        SSLerr(SSL_F_CIPHERSUITE_CB, SSL_R_NO_CIPHER_MATCH);
++        return 0;
++    }
++
++    if (!sk_SSL_CIPHER_push(ciphersuites, cipher)) {
++        SSLerr(SSL_F_CIPHERSUITE_CB, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++
++    return 1;
++}
++
++int set_ciphersuites(STACK_OF(SSL_CIPHER) **currciphers, const char *str)
++{
++    STACK_OF(SSL_CIPHER) *newciphers = sk_SSL_CIPHER_new_null();
++
++    if (newciphers == NULL)
++        return 0;
++
++    /* Parse the list. We explicitly allow an empty list */
++    if (*str != '\0'
++            &amp;&amp; !CONF_parse_list(str, ':', 1, ciphersuite_cb, newciphers)) {
++        sk_SSL_CIPHER_free(newciphers);
++        return 0;
++    }
++    sk_SSL_CIPHER_free(*currciphers);
++    *currciphers = newciphers;
++
++    return 1;
++}
++
++static int update_cipher_list_by_id(STACK_OF(SSL_CIPHER) **cipher_list_by_id,
++                                    STACK_OF(SSL_CIPHER) *cipherstack)
++{
++    STACK_OF(SSL_CIPHER) *tmp_cipher_list = sk_SSL_CIPHER_dup(cipherstack);
++
++    if (tmp_cipher_list == NULL) {
++        return 0;
++    }
++
++    sk_SSL_CIPHER_free(*cipher_list_by_id);
++    *cipher_list_by_id = tmp_cipher_list;
++
++    (void)sk_SSL_CIPHER_set_cmp_func(*cipher_list_by_id, ssl_cipher_ptr_id_cmp);
++    sk_SSL_CIPHER_sort(*cipher_list_by_id);
++
++    return 1;
++}
++
++static int update_cipher_list(STACK_OF(SSL_CIPHER) **cipher_list,
++                              STACK_OF(SSL_CIPHER) **cipher_list_by_id,
++                              STACK_OF(SSL_CIPHER) *tls13_ciphersuites)
++{
++    int i;
++    STACK_OF(SSL_CIPHER) *tmp_cipher_list = sk_SSL_CIPHER_dup(*cipher_list);
++
++    if (tmp_cipher_list == NULL)
++        return 0;
++
++    /*
++     * Delete any existing TLSv1.3 ciphersuites. These are always first in the
++     * list.
++     */
++    while (sk_SSL_CIPHER_num(tmp_cipher_list) &gt; 0
++           &amp;&amp; sk_SSL_CIPHER_value(tmp_cipher_list, 0)-&gt;min_tls
++              == TLS1_3_VERSION)
++        sk_SSL_CIPHER_delete(tmp_cipher_list, 0);
++
++    /* Insert the new TLSv1.3 ciphersuites */
++    for (i = 0; i &lt; sk_SSL_CIPHER_num(tls13_ciphersuites); i++)
++        sk_SSL_CIPHER_insert(tmp_cipher_list,
++                             sk_SSL_CIPHER_value(tls13_ciphersuites, i), i);
++
++    if (!update_cipher_list_by_id(cipher_list_by_id, tmp_cipher_list))
++        return 0;
++
++    sk_SSL_CIPHER_free(*cipher_list);
++    *cipher_list = tmp_cipher_list;
++
++    return 1;
++}
++
++int SSL_CTX_set_ciphersuites(SSL_CTX *ctx, const char *str)
++{
++    int ret = set_ciphersuites(&amp;(ctx-&gt;tls13_ciphersuites), str);
++
++    if (ret &amp;&amp; ctx-&gt;cipher_list != NULL) {
++        /* We already have a cipher_list, so we need to update it */
++        return update_cipher_list(&amp;ctx-&gt;cipher_list, &amp;ctx-&gt;cipher_list_by_id,
++                                  ctx-&gt;tls13_ciphersuites);
++    }
++
++    return ret;
++}
++
++int SSL_set_ciphersuites(SSL *s, const char *str)
++{
++    int ret = set_ciphersuites(&amp;(s-&gt;tls13_ciphersuites), str);
++
++    if (ret &amp;&amp; s-&gt;cipher_list != NULL) {
++        /* We already have a cipher_list, so we need to update it */
++        return update_cipher_list(&amp;s-&gt;cipher_list, &amp;s-&gt;cipher_list_by_id,
++                                  s-&gt;tls13_ciphersuites);
++    }
++
++    return ret;
++}
++
+ STACK_OF(SSL_CIPHER) *ssl_create_cipher_list(const SSL_METHOD *ssl_method,
+                                              STACK_OF(SSL_CIPHER) *tls13_ciphersuites,
+                                              STACK_OF(SSL_CIPHER) **cipher_list,
+@@ -1283,7 +1409,7 @@ STACK_OF(SSL_CIPHER) *ssl_create_cipher_list(const SSL_METHOD *ssl_method,
+ {
+     int ok, num_of_ciphers, num_of_alias_max, num_of_group_aliases, i;
+     uint32_t disabled_mkey, disabled_auth, disabled_enc, disabled_mac;
+-    STACK_OF(SSL_CIPHER) *cipherstack, *tmp_cipher_list;
++    STACK_OF(SSL_CIPHER) *cipherstack;
+     const char *rule_p;
+     CIPHER_ORDER *co_list = NULL, *head = NULL, *tail = NULL, *curr;
+     const SSL_CIPHER **ca_list = NULL;
+@@ -1498,19 +1624,13 @@ STACK_OF(SSL_CIPHER) *ssl_create_cipher_list(const SSL_METHOD *ssl_method,
+     }
+     OPENSSL_free(co_list);      /* Not needed any longer */
+ 
+-    tmp_cipher_list = sk_SSL_CIPHER_dup(cipherstack);
+-    if (tmp_cipher_list == NULL) {
++    if (!update_cipher_list_by_id(cipher_list_by_id, cipherstack)) {
+         sk_SSL_CIPHER_free(cipherstack);
+         return NULL;
+     }
+     sk_SSL_CIPHER_free(*cipher_list);
+     *cipher_list = cipherstack;
+-    if (*cipher_list_by_id != NULL)
+-        sk_SSL_CIPHER_free(*cipher_list_by_id);
+-    *cipher_list_by_id = tmp_cipher_list;
+-    (void)sk_SSL_CIPHER_set_cmp_func(*cipher_list_by_id, ssl_cipher_ptr_id_cmp);
+ 
+-    sk_SSL_CIPHER_sort(*cipher_list_by_id);
+     return cipherstack;
+ }
+ 
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index ae15730..b1d78dc 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -2549,99 +2549,6 @@ int SSL_set_cipher_list(SSL *s, const char *str)
+     return 1;
+ }
+ 
+-static int ciphersuite_cb(const char *elem, int len, void *arg)
+-{
+-    STACK_OF(SSL_CIPHER) *ciphersuites = (STACK_OF(SSL_CIPHER) *)arg;
+-    const SSL_CIPHER *cipher;
+-    /* Arbitrary sized temp buffer for the cipher name. Should be big enough */
+-    char name[80];
+-
+-    if (len &gt; (int)(sizeof(name) - 1)) {
+-        SSLerr(SSL_F_CIPHERSUITE_CB, SSL_R_NO_CIPHER_MATCH);
+-        return 0;
+-    }
+-
+-    memcpy(name, elem, len);
+-    name[len] = '\0';
+-
+-    cipher = ssl3_get_cipher_by_std_name(name);
+-    if (cipher == NULL) {
+-        SSLerr(SSL_F_CIPHERSUITE_CB, SSL_R_NO_CIPHER_MATCH);
+-        return 0;
+-    }
+-
+-    if (!sk_SSL_CIPHER_push(ciphersuites, cipher)) {
+-        SSLerr(SSL_F_CIPHERSUITE_CB, ERR_R_INTERNAL_ERROR);
+-        return 0;
+-    }
+-
+-    return 1;
+-}
+-
+-static int set_ciphersuites(STACK_OF(SSL_CIPHER) **currciphers, const char *str)
+-{
+-    STACK_OF(SSL_CIPHER) *newciphers = sk_SSL_CIPHER_new_null();
+-
+-    if (newciphers == NULL)
+-        return 0;
+-
+-    /* Parse the list. We explicitly allow an empty list */
+-    if (*str != '\0'
+-            &amp;&amp; !CONF_parse_list(str, ':', 1, ciphersuite_cb, newciphers)) {
+-        sk_SSL_CIPHER_free(newciphers);
+-        return 0;
+-    }
+-    sk_SSL_CIPHER_free(*currciphers);
+-    *currciphers = newciphers;
+-
+-    return 1;
+-}
+-
+-static int update_cipher_list(STACK_OF(SSL_CIPHER) *cipher_list,
+-                              STACK_OF(SSL_CIPHER) *tls13_ciphersuites)
+-{
+-    int i;
+-
+-    /*
+-     * Delete any existing TLSv1.3 ciphersuites. These are always first in the
+-     * list.
+-     */
+-    while (sk_SSL_CIPHER_num(cipher_list) &gt; 0
+-           &amp;&amp; sk_SSL_CIPHER_value(cipher_list, 0)-&gt;min_tls == TLS1_3_VERSION)
+-        sk_SSL_CIPHER_delete(cipher_list, 0);
+-
+-    /* Insert the new TLSv1.3 ciphersuites */
+-    for (i = 0; i &lt; sk_SSL_CIPHER_num(tls13_ciphersuites); i++)
+-        sk_SSL_CIPHER_insert(cipher_list,
+-                             sk_SSL_CIPHER_value(tls13_ciphersuites, i), i);
+-
+-    return 1;
+-}
+-
+-int SSL_CTX_set_ciphersuites(SSL_CTX *ctx, const char *str)
+-{
+-    int ret = set_ciphersuites(&amp;(ctx-&gt;tls13_ciphersuites), str);
+-
+-    if (ret &amp;&amp; ctx-&gt;cipher_list != NULL) {
+-        /* We already have a cipher_list, so we need to update it */
+-        return update_cipher_list(ctx-&gt;cipher_list, ctx-&gt;tls13_ciphersuites);
+-    }
+-
+-    return ret;
+-}
+-
+-int SSL_set_ciphersuites(SSL *s, const char *str)
+-{
+-    int ret = set_ciphersuites(&amp;(s-&gt;tls13_ciphersuites), str);
+-
+-    if (ret &amp;&amp; s-&gt;cipher_list != NULL) {
+-        /* We already have a cipher_list, so we need to update it */
+-        return update_cipher_list(s-&gt;cipher_list, s-&gt;tls13_ciphersuites);
+-    }
+-
+-    return ret;
+-}
+-
+ char *SSL_get_shared_ciphers(const SSL *s, char *buf, int len)
+ {
+     char *p;
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index a9ef6c3..b1d6e40 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -2210,6 +2210,7 @@ __owur int ssl_cipher_id_cmp(const SSL_CIPHER *a, const SSL_CIPHER *b);
+ DECLARE_OBJ_BSEARCH_GLOBAL_CMP_FN(SSL_CIPHER, SSL_CIPHER, ssl_cipher_id);
+ __owur int ssl_cipher_ptr_id_cmp(const SSL_CIPHER *const *ap,
+                                  const SSL_CIPHER *const *bp);
++__owur int set_ciphersuites(STACK_OF(SSL_CIPHER) **currciphers, const char *str);
+ __owur STACK_OF(SSL_CIPHER) *ssl_create_cipher_list(const SSL_METHOD *ssl_method,
+                                                     STACK_OF(SSL_CIPHER) *tls13_ciphersuites,
+                                                     STACK_OF(SSL_CIPHER) **cipher_list,
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index 3dcf735..876be31 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -2439,6 +2439,87 @@ static int test_early_data_tls1_2(int idx)
+ }
+ # endif /* OPENSSL_NO_TLS1_2 */
+ 
++/*
++ * Test configuring the TLSv1.3 ciphersuites
++ *
++ * Test 0: Set a default ciphersuite in the SSL_CTX (no explicit cipher_list)
++ * Test 1: Set a non-default ciphersuite in the SSL_CTX (no explicit cipher_list)
++ * Test 2: Set a default ciphersuite in the SSL (no explicit cipher_list)
++ * Test 3: Set a non-default ciphersuite in the SSL (no explicit cipher_list)
++ * Test 4: Set a default ciphersuite in the SSL_CTX (SSL_CTX cipher_list)
++ * Test 5: Set a non-default ciphersuite in the SSL_CTX (SSL_CTX cipher_list)
++ * Test 6: Set a default ciphersuite in the SSL (SSL_CTX cipher_list)
++ * Test 7: Set a non-default ciphersuite in the SSL (SSL_CTX cipher_list)
++ * Test 8: Set a default ciphersuite in the SSL (SSL cipher_list)
++ * Test 9: Set a non-default ciphersuite in the SSL (SSL cipher_list)
++ */
++static int test_set_ciphersuite(int idx)
++{
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL;
++    int testresult = 0;
++
++    if (!TEST_true(create_ssl_ctx_pair(TLS_server_method(), TLS_client_method(),
++                                       TLS1_VERSION, TLS_MAX_VERSION,
++                                       &amp;sctx, &amp;cctx, cert, privkey))
++            || !TEST_true(SSL_CTX_set_ciphersuites(sctx,
++                           &quot;TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_SHA256&quot;)))
++        goto end;
++
++    if (idx &gt;=4 &amp;&amp; idx &lt;= 7) {
++        /* SSL_CTX explicit cipher list */
++        if (!TEST_true(SSL_CTX_set_cipher_list(cctx, &quot;AES256-GCM-SHA384&quot;)))
++            goto end;
++    }
++
++    if (idx == 0 || idx == 4) {
++        /* Default ciphersuite */
++        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
++                                                &quot;TLS_AES_128_GCM_SHA256&quot;)))
++            goto end;
++    } else if (idx == 1 || idx == 5) {
++        /* Non default ciphersuite */
++        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
++                                                &quot;TLS_AES_128_CCM_SHA256&quot;)))
++            goto end;
++    }
++
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &amp;serverssl,
++                                          &amp;clientssl, NULL, NULL)))
++        goto end;
++
++    if (idx == 8 || idx == 9) {
++        /* SSL explicit cipher list */
++        if (!TEST_true(SSL_set_cipher_list(clientssl, &quot;AES256-GCM-SHA384&quot;)))
++            goto end;
++    }
++
++    if (idx == 2 || idx == 6 || idx == 8) {
++        /* Default ciphersuite */
++        if (!TEST_true(SSL_set_ciphersuites(clientssl,
++                                            &quot;TLS_AES_128_GCM_SHA256&quot;)))
++            goto end;
++    } else if (idx == 3 || idx == 7 || idx == 9) {
++        /* Non default ciphersuite */
++        if (!TEST_true(SSL_set_ciphersuites(clientssl,
++                                            &quot;TLS_AES_128_CCM_SHA256&quot;)))
++            goto end;
++    }
++
++    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
++        goto end;
++
++    testresult = 1;
++
++ end:
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++
++    return testresult;
++}
++
+ static int test_ciphersuite_change(void)
+ {
+     SSL_CTX *cctx = NULL, *sctx = NULL;
+@@ -3770,6 +3851,7 @@ int setup_tests(void)
+ # endif
+ #endif
+ #ifndef OPENSSL_NO_TLS1_3
++    ADD_ALL_TESTS(test_set_ciphersuite, 10);
+     ADD_TEST(test_ciphersuite_change);
+ #ifdef OPENSSL_NO_PSK
+     ADD_ALL_TESTS(test_tls13_psk, 1);
+diff --git a/test/sslcorrupttest.c b/test/sslcorrupttest.c
+index 0219559..30d3d3d 100644
+--- a/test/sslcorrupttest.c
++++ b/test/sslcorrupttest.c
+@@ -198,11 +198,9 @@ static int test_ssl_corrupt(int testidx)
+                                        &amp;sctx, &amp;cctx, cert, privkey)))
+         return 0;
+ 
+-    if (!TEST_true(SSL_CTX_set_cipher_list(cctx, cipher_list[testidx])))
+-        goto end;
+-
+-    if (!TEST_ptr(ciphers = SSL_CTX_get_ciphers(cctx))
++    if (!TEST_true(SSL_CTX_set_cipher_list(cctx, cipher_list[testidx]))
+             || !TEST_true(SSL_CTX_set_ciphersuites(cctx, &quot;&quot;))
++            || !TEST_ptr(ciphers = SSL_CTX_get_ciphers(cctx))
+             || !TEST_int_eq(sk_SSL_CIPHER_num(ciphers), 1)
+             || !TEST_ptr(currcipher = sk_SSL_CIPHER_value(ciphers, 0)))
+         goto end;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018891.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018895.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18894">[ date ]</a>
+              <a href="thread.html#18894">[ thread ]</a>
+              <a href="subject.html#18894">[ subject ]</a>
+              <a href="author.html#18894">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

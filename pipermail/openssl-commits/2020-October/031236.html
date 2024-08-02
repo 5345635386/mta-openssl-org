@@ -1,0 +1,287 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1602242526.274289.1464.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="031230.html">
+   <LINK REL="Next"  HREF="031256.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1602242526.274289.1464.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Oct  9 11:22:06 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="031230.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="031256.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31236">[ date ]</a>
+              <a href="thread.html#31236">[ thread ]</a>
+              <a href="subject.html#31236">[ subject ]</a>
+              <a href="author.html#31236">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3094351625f0b222f92c22ce4943461df8c7e301 (commit)
+      from  86e5ac6d844136324d4ccb649c768e530ce6e0af (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3094351625f0b222f92c22ce4943461df8c7e301
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Oct 8 08:11:32 2020 +0200
+
+    Fix diverse ERR code conflicts
+    
+    There was a number of potential range conflicts between reason codes
+    from different places.  Library specific reason codes are allowed to
+    start at 100, so it means that anything &quot;global&quot; is limited to the
+    range 1..99.
+    At the same time, we have the ERR_R_LIB_xxx reason codes, which have
+    the same numbers as ERR_LIB_xxx, potential range 1..255.
+    And then we have the common ERR_R_ reason codes, potential range in
+    OpenSSL 1.1.1 is 1..99, where fatal reasons occupy 64..99.  For
+    OpenSSL 3.0-dev, the range for the common reason codes was pushed up
+    to 64..99 in an attempt to reduce the conflicts with the ERR_R_LIB_xxx
+    reason codes.
+    
+    Currently existing conflicts in OpenSSL 1.1.1:
+    
+    ERR_R_BUF_LIB and ERR_R_PASSED_INVALID_ARGUMENT have the same code.
+    
+    There are currently no existing conflicts in OpenSSL 3.0-dev, but
+    considering that ERR_LIB_HTTP is 61, a few more modules and associated
+    ERR_R_LIB_xxx are going to sniff awfully close to 64, where the
+    common ERR_R_ codes currently start.
+    
+    To avoid these range conflicts, the strategy to recognise common
+    reason codes is change to depend on a reason flag, ERR_RFLAG_COMMON,
+    and the common error codes themselves have moved start at 256, giving
+    them the potential range 256..2^18-1, and thus allowing ERR_R_LIB_xxx
+    the full range of library codes, 1..255.
+    
+    The dual purpose ERR_R_FATAL is also handled in this change, by
+    allowing the rflags and reason codes to overlap by 1 bit, and make
+    both ERR_R_FATAL and ERR_RFLAG_FATAL have the same value, 2^18.
+    
+    With this change, there's no need to worry about reason code conflicts
+    any more, every library specific range as well as the common range is
+    1..2^18-1.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13093">https://github.com/openssl/openssl/pull/13093</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ include/openssl/err.h.in | 126 +++++++++++++++++++++++++++--------------------
+ 1 file changed, 72 insertions(+), 54 deletions(-)
+
+diff --git a/include/openssl/err.h.in b/include/openssl/err.h.in
+index b916f436e3..0e6f4fbad2 100644
+--- a/include/openssl/err.h.in
++++ b/include/openssl/err.h.in
+@@ -190,24 +190,43 @@ struct err_state_st {
+  *
+  * A few of the reason bits are reserved as flags with special meaning:
+  *
+- *                    &lt;4 bits&gt;&lt;-------------- 19 bits -------------&gt;
+- *                   +-------+-------------------------------------+
+- *                   | rflags|                reason               |
+- *                   +-------+-------------------------------------+
++ *                    &lt;5 bits-&lt;&gt;--------- 19 bits -----------------&gt;
++ *                   +-------+-+-----------------------------------+
++ *                   | rflags| |          reason                   |
++ *                   +-------+-+-----------------------------------+
++ *                            ^
++ *                            |
++ *                           ERR_RFLAG_FATAL = ERR_R_FATAL
+  *
+- * We have the reason flags being part of the overall reason code for
+- * backward compatibility reasons, i.e. how ERR_R_FATAL was implemented.
++ * The reason flags are part of the overall reason code for practical
++ * reasons, as they provide an easy way to place different types of
++ * reason codes in different numeric ranges.
++ *
++ * The currently known reason flags are:
++ *
++ * ERR_RFLAG_FATAL      Flags that the reason code is considered fatal.
++ *                      For backward compatibility reasons, this flag
++ *                      is also the code for ERR_R_FATAL (that reason
++ *                      code served the dual purpose of flag and reason
++ *                      code in one in pre-3.0 OpenSSL).
++ * ERR_RFLAG_COMMON     Flags that the reason code is common to all
++ *                      libraries.  All ERR_R_ macros must use this flag,
++ *                      and no other _R_ macro is allowed to use it.
+  */
+ 
+ /* Macros to help decode recorded system errors */
+ # define ERR_SYSTEM_FLAG                ((unsigned int)INT_MAX + 1)
+ # define ERR_SYSTEM_MASK                ((unsigned int)INT_MAX)
+ 
+-/* Macros to help decode recorded OpenSSL errors */
++/*
++ * Macros to help decode recorded OpenSSL errors
++ * As expressed above, RFLAGS and REASON overlap by one bit to allow
++ * ERR_R_FATAL to use ERR_RFLAG_FATAL as its reason code.
++ */
+ # define ERR_LIB_OFFSET                 23L
+ # define ERR_LIB_MASK                   0xFF
+-# define ERR_RFLAGS_OFFSET              19L
+-# define ERR_RFLAGS_MASK                0xF
++# define ERR_RFLAGS_OFFSET              18L
++# define ERR_RFLAGS_MASK                0x1F
+ # define ERR_REASON_MASK                0X7FFFFF
+ 
+ /*
+@@ -215,6 +234,7 @@ struct err_state_st {
+  * number.
+  */
+ # define ERR_RFLAG_FATAL                (0x1 &lt;&lt; ERR_RFLAGS_OFFSET)
++# define ERR_RFLAG_COMMON               (0x2 &lt;&lt; ERR_RFLAGS_OFFSET)
+ 
+ # define ERR_SYSTEM_ERROR(errcode)      (((errcode) &amp; ERR_SYSTEM_FLAG) != 0)
+ 
+@@ -249,6 +269,11 @@ static ossl_unused ossl_inline int ERR_FATAL_ERROR(unsigned long errcode)
+     return (ERR_GET_RFLAGS(errcode) &amp; ERR_RFLAG_FATAL) != 0;
+ }
+ 
++static ossl_unused ossl_inline int ERR_COMMON_ERROR(unsigned long errcode)
++{
++    return (ERR_GET_RFLAGS(errcode) &amp; ERR_RFLAG_COMMON) != 0;
++}
++
+ /*
+  * ERR_PACK is a helper macro to properly pack OpenSSL error codes and may
+  * only be used for that purpose.  System errors are packed internally.
+@@ -287,54 +312,47 @@ static ossl_unused ossl_inline int ERR_FATAL_ERROR(unsigned long errcode)
+ #  define SYS_F_SENDFILE          0
+ # endif
+ 
+-/* &quot;we came from here&quot; global reason codes, range 1..63 */
+-# define ERR_R_SYS_LIB   ERR_LIB_SYS/* 2 */
+-# define ERR_R_BN_LIB    ERR_LIB_BN/* 3 */
+-# define ERR_R_RSA_LIB   ERR_LIB_RSA/* 4 */
+-# define ERR_R_DH_LIB    ERR_LIB_DH/* 5 */
+-# define ERR_R_EVP_LIB   ERR_LIB_EVP/* 6 */
+-# define ERR_R_BUF_LIB   ERR_LIB_BUF/* 7 */
+-# define ERR_R_OBJ_LIB   ERR_LIB_OBJ/* 8 */
+-# define ERR_R_PEM_LIB   ERR_LIB_PEM/* 9 */
+-# define ERR_R_DSA_LIB   ERR_LIB_DSA/* 10 */
+-# define ERR_R_X509_LIB  ERR_LIB_X509/* 11 */
+-# define ERR_R_ASN1_LIB  ERR_LIB_ASN1/* 13 */
+-# define ERR_R_CRYPTO_LIB ERR_LIB_CRYPTO/* 15 */
+-# define ERR_R_EC_LIB    ERR_LIB_EC/* 16 */
+-# define ERR_R_BIO_LIB   ERR_LIB_BIO/* 32 */
+-# define ERR_R_PKCS7_LIB ERR_LIB_PKCS7/* 33 */
+-# define ERR_R_X509V3_LIB ERR_LIB_X509V3/* 34 */
+-# define ERR_R_ENGINE_LIB ERR_LIB_ENGINE/* 38 */
+-# define ERR_R_UI_LIB    ERR_LIB_UI/* 40 */
+-# define ERR_R_ECDSA_LIB ERR_LIB_ECDSA/* 42 */
+-# define ERR_R_OSSL_STORE_LIB ERR_LIB_OSSL_STORE/* 44 */
+-# define ERR_R_OSSL_DECODER_LIB ERR_LIB_OSSL_DECODER/* 60 */
+-
+ /*
+- * global reason codes, range 64..99 (sub-system specific codes start at 100)
+- *
+- * ERR_R_FATAL had dual purposes in pre-3.0 OpenSSL, as a standalone reason
+- * code as well as a fatal flag.  This is still possible to do, as 2**6 (64)
+- * is present in the whole range of global reason codes.
++ * All ERR_R_ codes must be combined with ERR_RFLAG_COMMON.
+  */
+-# define ERR_R_FATAL                             (64|ERR_RFLAG_FATAL)
+-# define ERR_R_MALLOC_FAILURE                    (65|ERR_RFLAG_FATAL)
+-# define ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED       (66|ERR_RFLAG_FATAL)
+-# define ERR_R_PASSED_NULL_PARAMETER             (67|ERR_RFLAG_FATAL)
+-# define ERR_R_INTERNAL_ERROR                    (68|ERR_RFLAG_FATAL)
+-# define ERR_R_DISABLED                          (69|ERR_RFLAG_FATAL)
+-# define ERR_R_INIT_FAIL                         (70|ERR_RFLAG_FATAL)
+-# define ERR_R_PASSED_INVALID_ARGUMENT           (71)
+-# define ERR_R_OPERATION_FAIL                    (72|ERR_RFLAG_FATAL)
+-# define ERR_R_INVALID_PROVIDER_FUNCTIONS        (73|ERR_RFLAG_FATAL)
+-# define ERR_R_INTERRUPTED_OR_CANCELLED          (74)
+-# define ERR_R_NESTED_ASN1_ERROR                 (76)
+-# define ERR_R_MISSING_ASN1_EOS                  (77)
+ 
+-/*
+- * 99 is the maximum possible ERR_R_... code, higher values are reserved for
+- * the individual libraries
+- */
++/* &quot;we came from here&quot; global reason codes, range 1..255 */
++# define ERR_R_SYS_LIB          (ERR_LIB_SYS/* 2 */ | ERR_RFLAG_COMMON)
++# define ERR_R_BN_LIB           (ERR_LIB_BN/* 3 */ | ERR_RFLAG_COMMON)
++# define ERR_R_RSA_LIB          (ERR_LIB_RSA/* 4 */ | ERR_RFLAG_COMMON)
++# define ERR_R_DH_LIB           (ERR_LIB_DH/* 5 */ | ERR_RFLAG_COMMON)
++# define ERR_R_EVP_LIB          (ERR_LIB_EVP/* 6 */ | ERR_RFLAG_COMMON)
++# define ERR_R_BUF_LIB          (ERR_LIB_BUF/* 7 */ | ERR_RFLAG_COMMON)
++# define ERR_R_OBJ_LIB          (ERR_LIB_OBJ/* 8 */ | ERR_RFLAG_COMMON)
++# define ERR_R_PEM_LIB          (ERR_LIB_PEM/* 9 */ | ERR_RFLAG_COMMON)
++# define ERR_R_DSA_LIB          (ERR_LIB_DSA/* 10 */ | ERR_RFLAG_COMMON)
++# define ERR_R_X509_LIB         (ERR_LIB_X509/* 11 */ | ERR_RFLAG_COMMON)
++# define ERR_R_ASN1_LIB         (ERR_LIB_ASN1/* 13 */ | ERR_RFLAG_COMMON)
++# define ERR_R_CRYPTO_LIB       (ERR_LIB_CRYPTO/* 15 */ | ERR_RFLAG_COMMON)
++# define ERR_R_EC_LIB           (ERR_LIB_EC/* 16 */ | ERR_RFLAG_COMMON)
++# define ERR_R_BIO_LIB          (ERR_LIB_BIO/* 32 */ | ERR_RFLAG_COMMON)
++# define ERR_R_PKCS7_LIB        (ERR_LIB_PKCS7/* 33 */ | ERR_RFLAG_COMMON)
++# define ERR_R_X509V3_LIB       (ERR_LIB_X509V3/* 34 */ | ERR_RFLAG_COMMON)
++# define ERR_R_ENGINE_LIB       (ERR_LIB_ENGINE/* 38 */ | ERR_RFLAG_COMMON)
++# define ERR_R_UI_LIB           (ERR_LIB_UI/* 40 */ | ERR_RFLAG_COMMON)
++# define ERR_R_ECDSA_LIB        (ERR_LIB_ECDSA/* 42 */ | ERR_RFLAG_COMMON)
++# define ERR_R_OSSL_STORE_LIB   (ERR_LIB_OSSL_STORE/* 44 */ | ERR_RFLAG_COMMON)
++# define ERR_R_OSSL_DECODER_LIB (ERR_LIB_OSSL_DECODER/* 60 */ | ERR_RFLAG_COMMON)
++
++/* Other common error codes, range 256..2^ERR_RFLAGS_OFFSET-1 */
++# define ERR_R_FATAL                             (ERR_RFLAG_FATAL|ERR_RFLAG_COMMON)
++# define ERR_R_MALLOC_FAILURE                    (256|ERR_R_FATAL)
++# define ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED       (257|ERR_R_FATAL)
++# define ERR_R_PASSED_NULL_PARAMETER             (258|ERR_R_FATAL)
++# define ERR_R_INTERNAL_ERROR                    (259|ERR_R_FATAL)
++# define ERR_R_DISABLED                          (260|ERR_R_FATAL)
++# define ERR_R_INIT_FAIL                         (261|ERR_R_FATAL)
++# define ERR_R_PASSED_INVALID_ARGUMENT           (262|ERR_RFLAG_COMMON)
++# define ERR_R_OPERATION_FAIL                    (263|ERR_R_FATAL)
++# define ERR_R_INVALID_PROVIDER_FUNCTIONS        (264|ERR_R_FATAL)
++# define ERR_R_INTERRUPTED_OR_CANCELLED          (265|ERR_RFLAG_COMMON)
++# define ERR_R_NESTED_ASN1_ERROR                 (266|ERR_RFLAG_COMMON)
++# define ERR_R_MISSING_ASN1_EOS                  (267|ERR_RFLAG_COMMON)
+ 
+ typedef struct ERR_string_data_st {
+     unsigned long error;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="031230.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="031256.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31236">[ date ]</a>
+              <a href="thread.html#31236">[ thread ]</a>
+              <a href="subject.html#31236">[ subject ]</a>
+              <a href="author.html#31236">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

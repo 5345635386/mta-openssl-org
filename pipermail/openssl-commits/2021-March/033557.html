@@ -1,0 +1,421 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1616368209.895910.5475.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033549.html">
+   <LINK REL="Next"  HREF="033563.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1616368209.895910.5475.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Sun Mar 21 23:10:09 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033549.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033563.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33557">[ date ]</a>
+              <a href="thread.html#33557">[ thread ]</a>
+              <a href="subject.html#33557">[ subject ]</a>
+              <a href="author.html#33557">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  251c48183b4d8934716ac1e5e66e2a10b81373fe (commit)
+      from  6e34a1048ce4871371eac224b995c3b4338f6166 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 251c48183b4d8934716ac1e5e66e2a10b81373fe
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu Mar 18 15:00:23 2021 +1000
+
+    Fix DER reading from stdin for BIO_f_readbuffer
+    
+    Fixes #14559
+    
+    The intitial implementation of the gets() function tried using the next bio's gets() function.
+    For a file BIO this returned incorrect data for binary data containing 0x00.
+    Just buffering all data during gets() did not work however since some
+    applications open and close the bio multiple times when dealing with pem
+    files containing multiple entries.. This does not work
+    when reading from stdin unless the data if buffered one byte at a time.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14599">https://github.com/openssl/openssl/pull/14599</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bf_readbuff.c              |  92 ++++++++++++++----------
+ test/bio_readbuffer_test.c            | 131 ++++++++++++++++++++++++++++++++++
+ test/build.info                       |   7 +-
+ test/recipes/61-test_bio_readbuffer.t |  29 ++++++++
+ 4 files changed, 222 insertions(+), 37 deletions(-)
+ create mode 100644 test/bio_readbuffer_test.c
+ create mode 100644 test/recipes/61-test_bio_readbuffer.t
+
+diff --git a/crypto/bio/bf_readbuff.c b/crypto/bio/bf_readbuff.c
+index 673d592ec0..135ccef83b 100644
+--- a/crypto/bio/bf_readbuff.c
++++ b/crypto/bio/bf_readbuff.c
+@@ -57,7 +57,7 @@ static int readbuffer_new(BIO *bi)
+     if (ctx == NULL)
+         return 0;
+     ctx-&gt;ibuf_size = DEFAULT_BUFFER_SIZE;
+-    ctx-&gt;ibuf = OPENSSL_malloc(DEFAULT_BUFFER_SIZE);
++    ctx-&gt;ibuf = OPENSSL_zalloc(DEFAULT_BUFFER_SIZE);
+     if (ctx-&gt;ibuf == NULL) {
+         OPENSSL_free(ctx);
+         return 0;
+@@ -220,6 +220,7 @@ static int readbuffer_gets(BIO *b, char *buf, int size)
+     BIO_F_BUFFER_CTX *ctx;
+     int num = 0, num_chars, found_newline;
+     char *p;
++    int i, j;
+ 
+     if (size == 0)
+         return 0;
+@@ -227,42 +228,61 @@ static int readbuffer_gets(BIO *b, char *buf, int size)
+     ctx = (BIO_F_BUFFER_CTX *)b-&gt;ptr;
+     BIO_clear_retry_flags(b);
+ 
+-    for (;;) {
+-        if (ctx-&gt;ibuf_len &gt; 0) {
+-            p = &amp;(ctx-&gt;ibuf[ctx-&gt;ibuf_off]);
+-            found_newline = 0;
+-            for (num_chars = 0;
+-                 (num_chars &lt; ctx-&gt;ibuf_len) &amp;&amp; (num_chars &lt; size);
+-                 num_chars++) {
+-                *(buf++) = p[num_chars];
+-                if (p[num_chars] == '\n') {
+-                    found_newline = 1;
+-                    num_chars++;
+-                    break;
+-                }
+-            }
+-            num += num_chars;
+-            size -= num_chars;
+-            ctx-&gt;ibuf_len -= num_chars;
+-            ctx-&gt;ibuf_off += num_chars;
+-            if (found_newline || size == 0) {
+-                *buf = '\0';
+-                return num;
+-            }
+-        } else {
+-            /* read another line and resize if we have to */
+-            if (!readbuffer_resize(ctx, size))
+-                return 0;
+-
+-            /* Read another line from the next bio using BIO_gets */
+-            num_chars = BIO_gets(b-&gt;next_bio, ctx-&gt;ibuf + ctx-&gt;ibuf_off,
+-                                 1 + size);
+-            if (num_chars &lt;= 0) {
+-                BIO_copy_next_retry(b);
+-                *buf = '\0';
+-                return num &gt; 0 ? num : num_chars;
++    /* If data is already buffered then use this first */
++    if (ctx-&gt;ibuf_len &gt; 0) {
++        p = ctx-&gt;ibuf + ctx-&gt;ibuf_off;
++        found_newline = 0;
++        for (num_chars = 0;
++             (num_chars &lt; ctx-&gt;ibuf_len) &amp;&amp; (num_chars &lt; size);
++             num_chars++) {
++            *buf++ = p[num_chars];
++            if (p[num_chars] == '\n') {
++                found_newline = 1;
++                num_chars++;
++                break;
+             }
+-            ctx-&gt;ibuf_len = num_chars;
++        }
++        num += num_chars;
++        size -= num_chars;
++        ctx-&gt;ibuf_len -= num_chars;
++        ctx-&gt;ibuf_off += num_chars;
++        if (found_newline || size == 0) {
++            *buf = '\0';
++            return num;
+         }
+     }
++    /*
++     * If there is no buffered data left then read any remaining data from the
++     * next bio.
++     */
++
++     /* Resize if we have to */
++     if (!readbuffer_resize(ctx, 1 + size))
++         return 0;
++     /*
++      * Read more data from the next bio using BIO_read_ex:
++      * Note we cannot use BIO_gets() here as it does not work on a
++      * binary stream that contains 0x00. (Since strlen() will stop at
++      * any 0x00 not at the last read '\n' in a FILE bio).
++      * Also note that some applications open and close the file bio
++      * multiple times and need to read the next available block when using
++      * stdin - so we need to READ one byte at a time!
++      */
++     p = ctx-&gt;ibuf + ctx-&gt;ibuf_off;
++     for (i = 0; i &lt; size; ++i) {
++         j = BIO_read(b-&gt;next_bio, p, 1);
++         if (j &lt;= 0) {
++             BIO_copy_next_retry(b);
++             *buf = '\0';
++             return num &gt; 0 ? num : j;
++         }
++         *buf++ = *p;
++         num++;
++         ctx-&gt;ibuf_off++;
++         if (*p == '\n')
++             break;
++         ++p;
++     }
++     *buf = '\0';
++     return num;
+ }
+diff --git a/test/bio_readbuffer_test.c b/test/bio_readbuffer_test.c
+new file mode 100644
+index 0000000000..58a03c2163
+--- /dev/null
++++ b/test/bio_readbuffer_test.c
+@@ -0,0 +1,131 @@
++/*
++ * Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/bio.h&gt;
++#include &quot;testutil.h&quot;
++
++static const char *filename = NULL;
++
++/*
++ * Test that a BIO_f_readbuffer() with a BIO_new_file() behaves nicely if
++ * BIO_gets() and BIO_read_ex() are both called.
++ * Since the BIO_gets() calls buffer the reads, the BIO_read_ex() should
++ * still be able to read the buffered data if we seek back to the start.
++ *
++ * The following cases are tested using tstid:
++ * 0 : Just use BIO_read_ex().
++ * 1 : Try a few reads using BIO_gets() before using BIO_read_ex()
++ * 2 : Read the entire file using BIO_gets() before using BIO_read_ex().
++ */
++static int test_readbuffer_file_bio(int tstid)
++{
++    int ret = 0, len, partial;
++    BIO *in = NULL, *in_bio = NULL, *readbuf_bio = NULL;
++    char buf[255];
++    char expected[4096];
++    size_t readbytes = 0, bytes = 0, count = 0;
++
++    /* Open a file BIO and read all the data */
++    if (!TEST_ptr(in = BIO_new_file(filename, &quot;r&quot;))
++        || !TEST_int_eq(BIO_read_ex(in, expected, sizeof(expected),
++                                    &amp;readbytes), 1)
++        || !TEST_int_lt(readbytes, sizeof(expected)))
++        goto err;
++    BIO_free(in);
++    in = NULL;
++
++    /* Create a new file bio that sits under a readbuffer BIO */
++    if (!TEST_ptr(readbuf_bio = BIO_new(BIO_f_readbuffer()))
++        || !TEST_ptr(in_bio = BIO_new_file(filename, &quot;r&quot;)))
++        goto err;
++
++    in_bio = BIO_push(readbuf_bio, in_bio);
++    readbuf_bio = NULL;
++
++    if (!TEST_int_eq(BIO_tell(in_bio), 0))
++        goto err;
++
++    if (tstid != 0) {
++        partial = 4;
++        while (!BIO_eof(in_bio)) {
++            len = BIO_gets(in_bio, buf, sizeof(buf));
++            if (len == 0) {
++                if (!TEST_true(BIO_eof(in_bio)))
++                    goto err;
++            } else {
++                if (!TEST_int_gt(len, 0)
++                    || !TEST_int_le(len, (int)sizeof(buf) - 1))
++                    goto err;
++                if (!TEST_true(buf[len] == 0))
++                    goto err;
++                if (len &gt; 1
++                    &amp;&amp; !BIO_eof(in_bio)
++                    &amp;&amp; len != ((int)sizeof(buf) - 1)
++                    &amp;&amp; !TEST_true(buf[len - 1] == '\n'))
++                    goto err;
++            }
++            if (tstid == 1 &amp;&amp; --partial == 0)
++                break;
++        }
++    }
++    if (!TEST_int_eq(BIO_seek(in_bio, 0), 1))
++        goto err;
++
++    len = 8; /* Do a small partial read to start with */
++    while (!BIO_eof(in_bio)) {
++        if (!TEST_int_eq(BIO_read_ex(in_bio, buf, len, &amp;bytes), 1))
++            break;
++        if (!TEST_mem_eq(buf, bytes, expected + count, bytes))
++            goto err;
++        count += bytes;
++        len = sizeof(buf); /* fill the buffer on subsequent reads */
++    }
++    if (!TEST_int_eq(count, readbytes))
++        goto err;
++    ret = 1;
++err:
++    BIO_free(in);
++    BIO_free_all(in_bio);
++    BIO_free(readbuf_bio);
++    return ret;
++}
++
++typedef enum OPTION_choice {
++    OPT_ERR = -1,
++    OPT_EOF = 0,
++    OPT_TEST_ENUM
++} OPTION_CHOICE;
++
++const OPTIONS *test_get_options(void)
++{
++    static const OPTIONS test_options[] = {
++        OPT_TEST_OPTIONS_WITH_EXTRA_USAGE(&quot;file\n&quot;),
++        { OPT_HELP_STR, 1, '-', &quot;file\tFile to run tests on.\n&quot; },
++        { NULL }
++    };
++    return test_options;
++}
++
++int setup_tests(void)
++{
++    OPTION_CHOICE o;
++
++    while ((o = opt_next()) != OPT_EOF) {
++        switch (o) {
++        case OPT_TEST_CASES:
++            break;
++        default:
++            return 0;
++        }
++    }
++    filename = test_get_argument(0);
++
++    ADD_ALL_TESTS(test_readbuffer_file_bio, 3);
++    return 1;
++}
+diff --git a/test/build.info b/test/build.info
+index 3b0fa12d20..8abb14f634 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -57,7 +57,8 @@ IF[{- !$disabled{tests} -}]
+           http_test servername_test ocspapitest fatalerrtest tls13ccstest \
+           sysdefaulttest errtest ssl_ctx_test gosttest \
+           context_internal_test aesgcmtest params_test evp_pkey_dparams_test \
+-          keymgmt_internal_test hexstr_test provider_status_test defltfips_test
++          keymgmt_internal_test hexstr_test provider_status_test defltfips_test \
++          bio_readbuffer_test
+ 
+   IF[{- !$disabled{'deprecated-3.0'} -}]
+     PROGRAMS{noinst}=enginetest
+@@ -307,6 +308,10 @@ IF[{- !$disabled{tests} -}]
+   INCLUDE[bio_callback_test]=../include ../apps/include
+   DEPEND[bio_callback_test]=../libcrypto libtestutil.a
+ 
++  SOURCE[bio_readbuffer_test]=bio_readbuffer_test.c
++  INCLUDE[bio_readbuffer_test]=../include ../apps/include
++  DEPEND[bio_readbuffer_test]=../libcrypto libtestutil.a
++
+   SOURCE[bio_memleak_test]=bio_memleak_test.c
+   INCLUDE[bio_memleak_test]=../include ../apps/include
+   DEPEND[bio_memleak_test]=../libcrypto libtestutil.a
+diff --git a/test/recipes/61-test_bio_readbuffer.t b/test/recipes/61-test_bio_readbuffer.t
+new file mode 100644
+index 0000000000..e10ab746ae
+--- /dev/null
++++ b/test/recipes/61-test_bio_readbuffer.t
+@@ -0,0 +1,29 @@
++#! /usr/bin/env perl
++# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++use strict;
++use warnings;
++
++use OpenSSL::Test qw(:DEFAULT srctop_file);
++
++setup('test_bio_readbuffer');
++
++my $pemfile = srctop_file(&quot;test&quot;, &quot;certs&quot;, &quot;leaf.pem&quot;);
++my $derfile = 'readbuffer_leaf.der';
++
++plan tests =&gt; 3;
++
++ok(run(app([ 'openssl', 'x509', '-inform', 'PEM', '-in', $pemfile,
++             '-outform', 'DER', '-out', $derfile])),
++   &quot;Generate a DER certificate&quot;);
++
++ok(run(test([&quot;bio_readbuffer_test&quot;, $derfile])),
++   &quot;Running bio_readbuffer_test $derfile&quot;);
++
++ok(run(test([&quot;bio_readbuffer_test&quot;, $pemfile])),
++   &quot;Running bio_readbuffer_test $pemfile&quot;);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033549.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033563.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33557">[ date ]</a>
+              <a href="thread.html#33557">[ thread ]</a>
+              <a href="subject.html#33557">[ subject ]</a>
+              <a href="author.html#33557">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

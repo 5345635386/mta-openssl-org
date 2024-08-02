@@ -1,0 +1,248 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1463749989.921432.30959.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007419.html">
+   <LINK REL="Next"  HREF="007423.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1463749989.921432.30959.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri May 20 13:13:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007419.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007423.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7421">[ date ]</a>
+              <a href="thread.html#7421">[ thread ]</a>
+              <a href="subject.html#7421">[ subject ]</a>
+              <a href="author.html#7421">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  464175692f1f00a9e5a87f040d0c59184d63b53b (commit)
+      from  72106aaab439eddc69df29aa328fb5eeb2086f84 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 464175692f1f00a9e5a87f040d0c59184d63b53b
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue May 17 12:28:14 2016 +0100
+
+    Simplify SSL BIO buffering logic
+    
+    The write BIO for handshake messages is bufferred so that we only write
+    out to the network when we have a complete flight. There was some
+    complexity in the buffering logic so that we switched buffering on and
+    off at various points through out the handshake. The only real reason to
+    do this was historically it complicated the state machine when you wanted
+    to flush because you had to traverse through the &quot;flush&quot; state (in order
+    to cope with NBIO). Where we knew up front that there was only going to
+    be one message in the flight we switched off buffering to avoid that.
+    
+    In the new state machine there is no longer a need for a flush state so
+    it is simpler just to have buffering on for the whole handshake. This
+    also gives us the added benefit that we can simply call flush after every
+    flight even if it only has one message in it. This means that BIO authors
+    can implement their own buffering strategies and not have to be aware of
+    the state of the SSL object (previously they would have to switch off
+    their own buffering during the handshake because they could not rely on
+    a flush being received when they really needed to write data out). This
+    last point addresses GitHub Issue #322.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c            | 23 ++++++++---------------
+ ssl/ssl_locl.h           |  4 ++--
+ ssl/statem/statem.c      | 20 ++++++++++----------
+ ssl/statem/statem_clnt.c | 15 ++-------------
+ test/heartbeat_test.c    |  2 +-
+ 5 files changed, 23 insertions(+), 41 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index 9fb6e89..83ad9ef 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -3220,34 +3220,27 @@ const COMP_METHOD *SSL_get_current_expansion(SSL *s)
+ #endif
+ }
+ 
+-int ssl_init_wbio_buffer(SSL *s, int push)
++int ssl_init_wbio_buffer(SSL *s)
+ {
+     BIO *bbio;
+ 
+     if (s-&gt;bbio == NULL) {
+         bbio = BIO_new(BIO_f_buffer());
+         if (bbio == NULL)
+-            return (0);
++            return 0;
+         s-&gt;bbio = bbio;
++        s-&gt;wbio = BIO_push(bbio, s-&gt;wbio);
+     } else {
+         bbio = s-&gt;bbio;
+-        if (s-&gt;bbio == s-&gt;wbio)
+-            s-&gt;wbio = BIO_pop(s-&gt;wbio);
++        (void)BIO_reset(bbio);
+     }
+-    (void)BIO_reset(bbio);
+-/*      if (!BIO_set_write_buffer_size(bbio,16*1024)) */
++
+     if (!BIO_set_read_buffer_size(bbio, 1)) {
+         SSLerr(SSL_F_SSL_INIT_WBIO_BUFFER, ERR_R_BUF_LIB);
+-        return (0);
+-    }
+-    if (push) {
+-        if (s-&gt;wbio != bbio)
+-            s-&gt;wbio = BIO_push(bbio, s-&gt;wbio);
+-    } else {
+-        if (s-&gt;wbio == bbio)
+-            s-&gt;wbio = BIO_pop(bbio);
++        return 0;
+     }
+-    return (1);
++
++    return 1;
+ }
+ 
+ void ssl_free_wbio_buffer(SSL *s)
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 968a2ec..a1f5774 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -1787,7 +1787,7 @@ const SSL_METHOD *func_name(void)  \
+         }
+ 
+ struct openssl_ssl_test_functions {
+-    int (*p_ssl_init_wbio_buffer) (SSL *s, int push);
++    int (*p_ssl_init_wbio_buffer) (SSL *s);
+     int (*p_ssl3_setup_buffers) (SSL *s);
+ # ifndef OPENSSL_NO_HEARTBEATS
+     int (*p_dtls1_process_heartbeat) (SSL *s,
+@@ -1963,7 +1963,7 @@ __owur int dtls1_shutdown(SSL *s);
+ 
+ __owur int dtls1_dispatch_alert(SSL *s);
+ 
+-__owur int ssl_init_wbio_buffer(SSL *s, int push);
++__owur int ssl_init_wbio_buffer(SSL *s);
+ void ssl_free_wbio_buffer(SSL *s);
+ 
+ __owur int tls1_change_cipher_state(SSL *s, int which);
+diff --git a/ssl/statem/statem.c b/ssl/statem/statem.c
+index d0ea55f..20353c3 100644
+--- a/ssl/statem/statem.c
++++ b/ssl/statem/statem.c
+@@ -320,20 +320,20 @@ static int state_machine(SSL *s, int server)
+          */
+         s-&gt;s3-&gt;change_cipher_spec = 0;
+ 
+-        if (!server || st-&gt;state != MSG_FLOW_RENEGOTIATE) {
+-                /*
+-                 * Ok, we now need to push on a buffering BIO ...but not with
+-                 * SCTP
+-                 */
++
++        /*
++         * Ok, we now need to push on a buffering BIO ...but not with
++         * SCTP
++         */
+ #ifndef OPENSSL_NO_SCTP
+-                if (!SSL_IS_DTLS(s) || !BIO_dgram_is_sctp(SSL_get_wbio(s)))
++        if (!SSL_IS_DTLS(s) || !BIO_dgram_is_sctp(SSL_get_wbio(s)))
+ #endif
+-                    if (!ssl_init_wbio_buffer(s, server ? 1 : 0)) {
+-                        goto end;
+-                    }
++            if (!ssl_init_wbio_buffer(s)) {
++                goto end;
++            }
+ 
++        if (!server || st-&gt;state != MSG_FLOW_RENEGOTIATE)
+             ssl3_init_finished_mac(s);
+-        }
+ 
+         if (server) {
+             if (st-&gt;state != MSG_FLOW_RENEGOTIATE) {
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 7591bb9..ecbc43b 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -437,20 +437,9 @@ WORK_STATE ossl_statem_client_post_work(SSL *s, WORK_STATE wst)
+ 
+     switch(st-&gt;hand_state) {
+     case TLS_ST_CW_CLNT_HELLO:
+-        if (SSL_IS_DTLS(s) &amp;&amp; s-&gt;d1-&gt;cookie_len &gt; 0 &amp;&amp; statem_flush(s) != 1)
++        if (wst == WORK_MORE_A &amp;&amp; statem_flush(s) != 1)
+             return WORK_MORE_A;
+-#ifndef OPENSSL_NO_SCTP
+-        /* Disable buffering for SCTP */
+-        if (!SSL_IS_DTLS(s) || !BIO_dgram_is_sctp(SSL_get_wbio(s))) {
+-#endif
+-            /*
+-             * turn on buffering for the next lot of output
+-             */
+-            if (s-&gt;bbio != s-&gt;wbio)
+-                s-&gt;wbio = BIO_push(s-&gt;bbio, s-&gt;wbio);
+-#ifndef OPENSSL_NO_SCTP
+-            }
+-#endif
++
+         if (SSL_IS_DTLS(s)) {
+             /* Treat the next message as the first packet */
+             s-&gt;first_packet = 1;
+diff --git a/test/heartbeat_test.c b/test/heartbeat_test.c
+index f92510a..906736c 100644
+--- a/test/heartbeat_test.c
++++ b/test/heartbeat_test.c
+@@ -101,7 +101,7 @@ static HEARTBEAT_TEST_FIXTURE set_up(const char *const test_case_name,
+         goto fail;
+     }
+ 
+-    if (!ssl_init_wbio_buffer(fixture.s, 1)) {
++    if (!ssl_init_wbio_buffer(fixture.s)) {
+         fprintf(stderr, &quot;Failed to set up wbio buffer for test: %s\n&quot;,
+                 test_case_name);
+         setup_ok = 0;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007419.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007423.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7421">[ date ]</a>
+              <a href="thread.html#7421">[ thread ]</a>
+              <a href="subject.html#7421">[ subject ]</a>
+              <a href="author.html#7421">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

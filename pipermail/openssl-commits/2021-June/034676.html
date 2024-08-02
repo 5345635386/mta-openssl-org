@@ -1,0 +1,272 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623340726.298309.14822.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034674.html">
+   <LINK REL="Next"  HREF="034677.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623340726.298309.14822.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Thu Jun 10 15:58:46 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034674.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034677.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34676">[ date ]</a>
+              <a href="thread.html#34676">[ thread ]</a>
+              <a href="subject.html#34676">[ subject ]</a>
+              <a href="author.html#34676">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ef0449135c4e4e7f04bbeafbd76ce7b5c0518088 (commit)
+      from  bedda72ff771a41c317daa7bdb7cbe14608fbc03 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ef0449135c4e4e7f04bbeafbd76ce7b5c0518088
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Wed Jun 9 17:34:55 2021 +1000
+
+    Fix s_server app to not report an error when using a non DH certificate.
+    
+    Fixes #15071
+    
+    It always tries loading the cert as DH which previously did not produce
+    an error. The errors are not suppressed for these operations.
+    The output now matches previous versions of OpenSSL.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15670">https://github.com/openssl/openssl/pull/15670</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/include/apps.h |  3 +++
+ apps/lib/apps.c     | 76 +++++++++++++++++++++++++++++++++++++++--------------
+ apps/s_server.c     | 10 ++++---
+ 3 files changed, 66 insertions(+), 23 deletions(-)
+
+diff --git a/apps/include/apps.h b/apps/include/apps.h
+index 47a5f7f6f4..c9f77f6067 100644
+--- a/apps/include/apps.h
++++ b/apps/include/apps.h
+@@ -121,6 +121,9 @@ EVP_PKEY *load_pubkey(const char *uri, int format, int maybe_stdin,
+                       const char *pass, ENGINE *e, const char *desc);
+ EVP_PKEY *load_keyparams(const char *uri, int format, int maybe_stdin,
+                          const char *keytype, const char *desc);
++EVP_PKEY *load_keyparams_suppress(const char *uri, int format, int maybe_stdin,
++                                  const char *keytype, const char *desc,
++                                  int suppress_decode_errors);
+ char *next_item(char *opt); /* in list separated by comma and/or space */
+ int load_cert_certs(const char *uri,
+                     X509 **pcert, STACK_OF(X509) **pcerts,
+diff --git a/apps/lib/apps.c b/apps/lib/apps.c
+index 8604c75251..9aae725fc6 100644
+--- a/apps/lib/apps.c
++++ b/apps/lib/apps.c
+@@ -75,6 +75,14 @@ static int set_table_opts(unsigned long *flags, const char *arg,
+                           const NAME_EX_TBL * in_tbl);
+ static int set_multi_opts(unsigned long *flags, const char *arg,
+                           const NAME_EX_TBL * in_tbl);
++static
++int load_key_certs_crls_suppress(const char *uri, int format, int maybe_stdin,
++                                 const char *pass, const char *desc,
++                                 EVP_PKEY **ppkey, EVP_PKEY **ppubkey,
++                                 EVP_PKEY **pparams,
++                                 X509 **pcert, STACK_OF(X509) **pcerts,
++                                 X509_CRL **pcrl, STACK_OF(X509_CRL) **pcrls,
++                                 int suppress_decode_errors);
+ 
+ int app_init(long mesgwin);
+ 
+@@ -605,27 +613,37 @@ EVP_PKEY *load_pubkey(const char *uri, int format, int maybe_stdin,
+     return pkey;
+ }
+ 
+-EVP_PKEY *load_keyparams(const char *uri, int format, int maybe_stdin,
+-                         const char *keytype, const char *desc)
++EVP_PKEY *load_keyparams_suppress(const char *uri, int format, int maybe_stdin,
++                                 const char *keytype, const char *desc,
++                                 int suppress_decode_errors)
+ {
+     EVP_PKEY *params = NULL;
+ 
+     if (desc == NULL)
+         desc = &quot;key parameters&quot;;
+ 
+-    (void)load_key_certs_crls(uri, format, maybe_stdin, NULL, desc,
+-                              NULL, NULL, &amp;params, NULL, NULL, NULL, NULL);
++    (void)load_key_certs_crls_suppress(uri, format, maybe_stdin, NULL, desc,
++                                       NULL, NULL, &amp;params, NULL, NULL, NULL,
++                                       NULL, suppress_decode_errors);
+     if (params != NULL &amp;&amp; keytype != NULL &amp;&amp; !EVP_PKEY_is_a(params, keytype)) {
+-        BIO_printf(bio_err,
+-                   &quot;Unable to load %s from %s (unexpected parameters type)\n&quot;,
+-                   desc, uri);
+-        ERR_print_errors(bio_err);
++        if (!suppress_decode_errors) {
++            BIO_printf(bio_err,
++                       &quot;Unable to load %s from %s (unexpected parameters type)\n&quot;,
++                       desc, uri);
++            ERR_print_errors(bio_err);
++        }
+         EVP_PKEY_free(params);
+         params = NULL;
+     }
+     return params;
+ }
+ 
++EVP_PKEY *load_keyparams(const char *uri, int format, int maybe_stdin,
++                         const char *keytype, const char *desc)
++{
++    return load_keyparams_suppress(uri, format, maybe_stdin, keytype, desc, 0);
++}
++
+ void app_bail_out(char *fmt, ...)
+ {
+     va_list args;
+@@ -866,12 +884,14 @@ static const char *format2string(int format)
+  * In any case (also on error) the caller is responsible for freeing all members
+  * of *pcerts and *pcrls (as far as they are not NULL).
+  */
+-int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
+-                        const char *pass, const char *desc,
+-                        EVP_PKEY **ppkey, EVP_PKEY **ppubkey,
+-                        EVP_PKEY **pparams,
+-                        X509 **pcert, STACK_OF(X509) **pcerts,
+-                        X509_CRL **pcrl, STACK_OF(X509_CRL) **pcrls)
++static
++int load_key_certs_crls_suppress(const char *uri, int format, int maybe_stdin,
++                                 const char *pass, const char *desc,
++                                 EVP_PKEY **ppkey, EVP_PKEY **ppubkey,
++                                 EVP_PKEY **pparams,
++                                 X509 **pcert, STACK_OF(X509) **pcerts,
++                                 X509_CRL **pcrl, STACK_OF(X509_CRL) **pcrls,
++                                 int suppress_decode_errors)
+ {
+     PW_CB_DATA uidata;
+     OSSL_STORE_CTX *ctx = NULL;
+@@ -890,6 +910,9 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
+     OSSL_PARAM itp[2];
+     const OSSL_PARAM *params = NULL;
+ 
++    if (suppress_decode_errors)
++        ERR_set_mark();
++
+     if (ppkey != NULL) {
+         *ppkey = NULL;
+         cnt_expectations++;
+@@ -1074,12 +1097,14 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
+                 any = 1;
+             failed = &quot;CRL&quot;;
+         }
+-        if (failed != NULL)
+-            BIO_printf(bio_err, &quot;Could not read&quot;);
+-        if (any)
+-            BIO_printf(bio_err, &quot; any&quot;);
++        if (!suppress_decode_errors) {
++            if (failed != NULL)
++                BIO_printf(bio_err, &quot;Could not read&quot;);
++            if (any)
++                BIO_printf(bio_err, &quot; any&quot;);
++        }
+     }
+-    if (failed != NULL) {
++    if (!suppress_decode_errors &amp;&amp; failed != NULL) {
+         if (desc != NULL &amp;&amp; strstr(desc, failed) != NULL) {
+             BIO_printf(bio_err, &quot; %s&quot;, desc);
+         } else {
+@@ -1092,9 +1117,22 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
+         BIO_printf(bio_err, &quot;\n&quot;);
+         ERR_print_errors(bio_err);
+     }
++    if (suppress_decode_errors)
++        ERR_pop_to_mark();
+     return failed == NULL;
+ }
+ 
++int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
++                        const char *pass, const char *desc,
++                        EVP_PKEY **ppkey, EVP_PKEY **ppubkey,
++                        EVP_PKEY **pparams,
++                        X509 **pcert, STACK_OF(X509) **pcerts,
++                        X509_CRL **pcrl, STACK_OF(X509_CRL) **pcrls)
++{
++    return load_key_certs_crls_suppress(uri, format, maybe_stdin, pass, desc,
++                                        ppkey, ppubkey, pparams, pcert, pcerts,
++                                        pcrl, pcrls, 0);
++}
+ 
+ #define X509V3_EXT_UNKNOWN_MASK         (0xfL &lt;&lt; 16)
+ /* Return error for unknown extensions */
+diff --git a/apps/s_server.c b/apps/s_server.c
+index 644fe1a905..009ac5a1eb 100644
+--- a/apps/s_server.c
++++ b/apps/s_server.c
+@@ -2003,7 +2003,8 @@ int s_server_main(int argc, char *argv[])
+         if (dhfile != NULL)
+             dhpkey = load_keyparams(dhfile, FORMAT_UNDEF, 0, &quot;DH&quot;, &quot;DH parameters&quot;);
+         else if (s_cert_file != NULL)
+-            dhpkey = load_keyparams(s_cert_file, FORMAT_UNDEF, 0, &quot;DH&quot;, &quot;DH parameters&quot;);
++            dhpkey = load_keyparams_suppress(s_cert_file, FORMAT_UNDEF, 0, &quot;DH&quot;,
++                                             &quot;DH parameters&quot;, 1);
+ 
+         if (dhpkey != NULL) {
+             BIO_printf(bio_s_out, &quot;Setting temp DH parameters\n&quot;);
+@@ -2035,9 +2036,10 @@ int s_server_main(int argc, char *argv[])
+ 
+         if (ctx2 != NULL) {
+             if (dhfile != NULL) {
+-                EVP_PKEY *dhpkey2 = load_keyparams(s_cert_file2, FORMAT_UNDEF,
+-                                                   0, &quot;DH&quot;,
+-                                                   &quot;DH parameters&quot;);
++                EVP_PKEY *dhpkey2 = load_keyparams_suppress(s_cert_file2,
++                                                            FORMAT_UNDEF,
++                                                            0, &quot;DH&quot;,
++                                                            &quot;DH parameters&quot;, 1);
+ 
+                 if (dhpkey2 != NULL) {
+                     BIO_printf(bio_s_out, &quot;Setting temp DH parameters\n&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034674.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034677.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34676">[ date ]</a>
+              <a href="thread.html#34676">[ thread ]</a>
+              <a href="subject.html#34676">[ subject ]</a>
+              <a href="author.html#34676">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

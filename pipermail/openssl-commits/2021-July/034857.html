@@ -1,0 +1,668 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1625334290.317604.1791.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034856.html">
+   <LINK REL="Next"  HREF="034860.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1625334290.317604.1791.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sat Jul  3 17:44:50 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034856.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034860.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34857">[ date ]</a>
+              <a href="thread.html#34857">[ thread ]</a>
+              <a href="subject.html#34857">[ subject ]</a>
+              <a href="author.html#34857">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f40c5f2c53b9d5eec98993653c3d741b0226b697 (commit)
+       via  0550cdeb802a2462c4d59e0fc15a1f773054bc65 (commit)
+      from  a9fa32c2a082dc91fc2c2255c2ccef7dce0e9ee4 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f40c5f2c53b9d5eec98993653c3d741b0226b697
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Jul 2 12:38:18 2021 +0200
+
+    PROV &amp; STORE: Make the 'file:' store loader understand more binary formats
+    
+    The 'file:' store loader only understood DER natively.  With all the
+    whatever to key decoders gone, direct support for other binary file
+    formats are gone, and we need to recreate them for this store loader.
+    
+    With these changes, it now also understands MSBLOB and PVK files.
+    
+    As a consequence, any store loader that handles some form of open file
+    data (such as a PEM object) can now simply pass that data back via
+    OSSL_FUNC_store_load()'s object callback.  As long as libcrypto has
+    access to a decoder that can understand the data, the appropriate
+    OpenSSL object will be generated for it, even if the store loader sits
+    in a different provider than any decoder or keymgmt.
+    For example, an LDAP store loader, which typically finds diverse PEM
+    formatted blobs in the database, can simply pass those back via the
+    object callback, and let libcrypto do the rest of the work.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15981">https://github.com/openssl/openssl/pull/15981</A>)
+
+commit 0550cdeb802a2462c4d59e0fc15a1f773054bc65
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Jul 2 12:29:23 2021 +0200
+
+    PROV &amp; STORE: Don't decode keys in the 'file:' store loader
+    
+    This makes the 'file:' store loader only read the file, and only decode
+    down to a base level binary format, and simply pass that blob of data
+    back to the OSSL_FUNC_store_load() object callback.
+    
+    This offloads the decoding into specific OpenSSL types to libcrypto,
+    which takes away the issue of origins, which provider is it that holds
+    the key (or other future types of objects).
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15981">https://github.com/openssl/openssl/pull/15981</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/store/store_result.c                        |   2 +-
+ providers/implementations/storemgmt/build.info     |   2 +-
+ providers/implementations/storemgmt/file_store.c   |  89 +++----
+ .../implementations/storemgmt/file_store_any2obj.c | 261 +++++++++++++++++++++
+ .../implementations/storemgmt/file_store_der2obj.c | 109 ---------
+ .../implementations/storemgmt/file_store_local.h   |   2 +-
+ 6 files changed, 295 insertions(+), 170 deletions(-)
+ create mode 100644 providers/implementations/storemgmt/file_store_any2obj.c
+ delete mode 100644 providers/implementations/storemgmt/file_store_der2obj.c
+
+diff --git a/crypto/store/store_result.c b/crypto/store/store_result.c
+index 91c679718c..3a0dc9dfba 100644
+--- a/crypto/store/store_result.c
++++ b/crypto/store/store_result.c
+@@ -268,7 +268,7 @@ static EVP_PKEY *try_key_value(struct extracted_param_data_st *data,
+     }
+ 
+     decoderctx =
+-        OSSL_DECODER_CTX_new_for_pkey(&amp;pk, &quot;DER&quot;, data-&gt;data_structure,
++        OSSL_DECODER_CTX_new_for_pkey(&amp;pk, NULL, data-&gt;data_structure,
+                                       data-&gt;data_type, selection, libctx,
+                                       propq);
+     (void)OSSL_DECODER_CTX_set_passphrase_cb(decoderctx, cb, cbarg);
+diff --git a/providers/implementations/storemgmt/build.info b/providers/implementations/storemgmt/build.info
+index ad47fb1fe8..8e6445a4e7 100644
+--- a/providers/implementations/storemgmt/build.info
++++ b/providers/implementations/storemgmt/build.info
+@@ -3,4 +3,4 @@
+ 
+ $STORE_GOAL=../../libdefault.a
+ 
+-SOURCE[$STORE_GOAL]=file_store.c file_store_der2obj.c
++SOURCE[$STORE_GOAL]=file_store.c file_store_any2obj.c
+diff --git a/providers/implementations/storemgmt/file_store.c b/providers/implementations/storemgmt/file_store.c
+index 4f1e2de650..6ccda2b33f 100644
+--- a/providers/implementations/storemgmt/file_store.c
++++ b/providers/implementations/storemgmt/file_store.c
+@@ -419,13 +419,9 @@ void file_load_cleanup(void *construct_data)
+ 
+ static int file_setup_decoders(struct file_ctx_st *ctx)
+ {
+-    EVP_PKEY *dummy; /* for ossl_decoder_ctx_setup_for_pkey() */
+     OSSL_LIB_CTX *libctx = ossl_prov_ctx_get0_libctx(ctx-&gt;provctx);
+-    OSSL_DECODER *to_obj = NULL; /* Last resort decoder */
+-    OSSL_DECODER_INSTANCE *to_obj_inst = NULL;
+-    OSSL_DECODER_CLEANUP *old_cleanup = NULL;
+-    void *old_construct_data = NULL;
+-    int ok = 0, expect_evp_pkey = 0;
++    const OSSL_ALGORITHM *to_algo = NULL;
++    int ok = 0;
+ 
+     /* Setup for this session, so only if not already done */
+     if (ctx-&gt;_.file.decoderctx == NULL) {
+@@ -434,11 +430,6 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+             goto err;
+         }
+ 
+-        expect_evp_pkey = (ctx-&gt;expected_type == 0
+-                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PARAMS
+-                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PUBKEY
+-                           || ctx-&gt;expected_type == OSSL_STORE_INFO_PKEY);
+-
+         /* Make sure the input type is set */
+         if (!OSSL_DECODER_CTX_set_input_type(ctx-&gt;_.file.decoderctx,
+                                              ctx-&gt;_.file.input_type)) {
+@@ -446,59 +437,42 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+             goto err;
+         }
+ 
+-        /*
+-         * Create the internal last resort decoder implementation together
+-         * with a &quot;decoder instance&quot;.
+-         * The decoder doesn't need any identification or to be attached to
+-         * any provider, since it's only used locally.
+-         */
+-        to_obj = ossl_decoder_from_algorithm(0, &amp;ossl_der_to_obj_algorithm,
+-                                             NULL);
+-        if (to_obj == NULL)
+-            goto err;
+-        to_obj_inst = ossl_decoder_instance_new(to_obj, ctx-&gt;provctx);
+-        if (to_obj_inst == NULL)
+-            goto err;
++        for (to_algo = ossl_any_to_obj_algorithm;
++             to_algo-&gt;algorithm_names != NULL;
++             to_algo++) {
++            OSSL_DECODER *to_obj = NULL;
++            OSSL_DECODER_INSTANCE *to_obj_inst = NULL;
+ 
+-        if (!ossl_decoder_ctx_add_decoder_inst(ctx-&gt;_.file.decoderctx,
+-                                               to_obj_inst)) {
+-            ERR_raise(ERR_LIB_PROV, ERR_R_OSSL_DECODER_LIB);
+-            goto err;
++            /*
++             * Create the internal last resort decoder implementation
++             * together with a &quot;decoder instance&quot;.
++             * The decoder doesn't need any identification or to be
++             * attached to any provider, since it's only used locally.
++             */
++            to_obj = ossl_decoder_from_algorithm(0, to_algo, NULL);
++            if (to_obj != NULL)
++                to_obj_inst = ossl_decoder_instance_new(to_obj, ctx-&gt;provctx);
++            OSSL_DECODER_free(to_obj);
++            if (to_obj_inst == NULL)
++                goto err;
++
++            if (!ossl_decoder_ctx_add_decoder_inst(ctx-&gt;_.file.decoderctx,
++                                                   to_obj_inst)) {
++                ossl_decoder_instance_free(to_obj_inst);
++                ERR_raise(ERR_LIB_PROV, ERR_R_OSSL_DECODER_LIB);
++                goto err;
++            }
+         }
+-
+-        /*
+-         * OSSL_DECODER_INSTANCE shouldn't be freed from this point on.
+-         * That's going to happen whenever the OSSL_DECODER_CTX is freed.
+-         */
+-        to_obj_inst = NULL;
+-
+-        /*
+-         * Add on the usual decoder context for keys, with a dummy object.
+-         * Since we're setting up our own constructor, we don't need to care
+-         * more than that...
+-         */
+-        if ((expect_evp_pkey
+-             &amp;&amp; !ossl_decoder_ctx_setup_for_pkey(ctx-&gt;_.file.decoderctx,
+-                                                 &amp;dummy, NULL,
+-                                                 libctx, ctx-&gt;_.file.propq))
+-            || !OSSL_DECODER_CTX_add_extra(ctx-&gt;_.file.decoderctx,
+-                                           libctx, ctx-&gt;_.file.propq)) {
++        /* Add on the usual extra decoders */
++        if (!OSSL_DECODER_CTX_add_extra(ctx-&gt;_.file.decoderctx,
++                                        libctx, ctx-&gt;_.file.propq)) {
+             ERR_raise(ERR_LIB_PROV, ERR_R_OSSL_DECODER_LIB);
+             goto err;
+         }
+ 
+         /*
+-         * Then we throw away the installed finalizer data, and install our
+-         * own instead.
+-         */
+-        old_cleanup = OSSL_DECODER_CTX_get_cleanup(ctx-&gt;_.file.decoderctx);
+-        old_construct_data =
+-            OSSL_DECODER_CTX_get_construct_data(ctx-&gt;_.file.decoderctx);
+-        if (old_cleanup != NULL)
+-            old_cleanup(old_construct_data);
+-
+-        /*
+-         * Set the hooks.
++         * Then install our constructor hooks, which just passes decoded
++         * data to the load callback
+          */
+         if (!OSSL_DECODER_CTX_set_construct(ctx-&gt;_.file.decoderctx,
+                                             file_load_construct)
+@@ -511,7 +485,6 @@ static int file_setup_decoders(struct file_ctx_st *ctx)
+ 
+     ok = 1;
+  err:
+-    OSSL_DECODER_free(to_obj);
+     return ok;
+ }
+ 
+diff --git a/providers/implementations/storemgmt/file_store_any2obj.c b/providers/implementations/storemgmt/file_store_any2obj.c
+new file mode 100644
+index 0000000000..28601683bf
+--- /dev/null
++++ b/providers/implementations/storemgmt/file_store_any2obj.c
+@@ -0,0 +1,261 @@
++/*
++ * Copyright 2020-2021 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++/*
++ * This is a decoder that's completely internal to the 'file:' store
++ * implementation.  Only code in file_store.c know about this one.  Because
++ * of this close relationship, we can cut certain corners, such as making
++ * assumptions about the &quot;provider context&quot;, which is currently simply the
++ * provider context that the file_store.c code operates within.
++ *
++ * All this does is to read known binary encodings (currently: DER, MSBLOB,
++ * PVK) from the input if it can, and passes it on to the data callback as
++ * an object abstraction, leaving it to the callback to figure out what it
++ * actually is.
++ *
++ * This MUST be made the last decoder in a chain, leaving it to other more
++ * specialized decoders to recognise and process their stuff first.
++ */
++
++#include &lt;openssl/core_dispatch.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/core_object.h&gt;
++#include &lt;openssl/bio.h&gt;
++#include &lt;openssl/buffer.h&gt;
++#include &lt;openssl/err.h&gt;
++#include &lt;openssl/asn1err.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &quot;internal/asn1.h&quot;
++#include &quot;crypto/pem.h&quot;          /* For internal PVK and &quot;blob&quot; headers */
++#include &quot;prov/bio.h&quot;
++#include &quot;file_store_local.h&quot;
++
++/*
++ * newctx and freectx are not strictly necessary.  However, the method creator,
++ * ossl_decoder_from_algorithm(), demands that they exist, so we make sure to
++ * oblige.
++ */
++
++static OSSL_FUNC_decoder_newctx_fn any2obj_newctx;
++static OSSL_FUNC_decoder_freectx_fn any2obj_freectx;
++
++static void *any2obj_newctx(void *provctx)
++{
++    return provctx;
++}
++
++static void any2obj_freectx(void *vctx)
++{
++}
++
++static int any2obj_decode_final(void *provctx, int objtype, BUF_MEM *mem,
++                                OSSL_CALLBACK *data_cb, void *data_cbarg)
++{
++    /*
++     * 1 indicates that we successfully decoded something, or not at all.
++     * Ending up &quot;empty handed&quot; is not an error.
++     */
++    int ok = 1;
++
++    if (mem != NULL) {
++        OSSL_PARAM params[3];
++
++        params[0] =
++            OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &amp;objtype);
++        params[1] =
++            OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_DATA,
++                                              mem-&gt;data, mem-&gt;length);
++        params[2] = OSSL_PARAM_construct_end();
++
++        ok = data_cb(params, data_cbarg);
++        BUF_MEM_free(mem);
++    }
++    return ok;
++}
++
++static OSSL_FUNC_decoder_decode_fn der2obj_decode;
++static int der2obj_decode(void *provctx, OSSL_CORE_BIO *cin, int selection,
++                          OSSL_CALLBACK *data_cb, void *data_cbarg,
++                          OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
++{
++    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
++    BUF_MEM *mem = NULL;
++    int ok;
++
++    if (in == NULL)
++        return 0;
++
++    ERR_set_mark();
++    ok = (asn1_d2i_read_bio(in, &amp;mem) &gt;= 0);
++    ERR_pop_to_mark();
++    if (!ok &amp;&amp; mem != NULL) {
++        BUF_MEM_free(mem);
++        mem = NULL;
++    }
++    BIO_free(in);
++
++    /* any2obj_decode_final() frees |mem| for us */
++    return any2obj_decode_final(provctx, OSSL_OBJECT_UNKNOWN, mem,
++                                data_cb, data_cbarg);
++}
++
++static OSSL_FUNC_decoder_decode_fn msblob2obj_decode;
++static int msblob2obj_decode(void *provctx, OSSL_CORE_BIO *cin, int selection,
++                             OSSL_CALLBACK *data_cb, void *data_cbarg,
++                             OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
++{
++    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
++    BUF_MEM *mem = NULL;
++    size_t mem_len = 0, mem_want;
++    const unsigned char *p;
++    unsigned int bitlen, magic;
++    int isdss = -1;
++    int ispub = -1;
++    int ok = 0;
++
++    if (in == NULL)
++        goto err;
++
++    mem_want = 16;               /* The size of the MSBLOB header */
++    if ((mem = BUF_MEM_new()) == NULL
++        || !BUF_MEM_grow(mem, mem_want)) {
++        ERR_raise(ERR_LIB_PEM, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    ERR_set_mark();
++    ok = BIO_read(in, &amp;mem-&gt;data[0], mem_want) == (int)mem_want;
++    mem_len += mem_want;
++    ERR_pop_to_mark();
++    if (!ok)
++        goto next;
++
++
++    ERR_set_mark();
++    p = (unsigned char *)&amp;mem-&gt;data[0];
++    ok = ossl_do_blob_header(&amp;p, 16, &amp;magic, &amp;bitlen, &amp;isdss, &amp;ispub) &gt; 0;
++    ERR_pop_to_mark();
++    if (!ok)
++        goto next;
++
++    ok = 0;
++    mem_want = ossl_blob_length(bitlen, isdss, ispub);
++    if (!BUF_MEM_grow(mem, mem_len + mem_want)) {
++        ERR_raise(ERR_LIB_PEM, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    ERR_set_mark();
++    ok = BIO_read(in, &amp;mem-&gt;data[mem_len], mem_want) == (int)mem_want;
++    mem_len += mem_want;
++    ERR_pop_to_mark();
++
++ next:
++    /* Free resources we no longer need. */
++    BIO_free(in);
++    if (!ok &amp;&amp; mem != NULL) {
++        BUF_MEM_free(mem);
++        mem = NULL;
++    }
++
++    /* any2obj_decode_final() frees |mem| for us */
++    return any2obj_decode_final(provctx, OSSL_OBJECT_PKEY, mem,
++                                data_cb, data_cbarg);
++
++ err:
++    BIO_free(in);
++    BUF_MEM_free(mem);
++    return 0;
++}
++
++static OSSL_FUNC_decoder_decode_fn pvk2obj_decode;
++static int pvk2obj_decode(void *provctx, OSSL_CORE_BIO *cin, int selection,
++                             OSSL_CALLBACK *data_cb, void *data_cbarg,
++                             OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
++{
++    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
++    BUF_MEM *mem = NULL;
++    size_t mem_len = 0, mem_want;
++    const unsigned char *p;
++    unsigned int saltlen, keylen;
++    int ok = 0;
++
++    if (in == NULL)
++        goto err;
++
++    mem_want = 24;               /* The size of the PVK header */
++    if ((mem = BUF_MEM_new()) == NULL
++        || !BUF_MEM_grow(mem, mem_want)) {
++        ERR_raise(ERR_LIB_PEM, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    ERR_set_mark();
++    ok = BIO_read(in, &amp;mem-&gt;data[0], mem_want) == (int)mem_want;
++    mem_len += mem_want;
++    ERR_pop_to_mark();
++    if (!ok)
++        goto next;
++
++
++    ERR_set_mark();
++    p = (unsigned char *)&amp;mem-&gt;data[0];
++    ok = ossl_do_PVK_header(&amp;p, 24, 0, &amp;saltlen, &amp;keylen) &gt; 0;
++    ERR_pop_to_mark();
++    if (!ok)
++        goto next;
++
++    ok = 0;
++    mem_want = saltlen + keylen;
++    if (!BUF_MEM_grow(mem, mem_len + mem_want)) {
++        ERR_raise(ERR_LIB_PEM, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    ERR_set_mark();
++    ok = BIO_read(in, &amp;mem-&gt;data[mem_len], mem_want) == (int)mem_want;
++    mem_len += mem_want;
++    ERR_pop_to_mark();
++
++ next:
++    /* Free resources we no longer need. */
++    BIO_free(in);
++    if (!ok &amp;&amp; mem != NULL) {
++        BUF_MEM_free(mem);
++        mem = NULL;
++    }
++
++    /* any2obj_decode_final() frees |mem| for us */
++    return any2obj_decode_final(provctx, OSSL_OBJECT_PKEY, mem,
++                                data_cb, data_cbarg);
++
++ err:
++    BIO_free(in);
++    BUF_MEM_free(mem);
++    return 0;
++}
++
++#define MAKE_DECODER(fromtype, objtype)                                      \
++    static const OSSL_DISPATCH fromtype##_to_obj_decoder_functions[] = {     \
++        { OSSL_FUNC_DECODER_NEWCTX, (void (*)(void))any2obj_newctx },        \
++        { OSSL_FUNC_DECODER_FREECTX, (void (*)(void))any2obj_freectx },      \
++        { OSSL_FUNC_DECODER_DECODE, (void (*)(void))fromtype##2obj_decode }, \
++        { 0, NULL }                                                          \
++    }
++
++MAKE_DECODER(der, OSSL_OBJECT_UNKNOWN);
++MAKE_DECODER(msblob, OSSL_OBJECT_PKEY);
++MAKE_DECODER(pvk, OSSL_OBJECT_PKEY);
++
++const OSSL_ALGORITHM ossl_any_to_obj_algorithm[] = {
++    { &quot;obj&quot;, &quot;input=DER&quot;, der_to_obj_decoder_functions },
++    { &quot;obj&quot;, &quot;input=MSBLOB&quot;, msblob_to_obj_decoder_functions },
++    { &quot;obj&quot;, &quot;input=PVK&quot;, pvk_to_obj_decoder_functions },
++    { NULL, }
++};
+diff --git a/providers/implementations/storemgmt/file_store_der2obj.c b/providers/implementations/storemgmt/file_store_der2obj.c
+deleted file mode 100644
+index 5f71ea500d..0000000000
+--- a/providers/implementations/storemgmt/file_store_der2obj.c
++++ /dev/null
+@@ -1,109 +0,0 @@
+-/*
+- * Copyright 2020-2021 The OpenSSL Project Authors. All Rights Reserved.
+- *
+- * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+- * this file except in compliance with the License.  You can obtain a copy
+- * in the file LICENSE in the source distribution or at
+- * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+- */
+-
+-/*
+- * This is a decoder that's completely internal to the 'file:' store
+- * implementation.  Only code in file_store.c know about this one.  Because
+- * of this close relationship, we can cut certain corners, such as making
+- * assumptions about the &quot;provider context&quot;, which is currently simply the
+- * provider context that the file_store.c code operates within.
+- *
+- * All this does is to read DER from the input if it can, and passes it on
+- * to the data callback as an object abstraction, leaving it to the callback
+- * to figure out what it actually is.
+- *
+- * This MUST be made the last decoder in a chain, leaving it to other more
+- * specialized decoders to recognise and process their stuff first.
+- */
+-
+-#include &lt;openssl/core_dispatch.h&gt;
+-#include &lt;openssl/core_names.h&gt;
+-#include &lt;openssl/core_object.h&gt;
+-#include &lt;openssl/bio.h&gt;
+-#include &lt;openssl/buffer.h&gt;
+-#include &lt;openssl/err.h&gt;
+-#include &lt;openssl/asn1err.h&gt;
+-#include &lt;openssl/params.h&gt;
+-#include &quot;internal/asn1.h&quot;
+-#include &quot;prov/bio.h&quot;
+-#include &quot;file_store_local.h&quot;
+-
+-/*
+- * newctx and freectx are not strictly necessary.  However, the method creator,
+- * ossl_decoder_from_algorithm(), demands that they exist, so we make sure to
+- * oblige.
+- */
+-
+-static OSSL_FUNC_decoder_newctx_fn der2obj_newctx;
+-static OSSL_FUNC_decoder_freectx_fn der2obj_freectx;
+-
+-static void *der2obj_newctx(void *provctx)
+-{
+-    return provctx;
+-}
+-
+-static void der2obj_freectx(void *vctx)
+-{
+-}
+-
+-static OSSL_FUNC_decoder_decode_fn der2obj_decode;
+-
+-static int der2obj_decode(void *provctx, OSSL_CORE_BIO *cin, int selection,
+-                          OSSL_CALLBACK *data_cb, void *data_cbarg,
+-                          OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
+-{
+-    /*
+-     * We're called from file_store.c, so we know that OSSL_CORE_BIO is a
+-     * BIO in this case.
+-     */
+-    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
+-    BUF_MEM *mem = NULL;
+-    int ok;
+-
+-    if (in == NULL)
+-        return 0;
+-
+-    ERR_set_mark();
+-    ok = (asn1_d2i_read_bio(in, &amp;mem) &gt;= 0);
+-    ERR_pop_to_mark();
+-    if (!ok &amp;&amp; mem != NULL) {
+-        OPENSSL_free(mem-&gt;data);
+-        OPENSSL_free(mem);
+-        mem = NULL;
+-    }
+-
+-    ok = 1;
+-    if (mem != NULL) {
+-        OSSL_PARAM params[3];
+-        int object_type = OSSL_OBJECT_UNKNOWN;
+-
+-        params[0] =
+-            OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &amp;object_type);
+-        params[1] =
+-            OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_DATA,
+-                                              mem-&gt;data, mem-&gt;length);
+-        params[2] = OSSL_PARAM_construct_end();
+-
+-        ok = data_cb(params, data_cbarg);
+-        OPENSSL_free(mem-&gt;data);
+-        OPENSSL_free(mem);
+-    }
+-    BIO_free(in);
+-    return ok;
+-}
+-
+-static const OSSL_DISPATCH der_to_obj_decoder_functions[] = {
+-    { OSSL_FUNC_DECODER_NEWCTX, (void (*)(void))der2obj_newctx },
+-    { OSSL_FUNC_DECODER_FREECTX, (void (*)(void))der2obj_freectx },
+-    { OSSL_FUNC_DECODER_DECODE, (void (*)(void))der2obj_decode },
+-    { 0, NULL }
+-};
+-
+-const OSSL_ALGORITHM ossl_der_to_obj_algorithm =
+-    { &quot;obj&quot;, &quot;input=DER&quot;, der_to_obj_decoder_functions };
+diff --git a/providers/implementations/storemgmt/file_store_local.h b/providers/implementations/storemgmt/file_store_local.h
+index b25dacc18b..3459315948 100644
+--- a/providers/implementations/storemgmt/file_store_local.h
++++ b/providers/implementations/storemgmt/file_store_local.h
+@@ -7,5 +7,5 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-extern const OSSL_ALGORITHM ossl_der_to_obj_algorithm;
++extern const OSSL_ALGORITHM ossl_any_to_obj_algorithm[];
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034856.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034860.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34857">[ date ]</a>
+              <a href="thread.html#34857">[ thread ]</a>
+              <a href="subject.html#34857">[ subject ]</a>
+              <a href="author.html#34857">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

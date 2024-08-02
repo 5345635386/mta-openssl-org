@@ -1,0 +1,341 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461617881.981759.13336.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006638.html">
+   <LINK REL="Next"  HREF="006668.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461617881.981759.13336.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Mon Apr 25 20:58:01 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006638.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="006668.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6639">[ date ]</a>
+              <a href="thread.html#6639">[ thread ]</a>
+              <a href="subject.html#6639">[ subject ]</a>
+              <a href="author.html#6639">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dc3c5067cd90f3f2159e5d53c57b92730c687d7e (commit)
+      from  5a6694e30340d36fcf0b1dd349a7373010fb2524 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dc3c5067cd90f3f2159e5d53c57b92730c687d7e
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Apr 15 16:30:29 2016 +0200
+
+    crypto/poly1305/asm: chase overflow bit on x86 and ARM platforms.
+    
+    Even though no test could be found to trigger this, paper-n-pencil
+    estimate suggests that x86 and ARM inner loop lazy reductions can
+    loose a bit in H4&gt;&gt;*5+H0 step.
+    
+    Reviewed-by: Emilia K&#228;sper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/poly1305/asm/poly1305-armv4.pl | 57 ++++++++++++++++++++++++++++++++---
+ crypto/poly1305/asm/poly1305-armv8.pl | 32 +++++++++++---------
+ crypto/poly1305/asm/poly1305-x86.pl   |  5 +--
+ crypto/poly1305/poly1305.c            | 18 ++++++++++-
+ 4 files changed, 89 insertions(+), 23 deletions(-)
+
+diff --git a/crypto/poly1305/asm/poly1305-armv4.pl b/crypto/poly1305/asm/poly1305-armv4.pl
+index aa3f228..95e2133 100755
+--- a/crypto/poly1305/asm/poly1305-armv4.pl
++++ b/crypto/poly1305/asm/poly1305-armv4.pl
+@@ -10,7 +10,7 @@
+ #			IALU(*)/gcc-4.4		NEON
+ #
+ # ARM11xx(ARMv6)	7.78/+100%		-
+-# Cortex-A5		6.35/+130%		2.96
++# Cortex-A5		6.35/+130%		3.00
+ # Cortex-A8		6.25/+115%		2.36
+ # Cortex-A9		5.10/+95%		2.55
+ # Cortex-A15		3.85/+85%		1.25(**)
+@@ -523,6 +523,51 @@ poly1305_init_neon:
+ 	@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+ 	@ lazy reduction as discussed in &quot;NEON crypto&quot; by D.J. Bernstein
+ 	@ and P. Schwabe
++	@
++	@ H0&gt;&gt;+H1&gt;&gt;+H2&gt;&gt;+H3&gt;&gt;+H4
++	@ H3&gt;&gt;+H4&gt;&gt;*5+H0&gt;&gt;+H1
++	@
++	@ Trivia.
++	@
++	@ Result of multiplication of n-bit number by m-bit number is
++	@ n+m bits wide. However! Even though 2^n is a n+1-bit number,
++	@ m-bit number multiplied by 2^n is still n+m bits wide.
++	@
++	@ Sum of two n-bit numbers is n+1 bits wide, sum of three - n+2,
++	@ and so is sum of four. Sum of 2^m n-m-bit numbers and n-bit
++	@ one is n+1 bits wide.
++	@
++	@ &gt;&gt;+ denotes Hnext += Hn&gt;&gt;26, Hn &amp;= 0x3ffffff. This means that
++	@ H0, H2, H3 are guaranteed to be 26 bits wide, while H1 and H4
++	@ can be 27. However! In cases when their width exceeds 26 bits
++	@ they are limited by 2^26+2^6. This in turn means that *sum*
++	@ of the products with these values can still be viewed as sum
++	@ of 52-bit numbers as long as the amount of addends is not a
++	@ power of 2. For example,
++	@
++	@ H4 = H4*R0 + H3*R1 + H2*R2 + H1*R3 + H0 * R4,
++	@
++	@ which can't be larger than 5 * (2^26 + 2^6) * (2^26 + 2^6), or
++	@ 5 * (2^52 + 2*2^32 + 2^12), which in turn is smaller than
++	@ 8 * (2^52) or 2^55. However, the value is then multiplied by
++	@ by 5, so we should be looking at 5 * 5 * (2^52 + 2^33 + 2^12),
++	@ which is less than 32 * (2^52) or 2^57. And when processing
++	@ data we are looking at triple as many addends...
++	@
++	@ In key setup procedure pre-reduced H0 is limited by 5*4+1 and
++	@ 5*H4 - by 5*5 52-bit addends, or 57 bits. But when hashing the
++	@ input H0 is limited by (5*4+1)*3 addends, or 58 bits, while
++	@ 5*H4 by 5*5*3, or 59[!] bits. How is this relevant? vmlal.u32
++	@ instruction accepts 2x32-bit input and writes 2x64-bit result.
++	@ This means that result of reduction have to be compressed upon
++	@ loop wrap-around. This can be done in the process of reduction
++	@ to minimize amount of instructions [as well as amount of
++	@ 128-bit instructions, which benefits low-end processors], but
++	@ one has to watch for H2 (which is narrower than H0) and 5*H4
++	@ not being wider than 58 bits, so that result of right shift
++	@ by 26 bits fits in 32 bits. This is also useful on x86,
++	@ because it allows to use paddd in place for paddq, which
++	@ benefits Atom, where paddq is ridiculously slow.
+ 
+ 	vshr.u64	$T0,$D3,#26
+ 	vmovn.i64	$D3#lo,$D3
+@@ -887,7 +932,8 @@ poly1305_blocks_neon:
+ # endif
+ 
+ 	@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+-	@ lazy reduction interleaved with base 2^32 -&gt; base 2^26
++	@ lazy reduction interleaved with base 2^32 -&gt; base 2^26 of
++	@ inp[0:3] previously loaded to $H0-$H3 and smashed to $H0-$H4.
+ 
+ 	vshr.u64	$T0,$D3,#26
+ 	vmovn.i64	$D3#lo,$D3
+@@ -915,19 +961,20 @@ poly1305_blocks_neon:
+ 	  vbic.i32	$H3,#0xfc000000
+ 	 vshrn.u64	$T1#lo,$D2,#26
+ 	 vmovn.i64	$D2#lo,$D2
+-	vadd.i32	$D0#lo,$D0#lo,$T0#lo	@ h4 -&gt; h0
++	vaddl.u32	$D0,$D0#lo,$T0#lo	@ h4 -&gt; h0 [widen for a sec]
+ 	  vsri.u32	$H2,$H1,#20
+ 	 vadd.i32	$D3#lo,$D3#lo,$T1#lo	@ h2 -&gt; h3
+ 	  vshl.u32	$H1,$H1,#6
+ 	 vbic.i32	$D2#lo,#0xfc000000
+ 	  vbic.i32	$H2,#0xfc000000
+ 
+-	vshr.u32	$T0#lo,$D0#lo,#26
+-	vbic.i32	$D0#lo,#0xfc000000
++	vshrn.u64	$T0#lo,$D0,#26		@ re-narrow
++	vmovn.i64	$D0#lo,$D0
+ 	  vsri.u32	$H1,$H0,#26
+ 	  vbic.i32	$H0,#0xfc000000
+ 	 vshr.u32	$T1#lo,$D3#lo,#26
+ 	 vbic.i32	$D3#lo,#0xfc000000
++	vbic.i32	$D0#lo,#0xfc000000
+ 	vadd.i32	$D1#lo,$D1#lo,$T0#lo	@ h0 -&gt; h1
+ 	 vadd.i32	$D4#lo,$D4#lo,$T1#lo	@ h3 -&gt; h4
+ 	  vbic.i32	$H1,#0xfc000000
+diff --git a/crypto/poly1305/asm/poly1305-armv8.pl b/crypto/poly1305/asm/poly1305-armv8.pl
+index 2e1dae3..928d3cf 100755
+--- a/crypto/poly1305/asm/poly1305-armv8.pl
++++ b/crypto/poly1305/asm/poly1305-armv8.pl
+@@ -19,7 +19,7 @@
+ # Cortex-A53	2.69/+58%	1.47
+ # Cortex-A57	2.70/+7%	1.14
+ # Denver	1.64/+50%	1.18(*)
+-# X-Gene	2.13/+68%	2.19
++# X-Gene	2.13/+68%	2.27
+ #
+ # (*)	estimate based on resources availability is less than 1.0,
+ #	i.e. measured result is worse than expected, presumably binary
+@@ -507,9 +507,11 @@ poly1305_blocks_neon:
+ 	fmov	$IN01_1,x6
+ 	add	x10,x10,x11,lsl#32	// bfi	x10,x11,#32,#32
+ 	add	x12,x12,x13,lsl#32	// bfi	x12,x13,#32,#32
++	movi	$MASK.2d,#-1
+ 	fmov	$IN01_2,x8
+ 	fmov	$IN01_3,x10
+ 	fmov	$IN01_4,x12
++	ushr	$MASK.2d,$MASK.2d,#38
+ 
+ 	b.ls	.Lskip_loop
+ 
+@@ -660,41 +662,43 @@ poly1305_blocks_neon:
+ 	 fmov	$IN01_2,x8
+ 	umlal	$ACC2,$IN01_4,${S3}[0]
+ 	 fmov	$IN01_3,x10
++	 fmov	$IN01_4,x12
+ 
+ 	/////////////////////////////////////////////////////////////////
+ 	// lazy reduction as discussed in &quot;NEON crypto&quot; by D.J. Bernstein
+-        // and P. Schwabe
++	// and P. Schwabe
++	//
++	// [see discussion in poly1305-armv4 module]
+ 
+ 	ushr	$T0.2d,$ACC3,#26
+-	 fmov	$IN01_4,x12
+ 	xtn	$H3,$ACC3
+ 	 ushr	$T1.2d,$ACC0,#26
+-	 xtn	$H0,$ACC0
++	 and	$ACC0,$ACC0,$MASK.2d
+ 	add	$ACC4,$ACC4,$T0.2d	// h3 -&gt; h4
+ 	bic	$H3,#0xfc,lsl#24	// &amp;=0x03ffffff
+ 	 add	$ACC1,$ACC1,$T1.2d	// h0 -&gt; h1
+-	 bic	$H0,#0xfc,lsl#24
+ 
+-	shrn	$T0.2s,$ACC4,#26
++	ushr	$T0.2d,$ACC4,#26
+ 	xtn	$H4,$ACC4
+ 	 ushr	$T1.2d,$ACC1,#26
+ 	 xtn	$H1,$ACC1
+-	 add	$ACC2,$ACC2,$T1.2d	// h1 -&gt; h2
+ 	bic	$H4,#0xfc,lsl#24
+-	 bic	$H1,#0xfc,lsl#24
++	 add	$ACC2,$ACC2,$T1.2d	// h1 -&gt; h2
+ 
+-	add	$H0,$H0,$T0.2s
+-	shl	$T0.2s,$T0.2s,#2
++	add	$ACC0,$ACC0,$T0.2d
++	shl	$T0.2d,$T0.2d,#2
+ 	 shrn	$T1.2s,$ACC2,#26
+ 	 xtn	$H2,$ACC2
+-	add	$H0,$H0,$T0.2s		// h4 -&gt; h0
++	add	$ACC0,$ACC0,$T0.2d	// h4 -&gt; h0
++	 bic	$H1,#0xfc,lsl#24
+ 	 add	$H3,$H3,$T1.2s		// h2 -&gt; h3
+ 	 bic	$H2,#0xfc,lsl#24
+ 
+-	ushr	$T0.2s,$H0,#26
+-	bic	$H0,#0xfc,lsl#24
++	shrn	$T0.2s,$ACC0,#26
++	xtn	$H0,$ACC0
+ 	 ushr	$T1.2s,$H3,#26
+ 	 bic	$H3,#0xfc,lsl#24
++	 bic	$H0,#0xfc,lsl#24
+ 	add	$H1,$H1,$T0.2s		// h0 -&gt; h1
+ 	 add	$H4,$H4,$T1.2s		// h3 -&gt; h4
+ 
+@@ -702,9 +706,7 @@ poly1305_blocks_neon:
+ 
+ .Lskip_loop:
+ 	dup	$IN23_2,${IN23_2}[0]
+-	movi	$MASK.2d,#-1
+ 	add	$IN01_2,$IN01_2,$H2
+-	ushr	$MASK.2d,$MASK.2d,#38
+ 
+ 	////////////////////////////////////////////////////////////////
+ 	// multiply (inp[0:1]+hash) or inp[2:3] by r^2:r^1
+diff --git a/crypto/poly1305/asm/poly1305-x86.pl b/crypto/poly1305/asm/poly1305-x86.pl
+index 97d0a81..cf521c2 100755
+--- a/crypto/poly1305/asm/poly1305-x86.pl
++++ b/crypto/poly1305/asm/poly1305-x86.pl
+@@ -541,11 +541,12 @@ my $base = shift; $base = &quot;esp&quot; if (!defined($base));
+ 
+ sub lazy_reduction {
+ my $extra = shift;
+-my $paddx = defined($extra) ? paddq : paddd;
+ 
+ 	################################################################
+ 	# lazy reduction as discussed in &quot;NEON crypto&quot; by D.J. Bernstein
+ 	# and P. Schwabe
++	#
++	# [(*) see discussion in poly1305-armv4 module]
+ 
+ 	 &amp;movdqa	($T0,$D3);
+ 	 &amp;pand		($D3,$MASK);
+@@ -567,7 +568,7 @@ my $paddx = defined($extra) ? paddq : paddd;
+ 							# on Atom
+ 	 &amp;psllq		($T0,2);
+ 	&amp;paddq		($T1,$D2);			# h1 -&gt; h2
+-	 &amp;$paddx	($T0,$D0);			# h4 -&gt; h0
++	 &amp;paddq		($T0,$D0);			# h4 -&gt; h0 (*)
+ 	&amp;pand		($D1,$MASK);
+ 	&amp;movdqa		($D2,$T1);
+ 	&amp;psrlq		($T1,26);
+diff --git a/crypto/poly1305/poly1305.c b/crypto/poly1305/poly1305.c
+index 6bec8b3..2a766b3 100644
+--- a/crypto/poly1305/poly1305.c
++++ b/crypto/poly1305/poly1305.c
+@@ -590,7 +590,8 @@ static const struct poly1305_test poly1305_tests[] = {
+      &quot;5154ad0d2cb26e01274fc51148491f1b&quot;
+     },
+     /*
+-     * self-generated
++     * self-generated vectors exercise &quot;significant&quot; lengths, such that
++     * are handled by different code paths
+      */
+     {
+      &quot;ab0812724a7f1e342742cbed374d94d136c6b8795d45b3819830f2c04491faf0&quot;
+@@ -672,6 +673,21 @@ static const struct poly1305_test poly1305_tests[] = {
+      &quot;12976a08c4426d0ce8a82407c4f48207&quot;&quot;80f8c20aa71202d1e29179cbcb555a57&quot;,
+      &quot;b846d44e9bbd53cedffbfbb6b7fa4933&quot;
+     },
++    /*
++     * 4th power of the key spills to 131th bit in SIMD key setup
++     */
++    {
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;
++     &quot;ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff&quot;,
++     &quot;ad628107e8351d0f2c231a05dc4a4106&quot;&quot;00000000000000000000000000000000&quot;,
++     &quot;07145a4c02fe5fa32036de68fabe9066&quot;
++    },
+     {
+     /*
+      * poly1305_ieee754.c failed this in final stage
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006638.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="006668.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6639">[ date ]</a>
+              <a href="thread.html#6639">[ thread ]</a>
+              <a href="subject.html#6639">[ subject ]</a>
+              <a href="author.html#6639">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

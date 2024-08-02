@@ -1,0 +1,935 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596960496.823252.22971.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030065.html">
+   <LINK REL="Next"  HREF="030073.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1596960496.823252.22971.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Sun Aug  9 08:08:16 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030065.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030073.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30068">[ date ]</a>
+              <a href="thread.html#30068">[ thread ]</a>
+              <a href="subject.html#30068">[ subject ]</a>
+              <a href="author.html#30068">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  04cb5ec0b74896fe806625ac4d87e3396890f246 (commit)
+      from  dda4e259e51aeaf05a2417ef577accf778c9f6f6 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 04cb5ec0b74896fe806625ac4d87e3396890f246
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Sun Aug 9 18:06:52 2020 +1000
+
+    Add 'on demand self test' and status test to providers
+    
+    The default and legacy providers currently return 1 for status and self test checks.
+    Added test to show the 3 different stages the self test can be run (for installation, loading and on demand).
+    
+    For the fips provider:
+      - If the on demand self test fails, then any subsequent fetches should also fail. To implement this the
+        cached algorithms are flushed on failure.
+      - getting the self test callback in the fips provider is a bit complicated since the callback hangs off the core
+        libctx (as it is set by the application) not the actual fips library context. Also the callback can be set at
+        any time not just during the OSSL_provider_init() so it is calculated each time before doing any self test.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11752">https://github.com/openssl/openssl/pull/11752</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_fetch.c                             |  11 +-
+ crypto/property/property.c                         |  21 ++-
+ crypto/provider.c                                  |   6 +
+ crypto/provider_core.c                             |  19 ++-
+ crypto/sparse_array.c                              |   2 +-
+ doc/man3/OSSL_PROVIDER.pod                         |  14 +-
+ doc/man7/provider-base.pod                         |  11 ++
+ include/crypto/evp.h                               |   1 +
+ include/internal/property.h                        |   3 +-
+ include/internal/provider.h                        |   1 +
+ include/openssl/core_dispatch.h                    |   2 +
+ include/openssl/core_names.h                       |   1 +
+ include/openssl/provider.h                         |   1 +
+ providers/defltprov.c                              |   4 +-
+ providers/fips/fipsprov.c                          |  56 +++++--
+ providers/fips/self_test.c                         |   7 +
+ providers/fips/self_test.h                         |   1 +
+ providers/legacyprov.c                             |   4 +-
+ test/build.info                                    |   6 +-
+ test/provider_status_test.c                        | 185 +++++++++++++++++++++
+ .../{30-test_acvp.t =&gt; 30-test_provider_status.t}  |  26 +--
+ util/libcrypto.num                                 |   1 +
+ 22 files changed, 338 insertions(+), 45 deletions(-)
+ create mode 100644 test/provider_status_test.c
+ copy test/recipes/{30-test_acvp.t =&gt; 30-test_provider_status.t} (59%)
+
+diff --git a/crypto/evp/evp_fetch.c b/crypto/evp/evp_fetch.c
+index 5cb59d98fc..4c3992ab40 100644
+--- a/crypto/evp/evp_fetch.c
++++ b/crypto/evp/evp_fetch.c
+@@ -17,6 +17,7 @@
+ #include &quot;internal/core.h&quot;
+ #include &quot;internal/provider.h&quot;
+ #include &quot;internal/namemap.h&quot;
++#include &quot;internal/property.h&quot;
+ #include &quot;crypto/evp.h&quot;    /* evp_local.h needs it */
+ #include &quot;evp_local.h&quot;
+ 
+@@ -368,6 +369,14 @@ void *evp_generic_fetch_by_number(OPENSSL_CTX *libctx, int operation_id,
+     return ret;
+ }
+ 
++void evp_method_store_flush(OPENSSL_CTX *libctx)
++{
++    OSSL_METHOD_STORE *store = get_evp_method_store(libctx);
++
++    if (store != NULL)
++        ossl_method_store_flush_cache(store, 1);
++}
++
+ static int evp_set_default_properties(OPENSSL_CTX *libctx,
+                                       OSSL_PROPERTY_LIST *def_prop)
+ {
+@@ -378,7 +387,7 @@ static int evp_set_default_properties(OPENSSL_CTX *libctx,
+         ossl_property_free(*plp);
+         *plp = def_prop;
+         if (store != NULL)
+-            ossl_method_store_flush_cache(store);
++            ossl_method_store_flush_cache(store, 0);
+         return 1;
+     }
+     EVPerr(0, ERR_R_INTERNAL_ERROR);
+diff --git a/crypto/property/property.c b/crypto/property/property.c
+index 645e361b0a..cb82f8956b 100644
+--- a/crypto/property/property.c
++++ b/crypto/property/property.c
+@@ -394,10 +394,19 @@ fin:
+     return ret;
+ }
+ 
+-static void impl_cache_flush_alg(ossl_uintmax_t idx, ALGORITHM *alg)
++static void impl_cache_flush_alg(ossl_uintmax_t idx, ALGORITHM *alg, void *arg)
+ {
++    SPARSE_ARRAY_OF(ALGORITHM) *algs = arg;
++
+     lh_QUERY_doall(alg-&gt;cache, &amp;impl_cache_free);
+-    lh_QUERY_flush(alg-&gt;cache);
++    if (algs != NULL) {
++        sk_IMPLEMENTATION_pop_free(alg-&gt;impls, &amp;impl_free);
++        lh_QUERY_free(alg-&gt;cache);
++        OPENSSL_free(alg);
++        ossl_sa_ALGORITHM_set(algs, idx, NULL);
++    } else {
++        lh_QUERY_flush(alg-&gt;cache);
++    }
+ }
+ 
+ static void ossl_method_cache_flush(OSSL_METHOD_STORE *store, int nid)
+@@ -406,14 +415,16 @@ static void ossl_method_cache_flush(OSSL_METHOD_STORE *store, int nid)
+ 
+     if (alg != NULL) {
+         store-&gt;nelem -= lh_QUERY_num_items(alg-&gt;cache);
+-        impl_cache_flush_alg(0, alg);
++        impl_cache_flush_alg(0, alg, NULL);
+     }
+ }
+ 
+-void ossl_method_store_flush_cache(OSSL_METHOD_STORE *store)
++void ossl_method_store_flush_cache(OSSL_METHOD_STORE *store, int all)
+ {
++    void *arg = (all != 0 ? store-&gt;algs : NULL);
++
+     ossl_property_write_lock(store);
+-    ossl_sa_ALGORITHM_doall(store-&gt;algs, &amp;impl_cache_flush_alg);
++    ossl_sa_ALGORITHM_doall_arg(store-&gt;algs, &amp;impl_cache_flush_alg, arg);
+     store-&gt;nelem = 0;
+     ossl_property_unlock(store);
+ }
+diff --git a/crypto/provider.c b/crypto/provider.c
+index 8646aef771..40c837d8c0 100644
+--- a/crypto/provider.c
++++ b/crypto/provider.c
+@@ -10,6 +10,7 @@
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/cryptoerr.h&gt;
+ #include &lt;openssl/provider.h&gt;
++#include &lt;openssl/core_names.h&gt;
+ #include &quot;internal/provider.h&quot;
+ 
+ OSSL_PROVIDER *OSSL_PROVIDER_load(OPENSSL_CTX *libctx, const char *name)
+@@ -69,6 +70,11 @@ void *OSSL_PROVIDER_get0_provider_ctx(const OSSL_PROVIDER *prov)
+     return ossl_provider_prov_ctx(prov);
+ }
+ 
++int OSSL_PROVIDER_self_test(const OSSL_PROVIDER *prov)
++{
++    return ossl_provider_self_test(prov);
++}
++
+ int OSSL_PROVIDER_get_capabilities(const OSSL_PROVIDER *prov,
+                                    const char *capability,
+                                    OSSL_CALLBACK *cb,
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 79c330383c..4b5b013608 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -14,6 +14,7 @@
+ #include &lt;openssl/params.h&gt;
+ #include &lt;openssl/opensslv.h&gt;
+ #include &quot;crypto/cryptlib.h&quot;
++#include &quot;crypto/evp.h&quot; /* evp_method_store_flush */
+ #include &quot;internal/nelem.h&quot;
+ #include &quot;internal/thread_once.h&quot;
+ #include &quot;internal/provider.h&quot;
+@@ -71,6 +72,7 @@ struct ossl_provider_st {
+     OSSL_FUNC_provider_gettable_params_fn *gettable_params;
+     OSSL_FUNC_provider_get_params_fn *get_params;
+     OSSL_FUNC_provider_get_capabilities_fn *get_capabilities;
++    OSSL_FUNC_provider_self_test_fn *self_test;
+     OSSL_FUNC_provider_query_operation_fn *query_operation;
+ 
+     /*
+@@ -544,6 +546,10 @@ static int provider_activate(OSSL_PROVIDER *prov)
+             prov-&gt;get_params =
+                 OSSL_FUNC_provider_get_params(provider_dispatch);
+             break;
++        case OSSL_FUNC_PROVIDER_SELF_TEST:
++            prov-&gt;self_test =
++                OSSL_FUNC_provider_self_test(provider_dispatch);
++            break;
+         case OSSL_FUNC_PROVIDER_GET_CAPABILITIES:
+             prov-&gt;get_capabilities =
+                 OSSL_FUNC_provider_get_capabilities(provider_dispatch);
+@@ -824,6 +830,18 @@ int ossl_provider_get_params(const OSSL_PROVIDER *prov, OSSL_PARAM params[])
+         ? 0 : prov-&gt;get_params(prov-&gt;provctx, params);
+ }
+ 
++int ossl_provider_self_test(const OSSL_PROVIDER *prov)
++{
++    int ret;
++
++    if (prov-&gt;self_test == NULL)
++        return 1;
++    ret = prov-&gt;self_test(prov-&gt;provctx);
++    if (ret == 0)
++        evp_method_store_flush(ossl_provider_library_context(prov));
++    return ret;
++}
++
+ int ossl_provider_get_capabilities(const OSSL_PROVIDER *prov,
+                                    const char *capability,
+                                    OSSL_CALLBACK *cb,
+@@ -833,7 +851,6 @@ int ossl_provider_get_capabilities(const OSSL_PROVIDER *prov,
+         ? 1 : prov-&gt;get_capabilities(prov-&gt;provctx, capability, cb, arg);
+ }
+ 
+-
+ const OSSL_ALGORITHM *ossl_provider_query_operation(const OSSL_PROVIDER *prov,
+                                                     int operation_id,
+                                                     int *no_cache)
+diff --git a/crypto/sparse_array.c b/crypto/sparse_array.c
+index 9d444739f5..69a56db01c 100644
+--- a/crypto/sparse_array.c
++++ b/crypto/sparse_array.c
+@@ -162,7 +162,7 @@ void *OPENSSL_SA_get(const OPENSSL_SA *sa, ossl_uintmax_t n)
+     int level;
+     void **p, *r = NULL;
+ 
+-    if (sa == NULL)
++    if (sa == NULL || sa-&gt;nelem == 0)
+         return NULL;
+ 
+     if (n &lt;= sa-&gt;top) {
+diff --git a/doc/man3/OSSL_PROVIDER.pod b/doc/man3/OSSL_PROVIDER.pod
+index 63633842fa..6a1fdd204e 100644
+--- a/doc/man3/OSSL_PROVIDER.pod
++++ b/doc/man3/OSSL_PROVIDER.pod
+@@ -8,7 +8,8 @@ OSSL_PROVIDER_available, OSSL_PROVIDER_do_all,
+ OSSL_PROVIDER_gettable_params, OSSL_PROVIDER_get_params,
+ OSSL_PROVIDER_query_operation, OSSL_PROVIDER_get0_provider_ctx,
+ OSSL_PROVIDER_add_builtin, OSSL_PROVIDER_name,
+-OSSL_PROVIDER_get_capabilities - provider routines
++OSSL_PROVIDER_get_capabilities, OSSL_PROVIDER_self_test
++- provider routines
+ 
+ =head1 SYNOPSIS
+ 
+@@ -43,7 +44,7 @@ OSSL_PROVIDER_get_capabilities - provider routines
+                                     const char *capability,
+                                     OSSL_CALLBACK *cb,
+                                     void *arg);
+-
++ int OSSL_PROVIDER_self_test(const OSSL_PROVIDER *prov);
+ 
+ =head1 DESCRIPTION
+ 
+@@ -95,6 +96,11 @@ The caller must prepare the B&lt;OSSL_PARAM&gt; array before calling this
+ function, and the variables acting as buffers for this parameter array
+ should be filled with data when it returns successfully.
+ 
++OSSL_PROVIDER_self_test() is used to run a provider's self tests on demand.
++If the self tests fail then the provider will fail to provide any further
++services and algorithms. L&lt;OSSL_SELF_TEST_set_callback(3)&gt; may be called
++beforehand in order to display diagnostics for the running self tests.
++
+ OSSL_PROVIDER_query_operation() calls the provider's I&lt;query_operation&gt;
+ function (see L&lt;provider(7)&gt;), if the provider has one. It returns an
+ array of I&lt;OSSL_ALGORITHM&gt; for the given I&lt;operation_id&gt; terminated by an all
+@@ -133,11 +139,13 @@ otherwise 0.
+ OSSL_PROVIDER_gettable_params() returns a pointer to an array
+ of constant B&lt;OSSL_PARAM&gt;, or NULL if none is provided.
+ 
+-OSSL_PROVIDER_get_params() returns 1 on success, or 0 on error.
++OSSL_PROVIDER_get_params() and returns 1 on success, or 0 on error.
+ 
+ OSSL_PROVIDER_query_operation() returns an array of OSSL_ALGORITHM or NULL on
+ error.
+ 
++OSSL_PROVIDER_self_test() returns 1 if the self tests pass, or 0 on error.
++
+ =head1 EXAMPLES
+ 
+ This demonstrates how to load the provider module &quot;foo&quot; and ask for
+diff --git a/doc/man7/provider-base.pod b/doc/man7/provider-base.pod
+index d61645f961..efec869e25 100644
+--- a/doc/man7/provider-base.pod
++++ b/doc/man7/provider-base.pod
+@@ -139,6 +139,7 @@ F&lt;libcrypto&gt;):
+  provider_query_operation       OSSL_FUNC_PROVIDER_QUERY_OPERATION
+  provider_get_reason_strings    OSSL_FUNC_PROVIDER_GET_REASON_STRINGS
+  provider_get_capabilities      OSSL_FUNC_PROVIDER_GET_CAPABILITIES
++ provider_self_test             OSSL_FUNC_PROVIDER_SELF_TEST
+ 
+ =head2 Core functions
+ 
+@@ -241,6 +242,11 @@ callback multiple times (one for each capability). Capabilities can be useful fo
+ describing the services that a provider can offer. For further details see the
+ L&lt;/CAPABILITIES&gt; section below. It should return 1 on success or 0 on error.
+ 
++The provider_self_test() function should perform known answer tests on a subset
++of the algorithms that it uses, and may also verify the integrity of the
++provider module. It should return 1 on success or 0 on error. It will return 1
++if this function is not used.
++
+ None of these functions are mandatory, but a provider is fairly
+ useless without at least provider_query_operation(), and
+ provider_gettable_params() is fairly useless if not accompanied by
+@@ -268,6 +274,11 @@ This points to a string that is a build information associated with this provide
+ OpenSSL in-built providers use OPENSSL_FULL_VERSION_STR, but this may be
+ different for any third party provider.
+ 
++=item &quot;status&quot; (B&lt;OSSL_PROV_PARAM_STATUS&gt;) &lt;unsigned integer&gt;
++
++This returns 0 if the provider has entered an error state, otherwise it returns
++1.
++
+ =back 
+ 
+ provider_gettable_params() should return the above parameters.
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index f60ae9bc09..07e9ef4bb3 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -778,3 +778,4 @@ int evp_pkey_ctx_get_params_strict(EVP_PKEY_CTX *ctx, OSSL_PARAM *params);
+ EVP_PKEY *evp_pkcs82pkey_int(const PKCS8_PRIV_KEY_INFO *p8, OPENSSL_CTX *libctx,
+                              const char *propq);
+ #endif /* !defined(FIPS_MODULE) */
++void evp_method_store_flush(OPENSSL_CTX *libctx);
+diff --git a/include/internal/property.h b/include/internal/property.h
+index d8ff3582eb..ca1d1e055c 100644
+--- a/include/internal/property.h
++++ b/include/internal/property.h
+@@ -54,7 +54,8 @@ int ossl_method_store_cache_set(OSSL_METHOD_STORE *store, int nid,
+                                 const char *prop_query, void *result,
+                                 int (*method_up_ref)(void *),
+                                 void (*method_destruct)(void *));
+-void ossl_method_store_flush_cache(OSSL_METHOD_STORE *store);
++
++void ossl_method_store_flush_cache(OSSL_METHOD_STORE *store, int all);
+ 
+ /* Merge two property queries together */
+ OSSL_PROPERTY_LIST *ossl_property_merge(const OSSL_PROPERTY_LIST *a,
+diff --git a/include/internal/provider.h b/include/internal/provider.h
+index dcd57708ba..38bbd3bbef 100644
+--- a/include/internal/provider.h
++++ b/include/internal/provider.h
+@@ -75,6 +75,7 @@ int ossl_provider_get_capabilities(const OSSL_PROVIDER *prov,
+                                    const char *capability,
+                                    OSSL_CALLBACK *cb,
+                                    void *arg);
++int ossl_provider_self_test(const OSSL_PROVIDER *prov);
+ const OSSL_ALGORITHM *ossl_provider_query_operation(const OSSL_PROVIDER *prov,
+                                                     int operation_id,
+                                                     int *no_cache);
+diff --git a/include/openssl/core_dispatch.h b/include/openssl/core_dispatch.h
+index a3f5107aff..55144f126b 100644
+--- a/include/openssl/core_dispatch.h
++++ b/include/openssl/core_dispatch.h
+@@ -176,6 +176,8 @@ OSSL_CORE_MAKE_FUNC(const OSSL_ITEM *,provider_get_reason_strings,
+ # define OSSL_FUNC_PROVIDER_GET_CAPABILITIES   1029
+ OSSL_CORE_MAKE_FUNC(int, provider_get_capabilities, (void *provctx,
+                     const char *capability, OSSL_CALLBACK *cb, void *arg))
++# define OSSL_FUNC_PROVIDER_SELF_TEST          1030
++OSSL_CORE_MAKE_FUNC(int, provider_self_test, (void *provctx))
+ 
+ /* Operations */
+ 
+diff --git a/include/openssl/core_names.h b/include/openssl/core_names.h
+index 9ce4115a89..b511571fb3 100644
+--- a/include/openssl/core_names.h
++++ b/include/openssl/core_names.h
+@@ -23,6 +23,7 @@ extern &quot;C&quot; {
+ #define OSSL_PROV_PARAM_NAME            &quot;name&quot;                /* utf8_string */
+ #define OSSL_PROV_PARAM_VERSION         &quot;version&quot;             /* utf8_string */
+ #define OSSL_PROV_PARAM_BUILDINFO       &quot;buildinfo&quot;           /* utf8_string */
++#define OSSL_PROV_PARAM_STATUS          &quot;status&quot;              /* uint */
+ 
+ /* Self test callback parameters */
+ #define OSSL_PROV_PARAM_SELF_TEST_PHASE  &quot;st-phase&quot; /* utf8_string */
+diff --git a/include/openssl/provider.h b/include/openssl/provider.h
+index cb5fc9f8bf..5470984e13 100644
+--- a/include/openssl/provider.h
++++ b/include/openssl/provider.h
+@@ -29,6 +29,7 @@ int OSSL_PROVIDER_do_all(OPENSSL_CTX *ctx,
+ 
+ const OSSL_PARAM *OSSL_PROVIDER_gettable_params(const OSSL_PROVIDER *prov);
+ int OSSL_PROVIDER_get_params(const OSSL_PROVIDER *prov, OSSL_PARAM params[]);
++int OSSL_PROVIDER_self_test(const OSSL_PROVIDER *prov);
+ int OSSL_PROVIDER_get_capabilities(const OSSL_PROVIDER *prov,
+                                    const char *capability,
+                                    OSSL_CALLBACK *cb,
+diff --git a/providers/defltprov.c b/providers/defltprov.c
+index 0ee717acac..4ab39e6531 100644
+--- a/providers/defltprov.c
++++ b/providers/defltprov.c
+@@ -62,7 +62,9 @@ static int deflt_get_params(void *provctx, OSSL_PARAM params[])
+     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
+     if (p != NULL &amp;&amp; !OSSL_PARAM_set_utf8_ptr(p, OPENSSL_FULL_VERSION_STR))
+         return 0;
+-
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_uint(p, 1))
++        return 0;
+     return 1;
+ }
+ 
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index 73bba5b3a9..e39c306e48 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -69,6 +69,8 @@ static OSSL_FUNC_CRYPTO_secure_free_fn *c_CRYPTO_secure_free;
+ static OSSL_FUNC_CRYPTO_secure_clear_free_fn *c_CRYPTO_secure_clear_free;
+ static OSSL_FUNC_CRYPTO_secure_allocated_fn *c_CRYPTO_secure_allocated;
+ static OSSL_FUNC_BIO_vsnprintf_fn *c_BIO_vsnprintf;
++static OSSL_FUNC_self_test_cb_fn *c_stcbfn = NULL;
++static OSSL_FUNC_core_get_library_context_fn *c_get_libctx = NULL;
+ 
+ typedef struct fips_global_st {
+     const OSSL_CORE_HANDLE *handle;
+@@ -97,6 +99,7 @@ static const OSSL_PARAM fips_param_types[] = {
+     OSSL_PARAM_DEFN(OSSL_PROV_PARAM_NAME, OSSL_PARAM_UTF8_PTR, NULL, 0),
+     OSSL_PARAM_DEFN(OSSL_PROV_PARAM_VERSION, OSSL_PARAM_UTF8_PTR, NULL, 0),
+     OSSL_PARAM_DEFN(OSSL_PROV_PARAM_BUILDINFO, OSSL_PARAM_UTF8_PTR, NULL, 0),
++    OSSL_PARAM_DEFN(OSSL_PROV_PARAM_STATUS, OSSL_PARAM_UNSIGNED_INTEGER, NULL, 0),
+     OSSL_PARAM_END
+ };
+ 
+@@ -144,10 +147,29 @@ static int fips_get_params(void *provctx, OSSL_PARAM params[])
+     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
+     if (p != NULL &amp;&amp; !OSSL_PARAM_set_utf8_ptr(p, OPENSSL_FULL_VERSION_STR))
+         return 0;
+-
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_uint(p, FIPS_is_running()))
++        return 0;
+     return 1;
+ }
+ 
++static void set_self_test_cb(const OSSL_CORE_HANDLE *handle)
++{
++    if (c_stcbfn != NULL &amp;&amp; c_get_libctx != NULL) {
++        c_stcbfn(c_get_libctx(handle), &amp;selftest_params.cb,
++                              &amp;selftest_params.cb_arg);
++    } else {
++        selftest_params.cb = NULL;
++        selftest_params.cb_arg = NULL;
++    }
++}
++
++static int fips_self_test(void *provctx)
++{
++    set_self_test_cb(FIPS_get_core_handle(selftest_params.libctx));
++    return SELF_TEST_post(&amp;selftest_params, 1) ? 1 : 0;
++}
++
+ /* FIPS specific version of the function of the same name in provlib.c */
+ /* TODO(3.0) - Is this function needed ? */
+ const char *ossl_prov_util_nid_to_name(int nid)
+@@ -444,6 +466,10 @@ static const OSSL_ALGORITHM *fips_query(void *provctx, int operation_id,
+                                         int *no_cache)
+ {
+     *no_cache = 0;
++
++    if (!FIPS_is_running())
++        return NULL;
++
+     switch (operation_id) {
+     case OSSL_OP_DIGEST:
+         return fips_digests;
+@@ -489,7 +515,9 @@ static const OSSL_DISPATCH fips_dispatch_table[] = {
+     { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS, (void (*)(void))fips_gettable_params },
+     { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))fips_get_params },
+     { OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))fips_query },
+-    { OSSL_FUNC_PROVIDER_GET_CAPABILITIES, (void (*)(void))provider_get_capabilities },
++    { OSSL_FUNC_PROVIDER_GET_CAPABILITIES,
++      (void (*)(void))provider_get_capabilities },
++    { OSSL_FUNC_PROVIDER_SELF_TEST, (void (*)(void))fips_self_test },
+     { 0, NULL }
+ };
+ 
+@@ -500,7 +528,6 @@ static const OSSL_DISPATCH intern_dispatch_table[] = {
+     { 0, NULL }
+ };
+ 
+-
+ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+                        const OSSL_DISPATCH *in,
+                        const OSSL_DISPATCH **out,
+@@ -508,8 +535,6 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+ {
+     FIPS_GLOBAL *fgbl;
+     OPENSSL_CTX *libctx = NULL;
+-    OSSL_FUNC_self_test_cb_fn *stcbfn = NULL;
+-    OSSL_FUNC_core_get_library_context_fn *c_get_libctx = NULL;
+ 
+     for (; in-&gt;function_id != 0; in++) {
+         switch (in-&gt;function_id) {
+@@ -592,7 +617,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+             c_BIO_vsnprintf = OSSL_FUNC_BIO_vsnprintf(in);
+             break;
+         case OSSL_FUNC_SELF_TEST_CB: {
+-            stcbfn = OSSL_FUNC_self_test_cb(in);
++            c_stcbfn = OSSL_FUNC_self_test_cb(in);
+             break;
+         }
+         default:
+@@ -601,14 +626,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
+         }
+     }
+ 
+-    if (stcbfn != NULL &amp;&amp; c_get_libctx != NULL) {
+-        stcbfn(c_get_libctx(handle), &amp;selftest_params.cb,
+-               &amp;selftest_params.cb_arg);
+-    }
+-    else {
+-        selftest_params.cb = NULL;
+-        selftest_params.cb_arg = NULL;
+-    }
++    set_self_test_cb(handle);
+ 
+     if (!c_get_params(handle, core_params)) {
+         ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_GET_PARAMETER);
+@@ -665,29 +683,31 @@ int fips_intern_provider_init(const OSSL_CORE_HANDLE *handle,
+                               const OSSL_DISPATCH **out,
+                               void **provctx)
+ {
+-    OSSL_FUNC_core_get_library_context_fn *c_get_libctx = NULL;
++    OSSL_FUNC_core_get_library_context_fn *c_internal_get_libctx = NULL;
+ 
+     for (; in-&gt;function_id != 0; in++) {
+         switch (in-&gt;function_id) {
+         case OSSL_FUNC_CORE_GET_LIBRARY_CONTEXT:
+-            c_get_libctx = OSSL_FUNC_core_get_library_context(in);
++            c_internal_get_libctx = OSSL_FUNC_core_get_library_context(in);
+             break;
+         default:
+             break;
+         }
+     }
+ 
+-    if (c_get_libctx == NULL)
++    if (c_internal_get_libctx == NULL)
+         return 0;
+ 
+     if ((*provctx = PROV_CTX_new()) == NULL)
+         return 0;
++
+     /*
+      * Using the parent library context only works because we are a built-in
+      * internal provider. This is not something that most providers would be
+      * able to do.
+      */
+-    PROV_CTX_set0_library_context(*provctx, (OPENSSL_CTX *)c_get_libctx(handle));
++    PROV_CTX_set0_library_context(*provctx,
++                                  (OPENSSL_CTX *)c_internal_get_libctx(handle));
+     PROV_CTX_set0_handle(*provctx, handle);
+ 
+     *out = intern_dispatch_table;
+diff --git a/providers/fips/self_test.c b/providers/fips/self_test.c
+index 8902510b44..978440adf1 100644
+--- a/providers/fips/self_test.c
++++ b/providers/fips/self_test.c
+@@ -305,3 +305,10 @@ end:
+ 
+     return ok;
+ }
++
++
++unsigned int FIPS_is_running(void)
++{
++    return FIPS_state == FIPS_STATE_RUNNING
++           || FIPS_state == FIPS_STATE_SELFTEST;
++}
+diff --git a/providers/fips/self_test.h b/providers/fips/self_test.h
+index 20f8a12472..f40788581c 100644
+--- a/providers/fips/self_test.h
++++ b/providers/fips/self_test.h
+@@ -34,3 +34,4 @@ typedef struct self_test_post_params_st {
+ 
+ int SELF_TEST_post(SELF_TEST_POST_PARAMS *st, int on_demand_test);
+ int SELF_TEST_kats(OSSL_SELF_TEST *event, OPENSSL_CTX *libctx);
++unsigned int FIPS_is_running(void);
+diff --git a/providers/legacyprov.c b/providers/legacyprov.c
+index 40d24873a2..549906a68a 100644
+--- a/providers/legacyprov.c
++++ b/providers/legacyprov.c
+@@ -61,7 +61,9 @@ static int legacy_get_params(void *provctx, OSSL_PARAM params[])
+     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
+     if (p != NULL &amp;&amp; !OSSL_PARAM_set_utf8_ptr(p, OPENSSL_FULL_VERSION_STR))
+         return 0;
+-
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_uint(p, 1))
++        return 0;
+     return 1;
+ }
+ 
+diff --git a/test/build.info b/test/build.info
+index d8a585e615..1dd3db7c79 100644
+--- a/test/build.info
++++ b/test/build.info
+@@ -57,7 +57,7 @@ IF[{- !$disabled{tests} -}]
+           http_test servername_test ocspapitest fatalerrtest tls13ccstest \
+           sysdefaulttest errtest ssl_ctx_test gosttest \
+           context_internal_test aesgcmtest params_test evp_pkey_dparams_test \
+-          keymgmt_internal_test hexstr_test
++          keymgmt_internal_test hexstr_test provider_status_test
+ 
+   IF[{- !$disabled{'deprecated-3.0'} -}]
+     PROGRAMS{noinst}=enginetest
+@@ -166,6 +166,10 @@ IF[{- !$disabled{tests} -}]
+     DEPEND[acvp_test]=../libcrypto.a libtestutil.a
+   ENDIF
+ 
++  SOURCE[provider_status_test]=provider_status_test.c
++  INCLUDE[provider_status_test]=../include ../apps/include
++  DEPEND[provider_status_test]=../libcrypto.a libtestutil.a
++
+   IF[{- !$disabled{'deprecated-3.0'} -}]
+     PROGRAMS{noinst}=igetest bftest casttest
+ 
+diff --git a/test/provider_status_test.c b/test/provider_status_test.c
+new file mode 100644
+index 0000000000..83572e81f8
+--- /dev/null
++++ b/test/provider_status_test.c
+@@ -0,0 +1,185 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;stddef.h&gt;
++#include &lt;string.h&gt;
++#include &lt;openssl/provider.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/self_test.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &quot;testutil.h&quot;
++
++typedef enum OPTION_choice {
++    OPT_ERR = -1,
++    OPT_EOF = 0,
++    OPT_PROVIDER_NAME,
++    OPT_CONFIG_FILE,
++    OPT_TEST_ENUM
++} OPTION_CHOICE;
++
++struct self_test_arg {
++    int count;
++};
++
++static OPENSSL_CTX *libctx = NULL;
++static char *provider_name = NULL;
++static struct self_test_arg self_test_args = { 0 };
++
++const OPTIONS *test_get_options(void)
++{
++    static const OPTIONS test_options[] = {
++        OPT_TEST_OPTIONS_DEFAULT_USAGE,
++        { &quot;provider_name&quot;, OPT_PROVIDER_NAME, 's',
++          &quot;The name of the provider to load&quot; },
++        { &quot;config&quot;, OPT_CONFIG_FILE, '&lt;',
++          &quot;The configuration file to use for the libctx&quot; },
++        { NULL }
++    };
++    return test_options;
++}
++
++static int self_test_events(const OSSL_PARAM params[], void *arg,
++                            const char *title, int corrupt)
++{
++    struct self_test_arg *args = arg;
++    const OSSL_PARAM *p = NULL;
++    const char *phase = NULL, *type = NULL, *desc = NULL;
++    int ret = 0;
++
++    if (args-&gt;count == 0)
++        BIO_printf(bio_out, &quot;\n%s\n&quot;, title);
++    args-&gt;count++;
++
++    p = OSSL_PARAM_locate_const(params, OSSL_PROV_PARAM_SELF_TEST_PHASE);
++    if (p == NULL || p-&gt;data_type != OSSL_PARAM_UTF8_STRING)
++        goto err;
++    phase = (const char *)p-&gt;data;
++
++    p = OSSL_PARAM_locate_const(params, OSSL_PROV_PARAM_SELF_TEST_DESC);
++    if (p == NULL || p-&gt;data_type != OSSL_PARAM_UTF8_STRING)
++        goto err;
++    desc = (const char *)p-&gt;data;
++
++    p = OSSL_PARAM_locate_const(params, OSSL_PROV_PARAM_SELF_TEST_TYPE);
++    if (p == NULL || p-&gt;data_type != OSSL_PARAM_UTF8_STRING)
++        goto err;
++    type = (const char *)p-&gt;data;
++
++    if (strcmp(phase, OSSL_SELF_TEST_PHASE_START) == 0)
++        BIO_printf(bio_out, &quot;%s : (%s) : &quot;, desc, type);
++    else if (strcmp(phase, OSSL_SELF_TEST_PHASE_PASS) == 0
++             || strcmp(phase, OSSL_SELF_TEST_PHASE_FAIL) == 0)
++        BIO_printf(bio_out, &quot;%s\n&quot;, phase);
++    /*
++     * The self test code will internally corrupt the KAT test result if an
++     * error is returned during the corrupt phase.
++     */
++    if (corrupt &amp;&amp; strcmp(phase, OSSL_SELF_TEST_PHASE_CORRUPT) == 0)
++        goto err;
++    ret = 1;
++err:
++    return ret;
++}
++
++static int self_test_on_demand_fail(const OSSL_PARAM params[], void *arg)
++{
++    return self_test_events(params, arg, &quot;On Demand Failure&quot;, 1);
++}
++
++static int self_test_on_demand(const OSSL_PARAM params[], void *arg)
++{
++    return self_test_events(params, arg, &quot;On Demand&quot;, 0);
++}
++
++static int self_test_on_load(const OSSL_PARAM params[], void *arg)
++{
++    return self_test_events(params, arg, &quot;On Loading&quot;, 0);
++}
++
++static int test_provider_status(void)
++{
++    int ret = 0;
++    unsigned int status = 0;
++    OSSL_PROVIDER *prov = NULL;
++    OSSL_PARAM params[2];
++    EVP_MD *fetch = NULL;
++
++    if (!TEST_ptr(prov = OSSL_PROVIDER_load(libctx, provider_name)))
++        goto err;
++
++    /* Test that the provider status is ok */
++    params[0] = OSSL_PARAM_construct_uint(OSSL_PROV_PARAM_STATUS, &amp;status);
++    params[1] = OSSL_PARAM_construct_end();
++    if (!TEST_true(OSSL_PROVIDER_get_params(prov, params))
++        || !TEST_true(status == 1))
++        goto err;
++    if (!TEST_ptr(fetch = EVP_MD_fetch(libctx, &quot;SHA256&quot;, NULL)))
++        goto err;
++    EVP_MD_free(fetch);
++    fetch = NULL;
++
++    /* Test that the provider self test is ok */
++    self_test_args.count = 0;
++    OSSL_SELF_TEST_set_callback(libctx, self_test_on_demand, &amp;self_test_args);
++    if (!TEST_true(OSSL_PROVIDER_self_test(prov)))
++        goto err;
++
++    /* Setup a callback that corrupts the self tests and causes status failures */
++    self_test_args.count = 0;
++    OSSL_SELF_TEST_set_callback(libctx, self_test_on_demand_fail, &amp;self_test_args);
++    if (!TEST_false(OSSL_PROVIDER_self_test(prov)))
++        goto err;
++    if (!TEST_true(OSSL_PROVIDER_get_params(prov, params))
++        || !TEST_uint_eq(status, 0))
++        goto err;
++    if (!TEST_ptr_null(fetch = EVP_MD_fetch(libctx, &quot;SHA256&quot;, NULL)))
++        goto err;
++
++    ret = 1;
++err:
++    EVP_MD_free(fetch);
++    OSSL_PROVIDER_unload(prov);
++    return ret;
++}
++
++int setup_tests(void)
++{
++    OPTION_CHOICE o;
++    char *config_file = NULL;
++
++    while ((o = opt_next()) != OPT_EOF) {
++        switch (o) {
++        case OPT_CONFIG_FILE:
++            config_file = opt_arg();
++            break;
++        case OPT_PROVIDER_NAME:
++            provider_name = opt_arg();
++            break;
++        case OPT_TEST_CASES:
++           break;
++        default:
++        case OPT_ERR:
++            return 0;
++        }
++    }
++
++    libctx = OPENSSL_CTX_new();
++    if (libctx == NULL)
++        return 0;
++    self_test_args.count = 0;
++    OSSL_SELF_TEST_set_callback(libctx, self_test_on_load, &amp;self_test_args);
++
++    if (!OPENSSL_CTX_load_config(libctx, config_file)) {
++        opt_printf_stderr(&quot;Failed to load config\n&quot;);
++        return 0;
++    }
++    ADD_TEST(test_provider_status);
++    return 1;
++}
+diff --git a/test/recipes/30-test_acvp.t b/test/recipes/30-test_provider_status.t
+similarity index 59%
+copy from test/recipes/30-test_acvp.t
+copy to test/recipes/30-test_provider_status.t
+index 8cfc07ecf7..03304ba4a2 100644
+--- a/test/recipes/30-test_acvp.t
++++ b/test/recipes/30-test_provider_status.t
+@@ -6,33 +6,35 @@
+ # in the file LICENSE in the source distribution or at
+ # <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+ 
++
+ use strict;
+ use warnings;
+ 
+-use OpenSSL::Test qw(:DEFAULT bldtop_dir srctop_dir srctop_file bldtop_file);
++use OpenSSL::Test qw(:DEFAULT data_file bldtop_dir srctop_file srctop_dir bldtop_file);
+ use OpenSSL::Test::Utils;
+ 
+ BEGIN {
+-setup(&quot;test_acvp&quot;);
++setup(&quot;test_provider_status&quot;);
+ }
+ 
+-my $no_fips = disabled('fips') || ($ENV{NO_FIPS} // 0);
+-
+-plan skip_all =&gt; &quot;ACVP is not supported by this test&quot;
+-    if $no_fips || disabled(&quot;acvp_tests&quot;);
+-
+ use lib srctop_dir('Configurations');
+ use lib bldtop_dir('.');
+ use platform;
+ 
+-my $infile = bldtop_file('providers', platform-&gt;dso('fips'));
++my $no_fips = disabled('fips') || ($ENV{NO_FIPS} // 0);
++
++plan skip_all =&gt; &quot;provider_status is not supported by this test&quot;
++    if $no_fips;
+ 
+ plan tests =&gt; 2;
+ 
++my $infile = bldtop_file('providers', platform-&gt;dso('fips'));
++
+ ok(run(app(['openssl', 'fipsinstall',
+-           '-out', bldtop_file('providers', 'fipsmodule.cnf'),
+-           '-module', $infile])),
++            '-out', bldtop_file('providers', 'fipsmodule.cnf'),
++            '-module', $infile])),
+    &quot;fipsinstall&quot;);
+ 
+-ok(run(test([&quot;acvp_test&quot;, &quot;-config&quot;, srctop_file(&quot;test&quot;,&quot;fips.cnf&quot;)])),
+-   &quot;running acvp_test&quot;);
++ok(run(test([&quot;provider_status_test&quot;, &quot;-config&quot;, srctop_file(&quot;test&quot;,&quot;fips.cnf&quot;),
++             &quot;-provider_name&quot;, &quot;fips&quot;])),
++   &quot;running provider_status_test&quot;);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 8cfe55f4fa..fe875f188d 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -5225,3 +5225,4 @@ PKCS7_new_with_libctx                   ?	3_0_0	EXIST::FUNCTION:
+ PKCS7_sign_with_libctx                  ?	3_0_0	EXIST::FUNCTION:
+ PKCS7_encrypt_with_libctx               ?	3_0_0	EXIST::FUNCTION:
+ SMIME_read_PKCS7_ex                     ?	3_0_0	EXIST::FUNCTION:
++OSSL_PROVIDER_self_test                 ?	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030065.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030073.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30068">[ date ]</a>
+              <a href="thread.html#30068">[ thread ]</a>
+              <a href="subject.html#30068">[ subject ]</a>
+              <a href="author.html#30068">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

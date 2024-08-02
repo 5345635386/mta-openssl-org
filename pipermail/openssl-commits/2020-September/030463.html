@@ -1,0 +1,477 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599322220.081244.13438.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030457.html">
+   <LINK REL="Next"  HREF="030464.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599322220.081244.13438.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Sat Sep  5 16:10:20 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030457.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030464.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30463">[ date ]</a>
+              <a href="thread.html#30463">[ thread ]</a>
+              <a href="subject.html#30463">[ subject ]</a>
+              <a href="author.html#30463">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  39082af2fa6549c3d92c917ea5a423bca57c7b42 (commit)
+      from  09e76c5dd34515f9df42b2f1deed5166ba6b31fa (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 39082af2fa6549c3d92c917ea5a423bca57c7b42
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Fri Sep 4 09:29:01 2020 +0200
+
+    Add OSSL_CMP_CTX_get1_newChain() and related CLI option -chainout
+    
+    Also simplify certificate saving in apps/cmp.c
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12790">https://github.com/openssl/openssl/pull/12790</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/cmp.c                    | 69 +++++++++++++++++++++----------------------
+ crypto/cmp/cmp_ctx.c          | 30 +++++++++++++++++++
+ crypto/cmp/cmp_local.h        |  2 ++
+ doc/man1/openssl-cmp.pod.in   |  5 ++++
+ doc/man3/OSSL_CMP_CTX_new.pod |  9 +++++-
+ include/openssl/cmp.h         |  1 +
+ test/cmp_ctx_test.c           |  4 +++
+ util/libcrypto.num            |  1 +
+ 8 files changed, 84 insertions(+), 37 deletions(-)
+
+diff --git a/apps/cmp.c b/apps/cmp.c
+index 4d6acdd499..1af27f7881 100644
+--- a/apps/cmp.c
++++ b/apps/cmp.c
+@@ -129,6 +129,7 @@ static char *opt_out_trusted = NULL;
+ static int opt_implicit_confirm = 0;
+ static int opt_disable_confirm = 0;
+ static char *opt_certout = NULL;
++static char *opt_chainout = NULL;
+ 
+ /* certificate enrollment and revocation */
+ static char *opt_oldcert = NULL;
+@@ -205,7 +206,7 @@ typedef enum OPTION_choice {
+     OPT_POLICIES, OPT_POLICY_OIDS, OPT_POLICY_OIDS_CRITICAL,
+     OPT_POPO, OPT_CSR,
+     OPT_OUT_TRUSTED, OPT_IMPLICIT_CONFIRM, OPT_DISABLE_CONFIRM,
+-    OPT_CERTOUT,
++    OPT_CERTOUT, OPT_CHAINOUT,
+ 
+     OPT_OLDCERT, OPT_REVREASON,
+ 
+@@ -314,6 +315,8 @@ const OPTIONS cmp_options[] = {
+      &quot;confirmation. WARNING: This leads to behavior violating RFC 4210&quot;},
+     {&quot;certout&quot;, OPT_CERTOUT, 's',
+      &quot;File to save newly enrolled certificate&quot;},
++    {&quot;chainout&quot;, OPT_CHAINOUT, 's',
++     &quot;File to save the chain of newly enrolled certificate&quot;},
+ 
+     OPT_SECTION(&quot;Certificate enrollment and revocation&quot;),
+ 
+@@ -521,7 +524,7 @@ static varref cmp_vars[] = { /* must be in same order as enumerated above! */
+     {(char **)&amp;opt_popo}, {&amp;opt_csr},
+     {&amp;opt_out_trusted},
+     {(char **)&amp;opt_implicit_confirm}, {(char **)&amp;opt_disable_confirm},
+-    {&amp;opt_certout},
++    {&amp;opt_certout}, {&amp;opt_chainout},
+ 
+     {&amp;opt_oldcert}, {(char **)&amp;opt_revreason},
+ 
+@@ -2066,18 +2069,21 @@ static int write_cert(BIO *bio, X509 *cert)
+ }
+ 
+ /*
+- * writes out a stack of certs to the given file.
++ * If destFile != NULL writes out a stack of certs to the given file.
++ * In any case frees the certs.
+  * Depending on options use either PEM or DER format,
+  * where DER does not make much sense for writing more than one cert!
+- * Returns number of written certificates on success, 0 on error.
++ * Returns number of written certificates on success, -1 on error.
+  */
+-static int save_certs(OSSL_CMP_CTX *ctx,
+-                      STACK_OF(X509) *certs, char *destFile, char *desc)
++static int save_free_certs(OSSL_CMP_CTX *ctx,
++                           STACK_OF(X509) *certs, char *destFile, char *desc)
+ {
+     BIO *bio = NULL;
+     int i;
+     int n = sk_X509_num(certs);
+ 
++    if (destFile == NULL)
++        goto end;
+     CMP_info3(&quot;received %d %s certificate(s), saving to file '%s'&quot;,
+               n, desc, destFile);
+     if (n &gt; 1 &amp;&amp; opt_certform != FORMAT_PEM)
+@@ -2087,19 +2093,20 @@ static int save_certs(OSSL_CMP_CTX *ctx,
+             || !BIO_write_filename(bio, (char *)destFile)) {
+         CMP_err1(&quot;could not open file '%s' for writing&quot;, destFile);
+         n = -1;
+-        goto err;
++        goto end;
+     }
+ 
+     for (i = 0; i &lt; n; i++) {
+         if (!write_cert(bio, sk_X509_value(certs, i))) {
+             CMP_err1(&quot;cannot write certificate to file '%s'&quot;, destFile);
+             n = -1;
+-            goto err;
++            goto end;
+         }
+     }
+ 
+- err:
++ end:
+     BIO_free(bio);
++    sk_X509_pop_free(certs, X509_free);
+     return n;
+ }
+ 
+@@ -2511,6 +2518,9 @@ static int get_opts(int argc, char **argv)
+         case OPT_CERTOUT:
+             opt_certout = opt_str(&quot;certout&quot;);
+             break;
++        case OPT_CHAINOUT:
++            opt_chainout = opt_str(&quot;chainout&quot;);
++            break;
+         case OPT_OLDCERT:
+             opt_oldcert = opt_str(&quot;oldcert&quot;);
+             break;
+@@ -2935,39 +2945,26 @@ int cmp_main(int argc, char **argv)
+             OPENSSL_free(buf);
+         }
+ 
+-        if (opt_cacertsout != NULL) {
+-            STACK_OF(X509) *certs = OSSL_CMP_CTX_get1_caPubs(cmp_ctx);
+-
+-            if (sk_X509_num(certs) &gt; 0
+-                    &amp;&amp; save_certs(cmp_ctx, certs, opt_cacertsout, &quot;CA&quot;) &lt; 0) {
+-                sk_X509_pop_free(certs, X509_free);
+-                goto err;
+-            }
+-            sk_X509_pop_free(certs, X509_free);
+-        }
+-
+-        if (opt_extracertsout != NULL) {
+-            STACK_OF(X509) *certs = OSSL_CMP_CTX_get1_extraCertsIn(cmp_ctx);
+-            if (sk_X509_num(certs) &gt; 0
+-                    &amp;&amp; save_certs(cmp_ctx, certs, opt_extracertsout,
+-                                  &quot;extra&quot;) &lt; 0) {
+-                sk_X509_pop_free(certs, X509_free);
+-                goto err;
+-            }
+-            sk_X509_pop_free(certs, X509_free);
+-        }
+-
+-        if (opt_certout != NULL &amp;&amp; newcert != NULL) {
++        if (save_free_certs(cmp_ctx, OSSL_CMP_CTX_get1_caPubs(cmp_ctx),
++                            opt_cacertsout, &quot;CA&quot;) &lt; 0)
++            goto err;
++        if (save_free_certs(cmp_ctx, OSSL_CMP_CTX_get1_extraCertsIn(cmp_ctx),
++                            opt_extracertsout, &quot;extra&quot;) &lt; 0)
++            goto err;
++        if (newcert != NULL) {
+             STACK_OF(X509) *certs = sk_X509_new_null();
+ 
+-            if (certs == NULL || !sk_X509_push(certs, newcert)
+-                    || save_certs(cmp_ctx, certs, opt_certout,
+-                                  &quot;enrolled&quot;) &lt; 0) {
++            if (!X509_add_cert(certs, newcert, X509_ADD_FLAG_UP_REF)) {
+                 sk_X509_free(certs);
+                 goto err;
+             }
+-            sk_X509_free(certs);
++            if (save_free_certs(cmp_ctx, certs, opt_certout, &quot;enrolled&quot;) &lt; 0)
++                goto err;
+         }
++        if (save_free_certs(cmp_ctx, OSSL_CMP_CTX_get1_newChain(cmp_ctx),
++                            opt_chainout, &quot;chain&quot;) &lt; 0)
++            goto err;
++
+         if (!OSSL_CMP_CTX_reinit(cmp_ctx))
+             goto err;
+     }
+diff --git a/crypto/cmp/cmp_ctx.c b/crypto/cmp/cmp_ctx.c
+index 57878a8f8d..50c5d0e061 100644
+--- a/crypto/cmp/cmp_ctx.c
++++ b/crypto/cmp/cmp_ctx.c
+@@ -162,6 +162,7 @@ int OSSL_CMP_CTX_reinit(OSSL_CMP_CTX *ctx)
+ 
+     return ossl_cmp_ctx_set0_statusString(ctx, NULL)
+         &amp;&amp; ossl_cmp_ctx_set0_newCert(ctx, NULL)
++        &amp;&amp; ossl_cmp_ctx_set1_newChain(ctx, NULL)
+         &amp;&amp; ossl_cmp_ctx_set1_caPubs(ctx, NULL)
+         &amp;&amp; ossl_cmp_ctx_set1_extraCertsIn(ctx, NULL)
+         &amp;&amp; ossl_cmp_ctx_set0_validatedSrvCert(ctx, NULL)
+@@ -216,6 +217,7 @@ void OSSL_CMP_CTX_free(OSSL_CMP_CTX *ctx)
+ 
+     sk_ASN1_UTF8STRING_pop_free(ctx-&gt;statusString, ASN1_UTF8STRING_free);
+     X509_free(ctx-&gt;newCert);
++    sk_X509_pop_free(ctx-&gt;newChain, X509_free);
+     sk_X509_pop_free(ctx-&gt;caPubs, X509_free);
+     sk_X509_pop_free(ctx-&gt;extraCertsIn, X509_free);
+ 
+@@ -459,6 +461,34 @@ int OSSL_CMP_CTX_set1_secretValue(OSSL_CMP_CTX *ctx, const unsigned char *sec,
+     return 1;
+ }
+ 
++/* Returns the cert chain computed by OSSL_CMP_certConf_cb(), NULL on error */
++STACK_OF(X509) *OSSL_CMP_CTX_get1_newChain(const OSSL_CMP_CTX *ctx)
++{
++    if (ctx == NULL) {
++        CMPerr(0, CMP_R_NULL_ARGUMENT);
++        return NULL;
++    }
++    if (ctx-&gt;newChain == NULL)
++        return sk_X509_new_null();
++    return X509_chain_up_ref(ctx-&gt;newChain);
++}
++
++/*
++ * Copies any given stack of inbound X509 certificates to newChain
++ * of the OSSL_CMP_CTX structure so that they may be retrieved later.
++ */
++int ossl_cmp_ctx_set1_newChain(OSSL_CMP_CTX *ctx, STACK_OF(X509) *newChain)
++{
++    if (!ossl_assert(ctx != NULL))
++        return 0;
++
++    sk_X509_pop_free(ctx-&gt;newChain, X509_free);
++    ctx-&gt;newChain= NULL;
++    if (newChain == NULL)
++        return 1;
++    return (ctx-&gt;newChain = X509_chain_up_ref(newChain)) != NULL;
++}
++
+ /*
+  * Returns the stack of certificates received in a response message.
+  * The stack is duplicated so the caller must handle freeing it!
+diff --git a/crypto/cmp/cmp_local.h b/crypto/cmp/cmp_local.h
+index 41c10b22c1..a6e55cfd1b 100644
+--- a/crypto/cmp/cmp_local.h
++++ b/crypto/cmp/cmp_local.h
+@@ -120,6 +120,7 @@ struct ossl_cmp_ctx_st {
+     /* TODO: this should be a stack since there could be more than one */
+     X509 *newCert; /* newly enrolled cert received from the CA */
+     /* TODO: this should be a stack since there could be more than one */
++    STACK_OF(X509) *newChain; /* chain of newly enrolled cert received */
+     STACK_OF(X509) *caPubs; /* CA certs received from server (in IP message) */
+     STACK_OF(X509) *extraCertsIn; /* extraCerts received from server */
+ 
+@@ -780,6 +781,7 @@ int ossl_cmp_ctx_set0_statusString(OSSL_CMP_CTX *ctx,
+                                    OSSL_CMP_PKIFREETEXT *text);
+ int ossl_cmp_ctx_set_failInfoCode(OSSL_CMP_CTX *ctx, int fail_info);
+ int ossl_cmp_ctx_set0_newCert(OSSL_CMP_CTX *ctx, X509 *cert);
++int ossl_cmp_ctx_set1_newChain(OSSL_CMP_CTX *ctx, STACK_OF(X509) *newChain);
+ int ossl_cmp_ctx_set1_caPubs(OSSL_CMP_CTX *ctx, STACK_OF(X509) *caPubs);
+ int ossl_cmp_ctx_set1_extraCertsIn(OSSL_CMP_CTX *ctx,
+                                    STACK_OF(X509) *extraCertsIn);
+diff --git a/doc/man1/openssl-cmp.pod.in b/doc/man1/openssl-cmp.pod.in
+index 760e21ccbe..d91bd31684 100644
+--- a/doc/man1/openssl-cmp.pod.in
++++ b/doc/man1/openssl-cmp.pod.in
+@@ -63,6 +63,7 @@ B&lt;openssl&gt; B&lt;cmp&gt;
+ [B&lt;-implicit_confirm&gt;]
+ [B&lt;-disable_confirm&gt;]
+ [B&lt;-certout&gt; I&lt;filename&gt;]
++[B&lt;-chainout&gt; I&lt;filename&gt;]
+ 
+ [B&lt;-oldcert&gt; I&lt;filename&gt;]
+ [B&lt;-revreason&gt; I&lt;number&gt;]
+@@ -378,6 +379,10 @@ B&lt;WARNING:&gt; This leads to behavior violating RFC 4210.
+ 
+ The file where the newly enrolled certificate should be saved.
+ 
++=item B&lt;-chainout&gt; I&lt;filename&gt;
++
++The file where the chain of the newly enrolled certificate should be saved.
++
+ =back
+ 
+ 
+diff --git a/doc/man3/OSSL_CMP_CTX_new.pod b/doc/man3/OSSL_CMP_CTX_new.pod
+index 62e1a562c9..fda5150434 100644
+--- a/doc/man3/OSSL_CMP_CTX_new.pod
++++ b/doc/man3/OSSL_CMP_CTX_new.pod
+@@ -54,6 +54,7 @@ OSSL_CMP_CTX_get_status,
+ OSSL_CMP_CTX_get0_statusString,
+ OSSL_CMP_CTX_get_failInfoCode,
+ OSSL_CMP_CTX_get0_newCert,
++OSSL_CMP_CTX_get1_newChain,
+ OSSL_CMP_CTX_get1_caPubs,
+ OSSL_CMP_CTX_get1_extraCertsIn,
+ OSSL_CMP_CTX_set1_transactionID,
+@@ -144,6 +145,7 @@ OSSL_CMP_CTX_set1_senderNonce
+  int OSSL_CMP_CTX_get_failInfoCode(const OSSL_CMP_CTX *ctx);
+ 
+  X509 *OSSL_CMP_CTX_get0_newCert(const OSSL_CMP_CTX *ctx);
++ STACK_OF(X509) *OSSL_CMP_CTX_get1_newChain(const OSSL_CMP_CTX *ctx);
+  STACK_OF(X509) *OSSL_CMP_CTX_get1_caPubs(const OSSL_CMP_CTX *ctx);
+  STACK_OF(X509) *OSSL_CMP_CTX_get1_extraCertsIn(const OSSL_CMP_CTX *ctx);
+ 
+@@ -170,7 +172,7 @@ OSSL_CMP_CTX_free() deallocates an OSSL_CMP_CTX structure.
+ 
+ OSSL_CMP_CTX_reinit() prepares the given B&lt;ctx&gt; for a further transaction by
+ clearing the internal CMP transaction (aka session) status, PKIStatusInfo,
+-and any previous results (newCert, caPubs, and extraCertsIn)
++and any previous results (newCert, newChain, caPubs, and extraCertsIn)
+ from the last executed transaction.
+ All other field values (i.e., CMP options) are retained for potential re-use.
+ 
+@@ -579,6 +581,10 @@ OSSL_CMP_CTX_FAILINFO_badAlg. Returns -1 if the failInfoCode field is unset.
+ OSSL_CMP_CTX_get0_newCert() returns the pointer to the newly obtained
+ certificate in case it is available, else NULL.
+ 
++OSSL_CMP_CTX_get1_newChain() returns a pointer to a duplicate of the stack of
++X.509 certificates computed by OSSL_CMP_certConf_cb() (if this function has
++been called) on the last received certificate response message IP/CP/KUP.
++
+ OSSL_CMP_CTX_get1_caPubs() returns a pointer to a duplicate of the stack of
+ X.509 certificates received in the caPubs field of last received certificate
+ response message IP/CP/KUP.
+@@ -611,6 +617,7 @@ OSSL_CMP_CTX_get0_newPkey(),
+ OSSL_CMP_CTX_get_certConf_cb_arg(),
+ OSSL_CMP_CTX_get0_statusString(),
+ OSSL_CMP_CTX_get0_newCert(),
++OSSL_CMP_CTX_get0_newChain(),
+ OSSL_CMP_CTX_get1_caPubs(), and
+ OSSL_CMP_CTX_get1_extraCertsIn()
+ return the intended pointer value as described above or NULL on error.
+diff --git a/include/openssl/cmp.h b/include/openssl/cmp.h
+index cf79a4c71f..d12d48ba4f 100644
+--- a/include/openssl/cmp.h
++++ b/include/openssl/cmp.h
+@@ -331,6 +331,7 @@ OSSL_CMP_PKIFREETEXT *OSSL_CMP_CTX_get0_statusString(const OSSL_CMP_CTX *ctx);
+ int OSSL_CMP_CTX_get_failInfoCode(const OSSL_CMP_CTX *ctx);
+ #  define OSSL_CMP_PKISI_BUFLEN 1024
+ X509 *OSSL_CMP_CTX_get0_newCert(const OSSL_CMP_CTX *ctx);
++STACK_OF(X509) *OSSL_CMP_CTX_get1_newChain(const OSSL_CMP_CTX *ctx);
+ STACK_OF(X509) *OSSL_CMP_CTX_get1_caPubs(const OSSL_CMP_CTX *ctx);
+ STACK_OF(X509) *OSSL_CMP_CTX_get1_extraCertsIn(const OSSL_CMP_CTX *ctx);
+ int OSSL_CMP_CTX_set1_transactionID(OSSL_CMP_CTX *ctx,
+diff --git a/test/cmp_ctx_test.c b/test/cmp_ctx_test.c
+index 184e5bf498..9b2a53df5f 100644
+--- a/test/cmp_ctx_test.c
++++ b/test/cmp_ctx_test.c
+@@ -76,6 +76,7 @@ static int execute_CTX_reinit_test(OSSL_CMP_CTX_TEST_FIXTURE *fixture)
+     if (!ossl_cmp_ctx_set0_statusString(ctx, sk_ASN1_UTF8STRING_new_null())
+             || !ossl_cmp_ctx_set0_newCert(ctx, X509_new())
+             || !TEST_ptr(certs = sk_X509_new_1())
++            || !ossl_cmp_ctx_set1_newChain(ctx, certs)
+             || !ossl_cmp_ctx_set1_caPubs(ctx, certs)
+             || !ossl_cmp_ctx_set1_extraCertsIn(ctx, certs)
+             || !ossl_cmp_ctx_set0_validatedSrvCert(ctx, X509_new())
+@@ -93,6 +94,7 @@ static int execute_CTX_reinit_test(OSSL_CMP_CTX_TEST_FIXTURE *fixture)
+                        &amp;&amp; ctx-&gt;failInfoCode == -1
+                        &amp;&amp; ctx-&gt;statusString == NULL
+                        &amp;&amp; ctx-&gt;newCert == NULL
++                       &amp;&amp; ctx-&gt;newChain == NULL
+                        &amp;&amp; ctx-&gt;caPubs == NULL
+                        &amp;&amp; ctx-&gt;extraCertsIn == NULL
+                        &amp;&amp; ctx-&gt;validatedSrvCert == NULL
+@@ -780,6 +782,7 @@ DEFINE_SET_GET_INT_TEST(ossl_cmp, ctx, status)
+ DEFINE_SET_GET_SK_TEST(ossl_cmp, ctx, 0, 0, statusString, ASN1_UTF8STRING)
+ DEFINE_SET_GET_INT_TEST(ossl_cmp, ctx, failInfoCode)
+ DEFINE_SET_GET_TEST(ossl_cmp, ctx, 0, 0, 0, newCert, X509)
++DEFINE_SET_GET_SK_X509_TEST(ossl_cmp, ctx, 1, 1, newChain)
+ DEFINE_SET_GET_SK_X509_TEST(ossl_cmp, ctx, 1, 1, caPubs)
+ DEFINE_SET_GET_SK_X509_TEST(ossl_cmp, ctx, 1, 1, extraCertsIn)
+ 
+@@ -869,6 +872,7 @@ int setup_tests(void)
+     ADD_TEST(test_CTX_set0_get0_statusString);
+     ADD_TEST(test_CTX_set_get_failInfoCode);
+     ADD_TEST(test_CTX_set0_get0_newCert);
++    ADD_TEST(test_CTX_set1_get1_newChain);
+     ADD_TEST(test_CTX_set1_get1_caPubs);
+     ADD_TEST(test_CTX_set1_get1_extraCertsIn);
+     /* exported for testing and debugging purposes: */
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index d5e7ab423e..cfe1cb8bc6 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4797,6 +4797,7 @@ OSSL_CMP_CTX_get_status                 ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_get0_statusString          ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_get_failInfoCode           ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_get0_newCert               ?	3_0_0	EXIST::FUNCTION:CMP
++OSSL_CMP_CTX_get1_newChain              ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_get1_caPubs                ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_get1_extraCertsIn          ?	3_0_0	EXIST::FUNCTION:CMP
+ OSSL_CMP_CTX_set1_transactionID         ?	3_0_0	EXIST::FUNCTION:CMP
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030457.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030464.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30463">[ date ]</a>
+              <a href="thread.html#30463">[ thread ]</a>
+              <a href="subject.html#30463">[ subject ]</a>
+              <a href="author.html#30463">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

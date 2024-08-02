@@ -1,0 +1,209 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1533132578.134458.11332.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019915.html">
+   <LINK REL="Next"  HREF="019923.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1533132578.134458.11332.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update">appro at openssl.org
+       </A><BR>
+    <I>Wed Aug  1 14:09:38 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019915.html">[openssl-commits] Still FAILED build of OpenSSL branch master with	options -d --strict-warnings no-md5
+</A></li>
+        <LI>Next message: <A HREF="019923.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19917">[ date ]</a>
+              <a href="thread.html#19917">[ thread ]</a>
+              <a href="subject.html#19917">[ subject ]</a>
+              <a href="author.html#19917">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_0-stable has been updated
+       via  24233a0f3c491919ee3a38e2567271ccc041ee1d (commit)
+      from  c0cc23af26d0363dbd164ceae97ed044e3fd8861 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 24233a0f3c491919ee3a38e2567271ccc041ee1d
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Tue Jul 31 14:59:14 2018 +0200
+
+    asn1/tasn_utl.c: fix logical error in and overhaul asn1_do_lock.
+    
+    CRYPTO_atomic_add was assumed to return negative value on error, while
+    it returns 0.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (cherry picked from commit 680b9d45b005c2d0a48fd574db903bf4486b49ae)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/tasn_utl.c | 35 +++++++++++++++++++++++------------
+ 1 file changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/crypto/asn1/tasn_utl.c b/crypto/asn1/tasn_utl.c
+index f79d7d6..22e853d 100644
+--- a/crypto/asn1/tasn_utl.c
++++ b/crypto/asn1/tasn_utl.c
+@@ -57,8 +57,10 @@ int asn1_set_choice_selector(ASN1_VALUE **pval, int value,
+ int asn1_do_lock(ASN1_VALUE **pval, int op, const ASN1_ITEM *it)
+ {
+     const ASN1_AUX *aux;
+-    int *lck, ret;
++    CRYPTO_REF_COUNT *lck;
+     CRYPTO_RWLOCK **lock;
++    int ret = -1;
++
+     if ((it-&gt;itype != ASN1_ITYPE_SEQUENCE)
+         &amp;&amp; (it-&gt;itype != ASN1_ITYPE_NDEF_SEQUENCE))
+         return 0;
+@@ -67,25 +69,34 @@ int asn1_do_lock(ASN1_VALUE **pval, int op, const ASN1_ITEM *it)
+         return 0;
+     lck = offset2ptr(*pval, aux-&gt;ref_offset);
+     lock = offset2ptr(*pval, aux-&gt;ref_lock);
+-    if (op == 0) {
+-        *lck = 1;
++
++    switch (op) {
++    case 0:
++        *lck = ret = 1;
+         *lock = CRYPTO_THREAD_lock_new();
+         if (*lock == NULL) {
+             ASN1err(ASN1_F_ASN1_DO_LOCK, ERR_R_MALLOC_FAILURE);
+             return -1;
+         }
+-        return 1;
+-    }
+-    if (CRYPTO_atomic_add(lck, op, &amp;ret, *lock) &lt; 0)
+-        return -1;  /* failed */
++        break;
++    case 1:
++        if (!CRYPTO_UP_REF(lck, &amp;ret, *lock))
++            return -1;
++        break;
++    case -1:
++        if (!CRYPTO_DOWN_REF(lck, &amp;ret, *lock))
++            return -1;  /* failed */
+ #ifdef REF_PRINT
+-    fprintf(stderr, &quot;%p:%4d:%s\n&quot;, it, *lck, it-&gt;sname);
++        fprintf(stderr, &quot;%p:%4d:%s\n&quot;, it, ret, it-&gt;sname);
+ #endif
+-    REF_ASSERT_ISNT(ret &lt; 0);
+-    if (ret == 0) {
+-        CRYPTO_THREAD_lock_free(*lock);
+-        *lock = NULL;
++        REF_ASSERT_ISNT(ret &lt; 0);
++        if (ret == 0) {
++            CRYPTO_THREAD_lock_free(*lock);
++            *lock = NULL;
++        }
++        break;
+     }
++
+     return ret;
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019915.html">[openssl-commits] Still FAILED build of OpenSSL branch master with	options -d --strict-warnings no-md5
+</A></li>
+	<LI>Next message: <A HREF="019923.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19917">[ date ]</a>
+              <a href="thread.html#19917">[ thread ]</a>
+              <a href="subject.html#19917">[ subject ]</a>
+              <a href="author.html#19917">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

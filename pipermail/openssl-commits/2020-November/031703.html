@@ -1,0 +1,492 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1604273115.946321.19228.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="031693.html">
+   <LINK REL="Next"  HREF="031718.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1604273115.946321.19228.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Sun Nov  1 23:25:15 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="031693.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="031718.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31703">[ date ]</a>
+              <a href="thread.html#31703">[ thread ]</a>
+              <a href="subject.html#31703">[ subject ]</a>
+              <a href="author.html#31703">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8ea761bf40e6578ecd95ec47772ef86a2e4d4607 (commit)
+      from  769302a68bad66a29cc9b8e765bc2afb102172b1 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8ea761bf40e6578ecd95ec47772ef86a2e4d4607
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Thu Oct 29 18:20:36 2020 +1000
+
+    Add AES KW inverse ciphers to the EVP layer
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13272">https://github.com/openssl/openssl/pull/13272</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES.md                                         |   9 ++
+ include/openssl/evp.h                              |   1 +
+ providers/defltprov.c                              |   9 ++
+ providers/fips/fipsprov.c                          |   9 ++
+ providers/implementations/ciphers/cipher_aes_wrp.c |  31 +++-
+ .../implementations/include/prov/implementations.h |   6 +
+ test/recipes/30-test_evp.t                         |   1 +
+ .../30-test_evp_data/evpciph_aes_common.txt        |  52 -------
+ test/recipes/30-test_evp_data/evpciph_aes_wrap.txt | 165 +++++++++++++++++++++
+ 9 files changed, 228 insertions(+), 55 deletions(-)
+ create mode 100644 test/recipes/30-test_evp_data/evpciph_aes_wrap.txt
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 828bbd1b75..dc3e837474 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -23,6 +23,15 @@ OpenSSL 3.0
+ 
+ ### Changes between 1.1.1 and 3.0 [xx XXX xxxx]
+ 
++ * Add support for AES Key Wrap inverse ciphers to the EVP layer.
++   The algorithms are:
++   &quot;AES-128-WRAP-INV&quot;, &quot;AES-192-WRAP-INV&quot;, &quot;AES-256-WRAP-INV&quot;,
++   &quot;AES-128-WRAP-PAD-INV&quot;, &quot;AES-192-WRAP-PAD-INV&quot; and &quot;AES-256-WRAP-PAD-INV&quot;.
++   The inverse ciphers use AES decryption for wrapping, and
++   AES encryption for unwrapping.
++
++   *Shane Lontis*
++
+  * Deprecated EVP_PKEY_set1_tls_encodedpoint() and
+    EVP_PKEY_get1_tls_encodedpoint(). These functions were previously used by
+    libssl to set or get an encoded public key in/from an EVP_PKEY object. With
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index ba13960d6a..7a3da03a89 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -320,6 +320,7 @@ DEPRECATEDIN_3_0(int (*EVP_CIPHER_meth_get_ctrl(const EVP_CIPHER *cipher))
+ # define         EVP_CIPH_FLAG_CIPHER_WITH_MAC   0x2000000
+ /* For supplementary wrap cipher support */
+ # define         EVP_CIPH_FLAG_GET_WRAP_CIPHER   0x4000000
++# define         EVP_CIPH_FLAG_INVERSE_CIPHER    0x8000000
+ 
+ /*
+  * Cipher context flag to indicate we can handle wrap mode: if allowed in
+diff --git a/providers/defltprov.c b/providers/defltprov.c
+index 959c48d1db..123f03e726 100644
+--- a/providers/defltprov.c
++++ b/providers/defltprov.c
+@@ -204,6 +204,15 @@ static const OSSL_ALGORITHM_CAPABLE deflt_ciphers[] = {
+         ossl_aes192wrappad_functions),
+     ALG(&quot;AES-128-WRAP-PAD:id-aes128-wrap-pad:AES128-WRAP-PAD&quot;,
+         ossl_aes128wrappad_functions),
++    ALG(&quot;AES-256-WRAP-INV:AES256-WRAP-INV&quot;, ossl_aes256wrapinv_functions),
++    ALG(&quot;AES-192-WRAP-INV:AES192-WRAP-INV&quot;, ossl_aes192wrapinv_functions),
++    ALG(&quot;AES-128-WRAP-INV:AES128-WRAP-INV&quot;, ossl_aes128wrapinv_functions),
++    ALG(&quot;AES-256-WRAP-PAD-INV:AES256-WRAP-PAD-INV&quot;,
++        ossl_aes256wrappadinv_functions),
++    ALG(&quot;AES-192-WRAP-PAD-INV:AES192-WRAP-PAD-INV&quot;,
++        ossl_aes192wrappadinv_functions),
++    ALG(&quot;AES-128-WRAP-PAD-INV:AES128-WRAP-PAD-INV&quot;,
++        ossl_aes128wrappadinv_functions),
+     ALGC(&quot;AES-128-CBC-HMAC-SHA1&quot;, ossl_aes128cbc_hmac_sha1_functions,
+          ossl_cipher_capable_aes_cbc_hmac_sha1),
+     ALGC(&quot;AES-256-CBC-HMAC-SHA1&quot;, ossl_aes256cbc_hmac_sha1_functions,
+diff --git a/providers/fips/fipsprov.c b/providers/fips/fipsprov.c
+index a4e6601071..33b2f0213e 100644
+--- a/providers/fips/fipsprov.c
++++ b/providers/fips/fipsprov.c
+@@ -286,6 +286,15 @@ static const OSSL_ALGORITHM_CAPABLE fips_ciphers[] = {
+         ossl_aes192wrappad_functions),
+     ALG(&quot;AES-128-WRAP-PAD:id-aes128-wrap-pad:AES128-WRAP-PAD&quot;,
+         ossl_aes128wrappad_functions),
++    ALG(&quot;AES-256-WRAP-INV:AES256-WRAP-INV&quot;, ossl_aes256wrapinv_functions),
++    ALG(&quot;AES-192-WRAP-INV:AES192-WRAP-INV&quot;, ossl_aes192wrapinv_functions),
++    ALG(&quot;AES-128-WRAP-INV:AES128-WRAP-INV&quot;, ossl_aes128wrapinv_functions),
++    ALG(&quot;AES-256-WRAP-PAD-INV:AES256-WRAP-PAD-INV&quot;,
++        ossl_aes256wrappadinv_functions),
++    ALG(&quot;AES-192-WRAP-PAD-INV:AES192-WRAP-PAD-INV&quot;,
++        ossl_aes192wrappadinv_functions),
++    ALG(&quot;AES-128-WRAP-PAD-INV:AES128-WRAP-PAD-INV&quot;,
++        ossl_aes128wrappadinv_functions),
+     ALGC(&quot;AES-128-CBC-HMAC-SHA1&quot;, ossl_aes128cbc_hmac_sha1_functions,
+          ossl_cipher_capable_aes_cbc_hmac_sha1),
+     ALGC(&quot;AES-256-CBC-HMAC-SHA1&quot;, ossl_aes256cbc_hmac_sha1_functions,
+diff --git a/providers/implementations/ciphers/cipher_aes_wrp.c b/providers/implementations/ciphers/cipher_aes_wrp.c
+index 3918161b46..ca57666e7a 100644
+--- a/providers/implementations/ciphers/cipher_aes_wrp.c
++++ b/providers/implementations/ciphers/cipher_aes_wrp.c
+@@ -25,6 +25,7 @@
+ /* TODO(3.0) Figure out what flags need to be passed */
+ #define WRAP_FLAGS (EVP_CIPH_WRAP_MODE | EVP_CIPH_CUSTOM_IV \
+                     | EVP_CIPH_ALWAYS_CALL_INIT)
++#define WRAP_FLAGS_INV (WRAP_FLAGS | EVP_CIPH_FLAG_INVERSE_CIPHER)
+ 
+ typedef size_t (*aeswrap_fn)(void *key, const unsigned char *iv,
+                              unsigned char *out, const unsigned char *in,
+@@ -85,7 +86,6 @@ static int aes_wrap_init(void *vctx, const unsigned char *key,
+         return 0;
+ 
+     ctx-&gt;enc = enc;
+-    ctx-&gt;block = enc ? (block128_f)AES_encrypt : (block128_f)AES_decrypt;
+     if (ctx-&gt;pad)
+         wctx-&gt;wrapfn = enc ? CRYPTO_128_wrap_pad : CRYPTO_128_unwrap_pad;
+     else
+@@ -96,14 +96,32 @@ static int aes_wrap_init(void *vctx, const unsigned char *key,
+             return 0;
+     }
+     if (key != NULL) {
++        int use_forward_transform;
++
+         if (keylen != ctx-&gt;keylen) {
+            ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_KEY_LENGTH);
+            return 0;
+         }
+-        if (ctx-&gt;enc)
+-            AES_set_encrypt_key(key, keylen * 8, &amp;wctx-&gt;ks.ks);
++        /*
++         * See SP800-38F : Section 5.1
++         * The forward and inverse transformations for the AES block
++         * cipher&#8212;called &#8220;cipher&#8221; and &#8220;inverse  cipher&#8221; are informally known as
++         * the AES encryption and AES decryption functions, respectively.
++         * If the designated cipher function for a key-wrap algorithm is chosen
++         * to be the AES decryption function, then CIPH-1K will be the AES
++         * encryption function.
++         */
++        if ((ctx-&gt;flags &amp; EVP_CIPH_FLAG_INVERSE_CIPHER) == 0)
++            use_forward_transform = ctx-&gt;enc;
+         else
++            use_forward_transform = !ctx-&gt;enc;
++        if (use_forward_transform) {
++            AES_set_encrypt_key(key, keylen * 8, &amp;wctx-&gt;ks.ks);
++            ctx-&gt;block = (block128_f)AES_encrypt;
++        } else {
+             AES_set_decrypt_key(key, keylen * 8, &amp;wctx-&gt;ks.ks);
++            ctx-&gt;block = (block128_f)AES_decrypt;
++        }
+     }
+     return 1;
+ }
+@@ -266,3 +284,10 @@ IMPLEMENT_cipher(wrap, wrap, WRAP, WRAP_FLAGS, 128, 64, AES_WRAP_NOPAD_IVLEN * 8
+ IMPLEMENT_cipher(wrap, wrappad, WRAP, WRAP_FLAGS, 256, 64, AES_WRAP_PAD_IVLEN * 8);
+ IMPLEMENT_cipher(wrap, wrappad, WRAP, WRAP_FLAGS, 192, 64, AES_WRAP_PAD_IVLEN * 8);
+ IMPLEMENT_cipher(wrap, wrappad, WRAP, WRAP_FLAGS, 128, 64, AES_WRAP_PAD_IVLEN * 8);
++
++IMPLEMENT_cipher(wrap, wrapinv, WRAP, WRAP_FLAGS_INV, 256, 64, AES_WRAP_NOPAD_IVLEN * 8);
++IMPLEMENT_cipher(wrap, wrapinv, WRAP, WRAP_FLAGS_INV, 192, 64, AES_WRAP_NOPAD_IVLEN * 8);
++IMPLEMENT_cipher(wrap, wrapinv, WRAP, WRAP_FLAGS_INV, 128, 64, AES_WRAP_NOPAD_IVLEN * 8);
++IMPLEMENT_cipher(wrap, wrappadinv, WRAP, WRAP_FLAGS_INV, 256, 64, AES_WRAP_PAD_IVLEN * 8);
++IMPLEMENT_cipher(wrap, wrappadinv, WRAP, WRAP_FLAGS_INV, 192, 64, AES_WRAP_PAD_IVLEN * 8);
++IMPLEMENT_cipher(wrap, wrappadinv, WRAP, WRAP_FLAGS_INV, 128, 64, AES_WRAP_PAD_IVLEN * 8);
+diff --git a/providers/implementations/include/prov/implementations.h b/providers/implementations/include/prov/implementations.h
+index 1db344b946..fd6b721364 100644
+--- a/providers/implementations/include/prov/implementations.h
++++ b/providers/implementations/include/prov/implementations.h
+@@ -82,6 +82,12 @@ extern const OSSL_DISPATCH ossl_aes128wrap_functions[];
+ extern const OSSL_DISPATCH ossl_aes256wrappad_functions[];
+ extern const OSSL_DISPATCH ossl_aes192wrappad_functions[];
+ extern const OSSL_DISPATCH ossl_aes128wrappad_functions[];
++extern const OSSL_DISPATCH ossl_aes256wrapinv_functions[];
++extern const OSSL_DISPATCH ossl_aes192wrapinv_functions[];
++extern const OSSL_DISPATCH ossl_aes128wrapinv_functions[];
++extern const OSSL_DISPATCH ossl_aes256wrappadinv_functions[];
++extern const OSSL_DISPATCH ossl_aes192wrappadinv_functions[];
++extern const OSSL_DISPATCH ossl_aes128wrappadinv_functions[];
+ extern const OSSL_DISPATCH ossl_aes256cbc_hmac_sha1_functions[];
+ extern const OSSL_DISPATCH ossl_aes128cbc_hmac_sha1_functions[];
+ extern const OSSL_DISPATCH ossl_aes256cbc_hmac_sha256_functions[];
+diff --git a/test/recipes/30-test_evp.t b/test/recipes/30-test_evp.t
+index 9a8bb74bb6..9739465f01 100644
+--- a/test/recipes/30-test_evp.t
++++ b/test/recipes/30-test_evp.t
+@@ -41,6 +41,7 @@ my @files = qw(
+                 evpciph_aes_ccm_cavs.txt
+                 evpciph_aes_common.txt
+                 evpciph_aes_cts1.txt
++                evpciph_aes_wrap.txt
+                 evpciph_des3_common.txt
+                 evpkdf_hkdf.txt
+                 evpkdf_pbkdf2.txt
+diff --git a/test/recipes/30-test_evp_data/evpciph_aes_common.txt b/test/recipes/30-test_evp_data/evpciph_aes_common.txt
+index 82a72db9b2..3d24829a8a 100644
+--- a/test/recipes/30-test_evp_data/evpciph_aes_common.txt
++++ b/test/recipes/30-test_evp_data/evpciph_aes_common.txt
+@@ -1146,58 +1146,6 @@ IV = 00000000000000000000000000000000
+ Plaintext = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1
+ Ciphertext = 27A7479BEFA1D476489F308CD4CFA6E2A96E4BBE3208FF25287DD3819616E89CC78CF7F5E543445F8333D8FA7F56000005279FA5D8B5E4AD40E736DDB4D35412328063FD2AAB53E5EA1E0A9F332500A5DF9487D07A5C92CC512C8866C7E860CE93FDF166A24912B422976146AE20CE846BB7DC9BA94A767AAEF20C0D61AD02655EA92DC4C4E41A8952C651D33174BE51A10C421110E6D81588EDE82103A252D8A750E8768DEFFFED9122810AAEB99F910409B03D164E727C31290FD4E039500872AF
+ 
+-# AES wrap tests from RFC3394
+-Cipher = id-aes128-wrap
+-Key = 000102030405060708090A0B0C0D0E0F
+-Plaintext = 00112233445566778899AABBCCDDEEFF
+-Ciphertext = 1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5
+-
+-Cipher = id-aes192-wrap
+-Key = 000102030405060708090A0B0C0D0E0F1011121314151617
+-Plaintext = 00112233445566778899AABBCCDDEEFF
+-Ciphertext = 96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D
+-
+-Cipher = id-aes256-wrap
+-Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
+-Plaintext = 00112233445566778899AABBCCDDEEFF
+-Ciphertext = 64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7
+-
+-Cipher = id-aes192-wrap
+-Key = 000102030405060708090A0B0C0D0E0F1011121314151617
+-Plaintext = 00112233445566778899AABBCCDDEEFF0001020304050607
+-Ciphertext = 031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2
+-
+-Cipher = id-aes256-wrap
+-Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
+-Plaintext = 00112233445566778899AABBCCDDEEFF0001020304050607
+-Ciphertext = A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1
+-
+-Cipher = id-aes256-wrap
+-Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
+-Plaintext = 00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F
+-Ciphertext = 28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21
+-
+-# Same as previous example but with invalid unwrap key: should be rejected
+-# without returning any plaintext
+-Cipher = id-aes256-wrap
+-Operation = DECRYPT
+-Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E00
+-Plaintext = 00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F
+-Ciphertext = 28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21
+-Result = CIPHERUPDATE_ERROR
+-
+-# AES wrap tests from RFC5649
+-Cipher = id-aes192-wrap-pad
+-Key = 5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8
+-Plaintext = c37b7e6492584340bed12207808941155068f738
+-Ciphertext = 138bdeaa9b8fa7fc61f97742e72248ee5ae6ae5360d1ae6a5f54f373fa543b6a
+-
+-Cipher = id-aes192-wrap-pad
+-Key = 5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8
+-Plaintext = 466f7250617369
+-Ciphertext = afbeb0f07dfbf5419200f2ccb50bb24f
+-
+-
+ Title = Case insensitive AES tests
+ 
+ Cipher = Aes-128-eCb
+diff --git a/test/recipes/30-test_evp_data/evpciph_aes_wrap.txt b/test/recipes/30-test_evp_data/evpciph_aes_wrap.txt
+new file mode 100644
+index 0000000000..080d13db72
+--- /dev/null
++++ b/test/recipes/30-test_evp_data/evpciph_aes_wrap.txt
+@@ -0,0 +1,165 @@
++#
++# Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++# AES wrap tests from RFC3394
++Cipher = id-aes128-wrap
++Key = 000102030405060708090A0B0C0D0E0F
++Plaintext = 00112233445566778899AABBCCDDEEFF
++Ciphertext = 1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5
++
++Cipher = id-aes192-wrap
++Key = 000102030405060708090A0B0C0D0E0F1011121314151617
++Plaintext = 00112233445566778899AABBCCDDEEFF
++Ciphertext = 96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D
++
++Cipher = id-aes256-wrap
++Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
++Plaintext = 00112233445566778899AABBCCDDEEFF
++Ciphertext = 64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7
++
++Cipher = id-aes192-wrap
++Key = 000102030405060708090A0B0C0D0E0F1011121314151617
++Plaintext = 00112233445566778899AABBCCDDEEFF0001020304050607
++Ciphertext = 031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2
++
++Cipher = id-aes256-wrap
++Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
++Plaintext = 00112233445566778899AABBCCDDEEFF0001020304050607
++Ciphertext = A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1
++
++Cipher = id-aes256-wrap
++Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
++Plaintext = 00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F
++Ciphertext = 28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21
++
++# Same as previous example but with invalid unwrap key: should be rejected
++# without returning any plaintext
++Cipher = id-aes256-wrap
++Operation = DECRYPT
++Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E00
++Plaintext = 00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F
++Ciphertext = 28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21
++Result = CIPHERUPDATE_ERROR
++
++# AES wrap tests from RFC5649
++Cipher = id-aes192-wrap-pad
++Key = 5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8
++Plaintext = c37b7e6492584340bed12207808941155068f738
++Ciphertext = 138bdeaa9b8fa7fc61f97742e72248ee5ae6ae5360d1ae6a5f54f373fa543b6a
++
++Cipher = id-aes192-wrap-pad
++Key = 5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8
++Plaintext = 466f7250617369
++Ciphertext = afbeb0f07dfbf5419200f2ccb50bb24f
++
++# AES wrap tests from
++# <A HREF="https://csrc.nist.gov/CSRC/media/Projects/">https://csrc.nist.gov/CSRC/media/Projects/</A>
++# Cryptographic-Algorithm-Validation-Program/documents/mac/kwtestvectors.zip
++# A small subset has been used.
++
++# KW_AD_128_inv
++Cipher = AES-128-WRAP-INV
++Operation = DECRYPT
++Key = 7aa9e9e3c6b2916b4b62ac06074d14e8
++Ciphertext = 110f6ba8d4aa2a24f0abfd2cd351ebb6cdfafb35941bbe33
++Plaintext = 77a44e843e1f85707cc7e149e5f873be
++
++Cipher = AES-128-WRAP-INV
++Operation = DECRYPT
++Key = accc4b014123f9e95d3c6f92d07da9fd
++Ciphertext = 020cc7c82b6b7cd2ff4d28186930305edce13d65cc36d8d1
++Result = CIPHERUPDATE_ERROR
++
++Cipher = AES-128-WRAP-INV
++Operation = DECRYPT
++Key = 68eceb881f8f34ccb6bebd4e149741ff
++Ciphertext = 67292ab62037d076734513943ac907994b6a45b74ed2349f009e2267dc95f13a01b0e2fa109b9b6a
++Plaintext = 2910c499dc41de663e7f349b26f00291537943fcc8845166cdd210368d5adf44
++
++Cipher = AES-128-WRAP-INV
++Operation = DECRYPT
++Key = f8f94a07506f4d1728f6bed6c89a9c5d
++Ciphertext = 85fe9d64465db07ec63062aeb4c9161558fabb01d6b9e787850831f9b3414a5cbd35023c63fd59626c64cb3c470d9b7d
++Plaintext = c248842911a3dbc5562b1fe0f3955c4da3fd74471062d074d9b972ce3a840f0cb63a768ed1c432b7
++
++# KW_AD_192_inv
++Cipher = AES-192-WRAP-INV
++Operation = DECRYPT
++Key = fd9f4c93416fe7cb53002a5b011a2d4695ec64460af59826
++Ciphertext = 5e25074c8d7e82f0224c151db4af874578d55dfa5cc98952
++Plaintext = 1097eb6e48232f5c5f15fb5d1c8b5f44
++
++# KW_AD_256_inv
++Cipher = AES-256-WRAP-INV
++Operation = DECRYPT
++Key = d660410f4c4eeb7b0f9dfb7b5dcd4eabac1cfcbb072b1825c96026f6a64dd7dd
++Ciphertext = 157629ebd041bf5b9f354bbda3a4906e7ec84cac6d7d7702
++Plaintext = 4142bea750ab0f332e9ea5185157af13
++
++# KW_AE_128_inv
++Cipher = AES-128-WRAP-INV
++Key = e88ba734ea243480a6129366753b58eb
++Plaintext = d140ac16a44c1c2b3f47037ea8898a3e
++Ciphertext = 600861ee14320006f0ae55c46d5e1ebf3303751df7f038df
++
++# KW_AE_192_inv
++Cipher = AES-192-WRAP-INV
++Key = 370c715135b44eb3773b1aff833bcd28b59aee866d4a36b3
++Plaintext = eae0f60f1cf33d5b75869e84c764a04e
++Ciphertext = ea4ba4add8add19950ca491d109ffa08f90312693055677a
++
++# KW_AE_256_inv
++Cipher = AES-256-WRAP-INV
++Key = de982f7c871f78e37462e2f48a62eecb2da81a10799c6ebf2bee8c786b624b0e
++Plaintext = ecafc437d9f1643c7645c2416c14c003
++Ciphertext = aec02ddb3f6de1f99103c6042dfc9001eb3cf56d9c2a11f7
++
++# KWP_AD_128_inv
++Cipher = AES-128-WRAP-PAD-INV
++Operation = DECRYPT
++Key = 7877f11e1a2d530a0b27274d4e6d7f2c
++Ciphertext = ea53d73d75f5f0642c64d4715d1c131a
++Plaintext = 52
++
++Cipher = AES-128-WRAP-PAD-INV
++Operation = DECRYPT
++Key = 983dc3acf84ca6522b26f818cd0cf64f
++Ciphertext = 441da28c430266c29e8413a5938089013c0e8251280ecddc
++Plaintext = f469d3232eed4d096f
++
++# KWP_AD_192_inv
++Cipher = AES-192-WRAP-PAD-INV
++Operation = DECRYPT
++Key = 427c6c0a2cc30bbe0cd9fc6b11c29f8cfe64df6ab0379433
++Ciphertext = f5dcb63193a377a526db98a852db6099
++Plaintext = 98
++
++# KWP_AD_256_inv
++Cipher = AES-256-WRAP-PAD-INV
++Operation = DECRYPT
++Key = 48658f36aa5e24621f86fa6db06487bd635b18ff87704431a1c42cd145115c51
++Ciphertext = 6990b3b115563ef6a0884a110a393ee4
++Plaintext = 16700199665ff161
++
++# KWP_AE_128_inv
++Cipher = AES-128-WRAP-PAD-INV
++Key = 1c321a356b0ee25e30de2d618c1facbe
++Plaintext = 42
++Ciphertext = 3ddf22da3080a1a5252574c76f833790
++
++# KWP_AE_192_inv
++Cipher = AES-192-WRAP-PAD-INV
++Key = fe3fe235bb36dcf03f01cbf32cc98a3abf10ab3d608d3b30
++Plaintext = 1d2b7fc29991bafaf7
++Ciphertext = c11afb3c0de263dfb9b672a5f81fe0b9acfe9c407691f332
++
++# KWP_AE_256_inv
++Cipher = AES-256-WRAP-PAD-INV
++Key = 148a3fa618a6998c30b9f0f67922354a3747f2fa2e4d2e0b7af9582d6f548fee
++Plaintext = 441125592acf9e5208dcd558a7ac0034d15530dbad7a2913963da0cbf60aa3
++Ciphertext = 23f26a9476829885055694062c89b86399e8d6125509c9e88bb0a5b5113f4bfc8d34a62cba3c9eee
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="031693.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="031718.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31703">[ date ]</a>
+              <a href="thread.html#31703">[ thread ]</a>
+              <a href="subject.html#31703">[ subject ]</a>
+              <a href="author.html#31703">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

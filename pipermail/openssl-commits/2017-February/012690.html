@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1486554331.555037.18054.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012682.html">
+   <LINK REL="Next"  HREF="012695.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1486554331.555037.18054.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Feb  8 11:45:31 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012682.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="012695.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12690">[ date ]</a>
+              <a href="thread.html#12690">[ thread ]</a>
+              <a href="subject.html#12690">[ subject ]</a>
+              <a href="author.html#12690">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  18b3a80a5fd368f59c322fbb16b7dc92c1f11efa (commit)
+      from  21d94d44246bfe2c220bc3b219443ccaedce308d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 18b3a80a5fd368f59c322fbb16b7dc92c1f11efa
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Wed Feb 8 09:33:44 2017 +0000
+
+    Fix crash in tls13_enc
+    
+    If s-&gt;s3-&gt;tmp.new_cipher is NULL then a crash can occur. This can happen
+    if an alert gets sent after version negotiation (i.e. we have selected
+    TLSv1.3 and ended up in tls13_enc), but before a ciphersuite has been
+    selected.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2575">https://github.com/openssl/openssl/pull/2575</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/record/ssl3_record_tls13.c | 13 ++++++++++++-
+ test/tls13encryptiontest.c     | 18 ++++++++++++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/ssl/record/ssl3_record_tls13.c b/ssl/record/ssl3_record_tls13.c
+index 9dc7075..d96a042 100644
+--- a/ssl/record/ssl3_record_tls13.c
++++ b/ssl/record/ssl3_record_tls13.c
+@@ -7,6 +7,7 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
++#include &lt;assert.h&gt;
+ #include &quot;../ssl_locl.h&quot;
+ #include &quot;record_locl.h&quot;
+ 
+@@ -29,7 +30,7 @@ int tls13_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
+     unsigned char *seq;
+     int lenu, lenf;
+     SSL3_RECORD *rec = &amp;recs[0];
+-    uint32_t alg_enc = s-&gt;s3-&gt;tmp.new_cipher-&gt;algorithm_enc;
++    uint32_t alg_enc;
+ 
+     if (n_recs != 1) {
+         /* Should not happen */
+@@ -52,8 +53,18 @@ int tls13_enc(SSL *s, SSL3_RECORD *recs, size_t n_recs, int send)
+         rec-&gt;input = rec-&gt;data;
+         return 1;
+     }
++
+     ivlen = EVP_CIPHER_CTX_iv_length(ctx);
+ 
++    /*
++     * To get here we must have selected a ciphersuite - otherwise ctx would
++     * be NULL
++     */
++    assert(s-&gt;s3-&gt;tmp.new_cipher != NULL);
++    if (s-&gt;s3-&gt;tmp.new_cipher == NULL)
++        return -1;
++    alg_enc = s-&gt;s3-&gt;tmp.new_cipher-&gt;algorithm_enc;
++
+     if (alg_enc &amp; SSL_AESCCM) {
+         if (alg_enc &amp; (SSL_AES128CCM8 | SSL_AES256CCM8))
+             taglen = EVP_CCM8_TLS_TAG_LEN;
+diff --git a/test/tls13encryptiontest.c b/test/tls13encryptiontest.c
+index 06bbbb3..8229293 100644
+--- a/test/tls13encryptiontest.c
++++ b/test/tls13encryptiontest.c
+@@ -34,6 +34,10 @@ typedef struct {
+ 
+ static RECORD_DATA refdata[] = {
+     {
++        /*
++         * Server: EncryptedExtensions, Certificate, CertificateVerify and
++         *         Finished
++         */
+         {
+             &quot;0800001e001c000a00140012001d001700180019010001010102010301040000&quot;
+             &quot;00000b0001b9000001b50001b0308201ac30820115a003020102020102300d06&quot;
+@@ -85,6 +89,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000000&quot;
+     },
+     {
++        /* Client: Finished */
+         {
+             &quot;1400002078367856d3c8cc4e0a95eb98906ca7a48bd3cc7029f48bd4ae0dc91a&quot;
+             &quot;b903ca8916&quot;,&quot;&quot;,&quot;&quot;
+@@ -98,6 +103,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000000&quot;
+     },
+     {
++        /* Server: NewSessionTicket */
+         {
+             &quot;040000a60002a3004abe594b00924e535321cadc96238da09caf9b02fecafdd6&quot;
+             &quot;5e3e418f03e43772cf512ed8066100503b1c08abbbf298a9d138ce821dd12fe1&quot;
+@@ -119,6 +125,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000000&quot;
+     },
+     {
++        /* Client: Application Data */
+         {
+             &quot;000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&quot;
+             &quot;202122232425262728292a2b2c2d2e2f303117&quot;,&quot;&quot;,&quot;&quot;
+@@ -133,6 +140,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000000&quot;
+     },
+     {
++        /* Server: Application Data */
+         {
+             &quot;000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&quot;
+             &quot;202122232425262728292a2b2c2d2e2f303117&quot;,&quot;&quot;,&quot;&quot;
+@@ -147,6 +155,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000001&quot;
+     },
+     {
++        /* Client: CloseNotify */
+         {
+             &quot;010015&quot;,&quot;&quot;,&quot;&quot;
+         },
+@@ -158,6 +167,7 @@ static RECORD_DATA refdata[] = {
+         &quot;0000000000000001&quot;
+     },
+     {
++        /* Server: CloseNotify */
+         {
+             &quot;010015&quot;,&quot;&quot;,&quot;&quot;
+         },
+@@ -281,6 +291,8 @@ static int test_record(SSL3_RECORD *rec, RECORD_DATA *recd, int enc)
+     return ret;
+ }
+ 
++#define TLS13_AES_128_GCM_SHA256_BYTES  ((const unsigned char *)&quot;\x13\x01&quot;)
++
+ static int test_tls13_encryption(void)
+ {
+     SSL_CTX *ctx = NULL;
+@@ -312,6 +324,12 @@ static int test_tls13_encryption(void)
+         goto err;
+     }
+ 
++    s-&gt;s3-&gt;tmp.new_cipher = SSL_CIPHER_find(s, TLS13_AES_128_GCM_SHA256_BYTES);
++    if (s-&gt;s3-&gt;tmp.new_cipher == NULL) {
++        fprintf(stderr, &quot;Failed to find cipher\n&quot;);
++        goto err;
++    }
++
+     for (ctr = 0; ctr &lt; OSSL_NELEM(refdata); ctr++) {
+         /* Load the record */
+         ivlen = EVP_CIPHER_iv_length(ciph);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012682.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="012695.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12690">[ date ]</a>
+              <a href="thread.html#12690">[ thread ]</a>
+              <a href="subject.html#12690">[ subject ]</a>
+              <a href="author.html#12690">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1680 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452713783.465870.28150.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002835.html">
+   <LINK REL="Next"  HREF="002843.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452713783.465870.28150.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Jan 13 19:36:23 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002835.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002843.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2837">[ date ]</a>
+              <a href="thread.html#2837">[ thread ]</a>
+              <a href="subject.html#2837">[ subject ]</a>
+              <a href="author.html#2837">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3aef36ffef89849348049296892327e6fdf9d705 (commit)
+      from  8ffcca65861520fb95e4603b2cb80b3028e56baa (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3aef36ffef89849348049296892327e6fdf9d705
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Tue Jan 5 13:06:03 2016 -0500
+
+    Add CRYPTO_EX_DATA; remove EC_EXTRA_DATA
+    
+    Add CRYPTO_EX_DATA add EndC_KEY_[gs]et_method, From Roumen Petrov.
+    Had to add various exdata calls to init/copy/free the exdata.
+    Had to remove const from some EC functions because exdata isn't
+    const-correct. :(
+    Also remove EC_EXTRA_DATA and use a union to hold the possible
+    pre-computed values and an enum to tell which value is in the
+    union. (Rich Salz)
+    
+    Reviewed-by: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_key.c                     |  61 ++-------
+ crypto/ec/ec_kmeth.c                   |  34 ++++-
+ crypto/ec/ec_lcl.h                     |  70 ++++++-----
+ crypto/ec/ec_lib.c                     | 223 +++++++++------------------------
+ crypto/ec/ec_mult.c                    |  91 +++-----------
+ crypto/ec/ecp_nistp224.c               |  71 +++--------
+ crypto/ec/ecp_nistp256.c               |  70 +++--------
+ crypto/ec/ecp_nistp521.c               |  69 +++-------
+ crypto/ec/ecp_nistz256.c               |  89 ++++---------
+ doc/crypto/CRYPTO_get_ex_new_index.pod |   3 +-
+ doc/crypto/EC_KEY_new.pod              |  57 ++++-----
+ doc/crypto/ec.pod                      |   7 +-
+ include/openssl/crypto.h               |  17 ++-
+ include/openssl/ec.h                   |  29 ++---
+ util/libeay.num                        |  14 ++-
+ 15 files changed, 283 insertions(+), 622 deletions(-)
+
+diff --git a/crypto/ec/ec_key.c b/crypto/ec/ec_key.c
+index 82d13eb..f236e3c 100644
+--- a/crypto/ec/ec_key.c
++++ b/crypto/ec/ec_key.c
+@@ -120,19 +120,16 @@ void EC_KEY_free(EC_KEY *r)
+         ENGINE_finish(r-&gt;engine);
+ #endif
+ 
++    CRYPTO_free_ex_data(CRYPTO_EX_INDEX_EC_KEY, r, &amp;r-&gt;ex_data);
+     EC_GROUP_free(r-&gt;group);
+     EC_POINT_free(r-&gt;pub_key);
+     BN_clear_free(r-&gt;priv_key);
+ 
+-    EC_EX_DATA_free_all_data(&amp;r-&gt;method_data);
+-
+     OPENSSL_clear_free((void *)r, sizeof(EC_KEY));
+ }
+ 
+-EC_KEY *EC_KEY_copy(EC_KEY *dest, const EC_KEY *src)
++EC_KEY *EC_KEY_copy(EC_KEY *dest, EC_KEY *src)
+ {
+-    EC_EXTRA_DATA *d;
+-
+     if (dest == NULL || src == NULL) {
+         ECerr(EC_F_EC_KEY_COPY, ERR_R_PASSED_NULL_PARAMETER);
+         return NULL;
+@@ -176,25 +173,15 @@ EC_KEY *EC_KEY_copy(EC_KEY *dest, const EC_KEY *src)
+         if (!BN_copy(dest-&gt;priv_key, src-&gt;priv_key))
+             return NULL;
+     }
+-    /* copy method/extra data */
+-    EC_EX_DATA_free_all_data(&amp;dest-&gt;method_data);
+-
+-    for (d = src-&gt;method_data; d != NULL; d = d-&gt;next) {
+-        void *t = d-&gt;dup_func(d-&gt;data);
+-
+-        if (t == NULL)
+-            return 0;
+-        if (!EC_EX_DATA_set_data
+-            (&amp;dest-&gt;method_data, t, d-&gt;dup_func, d-&gt;free_func,
+-             d-&gt;clear_free_func))
+-            return NULL;
+-    }
+ 
+     /* copy the rest */
+     dest-&gt;enc_flag = src-&gt;enc_flag;
+     dest-&gt;conv_form = src-&gt;conv_form;
+     dest-&gt;version = src-&gt;version;
+     dest-&gt;flags = src-&gt;flags;
++    if (!CRYPTO_dup_ex_data(CRYPTO_EX_INDEX_EC_KEY,
++                            &amp;dest-&gt;ex_data, &amp;src-&gt;ex_data))
++        return NULL;
+ 
+     if (src-&gt;meth != dest-&gt;meth) {
+ #ifndef OPENSSL_NO_ENGINE
+@@ -211,9 +198,10 @@ EC_KEY *EC_KEY_copy(EC_KEY *dest, const EC_KEY *src)
+     return dest;
+ }
+ 
+-EC_KEY *EC_KEY_dup(const EC_KEY *ec_key)
++EC_KEY *EC_KEY_dup(EC_KEY *ec_key)
+ {
+     EC_KEY *ret = EC_KEY_new_method(ec_key-&gt;engine);
++
+     if (ret == NULL)
+         return NULL;
+     if (EC_KEY_copy(ret, ec_key) == NULL) {
+@@ -513,41 +501,6 @@ void EC_KEY_set_conv_form(EC_KEY *key, point_conversion_form_t cform)
+         EC_GROUP_set_point_conversion_form(key-&gt;group, cform);
+ }
+ 
+-void *EC_KEY_get_key_method_data(EC_KEY *key,
+-                                 void *(*dup_func) (void *),
+-                                 void (*free_func) (void *),
+-                                 void (*clear_free_func) (void *))
+-{
+-    void *ret;
+-
+-    CRYPTO_r_lock(CRYPTO_LOCK_EC);
+-    ret =
+-        EC_EX_DATA_get_data(key-&gt;method_data, dup_func, free_func,
+-                            clear_free_func);
+-    CRYPTO_r_unlock(CRYPTO_LOCK_EC);
+-
+-    return ret;
+-}
+-
+-void *EC_KEY_insert_key_method_data(EC_KEY *key, void *data,
+-                                    void *(*dup_func) (void *),
+-                                    void (*free_func) (void *),
+-                                    void (*clear_free_func) (void *))
+-{
+-    EC_EXTRA_DATA *ex_data;
+-
+-    CRYPTO_w_lock(CRYPTO_LOCK_EC);
+-    ex_data =
+-        EC_EX_DATA_get_data(key-&gt;method_data, dup_func, free_func,
+-                            clear_free_func);
+-    if (ex_data == NULL)
+-        EC_EX_DATA_set_data(&amp;key-&gt;method_data, data, dup_func, free_func,
+-                            clear_free_func);
+-    CRYPTO_w_unlock(CRYPTO_LOCK_EC);
+-
+-    return ex_data;
+-}
+-
+ void EC_KEY_set_asn1_flag(EC_KEY *key, int flag)
+ {
+     if (key-&gt;group != NULL)
+diff --git a/crypto/ec/ec_kmeth.c b/crypto/ec/ec_kmeth.c
+index d6c2811..5d77cbe 100644
+--- a/crypto/ec/ec_kmeth.c
++++ b/crypto/ec/ec_kmeth.c
+@@ -93,6 +93,31 @@ void EC_KEY_set_default_method(const EC_KEY_METHOD *meth)
+         default_ec_key_meth = meth;
+ }
+ 
++const EC_KEY_METHOD *EC_KEY_get_method(const EC_KEY *key)
++{
++    return key-&gt;meth;
++}
++
++int EC_KEY_set_method(EC_KEY *key, const EC_KEY_METHOD *meth)
++{
++    void (*finish)(EC_KEY *key) = key-&gt;meth-&gt;finish;
++
++    if (finish != NULL)
++        finish(key);
++
++#ifndef OPENSSL_NO_ENGINE
++    if (key-&gt;engine != NULL) {
++        ENGINE_finish(key-&gt;engine);
++        key-&gt;engine = NULL;
++    }
++#endif
++
++    key-&gt;meth = meth;
++    if (meth-&gt;init != NULL)
++        return meth-&gt;init(key);
++    return 1;
++}
++
+ EC_KEY *EC_KEY_new_method(ENGINE *engine)
+ {
+     EC_KEY *ret = OPENSSL_zalloc(sizeof(*ret));
+@@ -101,6 +126,11 @@ EC_KEY *EC_KEY_new_method(ENGINE *engine)
+         ECerr(EC_F_EC_KEY_NEW_METHOD, ERR_R_MALLOC_FAILURE);
+         return (NULL);
+     }
++    if (!CRYPTO_new_ex_data(CRYPTO_EX_INDEX_EC_KEY, ret, &amp;ret-&gt;ex_data)) {
++        OPENSSL_free(ret);
++        return NULL;
++    }
++
+     ret-&gt;meth = EC_KEY_get_default_method();
+ #ifndef OPENSSL_NO_ENGINE
+     if (engine != NULL) {
+@@ -146,8 +176,8 @@ int ECDH_compute_key(void *out, size_t outlen, const EC_POINT *pub_key,
+ 
+ EC_KEY_METHOD *EC_KEY_METHOD_new(const EC_KEY_METHOD *meth)
+ {
+-    EC_KEY_METHOD *ret;
+-    ret = OPENSSL_zalloc(sizeof(*meth));
++    EC_KEY_METHOD *ret = OPENSSL_zalloc(sizeof(*meth));
++
+     if (ret == NULL)
+         return NULL;
+     if (meth != NULL)
+diff --git a/crypto/ec/ec_lcl.h b/crypto/ec/ec_lcl.h
+index ebfaae3..036f9ee 100644
+--- a/crypto/ec/ec_lcl.h
++++ b/crypto/ec/ec_lcl.h
+@@ -198,13 +198,14 @@ struct ec_method_st {
+     int (*field_set_to_one) (const EC_GROUP *, BIGNUM *r, BN_CTX *);
+ } /* EC_METHOD */ ;
+ 
+-typedef struct ec_extra_data_st {
+-    struct ec_extra_data_st *next;
+-    void *data;
+-    void *(*dup_func) (void *);
+-    void (*free_func) (void *);
+-    void (*clear_free_func) (void *);
+-} EC_EXTRA_DATA;                /* used in EC_GROUP */
++/*
++ * Types and functions to manipulate pre-computed values.
++ */
++typedef struct nistp224_pre_comp_st NISTP224_PRE_COMP;
++typedef struct nistp256_pre_comp_st NISTP256_PRE_COMP;
++typedef struct nistp512_pre_comp_st NISTP521_PRE_COMP;
++typedef struct nistz256_pre_comp_st NISTZ256_PRE_COMP;
++typedef struct ec_pre_comp_st EC_PRE_COMP;
+ 
+ struct ec_group_st {
+     const EC_METHOD *meth;
+@@ -216,7 +217,6 @@ struct ec_group_st {
+     unsigned char *seed;        /* optional seed for parameters (appears in
+                                  * ASN1) */
+     size_t seed_len;
+-    EC_EXTRA_DATA *extra_data;  /* linked list */
+     /*
+      * The following members are handled by the method functions, even if
+      * they appear generic
+@@ -254,8 +254,26 @@ struct ec_group_st {
+                            BN_CTX *);
+     /* data for ECDSA inverse */
+     BN_MONT_CTX *mont_data;
++
++    /* precomputed values for speed. */
++    enum {
++        pct_none,
++        pct_nistp224, pct_nistp256, pct_nistp521, pct_nistz256,
++        pct_ec } pre_comp_type;
++    union {
++        NISTP224_PRE_COMP *nistp224;
++        NISTP256_PRE_COMP *nistp256;
++        NISTP521_PRE_COMP *nistp521;
++        NISTZ256_PRE_COMP *nistz256;
++        EC_PRE_COMP *ec;
++    } pre_comp;
+ } /* EC_GROUP */ ;
+ 
++#define SETPRECOMP(g, type, pre) \
++    g-&gt;pre_comp_type = pct_##type, g-&gt;pre_comp.type = pre
++#define HAVEPRECOMP(g, type) \
++    g-&gt;pre_comp_type == pct_##type &amp;&amp; g-&gt;pre_comp.type != NULL
++
+ struct ec_key_st {
+     const EC_KEY_METHOD *meth;
+     ENGINE *engine;
+@@ -267,31 +285,9 @@ struct ec_key_st {
+     point_conversion_form_t conv_form;
+     int references;
+     int flags;
+-    EC_EXTRA_DATA *method_data;
++    CRYPTO_EX_DATA ex_data;
+ } /* EC_KEY */ ;
+ 
+-/*
+- * Basically a 'mixin' for extra data, but available for EC_GROUPs/EC_KEYs
+- * only (with visibility limited to 'package' level for now). We use the
+- * function pointers as index for retrieval; this obviates global
+- * ex_data-style index tables.
+- */
+-int EC_EX_DATA_set_data(EC_EXTRA_DATA **, void *data,
+-                        void *(*dup_func) (void *),
+-                        void (*free_func) (void *),
+-                        void (*clear_free_func) (void *));
+-void *EC_EX_DATA_get_data(const EC_EXTRA_DATA *, void *(*dup_func) (void *),
+-                          void (*free_func) (void *),
+-                          void (*clear_free_func) (void *));
+-void EC_EX_DATA_free_data(EC_EXTRA_DATA **, void *(*dup_func) (void *),
+-                          void (*free_func) (void *),
+-                          void (*clear_free_func) (void *));
+-void EC_EX_DATA_clear_free_data(EC_EXTRA_DATA **, void *(*dup_func) (void *),
+-                                void (*free_func) (void *),
+-                                void (*clear_free_func) (void *));
+-void EC_EX_DATA_free_all_data(EC_EXTRA_DATA **);
+-void EC_EX_DATA_clear_free_all_data(EC_EXTRA_DATA **);
+-
+ struct ec_point_st {
+     const EC_METHOD *meth;
+     /*
+@@ -306,6 +302,18 @@ struct ec_point_st {
+                                  * special case */
+ } /* EC_POINT */ ;
+ 
++NISTP224_PRE_COMP *EC_nistp224_pre_comp_dup(NISTP224_PRE_COMP *);
++NISTP256_PRE_COMP *EC_nistp256_pre_comp_dup(NISTP256_PRE_COMP *);
++NISTP521_PRE_COMP *EC_nistp521_pre_comp_dup(NISTP521_PRE_COMP *);
++NISTZ256_PRE_COMP *EC_nistz256_pre_comp_dup(NISTZ256_PRE_COMP *);
++NISTP256_PRE_COMP *EC_nistp256_pre_comp_dup(NISTP256_PRE_COMP *);
++EC_PRE_COMP *EC_ec_pre_comp_dup(EC_PRE_COMP *);
++void EC_nistp224_pre_comp_free(NISTP224_PRE_COMP *);
++void EC_nistp256_pre_comp_free(NISTP256_PRE_COMP *);
++void EC_nistp521_pre_comp_free(NISTP521_PRE_COMP *);
++void EC_nistz256_pre_comp_free(NISTZ256_PRE_COMP *);
++void EC_ec_pre_comp_free(EC_PRE_COMP *);
++
+ /*
+  * method functions in ec_mult.c (ec_lib.c uses these as defaults if
+  * group-&gt;method-&gt;mul is 0)
+diff --git a/crypto/ec/ec_lib.c b/crypto/ec/ec_lib.c
+index 7cb4759..d850b54 100644
+--- a/crypto/ec/ec_lib.c
++++ b/crypto/ec/ec_lib.c
+@@ -109,6 +109,32 @@ EC_GROUP *EC_GROUP_new(const EC_METHOD *meth)
+     return NULL;
+ }
+ 
++static void ec_group_free_precomp(EC_GROUP *group)
++{
++    switch (group-&gt;pre_comp_type) {
++    default:
++        break;
++    case pct_nistz256:
++        EC_nistz256_pre_comp_free(group-&gt;pre_comp.nistz256);
++        break;
++#ifndef OPENSSL_NO_EC_NISTP_64_GCC_128
++    case pct_nistp224:
++        EC_nistp224_pre_comp_free(group-&gt;pre_comp.nistp224);
++        break;
++    case pct_nistp256:
++        EC_nistp256_pre_comp_free(group-&gt;pre_comp.nistp256);
++        break;
++    case pct_nistp521:
++        EC_nistp521_pre_comp_free(group-&gt;pre_comp.nistp521);
++        break;
++#endif
++    case pct_ec:
++        EC_ec_pre_comp_free(group-&gt;pre_comp.ec);
++        break;
++    }
++    group-&gt;pre_comp.ec = NULL;
++}
++
+ void EC_GROUP_free(EC_GROUP *group)
+ {
+     if (!group)
+@@ -117,7 +143,7 @@ void EC_GROUP_free(EC_GROUP *group)
+     if (group-&gt;meth-&gt;group_finish != 0)
+         group-&gt;meth-&gt;group_finish(group);
+ 
+-    EC_EX_DATA_free_all_data(&amp;group-&gt;extra_data);
++    ec_group_free_precomp(group);
+     BN_MONT_CTX_free(group-&gt;mont_data);
+     EC_POINT_free(group-&gt;generator);
+     BN_free(group-&gt;order);
+@@ -136,10 +162,8 @@ void EC_GROUP_clear_free(EC_GROUP *group)
+     else if (group-&gt;meth-&gt;group_finish != 0)
+         group-&gt;meth-&gt;group_finish(group);
+ 
+-    EC_EX_DATA_clear_free_all_data(&amp;group-&gt;extra_data);
+-
++    ec_group_free_precomp(group);
+     BN_MONT_CTX_free(group-&gt;mont_data);
+-
+     EC_POINT_clear_free(group-&gt;generator);
+     BN_clear_free(group-&gt;order);
+     BN_clear_free(group-&gt;cofactor);
+@@ -149,8 +173,6 @@ void EC_GROUP_clear_free(EC_GROUP *group)
+ 
+ int EC_GROUP_copy(EC_GROUP *dest, const EC_GROUP *src)
+ {
+-    EC_EXTRA_DATA *d;
+-
+     if (dest-&gt;meth-&gt;group_copy == 0) {
+         ECerr(EC_F_EC_GROUP_COPY, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+         return 0;
+@@ -162,17 +184,29 @@ int EC_GROUP_copy(EC_GROUP *dest, const EC_GROUP *src)
+     if (dest == src)
+         return 1;
+ 
+-    EC_EX_DATA_free_all_data(&amp;dest-&gt;extra_data);
+-
+-    for (d = src-&gt;extra_data; d != NULL; d = d-&gt;next) {
+-        void *t = d-&gt;dup_func(d-&gt;data);
+-
+-        if (t == NULL)
+-            return 0;
+-        if (!EC_EX_DATA_set_data
+-            (&amp;dest-&gt;extra_data, t, d-&gt;dup_func, d-&gt;free_func,
+-             d-&gt;clear_free_func))
+-            return 0;
++    /* Copy precomputed */
++    dest-&gt;pre_comp_type = src-&gt;pre_comp_type;
++    switch (src-&gt;pre_comp_type) {
++    default:
++        dest-&gt;pre_comp.ec = NULL;
++        break;
++    case pct_nistz256:
++        dest-&gt;pre_comp.nistz256 = EC_nistz256_pre_comp_dup(src-&gt;pre_comp.nistz256);
++        break;
++#ifndef OPENSSL_NO_EC_NISTP_64_GCC_128
++    case pct_nistp224:
++        dest-&gt;pre_comp.nistp224 = EC_nistp224_pre_comp_dup(src-&gt;pre_comp.nistp224);
++        break;
++    case pct_nistp256:
++        dest-&gt;pre_comp.nistp256 = EC_nistp256_pre_comp_dup(src-&gt;pre_comp.nistp256);
++        break;
++    case pct_nistp521:
++        dest-&gt;pre_comp.nistp521 = EC_nistp521_pre_comp_dup(src-&gt;pre_comp.nistp521);
++        break;
++#endif
++    case pct_ec:
++        dest-&gt;pre_comp.ec = EC_ec_pre_comp_dup(src-&gt;pre_comp.ec);
++        break;
+     }
+ 
+     if (src-&gt;mont_data != NULL) {
+@@ -518,151 +552,6 @@ int EC_GROUP_cmp(const EC_GROUP *a, const EC_GROUP *b, BN_CTX *ctx)
+     return r;
+ }
+ 
+-/* this has 'package' visibility */
+-int EC_EX_DATA_set_data(EC_EXTRA_DATA **ex_data, void *data,
+-                        void *(*dup_func) (void *),
+-                        void (*free_func) (void *),
+-                        void (*clear_free_func) (void *))
+-{
+-    EC_EXTRA_DATA *d;
+-
+-    if (ex_data == NULL)
+-        return 0;
+-
+-    for (d = *ex_data; d != NULL; d = d-&gt;next) {
+-        if (d-&gt;dup_func == dup_func &amp;&amp; d-&gt;free_func == free_func
+-            &amp;&amp; d-&gt;clear_free_func == clear_free_func) {
+-            ECerr(EC_F_EC_EX_DATA_SET_DATA, EC_R_SLOT_FULL);
+-            return 0;
+-        }
+-    }
+-
+-    if (data == NULL)
+-        /* no explicit entry needed */
+-        return 1;
+-
+-    d = OPENSSL_malloc(sizeof(*d));
+-    if (d == NULL)
+-        return 0;
+-
+-    d-&gt;data = data;
+-    d-&gt;dup_func = dup_func;
+-    d-&gt;free_func = free_func;
+-    d-&gt;clear_free_func = clear_free_func;
+-
+-    d-&gt;next = *ex_data;
+-    *ex_data = d;
+-
+-    return 1;
+-}
+-
+-/* this has 'package' visibility */
+-void *EC_EX_DATA_get_data(const EC_EXTRA_DATA *ex_data,
+-                          void *(*dup_func) (void *),
+-                          void (*free_func) (void *),
+-                          void (*clear_free_func) (void *))
+-{
+-    const EC_EXTRA_DATA *d;
+-
+-    for (d = ex_data; d != NULL; d = d-&gt;next) {
+-        if (d-&gt;dup_func == dup_func &amp;&amp; d-&gt;free_func == free_func
+-            &amp;&amp; d-&gt;clear_free_func == clear_free_func)
+-            return d-&gt;data;
+-    }
+-
+-    return NULL;
+-}
+-
+-/* this has 'package' visibility */
+-void EC_EX_DATA_free_data(EC_EXTRA_DATA **ex_data,
+-                          void *(*dup_func) (void *),
+-                          void (*free_func) (void *),
+-                          void (*clear_free_func) (void *))
+-{
+-    EC_EXTRA_DATA **p;
+-
+-    if (ex_data == NULL)
+-        return;
+-
+-    for (p = ex_data; *p != NULL; p = &amp;((*p)-&gt;next)) {
+-        if ((*p)-&gt;dup_func == dup_func &amp;&amp; (*p)-&gt;free_func == free_func
+-            &amp;&amp; (*p)-&gt;clear_free_func == clear_free_func) {
+-            EC_EXTRA_DATA *next = (*p)-&gt;next;
+-
+-            (*p)-&gt;free_func((*p)-&gt;data);
+-            OPENSSL_free(*p);
+-
+-            *p = next;
+-            return;
+-        }
+-    }
+-}
+-
+-/* this has 'package' visibility */
+-void EC_EX_DATA_clear_free_data(EC_EXTRA_DATA **ex_data,
+-                                void *(*dup_func) (void *),
+-                                void (*free_func) (void *),
+-                                void (*clear_free_func) (void *))
+-{
+-    EC_EXTRA_DATA **p;
+-
+-    if (ex_data == NULL)
+-        return;
+-
+-    for (p = ex_data; *p != NULL; p = &amp;((*p)-&gt;next)) {
+-        if ((*p)-&gt;dup_func == dup_func &amp;&amp; (*p)-&gt;free_func == free_func
+-            &amp;&amp; (*p)-&gt;clear_free_func == clear_free_func) {
+-            EC_EXTRA_DATA *next = (*p)-&gt;next;
+-
+-            (*p)-&gt;clear_free_func((*p)-&gt;data);
+-            OPENSSL_free(*p);
+-
+-            *p = next;
+-            return;
+-        }
+-    }
+-}
+-
+-/* this has 'package' visibility */
+-void EC_EX_DATA_free_all_data(EC_EXTRA_DATA **ex_data)
+-{
+-    EC_EXTRA_DATA *d;
+-
+-    if (ex_data == NULL)
+-        return;
+-
+-    d = *ex_data;
+-    while (d) {
+-        EC_EXTRA_DATA *next = d-&gt;next;
+-
+-        d-&gt;free_func(d-&gt;data);
+-        OPENSSL_free(d);
+-
+-        d = next;
+-    }
+-    *ex_data = NULL;
+-}
+-
+-/* this has 'package' visibility */
+-void EC_EX_DATA_clear_free_all_data(EC_EXTRA_DATA **ex_data)
+-{
+-    EC_EXTRA_DATA *d;
+-
+-    if (ex_data == NULL)
+-        return;
+-
+-    d = *ex_data;
+-    while (d) {
+-        EC_EXTRA_DATA *next = d-&gt;next;
+-
+-        d-&gt;clear_free_func(d-&gt;data);
+-        OPENSSL_free(d);
+-
+-        d = next;
+-    }
+-    *ex_data = NULL;
+-}
+-
+ /* functions for EC_POINT objects */
+ 
+ EC_POINT *EC_POINT_new(const EC_GROUP *group)
+@@ -1091,3 +980,13 @@ int ec_precompute_mont_data(EC_GROUP *group)
+     BN_CTX_free(ctx);
+     return ret;
+ }
++
++int EC_KEY_set_ex_data(EC_KEY *key, int idx, void *arg)
++{
++    return CRYPTO_set_ex_data(&amp;key-&gt;ex_data, idx, arg);
++}
++
++void *EC_KEY_get_ex_data(const EC_KEY *key, int idx)
++{
++    return CRYPTO_get_ex_data(&amp;key-&gt;ex_data, idx);
++}
+diff --git a/crypto/ec/ec_mult.c b/crypto/ec/ec_mult.c
+index 7e29397..8a4e23d 100644
+--- a/crypto/ec/ec_mult.c
++++ b/crypto/ec/ec_mult.c
+@@ -75,7 +75,7 @@
+  */
+ 
+ /* structure for precomputed multiples of the generator */
+-typedef struct ec_pre_comp_st {
++struct ec_pre_comp_st {
+     const EC_GROUP *group;      /* parent EC_GROUP object */
+     size_t blocksize;           /* block size for wNAF splitting */
+     size_t numblocks;           /* max. number of blocks for which we have
+@@ -86,12 +86,7 @@ typedef struct ec_pre_comp_st {
+                                  * objects followed by a NULL */
+     size_t num;                 /* numblocks * 2^(w-1) */
+     int references;
+-} EC_PRE_COMP;
+-
+-/* functions to manage EC_PRE_COMP within the EC_GROUP extra_data framework */
+-static void *ec_pre_comp_dup(void *);
+-static void ec_pre_comp_free(void *);
+-static void ec_pre_comp_clear_free(void *);
++};
+ 
+ static EC_PRE_COMP *ec_pre_comp_new(const EC_GROUP *group)
+ {
+@@ -112,63 +107,29 @@ static EC_PRE_COMP *ec_pre_comp_new(const EC_GROUP *group)
+     return ret;
+ }
+ 
+-static void *ec_pre_comp_dup(void *src_)
++EC_PRE_COMP *EC_ec_pre_comp_dup(EC_PRE_COMP *pre)
+ {
+-    EC_PRE_COMP *src = src_;
+-
+-    /* no need to actually copy, these objects never change! */
+-
+-    CRYPTO_add(&amp;src-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
+-
+-    return src_;
++    if (pre != NULL)
++        CRYPTO_add(&amp;pre-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
++    return pre;
+ }
+ 
+-static void ec_pre_comp_free(void *pre_)
++void EC_ec_pre_comp_free(EC_PRE_COMP *pre)
+ {
+-    int i;
+-    EC_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
++    if (pre == NULL
++        || CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP) &gt; 0)
+         return;
+ 
+-    if (pre-&gt;points) {
+-        EC_POINT **p;
++    if (pre-&gt;points != NULL) {
++        EC_POINT **pts;
+ 
+-        for (p = pre-&gt;points; *p != NULL; p++)
+-            EC_POINT_free(*p);
++        for (pts = pre-&gt;points; *pts != NULL; pts++)
++            EC_POINT_free(*pts);
+         OPENSSL_free(pre-&gt;points);
+     }
+     OPENSSL_free(pre);
+ }
+ 
+-static void ec_pre_comp_clear_free(void *pre_)
+-{
+-    int i;
+-    EC_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    if (pre-&gt;points) {
+-        EC_POINT **p;
+-
+-        for (p = pre-&gt;points; *p != NULL; p++) {
+-            EC_POINT_clear_free(*p);
+-            OPENSSL_cleanse(p, sizeof(*p));
+-        }
+-        OPENSSL_free(pre-&gt;points);
+-    }
+-    OPENSSL_clear_free(pre, sizeof(*pre));
+-}
+-
+ /*
+  * TODO: table should be optimised for the wNAF-based implementation,
+  * sometimes smaller windows will give better performance (thus the
+@@ -250,10 +211,7 @@ int ec_wNAF_mul(const EC_GROUP *group, EC_POINT *r, const BIGNUM *scalar,
+ 
+         /* look if we can use precomputed multiples of generator */
+ 
+-        pre_comp =
+-            EC_EX_DATA_get_data(group-&gt;extra_data, ec_pre_comp_dup,
+-                                ec_pre_comp_free, ec_pre_comp_clear_free);
+-
++        pre_comp = group-&gt;pre_comp.ec;
+         if (pre_comp &amp;&amp; pre_comp-&gt;numblocks
+             &amp;&amp; (EC_POINT_cmp(group, generator, pre_comp-&gt;points[0], ctx) ==
+                 0)) {
+@@ -604,9 +562,7 @@ int ec_wNAF_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     int ret = 0;
+ 
+     /* if there is an old EC_PRE_COMP object, throw it away */
+-    EC_EX_DATA_free_data(&amp;group-&gt;extra_data, ec_pre_comp_dup,
+-                         ec_pre_comp_free, ec_pre_comp_clear_free);
+-
++    EC_ec_pre_comp_free(group-&gt;pre_comp.ec);
+     if ((pre_comp = ec_pre_comp_new(group)) == NULL)
+         return 0;
+ 
+@@ -728,19 +684,15 @@ int ec_wNAF_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     pre_comp-&gt;points = points;
+     points = NULL;
+     pre_comp-&gt;num = num;
+-
+-    if (!EC_EX_DATA_set_data(&amp;group-&gt;extra_data, pre_comp,
+-                             ec_pre_comp_dup, ec_pre_comp_free,
+-                             ec_pre_comp_clear_free))
+-        goto err;
++    SETPRECOMP(group, ec, pre_comp);
+     pre_comp = NULL;
+-
+     ret = 1;
++
+  err:
+     if (ctx != NULL)
+         BN_CTX_end(ctx);
+     BN_CTX_free(new_ctx);
+-    ec_pre_comp_free(pre_comp);
++    EC_ec_pre_comp_free(pre_comp);
+     if (points) {
+         EC_POINT **p;
+ 
+@@ -755,10 +707,5 @@ int ec_wNAF_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+ 
+ int ec_wNAF_have_precompute_mult(const EC_GROUP *group)
+ {
+-    if (EC_EX_DATA_get_data
+-        (group-&gt;extra_data, ec_pre_comp_dup, ec_pre_comp_free,
+-         ec_pre_comp_clear_free) != NULL)
+-        return 1;
+-    else
+-        return 0;
++    return HAVEPRECOMP(group, ec);
+ }
+diff --git a/crypto/ec/ecp_nistp224.c b/crypto/ec/ecp_nistp224.c
+index 8b1deaa..c2677a8 100644
+--- a/crypto/ec/ecp_nistp224.c
++++ b/crypto/ec/ecp_nistp224.c
+@@ -227,10 +227,10 @@ static const felem gmul[2][16][3] = {
+ };
+ 
+ /* Precomputation for the group generator. */
+-typedef struct {
++struct nistp224_pre_comp_st {
+     felem g_pre_comp[2][16][3];
+     int references;
+-} NISTP224_PRE_COMP;
++};
+ 
+ const EC_METHOD *EC_GFp_nistp224_method(void)
+ {
+@@ -1209,44 +1209,19 @@ static NISTP224_PRE_COMP *nistp224_pre_comp_new()
+     return ret;
+ }
+ 
+-static void *nistp224_pre_comp_dup(void *src_)
++NISTP224_PRE_COMP *EC_nistp224_pre_comp_dup(NISTP224_PRE_COMP *p)
+ {
+-    NISTP224_PRE_COMP *src = src_;
+-
+-    /* no need to actually copy, these objects never change! */
+-    CRYPTO_add(&amp;src-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
+-
+-    return src_;
++    if (p != NULL)
++        CRYPTO_add(&amp;p-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
++    return p;
+ }
+ 
+-static void nistp224_pre_comp_free(void *pre_)
++void EC_nistp224_pre_comp_free(NISTP224_PRE_COMP *p)
+ {
+-    int i;
+-    NISTP224_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
++    if (p == NULL
++        || CRYPTO_add(&amp;p-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP) &gt; 0)
+         return;
+-
+-    OPENSSL_free(pre);
+-}
+-
+-static void nistp224_pre_comp_clear_free(void *pre_)
+-{
+-    int i;
+-    NISTP224_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    OPENSSL_clear_free(pre, sizeof(*pre));
++    OPENSSL_free(p);
+ }
+ 
+ /******************************************************************************/
+@@ -1413,10 +1388,7 @@ int ec_GFp_nistp224_points_mul(const EC_GROUP *group, EC_POINT *r,
+         goto err;
+ 
+     if (scalar != NULL) {
+-        pre = EC_EX_DATA_get_data(group-&gt;extra_data,
+-                                  nistp224_pre_comp_dup,
+-                                  nistp224_pre_comp_free,
+-                                  nistp224_pre_comp_clear_free);
++        pre = group-&gt;pre_comp.nistp224;
+         if (pre)
+             /* we have precomputation, try to use it */
+             g_pre_comp = (const felem(*)[16][3])pre-&gt;g_pre_comp;
+@@ -1587,9 +1559,7 @@ int ec_GFp_nistp224_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     felem tmp_felems[32];
+ 
+     /* throw away old precomputation */
+-    EC_EX_DATA_free_data(&amp;group-&gt;extra_data, nistp224_pre_comp_dup,
+-                         nistp224_pre_comp_free,
+-                         nistp224_pre_comp_clear_free);
++    EC_nistp224_pre_comp_free(group-&gt;pre_comp.nistp224);
+     if (ctx == NULL)
+         if ((ctx = new_ctx = BN_CTX_new()) == NULL)
+             return 0;
+@@ -1692,29 +1662,20 @@ int ec_GFp_nistp224_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     }
+     make_points_affine(31, &amp;(pre-&gt;g_pre_comp[0][1]), tmp_felems);
+ 
+-    if (!EC_EX_DATA_set_data(&amp;group-&gt;extra_data, pre, nistp224_pre_comp_dup,
+-                             nistp224_pre_comp_free,
+-                             nistp224_pre_comp_clear_free))
+-        goto err;
+-    ret = 1;
++    SETPRECOMP(group, nistp224, pre);
+     pre = NULL;
++    ret = 1;
+  err:
+     BN_CTX_end(ctx);
+     EC_POINT_free(generator);
+     BN_CTX_free(new_ctx);
+-    nistp224_pre_comp_free(pre);
++    EC_nistp224_pre_comp_free(pre);
+     return ret;
+ }
+ 
+ int ec_GFp_nistp224_have_precompute_mult(const EC_GROUP *group)
+ {
+-    if (EC_EX_DATA_get_data(group-&gt;extra_data, nistp224_pre_comp_dup,
+-                            nistp224_pre_comp_free,
+-                            nistp224_pre_comp_clear_free)
+-        != NULL)
+-        return 1;
+-    else
+-        return 0;
++    return HAVEPRECOMP(group, nistp224);
+ }
+ 
+ #else
+diff --git a/crypto/ec/ecp_nistp256.c b/crypto/ec/ecp_nistp256.c
+index 48ed2c4..26c1693 100644
+--- a/crypto/ec/ecp_nistp256.c
++++ b/crypto/ec/ecp_nistp256.c
+@@ -1756,10 +1756,10 @@ static void batch_mul(felem x_out, felem y_out, felem z_out,
+ }
+ 
+ /* Precomputation for the group generator. */
+-typedef struct {
++struct nistp256_pre_comp_st {
+     smallfelem g_pre_comp[2][16][3];
+     int references;
+-} NISTP256_PRE_COMP;
++};
+ 
+ const EC_METHOD *EC_GFp_nistp256_method(void)
+ {
+@@ -1826,46 +1826,21 @@ static NISTP256_PRE_COMP *nistp256_pre_comp_new()
+     return ret;
+ }
+ 
+-static void *nistp256_pre_comp_dup(void *src_)
++NISTP256_PRE_COMP *EC_nistp256_pre_comp_dup(NISTP256_PRE_COMP *p)
+ {
+-    NISTP256_PRE_COMP *src = src_;
+-
+-    /* no need to actually copy, these objects never change! */
+-    CRYPTO_add(&amp;src-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
+-
+-    return src_;
++    if (p != NULL)
++        CRYPTO_add(&amp;p-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
++    return p;
+ }
+ 
+-static void nistp256_pre_comp_free(void *pre_)
++void EC_nistp256_pre_comp_free(NISTP256_PRE_COMP *pre)
+ {
+-    int i;
+-    NISTP256_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
++    if (pre == NULL
++            || CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP) &gt; 0)
+         return;
+-
+     OPENSSL_free(pre);
+ }
+ 
+-static void nistp256_pre_comp_clear_free(void *pre_)
+-{
+-    int i;
+-    NISTP256_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    OPENSSL_clear_free(pre, sizeof(*pre));
+-}
+-
+ /******************************************************************************/
+ /*
+  * OPENSSL EC_METHOD FUNCTIONS
+@@ -2031,10 +2006,7 @@ int ec_GFp_nistp256_points_mul(const EC_GROUP *group, EC_POINT *r,
+         goto err;
+ 
+     if (scalar != NULL) {
+-        pre = EC_EX_DATA_get_data(group-&gt;extra_data,
+-                                  nistp256_pre_comp_dup,
+-                                  nistp256_pre_comp_free,
+-                                  nistp256_pre_comp_clear_free);
++        pre = group-&gt;pre_comp.nistp256;
+         if (pre)
+             /* we have precomputation, try to use it */
+             g_pre_comp = (const smallfelem(*)[16][3])pre-&gt;g_pre_comp;
+@@ -2212,9 +2184,7 @@ int ec_GFp_nistp256_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     felem x_tmp, y_tmp, z_tmp;
+ 
+     /* throw away old precomputation */
+-    EC_EX_DATA_free_data(&amp;group-&gt;extra_data, nistp256_pre_comp_dup,
+-                         nistp256_pre_comp_free,
+-                         nistp256_pre_comp_clear_free);
++    EC_nistp256_pre_comp_free(group-&gt;pre_comp.nistp256);
+     if (ctx == NULL)
+         if ((ctx = new_ctx = BN_CTX_new()) == NULL)
+             return 0;
+@@ -2326,29 +2296,21 @@ int ec_GFp_nistp256_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     }
+     make_points_affine(31, &amp;(pre-&gt;g_pre_comp[0][1]), tmp_smallfelems);
+ 
+-    if (!EC_EX_DATA_set_data(&amp;group-&gt;extra_data, pre, nistp256_pre_comp_dup,
+-                             nistp256_pre_comp_free,
+-                             nistp256_pre_comp_clear_free))
+-        goto err;
+-    ret = 1;
++    SETPRECOMP(group, nistp256, pre);
+     pre = NULL;
++    ret = 1;
++
+  err:
+     BN_CTX_end(ctx);
+     EC_POINT_free(generator);
+     BN_CTX_free(new_ctx);
+-    nistp256_pre_comp_free(pre);
++    EC_nistp256_pre_comp_free(pre);
+     return ret;
+ }
+ 
+ int ec_GFp_nistp256_have_precompute_mult(const EC_GROUP *group)
+ {
+-    if (EC_EX_DATA_get_data(group-&gt;extra_data, nistp256_pre_comp_dup,
+-                            nistp256_pre_comp_free,
+-                            nistp256_pre_comp_clear_free)
+-        != NULL)
+-        return 1;
+-    else
+-        return 0;
++    return HAVEPRECOMP(group, nistp256);
+ }
+ #else
+ static void *dummy = &dummy;
+diff --git a/crypto/ec/ecp_nistp521.c b/crypto/ec/ecp_nistp521.c
+index dd5b19b..97744b2 100644
+--- a/crypto/ec/ecp_nistp521.c
++++ b/crypto/ec/ecp_nistp521.c
+@@ -1585,10 +1585,10 @@ static void batch_mul(felem x_out, felem y_out, felem z_out,
+ }
+ 
+ /* Precomputation for the group generator. */
+-typedef struct {
++struct nistp512_pre_comp_st {
+     felem g_pre_comp[16][3];
+     int references;
+-} NISTP521_PRE_COMP;
++};
+ 
+ const EC_METHOD *EC_GFp_nistp521_method(void)
+ {
+@@ -1654,44 +1654,19 @@ static NISTP521_PRE_COMP *nistp521_pre_comp_new()
+     return ret;
+ }
+ 
+-static void *nistp521_pre_comp_dup(void *src_)
++NISTP521_PRE_COMP *EC_nistp521_pre_comp_dup(NISTP521_PRE_COMP *p)
+ {
+-    NISTP521_PRE_COMP *src = src_;
+-
+-    /* no need to actually copy, these objects never change! */
+-    CRYPTO_add(&amp;src-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
+-
+-    return src_;
++    if (p != NULL)
++        CRYPTO_add(&amp;p-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
++    return p;
+ }
+ 
+-static void nistp521_pre_comp_free(void *pre_)
++void EC_nistp521_pre_comp_free(NISTP521_PRE_COMP *p)
+ {
+-    int i;
+-    NISTP521_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
++    if (p == NULL
++            || CRYPTO_add(&amp;p-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP) &gt; 0)
+         return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    OPENSSL_free(pre);
+-}
+-
+-static void nistp521_pre_comp_clear_free(void *pre_)
+-{
+-    int i;
+-    NISTP521_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    OPENSSL_clear_free(pre, sizeof(*pre));
++    OPENSSL_free(p);
+ }
+ 
+ /******************************************************************************/
+@@ -1858,10 +1833,7 @@ int ec_GFp_nistp521_points_mul(const EC_GROUP *group, EC_POINT *r,
+         goto err;
+ 
+     if (scalar != NULL) {
+-        pre = EC_EX_DATA_get_data(group-&gt;extra_data,
+-                                  nistp521_pre_comp_dup,
+-                                  nistp521_pre_comp_free,
+-                                  nistp521_pre_comp_clear_free);
++        pre = group-&gt;pre_comp.nistp521;
+         if (pre)
+             /* we have precomputation, try to use it */
+             g_pre_comp = &amp;pre-&gt;g_pre_comp[0];
+@@ -2036,9 +2008,7 @@ int ec_GFp_nistp521_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     felem tmp_felems[16];
+ 
+     /* throw away old precomputation */
+-    EC_EX_DATA_free_data(&amp;group-&gt;extra_data, nistp521_pre_comp_dup,
+-                         nistp521_pre_comp_free,
+-                         nistp521_pre_comp_clear_free);
++    EC_nistp521_pre_comp_free(group-&gt;pre_comp.nistp521);
+     if (ctx == NULL)
+         if ((ctx = new_ctx = BN_CTX_new()) == NULL)
+             return 0;
+@@ -2121,29 +2091,20 @@ int ec_GFp_nistp521_precompute_mult(EC_GROUP *group, BN_CTX *ctx)
+     }
+     make_points_affine(15, &amp;(pre-&gt;g_pre_comp[1]), tmp_felems);
+ 
+-    if (!EC_EX_DATA_set_data(&amp;group-&gt;extra_data, pre, nistp521_pre_comp_dup,
+-                             nistp521_pre_comp_free,
+-                             nistp521_pre_comp_clear_free))
+-        goto err;
++    SETPRECOMP(group, nistp521, pre);
+     ret = 1;
+     pre = NULL;
+  err:
+     BN_CTX_end(ctx);
+     EC_POINT_free(generator);
+     BN_CTX_free(new_ctx);
+-    nistp521_pre_comp_free(pre);
++    EC_nistp521_pre_comp_free(pre);
+     return ret;
+ }
+ 
+ int ec_GFp_nistp521_have_precompute_mult(const EC_GROUP *group)
+ {
+-    if (EC_EX_DATA_get_data(group-&gt;extra_data, nistp521_pre_comp_dup,
+-                            nistp521_pre_comp_free,
+-                            nistp521_pre_comp_clear_free)
+-        != NULL)
+-        return 1;
+-    else
+-        return 0;
++    return HAVEPRECOMP(group, nistp512);
+ }
+ 
+ #else
+diff --git a/crypto/ec/ecp_nistz256.c b/crypto/ec/ecp_nistz256.c
+index 3d83303..16e7929 100644
+--- a/crypto/ec/ecp_nistz256.c
++++ b/crypto/ec/ecp_nistz256.c
+@@ -65,7 +65,7 @@ typedef struct {
+ typedef P256_POINT_AFFINE PRECOMP256_ROW[64];
+ 
+ /* structure for precomputed multiples of the generator */
+-typedef struct ec_pre_comp_st {
++struct nistz256_pre_comp_st {
+     const EC_GROUP *group;      /* Parent EC_GROUP object */
+     size_t w;                   /* Window size */
+     /*
+@@ -76,7 +76,7 @@ typedef struct ec_pre_comp_st {
+     PRECOMP256_ROW *precomp;
+     void *precomp_storage;
+     int references;
+-} EC_PRE_COMP;
++};
+ 
+ /* Functions implemented in assembly */
+ /* Modular mul by 2: res = 2*a mod P */
+@@ -127,10 +127,7 @@ static const BN_ULONG ONE[P256_LIMBS] = {
+     TOBN(0xffffffff, 0xffffffff), TOBN(0x00000000, 0xfffffffe)
+ };
+ 
+-static void *ecp_nistz256_pre_comp_dup(void *);
+-static void ecp_nistz256_pre_comp_free(void *);
+-static void ecp_nistz256_pre_comp_clear_free(void *);
+-static EC_PRE_COMP *ecp_nistz256_pre_comp_new(const EC_GROUP *group);
++static NISTZ256_PRE_COMP *ecp_nistz256_pre_comp_new(const EC_GROUP *group);
+ 
+ /* Precomputed tables for the default generator */
+ extern const PRECOMP256_ROW ecp_nistz256_precomputed[37];
+@@ -763,7 +760,7 @@ __owur static int ecp_nistz256_mult_precompute(EC_GROUP *group, BN_CTX *ctx)
+     BIGNUM *order;
+     EC_POINT *P = NULL, *T = NULL;
+     const EC_POINT *generator;
+-    EC_PRE_COMP *pre_comp;
++    NISTZ256_PRE_COMP *pre_comp;
+     BN_CTX *new_ctx = NULL;
+     int i, j, k, ret = 0;
+     size_t w;
+@@ -771,11 +768,8 @@ __owur static int ecp_nistz256_mult_precompute(EC_GROUP *group, BN_CTX *ctx)
+     PRECOMP256_ROW *preComputedTable = NULL;
+     unsigned char *precomp_storage = NULL;
+ 
+-    /* if there is an old EC_PRE_COMP object, throw it away */
+-    EC_EX_DATA_free_data(&amp;group-&gt;extra_data, ecp_nistz256_pre_comp_dup,
+-                         ecp_nistz256_pre_comp_free,
+-                         ecp_nistz256_pre_comp_clear_free);
+-
++    /* if there is an old NISTZ256_PRE_COMP object, throw it away */
++    EC_nistz256_pre_comp_free(group-&gt;pre_comp.nistz256);
+     generator = EC_GROUP_get0_generator(group);
+     if (generator == NULL) {
+         ECerr(EC_F_ECP_NISTZ256_MULT_PRECOMPUTE, EC_R_UNDEFINED_GENERATOR);
+@@ -866,18 +860,9 @@ __owur static int ecp_nistz256_mult_precompute(EC_GROUP *group, BN_CTX *ctx)
+     pre_comp-&gt;w = w;
+     pre_comp-&gt;precomp = preComputedTable;
+     pre_comp-&gt;precomp_storage = precomp_storage;
+-
+     precomp_storage = NULL;
+-
+-    if (!EC_EX_DATA_set_data(&amp;group-&gt;extra_data, pre_comp,
+-                             ecp_nistz256_pre_comp_dup,
+-                             ecp_nistz256_pre_comp_free,
+-                             ecp_nistz256_pre_comp_clear_free)) {
+-        goto err;
+-    }
+-
++    SETPRECOMP(group, nistz256, pre_comp);
+     pre_comp = NULL;
+-
+     ret = 1;
+ 
+  err:
+@@ -885,7 +870,7 @@ __owur static int ecp_nistz256_mult_precompute(EC_GROUP *group, BN_CTX *ctx)
+         BN_CTX_end(ctx);
+     BN_CTX_free(new_ctx);
+ 
+-    ecp_nistz256_pre_comp_free(pre_comp);
++    EC_nistz256_pre_comp_free(pre_comp);
+     OPENSSL_free(precomp_storage);
+     EC_POINT_free(P);
+     EC_POINT_free(T);
+@@ -1135,7 +1120,7 @@ __owur static int ecp_nistz256_points_mul(const EC_GROUP *group,
+     size_t j;
+     unsigned char p_str[33] = { 0 };
+     const PRECOMP256_ROW *preComputedTable = NULL;
+-    const EC_PRE_COMP *pre_comp = NULL;
++    const NISTZ256_PRE_COMP *pre_comp = NULL;
+     const EC_POINT *generator = NULL;
+     BN_CTX *new_ctx = NULL;
+     const BIGNUM **new_scalars = NULL;
+@@ -1186,10 +1171,7 @@ __owur static int ecp_nistz256_points_mul(const EC_GROUP *group,
+         }
+ 
+         /* look if we can use precomputed multiples of generator */
+-        pre_comp =
+-            EC_EX_DATA_get_data(group-&gt;extra_data, ecp_nistz256_pre_comp_dup,
+-                                ecp_nistz256_pre_comp_free,
+-                                ecp_nistz256_pre_comp_clear_free);
++        pre_comp = group-&gt;pre_comp.nistz256;
+ 
+         if (pre_comp) {
+             /*
+@@ -1401,14 +1383,14 @@ __owur static int ecp_nistz256_get_affine(const EC_GROUP *group,
+     return 1;
+ }
+ 
+-static EC_PRE_COMP *ecp_nistz256_pre_comp_new(const EC_GROUP *group)
++static NISTZ256_PRE_COMP *ecp_nistz256_pre_comp_new(const EC_GROUP *group)
+ {
+-    EC_PRE_COMP *ret = NULL;
++    NISTZ256_PRE_COMP *ret = NULL;
+ 
+     if (!group)
+         return NULL;
+ 
+-    ret = OPENSSL_malloc(sizeof(*ret));
++    ret = OPENSSL_zalloc(sizeof(*ret));
+ 
+     if (ret == NULL) {
+         ECerr(EC_F_ECP_NISTZ256_PRE_COMP_NEW, ERR_R_MALLOC_FAILURE);
+@@ -1423,61 +1405,34 @@ static EC_PRE_COMP *ecp_nistz256_pre_comp_new(const EC_GROUP *group)
+     return ret;
+ }
+ 
+-static void *ecp_nistz256_pre_comp_dup(void *src_)
++NISTZ256_PRE_COMP *EC_nistz256_pre_comp_dup(NISTZ256_PRE_COMP *p)
+ {
+-    EC_PRE_COMP *src = src_;
+-
+-    /* no need to actually copy, these objects never change! */
+-    CRYPTO_add(&amp;src-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
+-
+-    return src_;
++    if (p != NULL)
++        CRYPTO_add(&amp;p-&gt;references, 1, CRYPTO_LOCK_EC_PRE_COMP);
++    return p;
+ }
+ 
+-static void ecp_nistz256_pre_comp_free(void *pre_)
++void EC_nistz256_pre_comp_free(NISTZ256_PRE_COMP *pre)
+ {
+-    int i;
+-    EC_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
++    if (pre == NULL
++            || CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP) &gt; 0)
+         return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+     OPENSSL_free(pre-&gt;precomp_storage);
+     OPENSSL_free(pre);
+ }
+ 
+-static void ecp_nistz256_pre_comp_clear_free(void *pre_)
+-{
+-    int i;
+-    EC_PRE_COMP *pre = pre_;
+-
+-    if (!pre)
+-        return;
+-
+-    i = CRYPTO_add(&amp;pre-&gt;references, -1, CRYPTO_LOCK_EC_PRE_COMP);
+-    if (i &gt; 0)
+-        return;
+-
+-    OPENSSL_clear_free(pre-&gt;precomp,
+-                       32 * sizeof(unsigned char) * (1 &lt;&lt; pre-&gt;w) * 2 * 37);
+-    OPENSSL_clear_free(pre, sizeof(*pre));
+-}
+ 
+ static int ecp_nistz256_window_have_precompute_mult(const EC_GROUP *group)
+ {
+     /* There is a hard-coded table for the default generator. */
+     const EC_POINT *generator = EC_GROUP_get0_generator(group);
++
+     if (generator != NULL &amp;&amp; ecp_nistz256_is_affine_G(generator)) {
+         /* There is a hard-coded table for the default generator. */
+         return 1;
+     }
+ 
+-    return EC_EX_DATA_get_data(group-&gt;extra_data, ecp_nistz256_pre_comp_dup,
+-                               ecp_nistz256_pre_comp_free,
+-                               ecp_nistz256_pre_comp_clear_free) != NULL;
++    return HAVEPRECOMP(group, nistz256);
+ }
+ 
+ const EC_METHOD *EC_GFp_nistz256_method(void)
+diff --git a/doc/crypto/CRYPTO_get_ex_new_index.pod b/doc/crypto/CRYPTO_get_ex_new_index.pod
+index 9d047a4..1720a8f 100644
+--- a/doc/crypto/CRYPTO_get_ex_new_index.pod
++++ b/doc/crypto/CRYPTO_get_ex_new_index.pod
+@@ -45,8 +45,7 @@ The specific structures are:
+     X509_STORE_CTX
+     DH
+     DSA
+-    ECDH
+-    ECDSA
++    EC_KEY
+     RSA
+     ENGINE
+     UI
+diff --git a/doc/crypto/EC_KEY_new.pod b/doc/crypto/EC_KEY_new.pod
+index a317a1e..2d7194e 100644
+--- a/doc/crypto/EC_KEY_new.pod
++++ b/doc/crypto/EC_KEY_new.pod
+@@ -2,7 +2,7 @@
+ 
+ =head1 NAME
+ 
+-EC_KEY_new, EC_KEY_get_flags, EC_KEY_set_flags, EC_KEY_clear_flags, EC_KEY_new_by_curve_name, EC_KEY_free, EC_KEY_copy, EC_KEY_dup, EC_KEY_up_ref, EC_KEY_get0_group, EC_KEY_set_group, EC_KEY_get0_private_key, EC_KEY_set_private_key, EC_KEY_get0_public_key, EC_KEY_set_public_key, EC_KEY_get_enc_flags, EC_KEY_set_enc_flags, EC_KEY_get_conv_form, EC_KEY_set_conv_form, EC_KEY_get_key_method_data, EC_KEY_insert_key_method_data, EC_KEY_set_asn1_flag, EC_KEY_precompute_mult, EC_KEY_generate_key, EC_KEY_check_key, EC_KEY_set_public_key_affine_coordinates - Functions for creating, destroying and manipulating B&lt;EC_KEY&gt; objects.
++EC_KEY_new, EC_KEY_get_flags, EC_KEY_set_flags, EC_KEY_clear_flags, EC_KEY_new_by_curve_name, EC_KEY_free, EC_KEY_copy, EC_KEY_dup, EC_KEY_up_ref, EC_KEY_get0_group, EC_KEY_set_group, EC_KEY_get0_private_key, EC_KEY_set_private_key, EC_KEY_get0_public_key, EC_KEY_set_public_key, EC_KEY_get_enc_flags, EC_KEY_set_enc_flags, EC_KEY_get_conv_form, EC_KEY_set_conv_form, EC_KEY_set_asn1_flag, EC_KEY_precompute_mult, EC_KEY_generate_key, EC_KEY_check_key, EC_KEY_set_public_key_affine_coordinates - Functions for creating, destroying and manipulating B&lt;EC_KEY&gt; objects.
+ 
+ =head1 SYNOPSIS
+ 
+@@ -26,76 +26,71 @@ EC_KEY_new, EC_KEY_get_flags, EC_KEY_set_flags, EC_KEY_clear_flags, EC_KEY_new_b
+  int EC_KEY_set_public_key(EC_KEY *key, const EC_POINT *pub);
+  point_conversion_form_t EC_KEY_get_conv_form(const EC_KEY *key);
+  void EC_KEY_set_conv_form(EC_KEY *eckey, point_conversion_form_t cform);
+- void *EC_KEY_get_key_method_data(EC_KEY *key, 
+-	void *(*dup_func)(void *), void (*free_func)(void *), void (*clear_free_func)(void *));
+- void EC_KEY_insert_key_method_data(EC_KEY *key, void *data,
+-	void *(*dup_func)(void *), void (*free_func)(void *), void (*clear_free_func)(void *));
+  void EC_KEY_set_asn1_flag(EC_KEY *eckey, int asn1_flag);
+  int EC_KEY_precompute_mult(EC_KEY *key, BN_CTX *ctx);
+  int EC_KEY_generate_key(EC_KEY *key);
+  int EC_KEY_check_key(const EC_KEY *key);
+  int EC_KEY_set_public_key_affine_coordinates(EC_KEY *key, BIGNUM *x, BIGNUM *y);
++ const EC_KEY_METHOD *EC_KEY_get_method(const EC_KEY *key);
++ int EC_KEY_set_method(EC_KEY *key, const EC_KEY_METHOD *meth);
+ 
+ =head1 DESCRIPTION
+ 
+-An EC_KEY represents a public key and (optionally) an associated private key. A new EC_KEY (with no associated curve) can be constructed by calling EC_KEY_new.
++An EC_KEY represents a public key and (optionally) an associated private key. A new EC_KEY (with no associated curve) can be constructed by calling EC_KEY_new().
+ The reference count for the newly created EC_KEY is initially set to 1. A curve can be associated with the EC_KEY by calling
+-EC_KEY_set_group.
++EC_KEY_set_group().
+ 
+-Alternatively a new EC_KEY can be constructed by calling EC_KEY_new_by_curve_name and supplying the nid of the associated curve. Refer to L&lt;EC_GROUP_new(3)&gt; for a description of curve names. This function simply wraps calls to EC_KEY_new and 
+-EC_GROUP_new_by_curve_name.
++Alternatively a new EC_KEY can be constructed by calling EC_KEY_new_by_curve_name() and supplying the nid of the associated curve. Refer to L&lt;EC_GROUP_new(3)&gt; for a description of curve names. This function simply wraps calls to EC_KEY_new() and
++EC_GROUP_new_by_curve_name().
+ 
+-Calling EC_KEY_free decrements the reference count for the EC_KEY object, and if it has dropped to zero then frees the memory associated
++Calling EC_KEY_free() decrements the reference count for the EC_KEY object, and if it has dropped to zero then frees the memory associated
+ with it.
+ If B&lt;key&gt; is NULL nothing is done.
+ 
+-EC_KEY_copy copies the contents of the EC_KEY in B&lt;src&gt; into B&lt;dest&gt;.
++EC_KEY_copy() copies the contents of the EC_KEY in B&lt;src&gt; into B&lt;dest&gt;.
+ 
+-EC_KEY_dup creates a new EC_KEY object and copies B&lt;ec_key&gt; into it.
++EC_KEY_dup() creates a new EC_KEY object and copies B&lt;ec_key&gt; into it.
+ 
+-EC_KEY_up_ref increments the reference count associated with the EC_KEY object.
++EC_KEY_up_ref() increments the reference count associated with the EC_KEY object.
+ 
+-EC_KEY_generate_key generates a new public and private key for the supplied B&lt;eckey&gt; object. B&lt;eckey&gt; must have an EC_GROUP object
++EC_KEY_generate_key() generates a new public and private key for the supplied B&lt;eckey&gt; object. B&lt;eckey&gt; must have an EC_GROUP object
+ associated with it before calling this function. The private key is a random integer (0 &lt; priv_key &lt; order, where order is the order
+ of the EC_GROUP object). The public key is an EC_POINT on the curve calculated by multiplying the generator for the curve by the
+ private key.
+ 
+-EC_KEY_check_key performs various sanity checks on the EC_KEY object to confirm that it is valid.
++EC_KEY_check_key() performs various sanity checks on the EC_KEY object to confirm that it is valid.
+ 
+-EC_KEY_set_public_key_affine_coordinates sets the public key for B&lt;key&gt; based on its affine co-ordinates, i.e. it constructs an EC_POINT
++EC_KEY_set_public_key_affine_coordinates() sets the public key for B&lt;key&gt; based on its affine co-ordinates, i.e. it constructs an EC_POINT
+ object based on the supplied B&lt;x&gt; and B&lt;y&gt; values and sets the public key to be this EC_POINT. It will also performs certain sanity checks
+ on the key to confirm that it is valid.
+ 
+-The functions EC_KEY_get0_group, EC_KEY_set_group, EC_KEY_get0_private_key, EC_KEY_set_private_key, EC_KEY_get0_public_key, and EC_KEY_set_public_key get and set the EC_GROUP object, the private key and the EC_POINT public key for the B&lt;key&gt; respectively.
++The functions EC_KEY_get0_group(), EC_KEY_set_group(), EC_KEY_get0_private_key(), EC_KEY_set_private_key(), EC_KEY_get0_public_key(), and EC_KEY_set_public_key() get and set the EC_GROUP object, the private key and the EC_POINT public key for the B&lt;key&gt; respectively.
+ 
+-The functions EC_KEY_get_conv_form and EC_KEY_set_conv_form get and set the point_conversion_form for the B&lt;key&gt;. For a description
++The functions EC_KEY_get_conv_form() and EC_KEY_set_conv_form() get and set the point_conversion_form for the B&lt;key&gt;. For a description
+ of point_conversion_forms please refer to L&lt;EC_POINT_new(3)&gt;.
+ 
+-EC_KEY_insert_key_method_data and EC_KEY_get_key_method_data enable the caller to associate arbitrary additional data specific to the
+-elliptic curve scheme being used with the EC_KEY object. This data is treated as a &quot;black box&quot; by the ec library. The data to be stored by EC_KEY_insert_key_method_data is provided in the B&lt;data&gt; parameter, which must have associated functions for duplicating, freeing and &quot;clear_freeing&quot; the data item. If a subsequent EC_KEY_get_key_method_data call is issued, the functions for duplicating, freeing and &quot;clear_freeing&quot; the data item must be provided again, and they must be the same as they were when the data item was inserted.
++EC_KEY_set_flags() sets the flags in the B&lt;flags&gt; parameter on the EC_KEY object. Any flags that are already set are left set. The currently defined standard flags are EC_FLAG_NON_FIPS_ALLOW and EC_FLAG_FIPS_CHECKED. In addition there is the flag EC_FLAG_COFACTOR_ECDH which is specific to ECDH and is defined in ecdh.h. EC_KEY_get_flags returns the current flags that are set for this EC_KEY. EC_KEY_clear_flags clears the flags indicated by the B&lt;flags&gt; parameter. All other flags are left in their existing state.
+ 
+-EC_KEY_set_flags sets the flags in the B&lt;flags&gt; parameter on the EC_KEY object. Any flags that are already set are left set. The currently defined standard flags are EC_FLAG_NON_FIPS_ALLOW and EC_FLAG_FIPS_CHECKED. In addition there is the flag EC_FLAG_COFACTOR_ECDH which is specific to ECDH and is defined in ecdh.h. EC_KEY_get_flags returns the current flags that are set for this EC_KEY. EC_KEY_clear_flags clears the flags indicated by the B&lt;flags&gt; parameter. All other flags are left in their existing state.
++EC_KEY_set_asn1_flag() sets the asn1_flag on the underlying EC_GROUP object (if set). Refer to L&lt;EC_GROUP_copy(3)&gt; for further information on the asn1_flag.
+ 
+-EC_KEY_set_asn1_flag sets the asn1_flag on the underlying EC_GROUP object (if set). Refer to L&lt;EC_GROUP_copy(3)&gt; for further information on the asn1_flag.
+-
+-EC_KEY_precompute_mult stores multiples of the underlying EC_GROUP generator for faster point multiplication. See also L&lt;EC_POINT_add(3)&gt;.
++EC_KEY_precompute_mult() stores multiples of the underlying EC_GROUP generator for faster point multiplication. See also L&lt;EC_POINT_add(3)&gt;.
+ 
+ 
+ =head1 RETURN VALUES
+ 
+-EC_KEY_new, EC_KEY_new_by_curve_name and EC_KEY_dup return a pointer to the newly created EC_KEY object, or NULL on error.
++EC_KEY_new(), EC_KEY_new_by_curve_name() and EC_KEY_dup() return a pointer to the newly created EC_KEY object, or NULL on error.
+ 
+-EC_KEY_get_flags returns the flags associated with the EC_KEY object as an integer.
++EC_KEY_get_flags() returns the flags associated with the EC_KEY object as an integer.
+ 
+-EC_KEY_copy returns a pointer to the destination key, or NULL on error.
++EC_KEY_copy() returns a pointer to the destination key, or NULL on error.
+ 
+-EC_KEY_up_ref, EC_KEY_set_group, EC_KEY_set_private_key, EC_KEY_set_public_key, EC_KEY_precompute_mult, EC_KEY_generate_key, EC_KEY_check_key and EC_KEY_set_public_key_affine_coordinates return 1 on success or 0 on error.
++EC_KEY_up_ref(), EC_KEY_set_group(), EC_KEY_set_private_key(), EC_KEY_set_public_key(), EC_KEY_precompute_mult(), EC_KEY_generate_key(), EC_KEY_check_key() and EC_KEY_set_public_key_affine_coordinates() return 1 on success or 0 on error.
+ 
+-EC_KEY_get0_group returns the EC_GROUP associated with the EC_KEY.
++EC_KEY_get0_group() returns the EC_GROUP associated with the EC_KEY.
+ 
+-EC_KEY_get0_private_key returns the private key associated with the EC_KEY.
++EC_KEY_get0_private_key() returns the private key associated with the EC_KEY.
+ 
+-EC_KEY_get_conv_form return the point_conversion_form for the EC_KEY.
++EC_KEY_get_conv_form() return the point_conversion_form for the EC_KEY.
+ 
+ 
+ =head1 SEE ALSO
+diff --git a/doc/crypto/ec.pod b/doc/crypto/ec.pod
+index 515dd29..d6f1381 100644
+--- a/doc/crypto/ec.pod
++++ b/doc/crypto/ec.pod
+@@ -136,10 +136,6 @@ ec - Elliptic Curve functions
+  void EC_KEY_set_enc_flags(EC_KEY *eckey, unsigned int flags);
+  point_conversion_form_t EC_KEY_get_conv_form(const EC_KEY *key);
+  void EC_KEY_set_conv_form(EC_KEY *eckey, point_conversion_form_t cform);
+- void *EC_KEY_get_key_method_data(EC_KEY *key, 
+-	void *(*dup_func)(void *), void (*free_func)(void *), void (*clear_free_func)(void *));
+- void EC_KEY_insert_key_method_data(EC_KEY *key, void *data,
+-	void *(*dup_func)(void *), void (*free_func)(void *), void (*clear_free_func)(void *));
+  void EC_KEY_set_asn1_flag(EC_KEY *eckey, int asn1_flag);
+  int EC_KEY_precompute_mult(EC_KEY *key, BN_CTX *ctx);
+  int EC_KEY_generate_key(EC_KEY *key);
+@@ -162,7 +158,8 @@ ec - Elliptic Curve functions
+  #define EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, nid) \
+ 	EVP_PKEY_CTX_ctrl(ctx, EVP_PKEY_EC, EVP_PKEY_OP_PARAMGEN, \
+ 				EVP_PKEY_CTRL_EC_PARAMGEN_CURVE_NID, nid, NULL)
+-
++ const EC_KEY_METHOD *EC_KEY_get_method(const EC_KEY *key);
++ int EC_KEY_set_method(EC_KEY *key, const EC_KEY_METHOD *meth);
+ 
+ =head1 DESCRIPTION
+ 
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index a32f373..dbdf84e 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -273,15 +273,14 @@ DEFINE_STACK_OF(void)
+ # define CRYPTO_EX_INDEX_X509_STORE_CTX   5
+ # define CRYPTO_EX_INDEX_DH               6
+ # define CRYPTO_EX_INDEX_DSA              7
+-# define CRYPTO_EX_INDEX_ECDH             8
+-# define CRYPTO_EX_INDEX_ECDSA            9
+-# define CRYPTO_EX_INDEX_RSA             10
+-# define CRYPTO_EX_INDEX_ENGINE          11
+-# define CRYPTO_EX_INDEX_UI              12
+-# define CRYPTO_EX_INDEX_BIO             13
+-# define CRYPTO_EX_INDEX_STORE           14
+-# define CRYPTO_EX_INDEX_APP             15
+-# define CRYPTO_EX_INDEX__COUNT          16
++# define CRYPTO_EX_INDEX_EC_KEY           8
++# define CRYPTO_EX_INDEX_RSA              9
++# define CRYPTO_EX_INDEX_ENGINE          10
++# define CRYPTO_EX_INDEX_UI              11
++# define CRYPTO_EX_INDEX_BIO             12
++# define CRYPTO_EX_INDEX_STORE           13
++# define CRYPTO_EX_INDEX_APP             14
++# define CRYPTO_EX_INDEX__COUNT          15
+ 
+ /*
+  * This is the default callbacks, but we can have others as well: this is
+diff --git a/include/openssl/ec.h b/include/openssl/ec.h
+index 3926907..3188cae 100644
+--- a/include/openssl/ec.h
++++ b/include/openssl/ec.h
+@@ -791,13 +791,13 @@ void EC_KEY_free(EC_KEY *key);
+  *  \param  src  src EC_KEY object
+  *  \return dst or NULL if an error occurred.
+  */
+-EC_KEY *EC_KEY_copy(EC_KEY *dst, const EC_KEY *src);
++EC_KEY *EC_KEY_copy(EC_KEY *dst, EC_KEY *src);
+ 
+ /** Creates a new EC_KEY object and copies the content from src to it.
+  *  \param  src  the source EC_KEY object
+  *  \return newly created EC_KEY object or NULL if an error occurred.
+  */
+-EC_KEY *EC_KEY_dup(const EC_KEY *src);
++EC_KEY *EC_KEY_dup(EC_KEY *src);
+ 
+ /** Increases the internal reference count of a EC_KEY object.
+  *  \param  key  EC_KEY object
+@@ -851,23 +851,12 @@ unsigned EC_KEY_get_enc_flags(const EC_KEY *key);
+ void EC_KEY_set_enc_flags(EC_KEY *eckey, unsigned int flags);
+ point_conversion_form_t EC_KEY_get_conv_form(const EC_KEY *key);
+ void EC_KEY_set_conv_form(EC_KEY *eckey, point_conversion_form_t cform);
+-/* functions to set/get method specific data  */
+-void *EC_KEY_get_key_method_data(EC_KEY *key,
+-                                 void *(*dup_func) (void *),
+-                                 void (*free_func) (void *),
+-                                 void (*clear_free_func) (void *));
+-/** Sets the key method data of an EC_KEY object, if none has yet been set.
+- *  \param  key              EC_KEY object
+- *  \param  data             opaque data to install.
+- *  \param  dup_func         a function that duplicates |data|.
+- *  \param  free_func        a function that frees |data|.
+- *  \param  clear_free_func  a function that wipes and frees |data|.
+- *  \return the previously set data pointer, or NULL if |data| was inserted.
+- */
+-void *EC_KEY_insert_key_method_data(EC_KEY *key, void *data,
+-                                    void *(*dup_func) (void *),
+-                                    void (*free_func) (void *),
+-                                    void (*clear_free_func) (void *));
++
++#define EC_KEY_get_ex_new_index(l, p, newf, dupf, freef) \
++    CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_EC_KEY, l, p, newf, dupf, freef)
++int EC_KEY_set_ex_data(EC_KEY *key, int idx, void *arg);
++void *EC_KEY_get_ex_data(const EC_KEY *key, int idx);
++
+ /* wrapper functions for the underlying EC_GROUP object */
+ void EC_KEY_set_asn1_flag(EC_KEY *eckey, int asn1_flag);
+ 
+@@ -1023,6 +1012,8 @@ int EC_KEY_print_fp(FILE *fp, const EC_KEY *key, int off);
+ const EC_KEY_METHOD *EC_KEY_OpenSSL(void);
+ const EC_KEY_METHOD *EC_KEY_get_default_method(void);
+ void EC_KEY_set_default_method(const EC_KEY_METHOD *meth);
++const EC_KEY_METHOD *EC_KEY_get_method(const EC_KEY *key);
++int EC_KEY_set_method(EC_KEY *key, const EC_KEY_METHOD *meth);
+ EC_KEY *EC_KEY_new_method(ENGINE *engine);
+ 
+ int ECDH_KDF_X9_62(unsigned char *out, size_t outlen,
+diff --git a/util/libeay.num b/util/libeay.num
+index af0520b..476334f 100755
+--- a/util/libeay.num
++++ b/util/libeay.num
+@@ -2947,7 +2947,7 @@ EC_POINT_bn2point                       3398	1_1_0	EXIST::FUNCTION:EC
+ X509_VERIFY_PARAM_set_depth             3399	1_1_0	EXIST::FUNCTION:
+ EC_KEY_set_asn1_flag                    3400	1_1_0	EXIST::FUNCTION:EC
+ STORE_get_method                        3401	1_1_0	NOEXIST::FUNCTION:
+-EC_KEY_get_key_method_data              3402	1_1_0	EXIST::FUNCTION:EC
++EC_KEY_get_key_method_data              3402	1_1_0	NOEXIST::FUNCTION:
+ ECDSA_sign_ex                           3403	1_1_0	EXIST::FUNCTION:EC
+ STORE_parse_attrs_end                   3404	1_1_0	NOEXIST::FUNCTION:
+ EC_GROUP_get_point_conversion_form      3405	1_1_0	EXIST:!VMS:FUNCTION:EC
+@@ -3113,7 +3113,7 @@ STORE_meth_set_cleanup_fn               3554	1_1_0	NOEXIST::FUNCTION:
+ STORE_method_set_cleanup_function       3554	1_1_0	NOEXIST::FUNCTION:
+ EC_GROUP_check                          3555	1_1_0	EXIST::FUNCTION:EC
+ d2i_ECPrivateKey_bio                    3556	1_1_0	EXIST::FUNCTION:EC
+-EC_KEY_insert_key_method_data           3557	1_1_0	EXIST::FUNCTION:EC
++EC_KEY_insert_key_method_data           3557	1_1_0	NOEXIST::FUNCTION:
+ STORE_meth_get_lock_store_fn            3558	1_1_0	NOEXIST::FUNCTION:
+ STORE_method_get_lock_store_function    3558	1_1_0	NOEXIST::FUNCTION:
+ X509_VERIFY_PARAM_get_depth             3559	1_1_0	EXIST::FUNCTION:
+@@ -4724,13 +4724,17 @@ CRYPTO_mem_debug_push                   5118	1_1_0	EXIST::FUNCTION:CRYPTO_MDEBUG
+ CRYPTO_set_mem_debug                    5119	1_1_0	EXIST::FUNCTION:
+ CRYPTO_mem_debug_pop                    5120	1_1_0	EXIST::FUNCTION:CRYPTO_MDEBUG
+ CRYPTO_secure_actual_size               5121	1_1_0	EXIST::FUNCTION:
+-lh_get_down_load                        5122	1_1_0	EXIST::FUNCTION:
+-lh_error                                5123	1_1_0	EXIST::FUNCTION:
+-lh_set_down_load                        5124	1_1_0	EXIST::FUNCTION:
++EC_KEY_set_ex_data                      5122	1_1_0	EXIST::FUNCTION:EC
++lh_get_down_load                        5123	1_1_0	EXIST::FUNCTION:
++EC_KEY_get_ex_data                      5124	1_1_0	EXIST::FUNCTION:EC
++EC_KEY_set_method                       5125	1_1_0	EXIST::FUNCTION:EC
+ EVP_CIPHER_CTX_set_num                  5125	1_1_0	EXIST::FUNCTION:
++EC_KEY_get_method                       5126	1_1_0	EXIST::FUNCTION:EC
+ EVP_CIPHER_meth_set_init                5126	1_1_0	EXIST::FUNCTION:
+ EVP_CIPHER_impl_ctx_size                5127	1_1_0	EXIST::FUNCTION:
++lh_error                                5127	1_1_0	EXIST::FUNCTION:
+ EVP_CIPHER_meth_set_cleanup             5128	1_1_0	EXIST::FUNCTION:
++lh_set_down_load                        5128	1_1_0	EXIST::FUNCTION:
+ EVP_CIPHER_meth_free                    5129	1_1_0	EXIST::FUNCTION:
+ EVP_CIPHER_CTX_encrypting               5130	1_1_0	EXIST::FUNCTION:
+ EVP_CIPHER_meth_set_set_asn1_params     5131	1_1_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002835.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002843.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2837">[ date ]</a>
+              <a href="thread.html#2837">[ thread ]</a>
+              <a href="subject.html#2837">[ subject ]</a>
+              <a href="author.html#2837">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,195 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619623189.579416.23348.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034051.html">
+   <LINK REL="Next"  HREF="034053.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619623189.579416.23348.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Apr 28 15:19:49 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034051.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034053.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34052">[ date ]</a>
+              <a href="thread.html#34052">[ thread ]</a>
+              <a href="subject.html#34052">[ subject ]</a>
+              <a href="author.html#34052">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  460d2fbcd75bef492638b54c17aa5f5bca7eec2a (commit)
+      from  2d5695016d880b9c6681f293ed5afb0379ce86b7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 460d2fbcd75bef492638b54c17aa5f5bca7eec2a
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Apr 26 14:58:40 2021 +0100
+
+    Store the list of activated providers in the libctx
+    
+    The provider config module was storing the list of activated providers
+    in a global variable. However, because different libctxs can each load
+    providers via config files we need to keep the list of activated providers
+    separate and in the libctx.
+    
+    Partially fixes #15030
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15033">https://github.com/openssl/openssl/pull/15033</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_conf.c      | 50 +++++++++++++++++++++++++++++++++------------
+ include/internal/cryptlib.h |  3 ++-
+ 2 files changed, 39 insertions(+), 14 deletions(-)
+
+diff --git a/crypto/provider_conf.c b/crypto/provider_conf.c
+index fb83977e6d..a04a7aa553 100644
+--- a/crypto/provider_conf.c
++++ b/crypto/provider_conf.c
+@@ -13,12 +13,41 @@
+ #include &lt;openssl/conf.h&gt;
+ #include &lt;openssl/safestack.h&gt;
+ #include &quot;internal/provider.h&quot;
++#include &quot;internal/cryptlib.h&quot;
+ 
+ DEFINE_STACK_OF(OSSL_PROVIDER)
+ 
+ /* PROVIDER config module */
+ 
+-static STACK_OF(OSSL_PROVIDER) *activated_providers = NULL;
++typedef struct {
++    STACK_OF(OSSL_PROVIDER) *activated_providers;
++} PROVIDER_CONF_GLOBAL;
++
++static void *prov_conf_ossl_ctx_new(OSSL_LIB_CTX *libctx)
++{
++    PROVIDER_CONF_GLOBAL *pcgbl = OPENSSL_zalloc(sizeof(*pcgbl));
++
++    if (pcgbl == NULL)
++        return NULL;
++
++    return pcgbl;
++}
++
++static void prov_conf_ossl_ctx_free(void *vpcgbl)
++{
++    PROVIDER_CONF_GLOBAL *pcgbl = vpcgbl;
++
++    sk_OSSL_PROVIDER_pop_free(pcgbl-&gt;activated_providers,
++                              ossl_provider_free);
++
++    OSSL_TRACE(CONF, &quot;Cleaned up providers\n&quot;);
++    OPENSSL_free(pcgbl);
++}
++
++static const OSSL_LIB_CTX_METHOD provider_conf_ossl_ctx_method = {
++    prov_conf_ossl_ctx_new,
++    prov_conf_ossl_ctx_free,
++};
+ 
+ static const char *skip_dot(const char *name)
+ {
+@@ -80,6 +109,9 @@ static int provider_conf_load(OSSL_LIB_CTX *libctx, const char *name,
+     const char *path = NULL;
+     long activate = 0;
+     int ok = 0;
++    PROVIDER_CONF_GLOBAL *pcgbl
++        = ossl_lib_ctx_get_data(libctx, OSSL_LIB_CTX_PROVIDER_CONF_INDEX,
++                                &amp;provider_conf_ossl_ctx_method);
+ 
+     name = skip_dot(name);
+     OSSL_TRACE1(CONF, &quot;Configuring provider %s\n&quot;, name);
+@@ -133,9 +165,9 @@ static int provider_conf_load(OSSL_LIB_CTX *libctx, const char *name,
+         if (!ossl_provider_activate(prov, 0)) {
+             ok = 0;
+         } else {
+-            if (activated_providers == NULL)
+-                activated_providers = sk_OSSL_PROVIDER_new_null();
+-            sk_OSSL_PROVIDER_push(activated_providers, prov);
++            if (pcgbl-&gt;activated_providers == NULL)
++                pcgbl-&gt;activated_providers = sk_OSSL_PROVIDER_new_null();
++            sk_OSSL_PROVIDER_push(pcgbl-&gt;activated_providers, prov);
+             ok = 1;
+         }
+     }
+@@ -172,16 +204,8 @@ static int provider_conf_init(CONF_IMODULE *md, const CONF *cnf)
+     return 1;
+ }
+ 
+-
+-static void provider_conf_deinit(CONF_IMODULE *md)
+-{
+-    sk_OSSL_PROVIDER_pop_free(activated_providers, ossl_provider_free);
+-    activated_providers = NULL;
+-    OSSL_TRACE(CONF, &quot;Cleaned up providers\n&quot;);
+-}
+-
+ void ossl_provider_add_conf_module(void)
+ {
+     OSSL_TRACE(CONF, &quot;Adding config module 'providers'\n&quot;);
+-    CONF_module_add(&quot;providers&quot;, provider_conf_init, provider_conf_deinit);
++    CONF_module_add(&quot;providers&quot;, provider_conf_init, NULL);
+ }
+diff --git a/include/internal/cryptlib.h b/include/internal/cryptlib.h
+index ea42447e78..e7dd1f65b4 100644
+--- a/include/internal/cryptlib.h
++++ b/include/internal/cryptlib.h
+@@ -162,7 +162,8 @@ typedef struct ossl_ex_data_global_st {
+ # define OSSL_LIB_CTX_BIO_PROV_INDEX                13
+ # define OSSL_LIB_CTX_GLOBAL_PROPERTIES             14
+ # define OSSL_LIB_CTX_STORE_LOADER_STORE_INDEX      15
+-# define OSSL_LIB_CTX_MAX_INDEXES                   16
++# define OSSL_LIB_CTX_PROVIDER_CONF_INDEX           16
++# define OSSL_LIB_CTX_MAX_INDEXES                   17
+ 
+ typedef struct ossl_lib_ctx_method {
+     void *(*new_func)(OSSL_LIB_CTX *ctx);
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034051.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034053.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34052">[ date ]</a>
+              <a href="thread.html#34052">[ thread ]</a>
+              <a href="subject.html#34052">[ subject ]</a>
+              <a href="author.html#34052">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

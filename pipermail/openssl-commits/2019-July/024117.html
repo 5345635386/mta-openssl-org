@@ -1,0 +1,1025 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1563912218.095038.14619.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024110.html">
+   <LINK REL="Next"  HREF="024127.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1563912218.095038.14619.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jul 23 20:03:38 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024110.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024127.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24117">[ date ]</a>
+              <a href="thread.html#24117">[ thread ]</a>
+              <a href="subject.html#24117">[ subject ]</a>
+              <a href="author.html#24117">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8b84b075ff065554c0cdd1086950f1a8614d93a4 (commit)
+      from  037439c46addc62130617bbba8c5e58e1548bfd8 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8b84b075ff065554c0cdd1086950f1a8614d93a4
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sun Jul 7 10:56:46 2019 +0200
+
+    Adapt DH to use with KEYMGMT
+    
+    The biggest part in this was to move the key-&gt;param builder from EVP
+    to the DH ASN.1 method, and to implement the KEYMGMT support in the
+    provider DH.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9394">https://github.com/openssl/openssl/pull/9394</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/dh/dh_ameth.c                              |  57 ++++++++-
+ crypto/dh/dh_asn1.c                               |   2 +
+ crypto/dh/dh_gen.c                                |   1 +
+ crypto/dh/dh_key.c                                |   1 +
+ crypto/dh/dh_lib.c                                |   2 +
+ crypto/dh/dh_locl.h                               |   3 +
+ crypto/dh/dh_rfc7919.c                            |   1 +
+ crypto/err/openssl.txt                            |   2 +
+ crypto/evp/evp_err.c                              |   1 +
+ crypto/evp/evp_lib.c                              | 134 ----------------------
+ crypto/evp/evp_locl.h                             |   2 +
+ crypto/evp/exchange.c                             |  71 +++++++-----
+ crypto/evp/pmeth_lib.c                            |   2 +-
+ doc/man3/EVP_KEYEXCH_free.pod                     |   7 +-
+ include/openssl/core_numbers.h                    |   8 +-
+ include/openssl/evp.h                             |   1 +
+ include/openssl/evperr.h                          |   1 +
+ providers/common/build.info                       |   2 +-
+ providers/common/exchange/build.info              |   2 +-
+ providers/common/exchange/{dh.c =&gt; dh_exch.c}     |  70 +++--------
+ providers/common/include/internal/provider_algs.h |   5 +-
+ providers/common/{exchange =&gt; keymgmt}/build.info |   4 +-
+ providers/common/keymgmt/dh_kmgmt.c               |  88 ++++++++++++++
+ providers/default/defltprov.c                     |  11 +-
+ util/libcrypto.num                                |   1 +
+ 25 files changed, 242 insertions(+), 237 deletions(-)
+ rename providers/common/exchange/{dh.c =&gt; dh_exch.c} (67%)
+ copy providers/common/{exchange =&gt; keymgmt}/build.info (80%)
+ create mode 100644 providers/common/keymgmt/dh_kmgmt.c
+
+diff --git a/crypto/dh/dh_ameth.c b/crypto/dh/dh_ameth.c
+index 524cac5..6da4878 100644
+--- a/crypto/dh/dh_ameth.c
++++ b/crypto/dh/dh_ameth.c
+@@ -16,6 +16,8 @@
+ #include &quot;internal/asn1_int.h&quot;
+ #include &quot;internal/evp_int.h&quot;
+ #include &lt;openssl/cms.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &quot;internal/param_build.h&quot;
+ 
+ /*
+  * i2d/d2i like DH parameter functions which use the appropriate routine for
+@@ -181,7 +183,7 @@ static int dh_priv_decode(EVP_PKEY *pkey, const PKCS8_PRIV_KEY_INFO *p8)
+         DHerr(DH_F_DH_PRIV_DECODE, DH_R_BN_ERROR);
+         goto dherr;
+     }
+-    /* Calculate public key */
++    /* Calculate public key, increments dirty_cnt */
+     if (!DH_generate_key(dh))
+         goto dherr;
+ 
+@@ -255,6 +257,7 @@ static int dh_param_decode(EVP_PKEY *pkey,
+         DHerr(DH_F_DH_PARAM_DECODE, ERR_R_DH_LIB);
+         return 0;
+     }
++    dh-&gt;dirty_cnt++;
+     EVP_PKEY_assign(pkey, pkey-&gt;ameth-&gt;pkey_id, dh);
+     return 1;
+ }
+@@ -415,6 +418,7 @@ static int int_dh_param_copy(DH *to, const DH *from, int is_x942)
+         }
+     } else
+         to-&gt;length = from-&gt;length;
++    to-&gt;dirty_cnt++;
+     return 1;
+ }
+ 
+@@ -540,6 +544,50 @@ static int dh_pkey_param_check(const EVP_PKEY *pkey)
+     return DH_check_ex(dh);
+ }
+ 
++static size_t dh_pkey_dirty_cnt(const EVP_PKEY *pkey)
++{
++    return pkey-&gt;pkey.dh-&gt;dirty_cnt;
++}
++
++static void *dh_pkey_export_to(const EVP_PKEY *pk, EVP_KEYMGMT *keymgmt)
++{
++    DH *dh = pk-&gt;pkey.dh;
++    OSSL_PARAM_BLD tmpl;
++    const BIGNUM *p = DH_get0_p(dh), *g = DH_get0_g(dh), *q = DH_get0_q(dh);
++    const BIGNUM *pub_key = DH_get0_pub_key(dh);
++    const BIGNUM *priv_key = DH_get0_priv_key(dh);
++    OSSL_PARAM *params;
++    void *provkey = NULL;
++
++    if (p == NULL || g == NULL || pub_key == NULL)
++        return NULL;
++
++    ossl_param_bld_init(&amp;tmpl);
++    if (!ossl_param_bld_push_BN(&amp;tmpl, OSSL_PKEY_PARAM_DH_P, p)
++        || !ossl_param_bld_push_BN(&amp;tmpl, OSSL_PKEY_PARAM_DH_G, g)
++        || !ossl_param_bld_push_BN(&amp;tmpl, OSSL_PKEY_PARAM_DH_PUB_KEY, pub_key))
++        return NULL;
++
++    if (q != NULL) {
++        if (!ossl_param_bld_push_BN(&amp;tmpl, OSSL_PKEY_PARAM_DH_Q, q))
++            return NULL;
++    }
++
++    if (priv_key != NULL) {
++        if (!ossl_param_bld_push_BN(&amp;tmpl, OSSL_PKEY_PARAM_DH_PRIV_KEY,
++                                    priv_key))
++            return NULL;
++    }
++
++    params = ossl_param_bld_to_param(&amp;tmpl);
++
++    /* We export, the provider imports */
++    provkey = evp_keymgmt_importkey(keymgmt, params);
++
++    ossl_param_bld_free(params);
++    return provkey;
++}
++
+ const EVP_PKEY_ASN1_METHOD dh_asn1_meth = {
+     EVP_PKEY_DH,
+     EVP_PKEY_DH,
+@@ -576,7 +624,12 @@ const EVP_PKEY_ASN1_METHOD dh_asn1_meth = {
+ 
+     0,
+     dh_pkey_public_check,
+-    dh_pkey_param_check
++    dh_pkey_param_check,
++
++    0, 0, 0, 0,
++
++    dh_pkey_dirty_cnt,
++    dh_pkey_export_to,
+ };
+ 
+ const EVP_PKEY_ASN1_METHOD dhx_asn1_meth = {
+diff --git a/crypto/dh/dh_asn1.c b/crypto/dh/dh_asn1.c
+index aabdfa8..71379d7 100644
+--- a/crypto/dh/dh_asn1.c
++++ b/crypto/dh/dh_asn1.c
+@@ -27,6 +27,8 @@ static int dh_cb(int operation, ASN1_VALUE **pval, const ASN1_ITEM *it,
+         DH_free((DH *)*pval);
+         *pval = NULL;
+         return 2;
++    } else if (operation == ASN1_OP_D2I_POST) {
++        ((DH *)*pval)-&gt;dirty_cnt++;
+     }
+     return 1;
+ }
+diff --git a/crypto/dh/dh_gen.c b/crypto/dh/dh_gen.c
+index bbf774f..6e98b59 100644
+--- a/crypto/dh/dh_gen.c
++++ b/crypto/dh/dh_gen.c
+@@ -111,6 +111,7 @@ static int dh_builtin_genparams(DH *ret, int prime_len, int generator,
+         goto err;
+     if (!BN_set_word(ret-&gt;g, g))
+         goto err;
++    ret-&gt;dirty_cnt++;
+     ok = 1;
+  err:
+     if (ok == -1) {
+diff --git a/crypto/dh/dh_key.c b/crypto/dh/dh_key.c
+index 4df993e..0d6b04d 100644
+--- a/crypto/dh/dh_key.c
++++ b/crypto/dh/dh_key.c
+@@ -154,6 +154,7 @@ static int generate_key(DH *dh)
+ 
+     dh-&gt;pub_key = pub_key;
+     dh-&gt;priv_key = priv_key;
++    dh-&gt;dirty_cnt++;
+     ok = 1;
+  err:
+     if (ok != 1)
+diff --git a/crypto/dh/dh_lib.c b/crypto/dh/dh_lib.c
+index 70298ed..df31662 100644
+--- a/crypto/dh/dh_lib.c
++++ b/crypto/dh/dh_lib.c
+@@ -209,6 +209,7 @@ int DH_set0_pqg(DH *dh, BIGNUM *p, BIGNUM *q, BIGNUM *g)
+         dh-&gt;length = BN_num_bits(q);
+     }
+ 
++    dh-&gt;dirty_cnt++;
+     return 1;
+ }
+ 
+@@ -242,6 +243,7 @@ int DH_set0_key(DH *dh, BIGNUM *pub_key, BIGNUM *priv_key)
+         dh-&gt;priv_key = priv_key;
+     }
+ 
++    dh-&gt;dirty_cnt++;
+     return 1;
+ }
+ 
+diff --git a/crypto/dh/dh_locl.h b/crypto/dh/dh_locl.h
+index bb64cde..f0247b8 100644
+--- a/crypto/dh/dh_locl.h
++++ b/crypto/dh/dh_locl.h
+@@ -35,6 +35,9 @@ struct dh_st {
+     const DH_METHOD *meth;
+     ENGINE *engine;
+     CRYPTO_RWLOCK *lock;
++
++    /* Provider data */
++    size_t dirty_cnt; /* If any key material changes, increment this */
+ };
+ 
+ struct dh_method {
+diff --git a/crypto/dh/dh_rfc7919.c b/crypto/dh/dh_rfc7919.c
+index e9f3eaf..4e676fd 100644
+--- a/crypto/dh/dh_rfc7919.c
++++ b/crypto/dh/dh_rfc7919.c
+@@ -22,6 +22,7 @@ static DH *dh_param_init(const BIGNUM *p, int32_t nbits)
+     dh-&gt;p = (BIGNUM *)p;
+     dh-&gt;g = (BIGNUM *)&amp;_bignum_const_2;
+     dh-&gt;length = nbits;
++    dh-&gt;dirty_cnt++;
+     return dh;
+ }
+ 
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index b852fa2..d88e989 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -821,6 +821,7 @@ EVP_F_EVP_KDF_CTRL:224:EVP_KDF_ctrl
+ EVP_F_EVP_KDF_CTRL_STR:225:EVP_KDF_ctrl_str
+ EVP_F_EVP_KDF_CTX_NEW:240:EVP_KDF_CTX_new
+ EVP_F_EVP_KDF_CTX_NEW_ID:226:EVP_KDF_CTX_new_id
++EVP_F_EVP_KEYEXCH_FETCH:245:EVP_KEYEXCH_fetch
+ EVP_F_EVP_KEYEXCH_FROM_DISPATCH:244:evp_keyexch_from_dispatch
+ EVP_F_EVP_MAC_CTRL:209:EVP_MAC_ctrl
+ EVP_F_EVP_MAC_CTRL_STR:210:EVP_MAC_ctrl_str
+@@ -2464,6 +2465,7 @@ EVP_R_NOT_XOF_OR_INVALID_LENGTH:178:not XOF or invalid length
+ EVP_R_NO_CIPHER_SET:131:no cipher set
+ EVP_R_NO_DEFAULT_DIGEST:158:no default digest
+ EVP_R_NO_DIGEST_SET:139:no digest set
++EVP_R_NO_KEYMGMT_PRESENT:196:no keymgmt present
+ EVP_R_NO_KEY_SET:154:no key set
+ EVP_R_NO_OPERATION_SET:149:no operation set
+ EVP_R_ONLY_ONESHOT_SUPPORTED:177:only oneshot supported
+diff --git a/crypto/evp/evp_err.c b/crypto/evp/evp_err.c
+index d517099..92df593 100644
+--- a/crypto/evp/evp_err.c
++++ b/crypto/evp/evp_err.c
+@@ -95,6 +95,7 @@ static const ERR_STRING_DATA EVP_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_CIPHER_SET), &quot;no cipher set&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_DEFAULT_DIGEST), &quot;no default digest&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_DIGEST_SET), &quot;no digest set&quot;},
++    {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_KEYMGMT_PRESENT), &quot;no keymgmt present&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_KEY_SET), &quot;no key set&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_NO_OPERATION_SET), &quot;no operation set&quot;},
+     {ERR_PACK(ERR_LIB_EVP, 0, EVP_R_ONLY_ONESHOT_SUPPORTED),
+diff --git a/crypto/evp/evp_lib.c b/crypto/evp/evp_lib.c
+index 0825c10..9091f8b 100644
+--- a/crypto/evp/evp_lib.c
++++ b/crypto/evp/evp_lib.c
+@@ -760,137 +760,3 @@ int EVP_hex2ctrl(int (*cb)(void *ctx, int cmd, void *buf, size_t buflen),
+     OPENSSL_free(bin);
+     return rv;
+ }
+-
+-#ifndef FIPS_MODE
+-# ifndef OPENSSL_NO_DH
+-/*
+- * TODO(3.0): Temporarily unavailable in FIPS mode. This will need to be added
+- * in later.
+- */
+-
+-#  define MAX_PARAMS 10
+-typedef struct {
+-    /* Number of the current param */
+-    size_t curr;
+-    struct {
+-        /* Key for the current param */
+-        const char *key;
+-        /* Value for the current param */
+-        const BIGNUM *bnparam;
+-        /* Size of the buffer required for the BN */
+-        size_t bufsz;
+-    } params[MAX_PARAMS];
+-    /* Running count of the total size required */
+-    size_t totsz;
+-    int ispublic;
+-} PARAMS_TEMPLATE;
+-
+-static int push_param_bn(PARAMS_TEMPLATE *tmpl, const char *key,
+-                         const BIGNUM *bn)
+-{
+-    int sz;
+-
+-    sz = BN_num_bytes(bn);
+-    if (sz &lt;= 0)
+-        return 0;
+-    tmpl-&gt;params[tmpl-&gt;curr].key = key;
+-    tmpl-&gt;params[tmpl-&gt;curr].bnparam = bn;
+-    tmpl-&gt;params[tmpl-&gt;curr++].bufsz = (size_t)sz;
+-    tmpl-&gt;totsz += sizeof(OSSL_PARAM) + (size_t)sz;
+-
+-    return 1;
+-}
+-
+-static OSSL_PARAM *param_template_to_param(PARAMS_TEMPLATE *tmpl, size_t *sz)
+-{
+-    size_t i;
+-    void *buf;
+-    OSSL_PARAM *param = NULL;
+-    unsigned char *currbuf = NULL;
+-
+-    if (tmpl-&gt;totsz == 0)
+-        return NULL;
+-
+-    /* Add some space for the end of OSSL_PARAM marker */
+-    tmpl-&gt;totsz += sizeof(*param);
+-
+-    if (tmpl-&gt;ispublic)
+-        buf = OPENSSL_zalloc(tmpl-&gt;totsz);
+-    else
+-        buf = OPENSSL_secure_zalloc(tmpl-&gt;totsz);
+-    if (buf == NULL)
+-        return NULL;
+-    param = buf;
+-
+-    currbuf = (unsigned char *)buf + (sizeof(*param) * (tmpl-&gt;curr + 1));
+-
+-    for (i = 0; i &lt; tmpl-&gt;curr; i++) {
+-        if (!ossl_assert((currbuf - (unsigned char *)buf )
+-                         + tmpl-&gt;params[i].bufsz &lt;= tmpl-&gt;totsz))
+-            goto err;
+-        if (BN_bn2nativepad(tmpl-&gt;params[i].bnparam, currbuf,
+-                            tmpl-&gt;params[i].bufsz) &lt; 0)
+-            goto err;
+-        param[i] = OSSL_PARAM_construct_BN(tmpl-&gt;params[i].key, currbuf,
+-                                           tmpl-&gt;params[i].bufsz);
+-        currbuf += tmpl-&gt;params[i].bufsz;
+-    }
+-    param[i] = OSSL_PARAM_construct_end();
+-
+-    if (sz != NULL)
+-        *sz = tmpl-&gt;totsz;
+-    return param;
+-
+- err:
+-    if (tmpl-&gt;ispublic)
+-        OPENSSL_free(param);
+-    else
+-        OPENSSL_clear_free(param, tmpl-&gt;totsz);
+-    return NULL;
+-}
+-
+-static OSSL_PARAM *evp_pkey_dh_to_param(EVP_PKEY *pkey, size_t *sz)
+-{
+-    DH *dh = pkey-&gt;pkey.dh;
+-    PARAMS_TEMPLATE tmpl = {0};
+-    const BIGNUM *p = DH_get0_p(dh), *g = DH_get0_g(dh), *q = DH_get0_q(dh);
+-    const BIGNUM *pub_key = DH_get0_pub_key(dh);
+-    const BIGNUM *priv_key = DH_get0_priv_key(dh);
+-
+-    if (p == NULL || g == NULL || pub_key == NULL)
+-        return NULL;
+-
+-    if (!push_param_bn(&amp;tmpl, OSSL_PKEY_PARAM_DH_P, p)
+-            || !push_param_bn(&amp;tmpl, OSSL_PKEY_PARAM_DH_G, g)
+-            || !push_param_bn(&amp;tmpl, OSSL_PKEY_PARAM_DH_PUB_KEY, pub_key))
+-        return NULL;
+-
+-    if (q != NULL) {
+-        if (!push_param_bn(&amp;tmpl, OSSL_PKEY_PARAM_DH_Q, q))
+-            return NULL;
+-    }
+-
+-    if (priv_key != NULL) {
+-        if (!push_param_bn(&amp;tmpl, OSSL_PKEY_PARAM_DH_PRIV_KEY, priv_key))
+-            return NULL;
+-    } else {
+-        tmpl.ispublic = 1;
+-    }
+-
+-    return param_template_to_param(&amp;tmpl, sz);
+-}
+-# endif /* OPENSSL_NO_DH */
+-
+-OSSL_PARAM *evp_pkey_to_param(EVP_PKEY *pkey, size_t *sz)
+-{
+-    switch (pkey-&gt;type) {
+-# ifndef OPENSSL_NO_DH
+-    case EVP_PKEY_DH:
+-        return evp_pkey_dh_to_param(pkey, sz);
+-# endif
+-    default:
+-        return NULL;
+-    }
+-}
+-
+-#endif /* FIPS_MODE */
+diff --git a/crypto/evp/evp_locl.h b/crypto/evp/evp_locl.h
+index ce46163..848ef29 100644
+--- a/crypto/evp/evp_locl.h
++++ b/crypto/evp/evp_locl.h
+@@ -94,6 +94,8 @@ struct evp_keyexch_st {
+     CRYPTO_REF_COUNT refcnt;
+     CRYPTO_RWLOCK *lock;
+ 
++    EVP_KEYMGMT *keymgmt;
++
+     OSSL_OP_keyexch_newctx_fn *newctx;
+     OSSL_OP_keyexch_init_fn *init;
+     OSSL_OP_keyexch_set_peer_fn *set_peer;
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index d8afcbd..1c48e7f 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -112,6 +112,7 @@ void EVP_KEYEXCH_free(EVP_KEYEXCH *exchange)
+         CRYPTO_DOWN_REF(&amp;exchange-&gt;refcnt, &amp;i, exchange-&gt;lock);
+         if (i &gt; 0)
+             return;
++        EVP_KEYMGMT_free(exchange-&gt;keymgmt);
+         ossl_provider_free(exchange-&gt;prov);
+         OPENSSL_free(exchange-&gt;name);
+         CRYPTO_THREAD_lock_free(exchange-&gt;lock);
+@@ -127,20 +128,46 @@ int EVP_KEYEXCH_up_ref(EVP_KEYEXCH *exchange)
+     return 1;
+ }
+ 
++OSSL_PROVIDER *EVP_KEYEXCH_provider(const EVP_KEYEXCH *exchange)
++{
++    return exchange-&gt;prov;
++}
++
+ EVP_KEYEXCH *EVP_KEYEXCH_fetch(OPENSSL_CTX *ctx, const char *algorithm,
+                                const char *properties)
+ {
+-    return evp_generic_fetch(ctx, OSSL_OP_KEYEXCH, algorithm, properties,
+-                             evp_keyexch_from_dispatch,
+-                             (int (*)(void *))EVP_KEYEXCH_up_ref,
+-                             (void (*)(void *))EVP_KEYEXCH_free);
++    /*
++     * Key exchange cannot work without a key, and we key management
++     * from the same provider to manage its keys.
++     */
++    EVP_KEYEXCH *keyexch =
++        evp_generic_fetch(ctx, OSSL_OP_KEYEXCH, algorithm, properties,
++                          evp_keyexch_from_dispatch,
++                          (int (*)(void *))EVP_KEYEXCH_up_ref,
++                          (void (*)(void *))EVP_KEYEXCH_free);
++
++    /* If the method is newly created, there's no keymgmt attached */
++    if (keyexch-&gt;keymgmt == NULL) {
++        EVP_KEYMGMT *keymgmt = EVP_KEYMGMT_fetch(ctx, algorithm, properties);
++
++        if (keymgmt == NULL
++            || (EVP_KEYEXCH_provider(keyexch)
++                != EVP_KEYMGMT_provider(keymgmt))) {
++            EVP_KEYEXCH_free(keyexch);
++            EVP_KEYMGMT_free(keymgmt);
++            EVPerr(EVP_F_EVP_KEYEXCH_FETCH, EVP_R_NO_KEYMGMT_PRESENT);
++            return NULL;
++        }
++
++        keyexch-&gt;keymgmt = keymgmt;
++    }
++    return keyexch;
+ }
+ 
+ int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange)
+ {
+     int ret;
+-    OSSL_PARAM *param = NULL;
+-    size_t paramsz = 0;
++    void *provkey = NULL;
+ 
+     ctx-&gt;operation = EVP_PKEY_OP_DERIVE;
+ 
+@@ -180,26 +207,19 @@ int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange)
+     EVP_KEYEXCH_free(ctx-&gt;exchange);
+     ctx-&gt;exchange = exchange;
+     if (ctx-&gt;pkey != NULL) {
+-        param = evp_pkey_to_param(ctx-&gt;pkey, &amp;paramsz);
+-        if (param == NULL) {
++        provkey = evp_keymgmt_export_to_provider(ctx-&gt;pkey, exchange-&gt;keymgmt);
++        if (provkey == NULL) {
+             EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX, EVP_R_INITIALIZATION_ERROR);
+             goto err;
+         }
+     }
+     ctx-&gt;exchprovctx = exchange-&gt;newctx(ossl_provider_ctx(exchange-&gt;prov));
+     if (ctx-&gt;exchprovctx == NULL) {
+-        OPENSSL_secure_clear_free(param, paramsz);
++        /* The provider key can stay in the cache */
+         EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX, EVP_R_INITIALIZATION_ERROR);
+         goto err;
+     }
+-    ret = exchange-&gt;init(ctx-&gt;exchprovctx, param);
+-    /*
+-     * TODO(3.0): Really we should detect whether to call OPENSSL_free or
+-     * OPENSSL_secure_clear_free based on the presence of a private key or not.
+-     * Since we always expect a private key to be present we just call
+-     * OPENSSL_secure_clear_free for now.
+-     */
+-    OPENSSL_secure_clear_free(param, paramsz);
++    ret = exchange-&gt;init(ctx-&gt;exchprovctx, provkey);
+ 
+     return ret ? 1 : 0;
+  err:
+@@ -229,7 +249,7 @@ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ {
+     int ret;
+-    OSSL_PARAM *param = NULL;
++    void *provkey = NULL;
+ 
+     if (ctx == NULL) {
+         EVPerr(EVP_F_EVP_PKEY_DERIVE_SET_PEER,
+@@ -252,21 +272,12 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+         return -2;
+     }
+ 
+-    param = evp_pkey_to_param(peer, NULL);
+-    if (param == NULL) {
++    provkey = evp_keymgmt_export_to_provider(peer, ctx-&gt;exchange-&gt;keymgmt);
++    if (provkey == NULL) {
+         EVPerr(EVP_F_EVP_PKEY_DERIVE_SET_PEER, ERR_R_INTERNAL_ERROR);
+         return 0;
+     }
+-    ret = ctx-&gt;exchange-&gt;set_peer(ctx-&gt;exchprovctx, param);
+-    /*
+-     * TODO(3.0): Really we should detect whether to call OPENSSL_free or
+-     * OPENSSL_secure_clear_free based on the presence of a private key or not.
+-     * Since we always expect a public key to be present we just call
+-     * OPENSSL_free for now.
+-     */
+-    OPENSSL_free(param);
+-
+-    return ret;
++    return ctx-&gt;exchange-&gt;set_peer(ctx-&gt;exchprovctx, provkey);
+ 
+  legacy:
+     if (ctx-&gt;pmeth == NULL
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index cc26f06..31b4ae4 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -171,7 +171,7 @@ static EVP_PKEY_CTX *int_ctx_new(EVP_PKEY *pkey, ENGINE *e, int id)
+     if (pkey != NULL)
+         EVP_PKEY_up_ref(pkey);
+ 
+-    if (pmeth != NULL &amp;&amp; pmeth-&gt;init) {
++    if (pmeth != NULL &amp;&amp; pmeth-&gt;init != NULL) {
+         if (pmeth-&gt;init(ret) &lt;= 0) {
+             ret-&gt;pmeth = NULL;
+             EVP_PKEY_CTX_free(ret);
+diff --git a/doc/man3/EVP_KEYEXCH_free.pod b/doc/man3/EVP_KEYEXCH_free.pod
+index 912434d..41926f6 100644
+--- a/doc/man3/EVP_KEYEXCH_free.pod
++++ b/doc/man3/EVP_KEYEXCH_free.pod
+@@ -2,7 +2,7 @@
+ 
+ =head1 NAME
+ 
+-EVP_KEYEXCH_fetch, EVP_KEYEXCH_free, EVP_KEYEXCH_up_ref
++EVP_KEYEXCH_fetch, EVP_KEYEXCH_free, EVP_KEYEXCH_up_ref, EVP_KEYEXCH_provider
+ - Functions to manage EVP_KEYEXCH algorithm objects
+ 
+ =head1 SYNOPSIS
+@@ -13,6 +13,7 @@ EVP_KEYEXCH_fetch, EVP_KEYEXCH_free, EVP_KEYEXCH_up_ref
+                                 const char *properties);
+  void EVP_KEYEXCH_free(EVP_KEYEXCH *exchange);
+  int EVP_KEYEXCH_up_ref(EVP_KEYEXCH *exchange);
++ OSSL_PROVIDER *EVP_KEYEXCH_provider(const EVP_KEYEXCH *exchange);
+ 
+ =head1 DESCRIPTION
+ 
+@@ -31,6 +32,8 @@ structure is freed.
+ EVP_KEYEXCH_up_ref() increments the reference count for an B&lt;EVP_KEYEXCH&gt;
+ structure.
+ 
++EVP_KEYEXCH_provider() returns the provider that I&lt;exchange&gt; was fetched from.
++
+ =head1 RETURN VALUES
+ 
+ EVP_KEYEXCH_fetch() returns a pointer to a B&lt;EVP_KEYEXCH&gt; for success
+@@ -40,7 +43,7 @@ EVP_KEYEXCH_up_ref() returns 1 for success or 0 otherwise.
+ 
+ =head1 SEE ALSO
+ 
+-L&lt;provider(7)/Fetching algorithms&gt;
++L&lt;provider(7)/Fetching algorithms&gt;, L&lt;OSSL_PROVIDER(3)&gt;
+ 
+ =head1 HISTORY
+ 
+diff --git a/include/openssl/core_numbers.h b/include/openssl/core_numbers.h
+index f8a700a..7bd0226 100644
+--- a/include/openssl/core_numbers.h
++++ b/include/openssl/core_numbers.h
+@@ -301,16 +301,14 @@ OSSL_CORE_MAKE_FUNC(const OSSL_PARAM *, OP_keymgmt_exportkey_types, (void))
+ # define OSSL_FUNC_KEYEXCH_SET_PARAMS                  7
+ 
+ OSSL_CORE_MAKE_FUNC(void *, OP_keyexch_newctx, (void *provctx))
+-OSSL_CORE_MAKE_FUNC(int, OP_keyexch_init, (void *ctx,
+-                                           OSSL_PARAM params[]))
++OSSL_CORE_MAKE_FUNC(int, OP_keyexch_init, (void *ctx, void *provkey))
+ OSSL_CORE_MAKE_FUNC(int, OP_keyexch_derive, (void *ctx,  unsigned char *key,
+                                              size_t *keylen, size_t outlen))
+-OSSL_CORE_MAKE_FUNC(int, OP_keyexch_set_peer, (void *ctx,
+-                                               OSSL_PARAM params[]))
++OSSL_CORE_MAKE_FUNC(int, OP_keyexch_set_peer, (void *ctx, void *provkey))
+ OSSL_CORE_MAKE_FUNC(void, OP_keyexch_freectx, (void *ctx))
+ OSSL_CORE_MAKE_FUNC(void *, OP_keyexch_dupctx, (void *ctx))
+ OSSL_CORE_MAKE_FUNC(int, OP_keyexch_set_params, (void *ctx,
+-                                                 OSSL_PARAM params[]))
++                                                 const OSSL_PARAM params[]))
+ 
+ /* Highest known operation number */
+ # define OSSL_OP__HIGHEST                            3
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index 24ad23f..8182915 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -1728,6 +1728,7 @@ void EVP_KEYEXCH_free(EVP_KEYEXCH *exchange);
+ int EVP_KEYEXCH_up_ref(EVP_KEYEXCH *exchange);
+ EVP_KEYEXCH *EVP_KEYEXCH_fetch(OPENSSL_CTX *ctx, const char *algorithm,
+                                const char *properties);
++OSSL_PROVIDER *EVP_KEYEXCH_provider(const EVP_KEYEXCH *exchange);
+ 
+ void EVP_add_alg_module(void);
+ 
+diff --git a/include/openssl/evperr.h b/include/openssl/evperr.h
+index b54f387..8b46d76 100644
+--- a/include/openssl/evperr.h
++++ b/include/openssl/evperr.h
+@@ -213,6 +213,7 @@ int ERR_load_EVP_strings(void);
+ # define EVP_R_NO_CIPHER_SET                              131
+ # define EVP_R_NO_DEFAULT_DIGEST                          158
+ # define EVP_R_NO_DIGEST_SET                              139
++# define EVP_R_NO_KEYMGMT_PRESENT                         196
+ # define EVP_R_NO_KEY_SET                                 154
+ # define EVP_R_NO_OPERATION_SET                           149
+ # define EVP_R_ONLY_ONESHOT_SUPPORTED                     177
+diff --git a/providers/common/build.info b/providers/common/build.info
+index c77606a..bc106d0 100644
+--- a/providers/common/build.info
++++ b/providers/common/build.info
+@@ -1,4 +1,4 @@
+-SUBDIRS=digests ciphers exchange
++SUBDIRS=digests ciphers exchange keymgmt
+ 
+ SOURCE[../../libcrypto]=\
+         provider_err.c provlib.c
+diff --git a/providers/common/exchange/build.info b/providers/common/exchange/build.info
+index 7957f51..c99c9d8 100644
+--- a/providers/common/exchange/build.info
++++ b/providers/common/exchange/build.info
+@@ -1,7 +1,7 @@
+ LIBS=../../../libcrypto
+ IF[{- !$disabled{dh} -}]
+   SOURCE[../../../libcrypto]=\
+-          dh.c
++          dh_exch.c
+ ENDIF
+ 
+ 
+diff --git a/providers/common/exchange/dh.c b/providers/common/exchange/dh_exch.c
+similarity index 67%
+rename from providers/common/exchange/dh.c
+rename to providers/common/exchange/dh_exch.c
+index ca6f0fc..439b28a 100644
+--- a/providers/common/exchange/dh.c
++++ b/providers/common/exchange/dh_exch.c
+@@ -21,6 +21,11 @@ static OSSL_OP_keyexch_derive_fn dh_derive;
+ static OSSL_OP_keyexch_freectx_fn dh_freectx;
+ static OSSL_OP_keyexch_dupctx_fn dh_dupctx;
+ 
++/*
++ * What's passed as an actual key is defined by the KEYMGMT interface.
++ * We happen to know that our KEYMGMT simply passes DH structures, so
++ * we use that here too.
++ */
+ 
+ typedef struct {
+     DH *dh;
+@@ -33,71 +38,24 @@ static void *dh_newctx(void *provctx)
+     return OPENSSL_zalloc(sizeof(PROV_DH_CTX));
+ }
+ 
+-static DH *param_to_dh(OSSL_PARAM params[], int priv)
+-{
+-    DH *dh = DH_new();
+-    OSSL_PARAM *paramptr;
+-    BIGNUM *p = NULL, *g = NULL, *pub_key = NULL, *priv_key = NULL;
+-
+-    if (dh == NULL)
+-        return NULL;
+-
+-    paramptr = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DH_P);
+-    if (paramptr == NULL
+-            || !OSSL_PARAM_get_BN(paramptr, &amp;p))
+-        goto err;
+-
+-    paramptr = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DH_G);
+-    if (paramptr == NULL || !OSSL_PARAM_get_BN(paramptr, &amp;g))
+-        goto err;
+-
+-    if (!DH_set0_pqg(dh, p, NULL, g))
+-        goto err;
+-    p = g = NULL;
+-
+-    paramptr = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DH_PUB_KEY);
+-    if (paramptr == NULL || !OSSL_PARAM_get_BN(paramptr, &amp;pub_key))
+-        goto err;
+-
+-    /* Private key is optional */
+-    if (priv) {
+-        paramptr = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_DH_PRIV_KEY);
+-        if (paramptr == NULL
+-                || (priv_key = BN_secure_new()) == NULL
+-                || !OSSL_PARAM_get_BN(paramptr, &amp;priv_key))
+-            goto err;
+-    }
+-
+-    if (!DH_set0_key(dh, pub_key, priv_key))
+-        goto err;
+-
+-    return dh;
+-
+- err:
+-    BN_free(p);
+-    BN_free(g);
+-    BN_free(pub_key);
+-    BN_free(priv_key);
+-    DH_free(dh);
+-    return NULL;
+-}
+-
+-static int dh_init(void *vpdhctx, OSSL_PARAM params[])
++static int dh_init(void *vpdhctx, void *vdh)
+ {
+     PROV_DH_CTX *pdhctx = (PROV_DH_CTX *)vpdhctx;
+ 
+     DH_free(pdhctx-&gt;dh);
+-    pdhctx-&gt;dh = param_to_dh(params, 1);
++    pdhctx-&gt;dh = vdh;
++    DH_up_ref(pdhctx-&gt;dh);
+ 
+     return pdhctx-&gt;dh != NULL;
+ }
+ 
+-static int dh_set_peer(void *vpdhctx, OSSL_PARAM params[])
++static int dh_set_peer(void *vpdhctx, void *vdh)
+ {
+     PROV_DH_CTX *pdhctx = (PROV_DH_CTX *)vpdhctx;
+ 
+     DH_free(pdhctx-&gt;dhpeer);
+-    pdhctx-&gt;dhpeer = param_to_dh(params, 0);
++    pdhctx-&gt;dhpeer = vdh;
++    DH_up_ref(pdhctx-&gt;dhpeer);
+ 
+     return pdhctx-&gt;dhpeer != NULL;
+ }
+@@ -164,7 +122,7 @@ static void *dh_dupctx(void *vpdhctx)
+     return dstctx;
+ }
+ 
+-static int dh_set_params(void *vpdhctx, OSSL_PARAM params[])
++static int dh_set_params(void *vpdhctx, const OSSL_PARAM params[])
+ {
+     PROV_DH_CTX *pdhctx = (PROV_DH_CTX *)vpdhctx;
+     const OSSL_PARAM *p;
+@@ -173,7 +131,7 @@ static int dh_set_params(void *vpdhctx, OSSL_PARAM params[])
+     if (pdhctx == NULL || params == NULL)
+         return 0;
+ 
+-    p = OSSL_PARAM_locate(params, OSSL_EXCHANGE_PARAM_PAD);
++    p = OSSL_PARAM_locate_const(params, OSSL_EXCHANGE_PARAM_PAD);
+     if (p == NULL || !OSSL_PARAM_get_int(p, &amp;pad))
+         return 0;
+ 
+@@ -182,7 +140,7 @@ static int dh_set_params(void *vpdhctx, OSSL_PARAM params[])
+     return 1;
+ }
+ 
+-const OSSL_DISPATCH dh_functions[] = {
++const OSSL_DISPATCH dh_keyexch_functions[] = {
+     { OSSL_FUNC_KEYEXCH_NEWCTX, (void (*)(void))dh_newctx },
+     { OSSL_FUNC_KEYEXCH_INIT, (void (*)(void))dh_init },
+     { OSSL_FUNC_KEYEXCH_DERIVE, (void (*)(void))dh_derive },
+diff --git a/providers/common/include/internal/provider_algs.h b/providers/common/include/internal/provider_algs.h
+index dbc79a5..80946ca 100644
+--- a/providers/common/include/internal/provider_algs.h
++++ b/providers/common/include/internal/provider_algs.h
+@@ -58,5 +58,8 @@ extern const OSSL_DISPATCH aes256ctr_functions[];
+ extern const OSSL_DISPATCH aes192ctr_functions[];
+ extern const OSSL_DISPATCH aes128ctr_functions[];
+ 
++/* Key management */
++extern const OSSL_DISPATCH dh_keymgmt_functions[];
++
+ /* Key Exchange */
+-extern const OSSL_DISPATCH dh_functions[];
++extern const OSSL_DISPATCH dh_keyexch_functions[];
+diff --git a/providers/common/exchange/build.info b/providers/common/keymgmt/build.info
+similarity index 80%
+copy from providers/common/exchange/build.info
+copy to providers/common/keymgmt/build.info
+index 7957f51..a41f3da 100644
+--- a/providers/common/exchange/build.info
++++ b/providers/common/keymgmt/build.info
+@@ -1,7 +1,5 @@
+ LIBS=../../../libcrypto
+ IF[{- !$disabled{dh} -}]
+   SOURCE[../../../libcrypto]=\
+-          dh.c
++          dh_kmgmt.c
+ ENDIF
+-
+-
+diff --git a/providers/common/keymgmt/dh_kmgmt.c b/providers/common/keymgmt/dh_kmgmt.c
+new file mode 100644
+index 0000000..67e3205
+--- /dev/null
++++ b/providers/common/keymgmt/dh_kmgmt.c
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2019 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;openssl/core_numbers.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/bn.h&gt;
++#include &lt;openssl/dh.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &quot;internal/provider_algs.h&quot;
++
++static OSSL_OP_keymgmt_importkey_fn dh_importkey;
++
++static int params_to_key(DH *dh, const OSSL_PARAM params[])
++{
++    const OSSL_PARAM *param_p, *param_g, *param_priv_key, *param_pub_key;
++    BIGNUM *p = NULL, *g = NULL, *priv_key = NULL, *pub_key = NULL;
++
++    if (dh == NULL)
++        return 0;
++
++    param_p = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_DH_P);
++    param_g = OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_DH_G);
++    param_priv_key =
++        OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_DH_PRIV_KEY);
++    param_pub_key =
++        OSSL_PARAM_locate_const(params, OSSL_PKEY_PARAM_DH_PUB_KEY);
++
++    /*
++     * DH documentation says that a public key must be present if a
++     * private key is present.
++     * We want to have at least a public key either way, so we end up
++     * requiring it unconditionally.
++     */
++    if (param_pub_key == NULL)
++        return 0;
++
++    if ((param_p != NULL &amp;&amp; !OSSL_PARAM_get_BN(param_p, &amp;p))
++        || (param_g != NULL &amp;&amp; !OSSL_PARAM_get_BN(param_g, &amp;g))
++        || (param_priv_key != NULL
++            &amp;&amp; !OSSL_PARAM_get_BN(param_priv_key, &amp;priv_key))
++        || !OSSL_PARAM_get_BN(param_pub_key, &amp;pub_key))
++        goto err;
++
++    if (!DH_set0_pqg(dh, p, NULL, g))
++        goto err;
++    p = g = NULL;
++
++    if (!DH_set0_key(dh, pub_key, priv_key))
++        goto err;
++    priv_key = pub_key = NULL;
++
++    return 1;
++
++ err:
++    BN_free(p);
++    BN_free(g);
++    BN_free(priv_key);
++    BN_free(pub_key);
++    return 0;
++}
++
++static void *dh_importkey(void *provctx, const OSSL_PARAM params[])
++{
++    DH *dh;
++
++    if ((dh = DH_new()) == NULL
++        || !params_to_key(dh, params)) {
++        DH_free(dh);
++        dh = NULL;
++    }
++    return dh;
++}
++
++const OSSL_DISPATCH dh_keymgmt_functions[] = {
++    /*
++     * TODO(3.0) When implementing OSSL_FUNC_KEYMGMT_GENKEY, remember to also
++     * implement OSSL_FUNC_KEYMGMT_EXPORTKEY.
++     */
++    { OSSL_FUNC_KEYMGMT_IMPORTKEY, (void (*)(void))dh_importkey },
++    { OSSL_FUNC_KEYMGMT_FREEKEY, (void (*)(void))DH_free },
++    { 0, NULL }
++};
+diff --git a/providers/default/defltprov.c b/providers/default/defltprov.c
+index 2c25bf7..95534b1 100644
+--- a/providers/default/defltprov.c
++++ b/providers/default/defltprov.c
+@@ -116,7 +116,14 @@ static const OSSL_ALGORITHM deflt_ciphers[] = {
+ 
+ static const OSSL_ALGORITHM deflt_keyexch[] = {
+ #ifndef OPENSSL_NO_DH
+-    { &quot;dhKeyAgreement&quot;, &quot;default=yes&quot;, dh_functions },
++    { &quot;dhKeyAgreement&quot;, &quot;default=yes&quot;, dh_keyexch_functions },
++#endif
++    { NULL, NULL, NULL }
++};
++
++static const OSSL_ALGORITHM deflt_keymgmt[] = {
++#ifndef OPENSSL_NO_DH
++    { &quot;dhKeyAgreement&quot;, &quot;default=yes&quot;, dh_keymgmt_functions },
+ #endif
+     { NULL, NULL, NULL }
+ };
+@@ -131,6 +138,8 @@ static const OSSL_ALGORITHM *deflt_query(OSSL_PROVIDER *prov,
+         return deflt_digests;
+     case OSSL_OP_CIPHER:
+         return deflt_ciphers;
++    case OSSL_OP_KEYMGMT:
++        return deflt_keymgmt;
+     case OSSL_OP_KEYEXCH:
+         return deflt_keyexch;
+     }
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index b0a7f81..1533a88 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4698,3 +4698,4 @@ EVP_CIPHER_provider                     4803	3_0_0	EXIST::FUNCTION:
+ OSSL_PROVIDER_name                      4804	3_0_0	EXIST::FUNCTION:
+ EVP_CIPHER_do_all_ex                    4805	3_0_0	EXIST::FUNCTION:
+ EVP_MD_do_all_ex                        4806	3_0_0	EXIST::FUNCTION:
++EVP_KEYEXCH_provider                    4807	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024110.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024127.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24117">[ date ]</a>
+              <a href="thread.html#24117">[ thread ]</a>
+              <a href="subject.html#24117">[ subject ]</a>
+              <a href="author.html#24117">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

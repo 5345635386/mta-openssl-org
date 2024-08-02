@@ -1,0 +1,354 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429533694.198377.30592.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000908.html">
+   <LINK REL="Next"  HREF="000911.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1429533694.198377.30592.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Mon Apr 20 12:41:34 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000908.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000911.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#909">[ date ]</a>
+              <a href="thread.html#909">[ thread ]</a>
+              <a href="subject.html#909">[ subject ]</a>
+              <a href="author.html#909">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  2c6343bfa3665f1e574b9f93db185ac28037c095 (commit)
+       via  cb2ed545828065e4099137ba3e3568328348f473 (commit)
+      from  35141544e2994f0f3b87be7d7c9a43ea3cd9840a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 2c6343bfa3665f1e574b9f93db185ac28037c095
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sat Mar 21 13:54:55 2015 +0100
+
+    Configure: engage ARMv8 Montgomery multiplication module.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit cb2ed545828065e4099137ba3e3568328348f473
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sat Mar 21 13:54:17 2015 +0100
+
+    Add ARMv8 Montgomery multiplication module.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Configure                   |   1 +
+ crypto/bn/asm/armv8-mont.pl | 244 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 245 insertions(+)
+ create mode 100755 crypto/bn/asm/armv8-mont.pl
+
+diff --git a/Configure b/Configure
+index 2e70238..95a9d3b 100755
+--- a/Configure
++++ b/Configure
+@@ -425,6 +425,7 @@ my %table=(
+     aarch64_asm =&gt; {
+ 	template	=&gt; 1,
+ 	cpuid_obj       =&gt; &quot;armcap.o arm64cpuid.o mem_clr.o&quot;,
++	bn_obj          =&gt; &quot;bn_asm.o armv8-mont.o&quot;,
+ 	aes_obj         =&gt; &quot;aes_core.o aes_cbc.o aesv8-armx.o vpaes-armv8.o&quot;,
+ 	sha1_obj        =&gt; &quot;sha1-armv8.o sha256-armv8.o sha512-armv8.o&quot;,
+ 	modes_obj       =&gt; &quot;ghashv8-armx.o&quot;,
+diff --git a/crypto/bn/asm/armv8-mont.pl b/crypto/bn/asm/armv8-mont.pl
+new file mode 100755
+index 0000000..0bf9bf3
+--- /dev/null
++++ b/crypto/bn/asm/armv8-mont.pl
+@@ -0,0 +1,244 @@
++#!/usr/bin/env perl
++
++# ====================================================================
++# Written by Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt; for the OpenSSL
++# project. The module is, however, dual licensed under OpenSSL and
++# CRYPTOGAMS licenses depending on where you obtain it. For further
++# details see <A HREF="http://www.openssl.org/~appro/cryptogams/.">http://www.openssl.org/~appro/cryptogams/.</A>
++# ====================================================================
++
++# March 2015
++#
++# &quot;Teaser&quot; Montgomery multiplication module for ARMv8. Needs more
++# work. While it does improve RSA sign performance by 20-30% (less for
++# longer keys) on most processors, for some reason RSA2048 is not
++# faster and RSA4096 goes 15-20% slower on Cortex-A57. Multiplication
++# instruction issue rate is limited on processor in question, meaning
++# that dedicated squaring procedure is a must. Well, actually all
++# contemporary AArch64 processors seem to have limited multiplication
++# issue rate, i.e. they can't issue multiplication every cycle, which
++# explains moderate improvement coefficients in comparison to
++# compiler-generated code. Recall that compiler is instructed to use
++# umulh and therefore uses same amount of multiplication instructions
++# to do the job. Assembly's edge is to minimize number of &quot;collateral&quot;
++# instructions and of course instruction scheduling.
++
++$flavour = shift;
++$output  = shift;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}arm-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/arm-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate arm-xlate.pl&quot;;
++
++open OUT,&quot;| \&quot;$^X\&quot; $xlate $flavour $output&quot;;
++*STDOUT=*OUT;
++
++($lo0,$hi0,$aj,$m0,$alo,$ahi,
++ $lo1,$hi1,$nj,$m1,$nlo,$nhi,
++ $ovf, $i,$j,$tp,$tj) = map(&quot;x$_&quot;,6..17,19..24);
++
++# int bn_mul_mont(
++$rp=&quot;x0&quot;;	# BN_ULONG *rp,
++$ap=&quot;x1&quot;;	# const BN_ULONG *ap,
++$bp=&quot;x2&quot;;	# const BN_ULONG *bp,
++$np=&quot;x3&quot;;	# const BN_ULONG *np,
++$n0=&quot;x4&quot;;	# const BN_ULONG *n0,
++$num=&quot;x5&quot;;	# int num);
++
++$code.=&lt;&lt;___;
++.text
++
++.globl	bn_mul_mont
++.type	bn_mul_mont,%function
++.align	5
++bn_mul_mont:
++	stp	x29,x30,[sp,#-64]!
++	add	x29,sp,#0
++	stp	x19,x20,[sp,#16]
++	stp	x21,x22,[sp,#32]
++	stp	x23,x24,[sp,#48]
++
++	ldr	$m0,[$bp],#8		// bp[0]
++	sub	$tp,sp,$num,lsl#3
++	ldp	$hi0,$aj,[$ap],#16	// ap[0..1]
++	lsl	$num,$num,#3
++	ldr	$n0,[$n0]		// *n0
++	and	$tp,$tp,#-16		// ABI says so
++	ldp	$hi1,$nj,[$np],#16	// np[0..1]
++
++	mul	$lo0,$hi0,$m0		// ap[0]*bp[0]
++	sub	$j,$num,#16		// j=num-2
++	umulh	$hi0,$hi0,$m0
++	mul	$alo,$aj,$m0		// ap[1]*bp[0]
++	umulh	$ahi,$aj,$m0
++
++	mul	$m1,$lo0,$n0		// &quot;tp[0]&quot;*n0
++	mov	sp,$tp			// alloca
++
++	mul	$lo1,$hi1,$m1		// np[0]*m1
++	umulh	$hi1,$hi1,$m1
++	mul	$nlo,$nj,$m1		// np[1]*m1
++	adds	$lo1,$lo1,$lo0		// discarded
++	umulh	$nhi,$nj,$m1
++	adc	$hi1,$hi1,xzr
++	cbz	$j,.L1st_skip
++
++.L1st:
++	ldr	$aj,[$ap],#8
++	adds	$lo0,$alo,$hi0
++	sub	$j,$j,#8		// j--
++	adc	$hi0,$ahi,xzr
++
++	ldr	$nj,[$np],#8
++	adds	$lo1,$nlo,$hi1
++	mul	$alo,$aj,$m0		// ap[j]*bp[0]
++	adc	$hi1,$nhi,xzr
++	umulh	$ahi,$aj,$m0
++
++	adds	$lo1,$lo1,$lo0
++	mul	$nlo,$nj,$m1		// np[j]*m1
++	adc	$hi1,$hi1,xzr
++	umulh	$nhi,$nj,$m1
++	str	$lo1,[$tp],#8		// tp[j-1]
++	cbnz	$j,.L1st
++
++.L1st_skip:
++	adds	$lo0,$alo,$hi0
++	sub	$ap,$ap,$num		// rewind $ap
++	adc	$hi0,$ahi,xzr
++
++	adds	$lo1,$nlo,$hi1
++	sub	$np,$np,$num		// rewind $np
++	adc	$hi1,$nhi,xzr
++
++	adds	$lo1,$lo1,$lo0
++	sub	$i,$num,#8		// i=num-1
++	adcs	$hi1,$hi1,$hi0
++
++	adc	$ovf,xzr,xzr		// upmost overflow bit
++	stp	$lo1,$hi1,[$tp]
++
++.Louter:
++	ldr	$m0,[$bp],#8		// bp[i]
++	ldp	$hi0,$aj,[$ap],#16
++	ldr	$tj,[sp]		// tp[0]
++	add	$tp,sp,#8
++
++	mul	$lo0,$hi0,$m0		// ap[0]*bp[i]
++	sub	$j,$num,#16		// j=num-2
++	umulh	$hi0,$hi0,$m0
++	ldp	$hi1,$nj,[$np],#16
++	mul	$alo,$aj,$m0		// ap[1]*bp[i]
++	adds	$lo0,$lo0,$tj
++	umulh	$ahi,$aj,$m0
++	adc	$hi0,$hi0,xzr
++
++	mul	$m1,$lo0,$n0
++	sub	$i,$i,#8		// i--
++
++	mul	$lo1,$hi1,$m1		// np[0]*m1
++	umulh	$hi1,$hi1,$m1
++	mul	$nlo,$nj,$m1		// np[1]*m1
++	adds	$lo1,$lo1,$lo0
++	umulh	$nhi,$nj,$m1
++	cbz	$j,.Linner_skip
++
++.Linner:
++	ldr	$aj,[$ap],#8
++	adc	$hi1,$hi1,xzr
++	ldr	$tj,[$tp],#8		// tp[j]
++	adds	$lo0,$alo,$hi0
++	sub	$j,$j,#8		// j--
++	adc	$hi0,$ahi,xzr
++
++	adds	$lo1,$nlo,$hi1
++	ldr	$nj,[$np],#8
++	adc	$hi1,$nhi,xzr
++
++	mul	$alo,$aj,$m0		// ap[j]*bp[i]
++	adds	$lo0,$lo0,$tj
++	umulh	$ahi,$aj,$m0
++	adc	$hi0,$hi0,xzr
++
++	mul	$nlo,$nj,$m1		// np[j]*m1
++	adds	$lo1,$lo1,$lo0
++	umulh	$nhi,$nj,$m1
++	str	$lo1,[$tp,#-16]		// tp[j-1]
++	cbnz	$j,.Linner
++
++.Linner_skip:
++	ldr	$tj,[$tp],#8		// tp[j]
++	adc	$hi1,$hi1,xzr
++	adds	$lo0,$alo,$hi0
++	sub	$ap,$ap,$num		// rewind $ap
++	adc	$hi0,$ahi,xzr
++
++	adds	$lo1,$nlo,$hi1
++	sub	$np,$np,$num		// rewind $np
++	adc	$hi1,$nhi,$ovf
++
++	adds	$lo0,$lo0,$tj
++	adc	$hi0,$hi0,xzr
++
++	adds	$lo1,$lo1,$lo0
++	adcs	$hi1,$hi1,$hi0
++	adc	$ovf,xzr,xzr		// upmost overflow bit
++	stp	$lo1,$hi1,[$tp,#-16]
++
++	cbnz	$i,.Louter
++
++	// Final step. We see if result is larger than modulus, and
++	// if it is, subtract the modulus. But comparison implies
++	// subtraction. So we subtract modulus, see if it borrowed,
++	// and conditionally copy original value. 
++	ldr	$tj,[sp]		// tp[0]
++	add	$tp,sp,#8
++	ldr	$nj,[$np],#8		// np[0]
++	subs	$j,$num,#8		// j=num-1 and clear borrow
++	mov	$ap,$rp
++.Lsub:
++	sbcs	$aj,$tj,$nj		// tp[j]-np[j]
++	ldr	$tj,[$tp],#8
++	sub	$j,$j,#8		// j--
++	ldr	$nj,[$np],#8
++	str	$aj,[$ap],#8		// rp[j]=tp[j]-np[j]
++	cbnz	$j,.Lsub
++
++	sbcs	$aj,$tj,$nj
++	sbcs	$ovf,$ovf,xzr		// did it borrow?
++	str	$aj,[$ap],#8		// rp[num-1]
++
++	ldr	$tj,[sp]		// tp[0]
++	add	$tp,sp,#8
++	ldr	$aj,[$rp],#8		// rp[0]
++	sub	$num,$num,#8		// num--
++	nop
++.Lcond_copy:
++	sub	$num,$num,#8		// num--
++	csel	$nj,$aj,$tj,cs		// did it borrow?
++	ldr	$tj,[$tp],#8
++	ldr	$aj,[$rp],#8
++	str	xzr,[$tp,#-16]		// wipe tp
++	str	$nj,[$rp,#-16]
++	cbnz	$num,.Lcond_copy
++
++	csel	$nj,$aj,$tj,cs
++	str	xzr,[$tp,#-8]		// wipe tp
++	str	$nj,[$rp,#-8]
++
++	ldp	x19,x20,[x29,#16]
++	mov	sp,x29
++	ldp	x21,x22,[x29,#32]
++	ldp	x23,x24,[x29,#48]
++	ldr	x29,[sp],#64
++	ret
++.size	bn_mul_mont,.-bn_mul_mont
++
++.asciz	&quot;Montgomery Multiplication for ARMv8, CRYPTOGAMS by &lt;appro\@openssl.org&gt;&quot;
++.align	4
++___
++
++print $code;
++
++close STDOUT;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000908.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000911.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#909">[ date ]</a>
+              <a href="thread.html#909">[ thread ]</a>
+              <a href="subject.html#909">[ subject ]</a>
+              <a href="author.html#909">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

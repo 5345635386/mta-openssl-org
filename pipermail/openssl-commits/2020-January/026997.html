@@ -1,0 +1,363 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578622227.467095.23090.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026992.html">
+   <LINK REL="Next"  HREF="026999.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1578622227.467095.23090.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Fri Jan 10 02:10:27 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026992.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="026999.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26997">[ date ]</a>
+              <a href="thread.html#26997">[ thread ]</a>
+              <a href="subject.html#26997">[ subject ]</a>
+              <a href="author.html#26997">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  11b44359862632e283feabf15dab85bb550ebace (commit)
+      from  1e8879691ff86bda75b6e2e66c0f528684df5d47 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 11b44359862632e283feabf15dab85bb550ebace
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Mon Oct 14 20:59:31 2019 +1000
+
+    Add GCM support for EVP_CTRL_GCM_IV_GEN and EVP_CTRL_GCM_SET_IV_INV to providers
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10173">https://github.com/openssl/openssl/pull/10173</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_enc.c                               | 20 ++++-
+ doc/man7/provider-cipher.pod                       | 12 +++
+ include/openssl/core_names.h                       | 42 +++++-----
+ providers/implementations/ciphers/ciphercommon.c   |  2 +
+ .../implementations/ciphers/ciphercommon_gcm.c     | 97 +++++++++++++++-------
+ 5 files changed, 118 insertions(+), 55 deletions(-)
+
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index c650addbd1..35feec17f6 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -1135,10 +1135,22 @@ int EVP_CIPHER_CTX_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void *ptr)
+             return 0;
+         params[0] = OSSL_PARAM_construct_size_t(OSSL_CIPHER_PARAM_IVLEN, &amp;sz);
+         break;
+-    case EVP_CTRL_GCM_SET_IV_FIXED:
+-        params[0] =
+-            OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TLS1_IV_FIXED,
+-                                              ptr, sz);
++    case EVP_CTRL_AEAD_SET_IV_FIXED:
++        params[0] = OSSL_PARAM_construct_octet_string(
++                        OSSL_CIPHER_PARAM_AEAD_TLS1_IV_FIXED, ptr, sz);
++        break;
++    case EVP_CTRL_GCM_IV_GEN:
++        set_params = 0;
++        if (arg &lt; 0)
++            sz = 0; /* special case that uses the iv length */
++        params[0] = OSSL_PARAM_construct_octet_string(
++                        OSSL_CIPHER_PARAM_AEAD_TLS1_GET_IV_GEN, ptr, sz);
++        break;
++    case EVP_CTRL_GCM_SET_IV_INV:
++        if (arg &lt; 0)
++            return 0;
++        params[0] = OSSL_PARAM_construct_octet_string(
++                        OSSL_CIPHER_PARAM_AEAD_TLS1_SET_IV_INV, ptr, sz);
+         break;
+     case EVP_CTRL_GET_RC5_ROUNDS:
+         set_params = 0; /* Fall thru */
+diff --git a/doc/man7/provider-cipher.pod b/doc/man7/provider-cipher.pod
+index 7ad239bcb6..80bba1f978 100644
+--- a/doc/man7/provider-cipher.pod
++++ b/doc/man7/provider-cipher.pod
+@@ -349,6 +349,18 @@ by AES SIV ciphers which disallow multiple operations by default.
+ Setting &quot;speed&quot; to 1 allows another encrypt or decrypt operation to be
+ performed. This is used for performance testing.
+ 
++=item &quot;tlsivgen&quot; (B&lt;OSSL_CIPHER_PARAM_AEAD_TLS1_GET_IV_GEN&gt;) &lt;octet string&gt;
++
++Gets the invocation field generated for encryption.
++Can only be called after &quot;tlsivfixed&quot; is set.
++This is only used for GCM mode.
++
++=item &quot;tlsivinv&quot; (B&lt;OSSL_CIPHER_PARAM_AEAD_TLS1_SET_IV_INV&gt;) &lt;octet string&gt;
++
++Sets the invocation field used for decryption.
++Can only be called after &quot;tlsivfixed&quot; is set.
++This is only used for GCM mode.
++
+ =item &quot;tls1multi_enc&quot; (B&lt;OSSL_CIPHER_PARAM_TLS1_MULTIBLOCK_ENC&gt;) &lt;octet string&gt;
+ 
+ Triggers a multiblock tls1 encrypt operation for a tls1 aware cipher that supports
+diff --git a/include/openssl/core_names.h b/include/openssl/core_names.h
+index 446af5fa8e..db9cb9ab2d 100644
+--- a/include/openssl/core_names.h
++++ b/include/openssl/core_names.h
+@@ -51,27 +51,29 @@ extern &quot;C&quot; {
+ #define OSSL_ALG_PARAM_PROPERTIES   &quot;properties&quot;/* utf8_string */
+ 
+ /* cipher parameters */
+-#define OSSL_CIPHER_PARAM_PADDING   &quot;padding&quot;    /* uint */
+-#define OSSL_CIPHER_PARAM_MODE      &quot;mode&quot;       /* uint */
+-#define OSSL_CIPHER_PARAM_BLOCK_SIZE &quot;blocksize&quot; /* size_t */
+-#define OSSL_CIPHER_PARAM_FLAGS     &quot;flags&quot;      /* ulong */
+-#define OSSL_CIPHER_PARAM_KEYLEN    &quot;keylen&quot;     /* size_t */
+-#define OSSL_CIPHER_PARAM_IVLEN     &quot;ivlen&quot;      /* size_t */
+-#define OSSL_CIPHER_PARAM_IV        &quot;iv&quot;         /* octet_string OR octet_ptr */
+-#define OSSL_CIPHER_PARAM_NUM       &quot;num&quot;        /* uint */
+-#define OSSL_CIPHER_PARAM_ROUNDS    &quot;rounds&quot;     /* uint */
+-#define OSSL_CIPHER_PARAM_AEAD_TAG           &quot;tag&quot;        /* octet_string */
+-#define OSSL_CIPHER_PARAM_AEAD_TLS1_AAD      &quot;tlsaad&quot;     /* octet_string */
+-#define OSSL_CIPHER_PARAM_AEAD_TLS1_AAD_PAD  &quot;tlsaadpad&quot;  /* size_t */
+-#define OSSL_CIPHER_PARAM_AEAD_TLS1_IV_FIXED &quot;tlsivfixed&quot; /* octet_string */
+-#define OSSL_CIPHER_PARAM_AEAD_IVLEN         OSSL_CIPHER_PARAM_IVLEN
+-#define OSSL_CIPHER_PARAM_AEAD_TAGLEN        &quot;taglen&quot;     /* size_t */
+-#define OSSL_CIPHER_PARAM_AEAD_MAC_KEY       &quot;mackey&quot;     /* octet_string */
+-#define OSSL_CIPHER_PARAM_RANDOM_KEY         &quot;randkey&quot;    /* octet_string */
+-#define OSSL_CIPHER_PARAM_RC2_KEYBITS        &quot;keybits&quot;    /* size_t */
+-#define OSSL_CIPHER_PARAM_SPEED              &quot;speed&quot;      /* uint */
++#define OSSL_CIPHER_PARAM_PADDING              &quot;padding&quot;    /* uint */
++#define OSSL_CIPHER_PARAM_MODE                 &quot;mode&quot;       /* uint */
++#define OSSL_CIPHER_PARAM_BLOCK_SIZE           &quot;blocksize&quot; /* size_t */
++#define OSSL_CIPHER_PARAM_FLAGS                &quot;flags&quot;      /* ulong */
++#define OSSL_CIPHER_PARAM_KEYLEN               &quot;keylen&quot;     /* size_t */
++#define OSSL_CIPHER_PARAM_IVLEN                &quot;ivlen&quot;      /* size_t */
++#define OSSL_CIPHER_PARAM_IV                   &quot;iv&quot;         /* octet_string OR octet_ptr */
++#define OSSL_CIPHER_PARAM_NUM                  &quot;num&quot;        /* uint */
++#define OSSL_CIPHER_PARAM_ROUNDS               &quot;rounds&quot;     /* uint */
++#define OSSL_CIPHER_PARAM_AEAD_TAG             &quot;tag&quot;        /* octet_string */
++#define OSSL_CIPHER_PARAM_AEAD_TLS1_AAD        &quot;tlsaad&quot;     /* octet_string */
++#define OSSL_CIPHER_PARAM_AEAD_TLS1_AAD_PAD    &quot;tlsaadpad&quot;  /* size_t */
++#define OSSL_CIPHER_PARAM_AEAD_TLS1_IV_FIXED   &quot;tlsivfixed&quot; /* octet_string */
++#define OSSL_CIPHER_PARAM_AEAD_TLS1_GET_IV_GEN &quot;tlsivgen&quot; /* octet_string */
++#define OSSL_CIPHER_PARAM_AEAD_TLS1_SET_IV_INV &quot;tlsivinv&quot; /* octet_string */
++#define OSSL_CIPHER_PARAM_AEAD_IVLEN           OSSL_CIPHER_PARAM_IVLEN
++#define OSSL_CIPHER_PARAM_AEAD_TAGLEN          &quot;taglen&quot;     /* size_t */
++#define OSSL_CIPHER_PARAM_AEAD_MAC_KEY         &quot;mackey&quot;     /* octet_string */
++#define OSSL_CIPHER_PARAM_RANDOM_KEY           &quot;randkey&quot;    /* octet_string */
++#define OSSL_CIPHER_PARAM_RC2_KEYBITS          &quot;keybits&quot;    /* size_t */
++#define OSSL_CIPHER_PARAM_SPEED                &quot;speed&quot;      /* uint */
+ /* For passing the AlgorithmIdentifier parameter in DER form */
+-#define OSSL_CIPHER_PARAM_ALG_ID             &quot;alg_id_param&quot; /* octet_string */
++#define OSSL_CIPHER_PARAM_ALG_ID               &quot;alg_id_param&quot; /* octet_string */
+ 
+ #define OSSL_CIPHER_PARAM_TLS1_MULTIBLOCK_MAX_SEND_FRAGMENT                    \
+     &quot;tls1multi_maxsndfrag&quot; /* uint */
+diff --git a/providers/implementations/ciphers/ciphercommon.c b/providers/implementations/ciphers/ciphercommon.c
+index a6b890704e..967622cf64 100644
+--- a/providers/implementations/ciphers/ciphercommon.c
++++ b/providers/implementations/ciphers/ciphercommon.c
+@@ -109,6 +109,7 @@ static const OSSL_PARAM cipher_aead_known_gettable_ctx_params[] = {
+     OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_IV, NULL, 0),
+     OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, NULL, 0),
+     OSSL_PARAM_size_t(OSSL_CIPHER_PARAM_AEAD_TLS1_AAD_PAD, NULL),
++    OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TLS1_GET_IV_GEN, NULL, 0),
+     OSSL_PARAM_END
+ };
+ const OSSL_PARAM *cipher_aead_gettable_ctx_params(void)
+@@ -121,6 +122,7 @@ static const OSSL_PARAM cipher_aead_known_settable_ctx_params[] = {
+     OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, NULL, 0),
+     OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TLS1_AAD, NULL, 0),
+     OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TLS1_IV_FIXED, NULL, 0),
++    OSSL_PARAM_octet_string(OSSL_CIPHER_PARAM_AEAD_TLS1_SET_IV_INV, NULL, 0),
+     OSSL_PARAM_END
+ };
+ const OSSL_PARAM *cipher_aead_settable_ctx_params(void)
+diff --git a/providers/implementations/ciphers/ciphercommon_gcm.c b/providers/implementations/ciphers/ciphercommon_gcm.c
+index 803f810a30..a6928e1ba3 100644
+--- a/providers/implementations/ciphers/ciphercommon_gcm.c
++++ b/providers/implementations/ciphers/ciphercommon_gcm.c
+@@ -77,6 +77,54 @@ int gcm_dinit(void *vctx, const unsigned char *key, size_t keylen,
+     return gcm_init(vctx, key, keylen, iv, ivlen, 0);
+ }
+ 
++/* increment counter (64-bit int) by 1 */
++static void ctr64_inc(unsigned char *counter)
++{
++    int n = 8;
++    unsigned char c;
++
++    do {
++        --n;
++        c = counter[n];
++        ++c;
++        counter[n] = c;
++        if (c &gt; 0)
++            return;
++    } while (n &gt; 0);
++}
++
++static int getivgen(PROV_GCM_CTX *ctx, unsigned char *out, size_t olen)
++{
++    if (!ctx-&gt;iv_gen
++        || !ctx-&gt;key_set
++        || !ctx-&gt;hw-&gt;setiv(ctx, ctx-&gt;iv, ctx-&gt;ivlen))
++        return 0;
++    if (olen == 0 || olen &gt; ctx-&gt;ivlen)
++        olen = ctx-&gt;ivlen;
++    memcpy(out, ctx-&gt;iv + ctx-&gt;ivlen - olen, olen);
++    /*
++     * Invocation field will be at least 8 bytes in size and so no need
++     * to check wrap around or increment more than last 8 bytes.
++     */
++    ctr64_inc(ctx-&gt;iv + ctx-&gt;ivlen - 8);
++    ctx-&gt;iv_state = IV_STATE_COPIED;
++    return 1;
++}
++
++static int setivinv(PROV_GCM_CTX *ctx, unsigned char *in, size_t inl)
++{
++    if (!ctx-&gt;iv_gen
++        || !ctx-&gt;key_set
++        || ctx-&gt;enc)
++        return 0;
++
++    memcpy(ctx-&gt;iv + ctx-&gt;ivlen - inl, in, inl);
++    if (!ctx-&gt;hw-&gt;setiv(ctx, ctx-&gt;iv, ctx-&gt;ivlen))
++        return 0;
++    ctx-&gt;iv_state = IV_STATE_COPIED;
++    return 1;
++}
++
+ int gcm_get_ctx_params(void *vctx, OSSL_PARAM params[])
+ {
+     PROV_GCM_CTX *ctx = (PROV_GCM_CTX *)vctx;
+@@ -138,7 +186,13 @@ int gcm_get_ctx_params(void *vctx, OSSL_PARAM params[])
+             return 0;
+         }
+     }
+-
++    p = OSSL_PARAM_locate(params, OSSL_CIPHER_PARAM_AEAD_TLS1_GET_IV_GEN);
++    if (p != NULL) {
++        if (p-&gt;data == NULL
++            || p-&gt;data_type != OSSL_PARAM_OCTET_STRING
++            || !getivgen(ctx, p-&gt;data, p-&gt;data_size))
++            return 0;
++    }
+     return 1;
+ }
+ 
+@@ -201,6 +255,14 @@ int gcm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+             return 0;
+         }
+     }
++    p = OSSL_PARAM_locate_const(params, OSSL_CIPHER_PARAM_AEAD_TLS1_SET_IV_INV);
++    if (p != NULL) {
++        if (p-&gt;data == NULL
++            || p-&gt;data_type != OSSL_PARAM_OCTET_STRING
++            || !setivinv(ctx, p-&gt;data, p-&gt;data_size))
++            return 0;
++    }
++
+ 
+     return 1;
+ }
+@@ -397,22 +459,6 @@ static int gcm_tls_iv_set_fixed(PROV_GCM_CTX *ctx, unsigned char *iv,
+     return 1;
+ }
+ 
+-/* increment counter (64-bit int) by 1 */
+-static void ctr64_inc(unsigned char *counter)
+-{
+-    int n = 8;
+-    unsigned char c;
+-
+-    do {
+-        --n;
+-        c = counter[n];
+-        ++c;
+-        counter[n] = c;
+-        if (c &gt; 0)
+-            return;
+-    } while (n &gt; 0);
+-}
+-
+ /*
+  * Handle TLS GCM packet format. This consists of the last portion of the IV
+  * followed by the payload and finally the tag. On encrypt generate IV,
+@@ -445,29 +491,17 @@ static int gcm_tls_cipher(PROV_GCM_CTX *ctx, unsigned char *out, size_t *padlen,
+         goto err;
+     }
+ 
+-    if (ctx-&gt;iv_gen == 0)
+-        goto err;
+     /*
+      * Set IV from start of buffer or generate IV and write to start of
+      * buffer.
+      */
+     if (ctx-&gt;enc) {
+-        if (!ctx-&gt;hw-&gt;setiv(ctx, ctx-&gt;iv, ctx-&gt;ivlen))
++        if (!getivgen(ctx, out, arg))
+             goto err;
+-        if (arg &gt; ctx-&gt;ivlen)
+-            arg = ctx-&gt;ivlen;
+-        memcpy(out, ctx-&gt;iv + ctx-&gt;ivlen - arg, arg);
+-        /*
+-         * Invocation field will be at least 8 bytes in size and so no need
+-         * to check wrap around or increment more than last 8 bytes.
+-         */
+-        ctr64_inc(ctx-&gt;iv + ctx-&gt;ivlen - 8);
+     } else {
+-        memcpy(ctx-&gt;iv + ctx-&gt;ivlen - arg, out, arg);
+-        if (!ctx-&gt;hw-&gt;setiv(ctx, ctx-&gt;iv, ctx-&gt;ivlen))
++        if (!setivinv(ctx, out, arg))
+             goto err;
+     }
+-    ctx-&gt;iv_state = IV_STATE_COPIED;
+ 
+     /* Fix buffer and length to point to payload */
+     in += EVP_GCM_TLS_EXPLICIT_IV_LEN;
+@@ -493,3 +527,4 @@ err:
+     *padlen = plen;
+     return rv;
+ }
++
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026992.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="026999.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26997">[ date ]</a>
+              <a href="thread.html#26997">[ thread ]</a>
+              <a href="subject.html#26997">[ subject ]</a>
+              <a href="author.html#26997">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

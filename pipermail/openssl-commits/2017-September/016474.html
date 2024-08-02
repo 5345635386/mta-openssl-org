@@ -1,0 +1,651 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1506545639.155202.20797.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016470.html">
+   <LINK REL="Next"  HREF="016475.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>paul.dale at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1506545639.155202.20797.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">paul.dale at oracle.com
+       </A><BR>
+    <I>Wed Sep 27 20:53:59 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016470.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="016475.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16474">[ date ]</a>
+              <a href="thread.html#16474">[ thread ]</a>
+              <a href="subject.html#16474">[ subject ]</a>
+              <a href="author.html#16474">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e431363f8c241abd0dfe9b83dfc1cec1bdfe13ab (commit)
+       via  1b3e2bbf64b96f636277ca29b31ba152c1831e74 (commit)
+      from  9f9442918aeaed5dc2442d81ab8d29fe3e1fb906 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e431363f8c241abd0dfe9b83dfc1cec1bdfe13ab
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Tue Sep 19 08:48:14 2017 +1000
+
+    Add stack space reservations.
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4386">https://github.com/openssl/openssl/pull/4386</A>)
+
+commit 1b3e2bbf64b96f636277ca29b31ba152c1831e74
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Thu Aug 17 10:10:07 2017 +1000
+
+    Add a reserve call to the stack data structure.
+    
+    This allows the caller to guarantee that there is sufficient space for a
+    number of insertions without reallocation.
+    
+    The expansion ratio when reallocating the array is reduced to 1.5 rather than 2.
+    
+    Change bounds testing to use a single size rather than both INT_MAX and
+    SIZE_MAX.  This simplifies some of the tests.
+    
+    Switch the stack pointers to data from char * to void *
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4386">https://github.com/openssl/openssl/pull/4386</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/async/async.c         |   4 +-
+ crypto/stack/stack.c         | 127 ++++++++++++++++++++++++++++++++-----------
+ crypto/x509v3/v3_info.c      |   9 ++-
+ doc/man3/DEFINE_STACK_OF.pod |  33 +++++++----
+ include/openssl/safestack.h  |   6 +-
+ include/openssl/stack.h      |  10 +++-
+ ssl/ssl_cert.c               |   8 ++-
+ ssl/ssl_lib.c                |   4 +-
+ test/sanitytest.c            |  11 ++++
+ test/stack_test.c            |  16 ++++--
+ util/libcrypto.num           |   1 +
+ 11 files changed, 170 insertions(+), 59 deletions(-)
+
+diff --git a/crypto/async/async.c b/crypto/async/async.c
+index 1359b50..7678b48 100644
+--- a/crypto/async/async.c
++++ b/crypto/async/async.c
+@@ -342,6 +342,8 @@ int ASYNC_init_thread(size_t max_size, size_t init_size)
+         OPENSSL_free(pool);
+         return 0;
+     }
++    if (!sk_ASYNC_JOB_reserve(pool-&gt;jobs, init_size))
++        goto err;
+ 
+     pool-&gt;max_size = max_size;
+ 
+@@ -358,7 +360,7 @@ int ASYNC_init_thread(size_t max_size, size_t init_size)
+             break;
+         }
+         job-&gt;funcargs = NULL;
+-        sk_ASYNC_JOB_push(pool-&gt;jobs, job);
++        sk_ASYNC_JOB_push(pool-&gt;jobs, job); /* Cannot fail due to reserve */
+         curr_size++;
+     }
+     pool-&gt;curr_size = curr_size;
+diff --git a/crypto/stack/stack.c b/crypto/stack/stack.c
+index 43ddf30..e71da73 100644
+--- a/crypto/stack/stack.c
++++ b/crypto/stack/stack.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -12,20 +12,25 @@
+ #include &quot;internal/numbers.h&quot;
+ #include &lt;openssl/stack.h&gt;
+ #include &lt;openssl/objects.h&gt;
++#include &lt;errno.h&gt;
++#include &lt;openssl/e_os2.h&gt;      /* For ossl_inline */
++
++/*
++ * The initial number of nodes in the array.
++ */
++static const int min_nodes = 4;
++static const int max_nodes = SIZE_MAX / sizeof(void *) &lt; INT_MAX
++                             ? (int)(SIZE_MAX / sizeof(void *))
++                             : INT_MAX;
+ 
+ struct stack_st {
+     int num;
+-    const char **data;
++    const void **data;
+     int sorted;
+-    size_t num_alloc;
++    int num_alloc;
+     OPENSSL_sk_compfunc comp;
+ };
+ 
+-#undef MIN_NODES
+-#define MIN_NODES       4
+-
+-#include &lt;errno.h&gt;
+-
+ OPENSSL_sk_compfunc OPENSSL_sk_set_cmp_func(OPENSSL_STACK *sk, OPENSSL_sk_compfunc c)
+ {
+     OPENSSL_sk_compfunc old = sk-&gt;comp;
+@@ -52,7 +57,7 @@ OPENSSL_STACK *OPENSSL_sk_dup(const OPENSSL_STACK *sk)
+ 
+     if ((ret-&gt;data = OPENSSL_malloc(sizeof(*ret-&gt;data) * sk-&gt;num_alloc)) == NULL)
+         goto err;
+-    memcpy(ret-&gt;data, sk-&gt;data, sizeof(char *) * sk-&gt;num);
++    memcpy(ret-&gt;data, sk-&gt;data, sizeof(void *) * sk-&gt;num);
+     return ret;
+  err:
+     OPENSSL_sk_free(ret);
+@@ -75,7 +80,7 @@ OPENSSL_STACK *OPENSSL_sk_deep_copy(const OPENSSL_STACK *sk,
+     /* direct structure assignment */
+     *ret = *sk;
+ 
+-    ret-&gt;num_alloc = sk-&gt;num &gt; MIN_NODES ? (size_t)sk-&gt;num : MIN_NODES;
++    ret-&gt;num_alloc = sk-&gt;num &gt; min_nodes ? sk-&gt;num : min_nodes;
+     ret-&gt;data = OPENSSL_zalloc(sizeof(*ret-&gt;data) * ret-&gt;num_alloc);
+     if (ret-&gt;data == NULL) {
+         OPENSSL_free(ret);
+@@ -107,10 +112,10 @@ OPENSSL_STACK *OPENSSL_sk_new(OPENSSL_sk_compfunc c)
+ 
+     if ((ret = OPENSSL_zalloc(sizeof(*ret))) == NULL)
+         goto err;
+-    if ((ret-&gt;data = OPENSSL_zalloc(sizeof(*ret-&gt;data) * MIN_NODES)) == NULL)
++    if ((ret-&gt;data = OPENSSL_zalloc(sizeof(*ret-&gt;data) * min_nodes)) == NULL)
+         goto err;
+     ret-&gt;comp = c;
+-    ret-&gt;num_alloc = MIN_NODES;
++    ret-&gt;num_alloc = min_nodes;
+     return (ret);
+ 
+  err:
+@@ -118,32 +123,88 @@ OPENSSL_STACK *OPENSSL_sk_new(OPENSSL_sk_compfunc c)
+     return (NULL);
+ }
+ 
+-int OPENSSL_sk_insert(OPENSSL_STACK *st, const void *data, int loc)
++/*
++ * Calculate the array growth based on the target size.
++ *
++ * The growth faction is a rational number and is defined by a numerator
++ * and a denominator.  According to Andrew Koenig in his paper &quot;Why Are
++ * Vectors Efficient?&quot; from JOOP 11(5) 1998, this factor should be less
++ * than the golden ratio (1.618...).
++ *
++ * We use 3/2 = 1.5 for simplicty of calculation and overflow checking.
++ * Another option 8/5 = 1.6 allows for slightly faster growth, although safe
++ * computation is more difficult.
++ *
++ * The limit to avoid overflow is spot on.  The modulo three correction term
++ * ensures that the limit is the largest number than can be expanded by the
++ * growth factor without exceeding the hard limit.
++ */
++static ossl_inline int compute_growth(int target, int current)
+ {
+-    if (st == NULL || st-&gt;num &lt; 0 || st-&gt;num == INT_MAX) {
+-        return 0;
++    const int limit = (max_nodes / 3) * 2 + (max_nodes % 3 ? 1 : 0);
++
++    while (current &lt; target) {
++        /* Check to see if we're at the hard limit */
++        if (current &gt;= max_nodes)
++            return 0;
++
++        /* Expand the size by a factor of 3/2 if it is within range */
++        current = current &lt; limit ? current + current / 2 : max_nodes;
+     }
++    return current;
++}
+ 
+-    if (st-&gt;num_alloc &lt;= (size_t)(st-&gt;num + 1)) {
+-        size_t doub_num_alloc = st-&gt;num_alloc * 2;
+-        const char **tmpdata;
++static int sk_reserve(OPENSSL_STACK *st, int n, int exact)
++{
++    const void **tmpdata;
++    int num_alloc;
+ 
+-        /* Overflow checks */
+-        if (doub_num_alloc &lt; st-&gt;num_alloc)
+-            return 0;
++    /* Check to see the reservation isn't exceeding the hard limit */
++    if (n &gt; max_nodes - st-&gt;num)
++        return 0;
+ 
+-        /* Avoid overflow due to multiplication by sizeof(char *) */
+-        if (doub_num_alloc &gt; SIZE_MAX / sizeof(char *))
+-            return 0;
++    /* Figure out the new size */
++    num_alloc = st-&gt;num + n;
++    if (num_alloc &lt; min_nodes)
++        num_alloc = min_nodes;
+ 
+-        tmpdata = OPENSSL_realloc((char *)st-&gt;data,
+-                                  sizeof(char *) * doub_num_alloc);
+-        if (tmpdata == NULL)
++    if (!exact) {
++        if (num_alloc &lt;= st-&gt;num_alloc)
++            return 1;
++        num_alloc = compute_growth(num_alloc, st-&gt;num_alloc);
++        if (num_alloc == 0)
+             return 0;
+-
+-        st-&gt;data = tmpdata;
+-        st-&gt;num_alloc = doub_num_alloc;
++    } else if (num_alloc == st-&gt;num_alloc) {
++        return 1;
+     }
++
++    tmpdata = OPENSSL_realloc((void *)st-&gt;data, sizeof(void *) * num_alloc);
++    if (tmpdata == NULL)
++        return 0;
++
++    st-&gt;data = tmpdata;
++    st-&gt;num_alloc = num_alloc;
++    return 1;
++}
++
++int OPENSSL_sk_reserve(OPENSSL_STACK *st, int n)
++{
++    if (st == NULL || st-&gt;num &lt; 0)
++        return 0;
++
++    if (n &lt; 0)
++        return 1;
++    return sk_reserve(st, n, 1);
++}
++
++int OPENSSL_sk_insert(OPENSSL_STACK *st, const void *data, int loc)
++{
++    if (st == NULL || st-&gt;num &lt; 0 || st-&gt;num == max_nodes)
++        return 0;
++
++    if (!sk_reserve(st, 1, 0))
++        return 0;
++
+     if ((loc &gt;= st-&gt;num) || (loc &lt; 0)) {
+         st-&gt;data[st-&gt;num] = data;
+     } else {
+@@ -168,7 +229,7 @@ void *OPENSSL_sk_delete_ptr(OPENSSL_STACK *st, const void *p)
+ 
+ void *OPENSSL_sk_delete(OPENSSL_STACK *st, int loc)
+ {
+-    const char *ret;
++    const void *ret;
+ 
+     if (st == NULL || loc &lt; 0 || loc &gt;= st-&gt;num)
+         return NULL;
+@@ -203,7 +264,7 @@ static int internal_find(OPENSSL_STACK *st, const void *data,
+                         ret_val_options);
+     if (r == NULL)
+         return (-1);
+-    return (int)((const char **)r - st-&gt;data);
++    return (int)((const void **)r - st-&gt;data);
+ }
+ 
+ int OPENSSL_sk_find(OPENSSL_STACK *st, const void *data)
+@@ -299,7 +360,7 @@ void *OPENSSL_sk_set(OPENSSL_STACK *st, int i, const void *data)
+ void OPENSSL_sk_sort(OPENSSL_STACK *st)
+ {
+     if (st &amp;&amp; !st-&gt;sorted &amp;&amp; st-&gt;comp != NULL) {
+-        qsort(st-&gt;data, st-&gt;num, sizeof(char *), st-&gt;comp);
++        qsort(st-&gt;data, st-&gt;num, sizeof(void *), st-&gt;comp);
+         st-&gt;sorted = 1;
+     }
+ }
+diff --git a/crypto/x509v3/v3_info.c b/crypto/x509v3/v3_info.c
+index c2c0949..6b98575 100644
+--- a/crypto/x509v3/v3_info.c
++++ b/crypto/x509v3/v3_info.c
+@@ -107,20 +107,23 @@ static AUTHORITY_INFO_ACCESS *v2i_AUTHORITY_INFO_ACCESS(X509V3_EXT_METHOD
+     CONF_VALUE *cnf, ctmp;
+     ACCESS_DESCRIPTION *acc;
+     int i, objlen;
++    const int num = sk_CONF_VALUE_num(nval);
+     char *objtmp, *ptmp;
+ 
+     if ((ainfo = sk_ACCESS_DESCRIPTION_new_null()) == NULL) {
+         X509V3err(X509V3_F_V2I_AUTHORITY_INFO_ACCESS, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    for (i = 0; i &lt; sk_CONF_VALUE_num(nval); i++) {
++    if (!sk_ACCESS_DESCRIPTION_reserve(ainfo, num))
++        goto err;
++    for (i = 0; i &lt; num; i++) {
+         cnf = sk_CONF_VALUE_value(nval, i);
+-        if ((acc = ACCESS_DESCRIPTION_new()) == NULL
+-            || !sk_ACCESS_DESCRIPTION_push(ainfo, acc)) {
++        if ((acc = ACCESS_DESCRIPTION_new()) == NULL) {
+             X509V3err(X509V3_F_V2I_AUTHORITY_INFO_ACCESS,
+                       ERR_R_MALLOC_FAILURE);
+             goto err;
+         }
++        sk_ACCESS_DESCRIPTION_push(ainfo, acc); /* Cannot fail due to reserve */
+         ptmp = strchr(cnf-&gt;name, ';');
+         if (!ptmp) {
+             X509V3err(X509V3_F_V2I_AUTHORITY_INFO_ACCESS,
+diff --git a/doc/man3/DEFINE_STACK_OF.pod b/doc/man3/DEFINE_STACK_OF.pod
+index 82989fa..a9fc769 100644
+--- a/doc/man3/DEFINE_STACK_OF.pod
++++ b/doc/man3/DEFINE_STACK_OF.pod
+@@ -5,17 +5,18 @@
+ DEFINE_STACK_OF, DEFINE_STACK_OF_CONST, DEFINE_SPECIAL_STACK_OF,
+ DEFINE_SPECIAL_STACK_OF_CONST,
+ OPENSSL_sk_deep_copy, OPENSSL_sk_delete, OPENSSL_sk_delete_ptr,
+-OPENSSL_sk_dup, OPENSSL_sk_find, OPENSSL_sk_find_ex, OPENSSL_sk_free,
+-OPENSSL_sk_insert, OPENSSL_sk_is_sorted, OPENSSL_sk_new, OPENSSL_sk_new_null,
+-OPENSSL_sk_num, OPENSSL_sk_pop, OPENSSL_sk_pop_free, OPENSSL_sk_push,
+-OPENSSL_sk_set, OPENSSL_sk_set_cmp_func, OPENSSL_sk_shift, OPENSSL_sk_sort,
++OPENSSL_sk_dup, OPENSSL_sk_find, OPENSSL_sk_find_ex,
++OPENSSL_sk_free, OPENSSL_sk_insert, OPENSSL_sk_is_sorted,
++OPENSSL_sk_new, OPENSSL_sk_new_null, OPENSSL_sk_num, OPENSSL_sk_pop,
++OPENSSL_sk_pop_free, OPENSSL_sk_push, OPENSSL_sk_reserve, OPENSSL_sk_set,
++OPENSSL_sk_set_cmp_func, OPENSSL_sk_shift, OPENSSL_sk_sort,
+ OPENSSL_sk_unshift, OPENSSL_sk_value, OPENSSL_sk_zero,
+-sk_TYPE_num, sk_TYPE_value, sk_TYPE_new, sk_TYPE_new_null, sk_TYPE_free,
+-sk_TYPE_zero, sk_TYPE_delete, sk_TYPE_delete_ptr, sk_TYPE_push,
+-sk_TYPE_unshift, sk_TYPE_pop, sk_TYPE_shift, sk_TYPE_pop_free,
+-sk_TYPE_insert, sk_TYPE_set, sk_TYPE_find, sk_TYPE_find_ex, sk_TYPE_sort,
+-sk_TYPE_is_sorted, sk_TYPE_dup, sk_TYPE_deep_copy, sk_TYPE_set_cmp_func -
+-stack container
++sk_TYPE_num, sk_TYPE_value, sk_TYPE_new, sk_TYPE_new_null,
++sk_TYPE_reserve, sk_TYPE_free, sk_TYPE_zero, sk_TYPE_delete,
++sk_TYPE_delete_ptr, sk_TYPE_push, sk_TYPE_unshift, sk_TYPE_pop,
++sk_TYPE_shift, sk_TYPE_pop_free, sk_TYPE_insert, sk_TYPE_set,
++sk_TYPE_find, sk_TYPE_find_ex, sk_TYPE_sort, sk_TYPE_is_sorted,
++sk_TYPE_dup, sk_TYPE_deep_copy, sk_TYPE_set_cmp_func - stack container
+ 
+ =head1 SYNOPSIS
+ 
+@@ -37,6 +38,7 @@ stack container
+  TYPE *sk_TYPE_value(const STACK_OF(TYPE) *sk, int idx);
+  STACK_OF(TYPE) *sk_TYPE_new(sk_TYPE_compfunc compare);
+  STACK_OF(TYPE) *sk_TYPE_new_null(void);
++ int sk_TYPE_reserve(STACK_OF(TYPE) *sk, size_t n);
+  void sk_TYPE_free(const STACK_OF(TYPE) *sk);
+  void sk_TYPE_zero(const STACK_OF(TYPE) *sk);
+  TYPE *sk_TYPE_delete(STACK_OF(TYPE) *sk, int i);
+@@ -100,6 +102,12 @@ If B&lt;compar&gt; is B&lt;NULL&gt; then no comparison function is used.
+ 
+ sk_TYPE_new_null() allocates a new empty stack with no comparison function.
+ 
++sk_TYPE_reserve() allocates additional memory in the B&lt;sk&gt; structure
++such that the next B&lt;n&gt; calls to sk_TYPE_insert(), sk_TYPE_push()
++or sk_TYPE_unshift() will not fail or cause memory to be allocated
++or reallocated. If B&lt;n&gt; is zero, any excess space allocated in the
++B&lt;sk&gt; structure is freed. On error B&lt;sk&gt; is unchanged.
++
+ sk_TYPE_set_cmp_func() sets the comparison function of B&lt;sk&gt; to B&lt;compar&gt;.
+ The previous comparison function is returned or B&lt;NULL&gt; if there was
+ no previous comparison function.
+@@ -201,6 +209,9 @@ index is out of range.
+ sk_TYPE_new() and sk_TYPE_new_null() return an empty stack or B&lt;NULL&gt; if
+ an error occurs.
+ 
++sk_TYPE_reserve() returns B&lt;1&gt; on successful allocation of the required memory
++or B&lt;0&gt; on error.
++
+ sk_TYPE_set_cmp_func() returns the old comparison function or B&lt;NULL&gt; if
+ there was no old comparison function.
+ 
+@@ -232,7 +243,7 @@ and was not a public API.
+ 
+ =head1 COPYRIGHT
+ 
+-Copyright 2000-2016 The OpenSSL Project Authors. All Rights Reserved.
++Copyright 2000-2017 The OpenSSL Project Authors. All Rights Reserved.
+ 
+ Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ this file except in compliance with the License.  You can obtain a copy
+diff --git a/include/openssl/safestack.h b/include/openssl/safestack.h
+index 9fe733c..4241c4f 100644
+--- a/include/openssl/safestack.h
++++ b/include/openssl/safestack.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1999-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -40,6 +40,10 @@ extern &quot;C&quot; {
+     { \
+         return (STACK_OF(t1) *)OPENSSL_sk_new_null(); \
+     } \
++    static ossl_inline int sk_##t1##_reserve(STACK_OF(t1) *sk, int n) \
++    { \
++        return OPENSSL_sk_reserve((OPENSSL_STACK *)sk, n); \
++    } \
+     static ossl_inline void sk_##t1##_free(STACK_OF(t1) *sk) \
+     { \
+         OPENSSL_sk_free((OPENSSL_STACK *)sk); \
+diff --git a/include/openssl/stack.h b/include/openssl/stack.h
+index 23ad3b8..aee763c 100644
+--- a/include/openssl/stack.h
++++ b/include/openssl/stack.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -27,9 +27,12 @@ void *OPENSSL_sk_set(OPENSSL_STACK *st, int i, const void *data);
+ 
+ OPENSSL_STACK *OPENSSL_sk_new(OPENSSL_sk_compfunc cmp);
+ OPENSSL_STACK *OPENSSL_sk_new_null(void);
++int OPENSSL_sk_reserve(OPENSSL_STACK *st, int n);
+ void OPENSSL_sk_free(OPENSSL_STACK *);
+ void OPENSSL_sk_pop_free(OPENSSL_STACK *st, void (*func) (void *));
+-OPENSSL_STACK *OPENSSL_sk_deep_copy(const OPENSSL_STACK *, OPENSSL_sk_copyfunc c, OPENSSL_sk_freefunc f);
++OPENSSL_STACK *OPENSSL_sk_deep_copy(const OPENSSL_STACK *,
++                                    OPENSSL_sk_copyfunc c,
++                                    OPENSSL_sk_freefunc f);
+ int OPENSSL_sk_insert(OPENSSL_STACK *sk, const void *data, int where);
+ void *OPENSSL_sk_delete(OPENSSL_STACK *st, int loc);
+ void *OPENSSL_sk_delete_ptr(OPENSSL_STACK *st, const void *p);
+@@ -40,7 +43,8 @@ int OPENSSL_sk_unshift(OPENSSL_STACK *st, const void *data);
+ void *OPENSSL_sk_shift(OPENSSL_STACK *st);
+ void *OPENSSL_sk_pop(OPENSSL_STACK *st);
+ void OPENSSL_sk_zero(OPENSSL_STACK *st);
+-OPENSSL_sk_compfunc OPENSSL_sk_set_cmp_func(OPENSSL_STACK *sk, OPENSSL_sk_compfunc cmp);
++OPENSSL_sk_compfunc OPENSSL_sk_set_cmp_func(OPENSSL_STACK *sk,
++                                            OPENSSL_sk_compfunc cmp);
+ OPENSSL_STACK *OPENSSL_sk_dup(const OPENSSL_STACK *st);
+ void OPENSSL_sk_sort(OPENSSL_STACK *st);
+ int OPENSSL_sk_is_sorted(const OPENSSL_STACK *st);
+diff --git a/ssl/ssl_cert.c b/ssl/ssl_cert.c
+index ba5fb65..a517cf1 100644
+--- a/ssl/ssl_cert.c
++++ b/ssl/ssl_cert.c
+@@ -460,6 +460,7 @@ static void set0_CA_list(STACK_OF(X509_NAME) **ca_list,
+ STACK_OF(X509_NAME) *SSL_dup_CA_list(const STACK_OF(X509_NAME) *sk)
+ {
+     int i;
++    const int num = sk_X509_NAME_num(sk);
+     STACK_OF(X509_NAME) *ret;
+     X509_NAME *name;
+ 
+@@ -468,13 +469,16 @@ STACK_OF(X509_NAME) *SSL_dup_CA_list(const STACK_OF(X509_NAME) *sk)
+         SSLerr(SSL_F_SSL_DUP_CA_LIST, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    for (i = 0; i &lt; sk_X509_NAME_num(sk); i++) {
++    if (!sk_X509_NAME_reserve(ret, num))
++        return NULL;
++    for (i = 0; i &lt; num; i++) {
+         name = X509_NAME_dup(sk_X509_NAME_value(sk, i));
+-        if (name == NULL || !sk_X509_NAME_push(ret, name)) {
++        if (name == NULL) {
+             sk_X509_NAME_pop_free(ret, X509_NAME_free);
+             X509_NAME_free(name);
+             return NULL;
+         }
++        sk_X509_NAME_push(ret, name);   /* Cannot fail after reserve call */
+     }
+     return (ret);
+ }
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index e04feec..85425a1 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -161,6 +161,7 @@ static int ssl_dane_dup(SSL *to, SSL *from)
+     if (!DANETLS_ENABLED(&amp;from-&gt;dane))
+         return 1;
+ 
++    num = sk_danetls_record_num(from-&gt;dane.trecs);
+     dane_final(&amp;to-&gt;dane);
+     to-&gt;dane.flags = from-&gt;dane.flags;
+     to-&gt;dane.dctx = &amp;to-&gt;ctx-&gt;dane;
+@@ -170,8 +171,9 @@ static int ssl_dane_dup(SSL *to, SSL *from)
+         SSLerr(SSL_F_SSL_DANE_DUP, ERR_R_MALLOC_FAILURE);
+         return 0;
+     }
++    if (!sk_danetls_record_reserve(to-&gt;dane.trecs, num))
++        return 0;
+ 
+-    num = sk_danetls_record_num(from-&gt;dane.trecs);
+     for (i = 0; i &lt; num; ++i) {
+         danetls_record *t = sk_danetls_record_value(from-&gt;dane.trecs, i);
+ 
+diff --git a/test/sanitytest.c b/test/sanitytest.c
+index 743c03b..c1c51a2 100644
+--- a/test/sanitytest.c
++++ b/test/sanitytest.c
+@@ -75,6 +75,16 @@ static int test_sanity_unsigned_convertion(void)
+     return 1;
+ }
+ 
++static int test_sanity_range(void)
++{
++    /* This isn't possible to check using the framework functions */
++    if (SIZE_MAX &lt; INT_MAX) {
++        TEST_error(&quot;int must not be wider than size_t&quot;);
++        return 0;
++    }
++    return 1;
++}
++
+ int setup_tests(void)
+ {
+     ADD_TEST(test_sanity_null_zero);
+@@ -82,6 +92,7 @@ int setup_tests(void)
+     ADD_TEST(test_sanity_twos_complement);
+     ADD_TEST(test_sanity_sign);
+     ADD_TEST(test_sanity_unsigned_convertion);
++    ADD_TEST(test_sanity_range);
+     return 1;
+ }
+ 
+diff --git a/test/stack_test.c b/test/stack_test.c
+index c0ec46a..680f68d 100644
+--- a/test/stack_test.c
++++ b/test/stack_test.c
+@@ -50,7 +50,7 @@ static int int_compare(const int *const *a, const int *const *b)
+     return 0;
+ }
+ 
+-static int test_int_stack(void)
++static int test_int_stack(int reserve)
+ {
+     static int v[] = { 1, 2, -4, 16, 999, 1, -173, 1, 9 };
+     static int notpresent = -1;
+@@ -84,6 +84,10 @@ static int test_int_stack(void)
+     int i;
+     int testresult = 0;
+ 
++    if (!TEST_ptr(s)
++        || (reserve &gt; 0 &amp;&amp; !TEST_true(sk_sint_reserve(s, 5 * reserve))))
++        goto end;
++
+     /* Check push and num */
+     for (i = 0; i &lt; n; i++) {
+         if (!TEST_int_eq(sk_sint_num(s), i)) {
+@@ -167,7 +171,7 @@ static int uchar_compare(const unsigned char *const *a,
+     return **a - (signed int)**b;
+ }
+ 
+-static int test_uchar_stack(void)
++static int test_uchar_stack(int reserve)
+ {
+     static const unsigned char v[] = { 1, 3, 7, 5, 255, 0 };
+     const int n = OSSL_NELEM(v);
+@@ -175,6 +179,10 @@ static int test_uchar_stack(void)
+     int i;
+     int testresult = 0;
+ 
++    if (!TEST_ptr(s)
++        || (reserve &gt; 0 &amp;&amp; !TEST_true(sk_uchar_reserve(s, 5 * reserve))))
++        goto end;
++
+     /* unshift and num */
+     for (i = 0; i &lt; n; i++) {
+         if (!TEST_int_eq(sk_uchar_num(s), i)) {
+@@ -364,8 +372,8 @@ end:
+ 
+ int setup_tests(void)
+ {
+-    ADD_TEST(test_int_stack);
+-    ADD_TEST(test_uchar_stack);
++    ADD_ALL_TESTS(test_int_stack, 4);
++    ADD_ALL_TESTS(test_uchar_stack, 4);
+     ADD_TEST(test_SS_stack);
+     ADD_TEST(test_SU_stack);
+     return 1;
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 363059b..48e97ff 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4397,3 +4397,4 @@ EVP_PKEY_check                          4340	1_1_1	EXIST::FUNCTION:
+ EVP_PKEY_meth_set_check                 4341	1_1_1	EXIST::FUNCTION:
+ EVP_PKEY_meth_get_check                 4342	1_1_1	EXIST::FUNCTION:
+ EVP_PKEY_meth_remove                    4343	1_1_1	EXIST::FUNCTION:
++OPENSSL_sk_reserve                      4344	1_1_1	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016470.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="016475.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16474">[ date ]</a>
+              <a href="thread.html#16474">[ thread ]</a>
+              <a href="subject.html#16474">[ subject ]</a>
+              <a href="author.html#16474">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

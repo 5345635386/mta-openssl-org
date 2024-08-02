@@ -1,0 +1,228 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1439569906.456767.19667.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001567.html">
+   <LINK REL="Next"  HREF="001591.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1439569906.456767.19667.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri Aug 14 16:31:46 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001567.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001591.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1568">[ date ]</a>
+              <a href="thread.html#1568">[ thread ]</a>
+              <a href="subject.html#1568">[ subject ]</a>
+              <a href="author.html#1568">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ac1123320145f731fb04a4cc3df1fbd9c3d5e513 (commit)
+      from  efcdbcbeda556876c0147dca21d51610de30dfd9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ac1123320145f731fb04a4cc3df1fbd9c3d5e513
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Aug 4 22:12:53 2015 +0100
+
+    PACKETise CertificateRequest
+    
+    Process CertificateRequest messages using the PACKET API
+    
+    Reviewed-by: Emilia K&#228;sper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_clnt.c | 66 ++++++++++++++++++++++++++++++-----------------------------
+ 1 file changed, 34 insertions(+), 32 deletions(-)
+
+diff --git a/ssl/s3_clnt.c b/ssl/s3_clnt.c
+index 1394293..e7bbfc9 100644
+--- a/ssl/s3_clnt.c
++++ b/ssl/s3_clnt.c
+@@ -2011,12 +2011,13 @@ int ssl3_get_key_exchange(SSL *s)
+ int ssl3_get_certificate_request(SSL *s)
+ {
+     int ok, ret = 0;
+-    unsigned long n, nc, l;
+-    unsigned int llen, ctype_num, i;
++    unsigned long n;
++    unsigned int list_len, ctype_num, i, name_len;
+     X509_NAME *xn = NULL;
+-    const unsigned char *p, *q;
+-    unsigned char *d;
++    unsigned char *data;
++    unsigned char *namestart, *namebytes;
+     STACK_OF(X509_NAME) *ca_sk = NULL;
++    PACKET pkt;
+ 
+     n = s-&gt;method-&gt;ssl_get_message(s,
+                                    SSL3_ST_CR_CERT_REQ_A,
+@@ -2055,7 +2056,11 @@ int ssl3_get_certificate_request(SSL *s)
+         }
+     }
+ 
+-    p = d = (unsigned char *)s-&gt;init_msg;
++    if (!PACKET_buf_init(&amp;pkt, s-&gt;init_msg, n)) {
++        ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
++        SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
+ 
+     if ((ca_sk = sk_X509_NAME_new(ca_dn_cmp)) == NULL) {
+         SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
+@@ -2063,7 +2068,12 @@ int ssl3_get_certificate_request(SSL *s)
+     }
+ 
+     /* get the certificate types */
+-    ctype_num = *(p++);
++    if (!PACKET_get_1(&amp;pkt, &amp;ctype_num)
++            || !PACKET_get_bytes(&amp;pkt, &amp;data, ctype_num)) {
++        ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
++        SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, SSL_R_LENGTH_MISMATCH);
++        goto err;
++    }
+     OPENSSL_free(s-&gt;cert-&gt;ctypes);
+     s-&gt;cert-&gt;ctypes = NULL;
+     if (ctype_num &gt; SSL3_CT_NUMBER) {
+@@ -2073,31 +2083,27 @@ int ssl3_get_certificate_request(SSL *s)
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
+             goto err;
+         }
+-        memcpy(s-&gt;cert-&gt;ctypes, p, ctype_num);
++        memcpy(s-&gt;cert-&gt;ctypes, data, ctype_num);
+         s-&gt;cert-&gt;ctype_num = (size_t)ctype_num;
+         ctype_num = SSL3_CT_NUMBER;
+     }
+     for (i = 0; i &lt; ctype_num; i++)
+-        s-&gt;s3-&gt;tmp.ctype[i] = p[i];
+-    p += p[-1];
++        s-&gt;s3-&gt;tmp.ctype[i] = data[i];
++
+     if (SSL_USE_SIGALGS(s)) {
+-        n2s(p, llen);
+-        /*
+-         * Check we have enough room for signature algorithms and following
+-         * length value.
+-         */
+-        if ((unsigned long)(p - d + llen + 2) &gt; n) {
++        if (!PACKET_get_net_2(&amp;pkt, &amp;list_len)
++                || !PACKET_get_bytes(&amp;pkt, &amp;data, list_len)) {
+             ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+-            SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST,
+-                   SSL_R_DATA_LENGTH_TOO_LONG);
++            SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, SSL_R_LENGTH_MISMATCH);
+             goto err;
+         }
++
+         /* Clear certificate digests and validity flags */
+         for (i = 0; i &lt; SSL_PKEY_NUM; i++) {
+             s-&gt;s3-&gt;tmp.md[i] = NULL;
+             s-&gt;s3-&gt;tmp.valid_flags[i] = 0;
+         }
+-        if ((llen &amp; 1) || !tls1_save_sigalgs(s, p, llen)) {
++        if ((list_len &amp; 1) || !tls1_save_sigalgs(s, data, list_len)) {
+             ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST,
+                    SSL_R_SIGNATURE_ALGORITHMS_ERROR);
+@@ -2108,35 +2114,34 @@ int ssl3_get_certificate_request(SSL *s)
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
+             goto err;
+         }
+-        p += llen;
+     }
+ 
+     /* get the CA RDNs */
+-    n2s(p, llen);
+-
+-    if ((unsigned long)(p - d + llen) != n) {
++    if (!PACKET_get_net_2(&amp;pkt, &amp;list_len)
++            || PACKET_remaining(&amp;pkt) != list_len) {
+         ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+         SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, SSL_R_LENGTH_MISMATCH);
+         goto err;
+     }
+ 
+-    for (nc = 0; nc &lt; llen;) {
+-        n2s(p, l);
+-        if ((l + nc + 2) &gt; llen) {
++    while (PACKET_remaining(&amp;pkt)) {
++        if (!PACKET_get_net_2(&amp;pkt, &amp;name_len)
++                || !PACKET_get_bytes(&amp;pkt, &amp;namebytes, name_len)) {
+             ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+-            SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, SSL_R_CA_DN_TOO_LONG);
++            SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, SSL_R_LENGTH_MISMATCH);
+             goto err;
+         }
+ 
+-        q = p;
++        namestart = namebytes;
+ 
+-        if ((xn = d2i_X509_NAME(NULL, &amp;q, l)) == NULL) {
++        if ((xn = d2i_X509_NAME(NULL, (const unsigned char **)&amp;namebytes,
++                                name_len)) == NULL) {
+             ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_ASN1_LIB);
+             goto err;
+         }
+ 
+-        if (q != (p + l)) {
++        if (namebytes != (namestart + name_len)) {
+             ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST,
+                    SSL_R_CA_DN_LENGTH_MISMATCH);
+@@ -2146,9 +2151,6 @@ int ssl3_get_certificate_request(SSL *s)
+             SSLerr(SSL_F_SSL3_GET_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
+             goto err;
+         }
+-
+-        p += l;
+-        nc += l + 2;
+     }
+ 
+     /* we should setup a certificate to return.... */
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001567.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001591.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1568">[ date ]</a>
+              <a href="thread.html#1568">[ thread ]</a>
+              <a href="subject.html#1568">[ subject ]</a>
+              <a href="author.html#1568">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

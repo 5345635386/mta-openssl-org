@@ -1,0 +1,233 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [web]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bweb%5D%20%20master%20update&In-Reply-To=%3C1627374685.120826.539.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034925.html">
+   <LINK REL="Next"  HREF="034986.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[web]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bweb%5D%20%20master%20update&In-Reply-To=%3C1627374685.120826.539.nullmailer%40dev.openssl.org%3E"
+       TITLE="[web]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jul 27 08:31:25 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034925.html">[web]  master update
+</A></li>
+        <LI>Next message: <A HREF="034986.html">[web]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34984">[ date ]</a>
+              <a href="thread.html#34984">[ thread ]</a>
+              <a href="subject.html#34984">[ subject ]</a>
+              <a href="author.html#34984">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  61f488185e0736cf5196efc9d5f4f4b3370b3f8e (commit)
+      from  539bea014de78db5ff5b0785a46bfd7647b0b589 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 61f488185e0736cf5196efc9d5f4f4b3370b3f8e
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Jul 27 09:55:07 2021 +0200
+
+    Simplify the CDN purge
+    
+    Our CDN (Akamai) purge script was run as a standalone automation, in
+    parallell with the automatic 'make' run.  The consequence was that the
+    CDN could catch a copy of our original web pages in a semi built state,
+    as demonstrated by openssl/openssl#16152.
+    
+    The solution is the ensure that the purge is run in sequence after
+    everything is built.  We simplify this further by moving the actual
+    script into the web source.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/web/pull/248">https://github.com/openssl/web/pull/248</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Makefile           |  7 +++--
+ bin/purge-one-hour | 90 ++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 32b9244..fb15dad 100644
+--- a/Makefile
++++ b/Makefile
+@@ -56,15 +56,18 @@ SRCLISTS = $(foreach S,$(FUTURESERIES) $(SERIES) $(OLDSERIES2) fips,source/old/$
+ 	@rm -f $@
+ 	./bin/md-to-html5 $&lt;
+ 
+-all: suball manmaster mancross
++all: suball manmaster mancross akamai-purge
+ 
+ suball: $(SIMPLE) $(SRCLISTS)
+ 
+-relupd: suball manpages mancross
++relupd: suball manpages mancross akamai-purge
+ 
+ clean:
+ 	rm -f $(SIMPLE) $(SRCLISTS)
+ 
++akamai-purge:
++	./bin/purge-one-hour
++
+ # Legacy targets
+ hack-source_htaccess: all
+ simple: all
+diff --git a/bin/purge-one-hour b/bin/purge-one-hour
+index 5e10e49..895967f 100755
+--- a/bin/purge-one-hour
++++ b/bin/purge-one-hour
+@@ -1,3 +1,89 @@
+-#! /bin/sh
++#! /usr/bin/perl
++#
++# script to purge the Akamai cache.
++#
++# Notes:
++#
++# - we limit the purging to files newer than an hour
++# - there must be a file ~openssl/.edgerc with our Akamai credentials
++# - the Akamai supplied program 'akamai-purge' must be installed in
++#   /usr/local/bin
+ 
+-/opt/openssl/maker/triggered-makers/akamai-purge
++use strict;
++use warnings;
++
++# Find all .html files that include a .inc file, and create a map
++my %inc2html = ();
++
++my $debug = $ENV{DEBUG};
++my $dryrun = $ENV{DRYRUN};
++
++my $base = '/var/www/openssl';	# MUST NOT end with a slash
++
++foreach ( `find $base -type f -name '*.html'` ) {
++    chomp;
++    my $file = $_;
++    my ($dn, $fn) = $_ =~ m/^(?:(.*)\/)?([^\/]*)$/;
++    my @incs = ();
++
++    open HTML, $_;
++    foreach ( &lt;HTML&gt; ) {
++	if (/&lt;!--\s*#include\s+virtual=&quot;([^&quot;]*)&quot;\s*--&gt;/) {
++	    my $vf = $1;
++	    $vf = ($vf =~ m|^/|) ? &quot;$base$vf&quot; : &quot;$dn/$vf&quot;;
++	    push @incs, &quot;$vf&quot;;
++	}
++    }
++    close HTML;
++
++    foreach ( @incs ) {
++	push @{$inc2html{$_}}, $file;
++    }
++}
++
++if ($debug) {
++    for ( sort keys %inc2html ) {
++	print STDERR &quot;DEBUG: $_ =&gt; &quot;, join(&quot;, &quot;, @{$inc2html{$_}}), &quot;\n&quot;;
++    }
++}
++
++# Find all files younger than an hour
++# Discard those in .git/ and bin/
++# Discard any .ht*
++# For any virtually included file, use the corresponding .html file instead
++# For all remaining files, turn it into a valid URL
++# For any valid index file, duplicate into two URLs without the file,
++#    one with an ending slash and one without.
++my %files = ();
++
++foreach ( `find $base -type f -mtime -2` ) {
++    chomp;
++    next if /^\Q$base\E\/(\.git|bin)/;
++    next if /\/\.ht\w+$/;
++    my $x = $_;
++    my @files = defined $inc2html{$x} ? @{$inc2html{$x}} : ( $x );
++    foreach ( @files ) {
++	s/^\Q$base\E\//https:\/\/www.openssl.org\//;
++	$files{$_} = 1;
++	if ( /^(.*)\/index.(html|cgi|pl|php|xhtml|htm)$/ ) {
++	    $files{&quot;$1/&quot;} = $files{&quot;$1&quot;} = 1;
++	}
++    }
++}
++
++# Finally, output the result to the akamai-purge program
++my @files = sort keys %files;
++while ( @files ) {
++    my $count = 500;		# Try not to overwhelm Akamai
++    if ( $dryrun || open PURGE, '| /usr/local/bin/akamai-purge invalidate' ) {
++	printf STDERR
++	    &quot;DEBUG: Invoking '/usr/local/bin/akamai-purge invalidate' with:\n&quot;
++	    if $debug;
++	while ( @files &amp;&amp; $count-- &gt; 0 ) {
++	    my $file = pop @files;
++	    print STDERR &quot;  &quot;,$file,&quot;\n&quot; if $debug;
++	    print PURGE $file,&quot;\n&quot; unless $dryrun;
++	}
++	close PURGE unless $dryrun;
++    }
++}
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034925.html">[web]  master update
+</A></li>
+	<LI>Next message: <A HREF="034986.html">[web]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34984">[ date ]</a>
+              <a href="thread.html#34984">[ thread ]</a>
+              <a href="subject.html#34984">[ subject ]</a>
+              <a href="author.html#34984">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

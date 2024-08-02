@@ -1,0 +1,503 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-October/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1601810666.348211.6493.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="031118.html">
+   <LINK REL="Next"  HREF="031131.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1601810666.348211.6493.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Sun Oct  4 11:24:26 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="031118.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="031131.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31119">[ date ]</a>
+              <a href="thread.html#31119">[ thread ]</a>
+              <a href="subject.html#31119">[ subject ]</a>
+              <a href="author.html#31119">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6514dee7264d30be1ab9ab07f9798071184e7b7a (commit)
+      from  70c06aafa691a77861bd3d3aaf93afa2a55e04ce (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6514dee7264d30be1ab9ab07f9798071184e7b7a
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Sep 30 18:01:06 2020 +0200
+
+    APPS: Reduce deprecation warning suppression - ENGINE
+    
+    Some of our apps turn off deprecation warnings solely for the sake of
+    ENGINE, and thereby shadowing other deprecations that we should take
+    better care of.
+    
+    To solve this, all apps ENGINE functionality is move to one file,
+    where deprecation warning suppression is activate, and the same
+    suppression can then easily be removed in at least some of the apps.
+    Any remaining suppression that we still need to deal with should
+    happen as separate efforts.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13044">https://github.com/openssl/openssl/pull/13044</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/include/apps.h |   6 +++
+ apps/lib/apps.c     |  90 +-------------------------------
+ apps/lib/build.info |   3 +-
+ apps/lib/engine.c   | 145 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ apps/req.c          |  11 ++--
+ apps/s_client.c     |   9 ++--
+ 6 files changed, 162 insertions(+), 102 deletions(-)
+ create mode 100644 apps/lib/engine.c
+
+diff --git a/apps/include/apps.h b/apps/include/apps.h
+index 8a6f2b046c..ac008e9572 100644
+--- a/apps/include/apps.h
++++ b/apps/include/apps.h
+@@ -151,6 +151,12 @@ __owur int ctx_set_ctlog_list_file(SSL_CTX *ctx, const char *path);
+ ENGINE *setup_engine_methods(const char *id, unsigned int methods, int debug);
+ # define setup_engine(e, debug) setup_engine_methods(e, (unsigned int)-1, debug)
+ void release_engine(ENGINE *e);
++int init_engine(ENGINE *e);
++int finish_engine(ENGINE *e);
++EVP_PKEY *load_engine_private_key(ENGINE *e, const char *keyid,
++                                  const char *pass, const char *desc);
++EVP_PKEY *load_engine_public_key(ENGINE *e, const char *keyid,
++                                 const char *pass, const char *desc);
+ 
+ # ifndef OPENSSL_NO_OCSP
+ OCSP_RESPONSE *process_responder(OCSP_REQUEST *req,
+diff --git a/apps/lib/apps.c b/apps/lib/apps.c
+index decd5df7f7..14b8cc8b3c 100644
+--- a/apps/lib/apps.c
++++ b/apps/lib/apps.c
+@@ -7,9 +7,6 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/* We need to use some engine deprecated APIs */
+-#define OPENSSL_SUPPRESS_DEPRECATED
+-
+ #if !defined(_POSIX_C_SOURCE) &amp;&amp; defined(OPENSSL_SYS_VMS)
+ /*
+  * On VMS, you need to define this to get the declaration of fileno().  The
+@@ -36,9 +33,6 @@
+ #include &lt;openssl/pkcs12.h&gt;
+ #include &lt;openssl/ui.h&gt;
+ #include &lt;openssl/safestack.h&gt;
+-#ifndef OPENSSL_NO_ENGINE
+-# include &lt;openssl/engine.h&gt;
+-#endif
+ #ifndef OPENSSL_NO_RSA
+ # include &lt;openssl/rsa.h&gt;
+ #endif
+@@ -557,24 +551,11 @@ EVP_PKEY *load_key(const char *uri, int format, int may_stdin,
+         if (e == NULL) {
+             BIO_printf(bio_err, &quot;No engine specified for loading %s\n&quot;, desc);
+         } else {
+-#ifndef OPENSSL_NO_ENGINE
+-            PW_CB_DATA cb_data;
+-
+-            cb_data.password = pass;
+-            cb_data.prompt_info = uri;
+-            if (ENGINE_init(e)) {
+-                pkey = ENGINE_load_private_key(e, uri,
+-                                               (UI_METHOD *)get_ui_method(),
+-                                               &amp;cb_data);
+-                ENGINE_finish(e);
+-            }
++            pkey = load_engine_private_key(e, uri, pass, desc);
+             if (pkey == NULL) {
+                 BIO_printf(bio_err, &quot;Cannot load %s from engine\n&quot;, desc);
+                 ERR_print_errors(bio_err);
+             }
+-#else
+-            BIO_printf(bio_err, &quot;Engines not supported for loading %s\n&quot;, desc);
+-#endif
+         }
+     } else {
+         (void)load_key_certs_crls(uri, may_stdin, pass, desc,
+@@ -600,20 +581,11 @@ EVP_PKEY *load_pubkey(const char *uri, int format, int maybe_stdin,
+         if (e == NULL) {
+             BIO_printf(bio_err, &quot;No engine specified for loading %s\n&quot;, desc);
+         } else {
+-#ifndef OPENSSL_NO_ENGINE
+-            PW_CB_DATA cb_data;
+-
+-            cb_data.password = pass;
+-            cb_data.prompt_info = uri;
+-            pkey = ENGINE_load_public_key(e, uri, (UI_METHOD *)get_ui_method(),
+-                                          &amp;cb_data);
++            pkey = load_engine_public_key(e, uri, pass, desc);
+             if (pkey == NULL) {
+                 BIO_printf(bio_err, &quot;Cannot load %s from engine\n&quot;, desc);
+                 ERR_print_errors(bio_err);
+             }
+-#else
+-            BIO_printf(bio_err, &quot;Engines not supported for loading %s\n&quot;, desc);
+-#endif
+         }
+     } else {
+         (void)load_key_certs_crls(uri, maybe_stdin, pass, desc,
+@@ -1160,64 +1132,6 @@ X509_STORE *setup_verify(const char *CAfile, int noCAfile,
+     return NULL;
+ }
+ 
+-#ifndef OPENSSL_NO_ENGINE
+-/* Try to load an engine in a shareable library */
+-static ENGINE *try_load_engine(const char *engine)
+-{
+-    ENGINE *e = ENGINE_by_id(&quot;dynamic&quot;);
+-    if (e) {
+-        if (!ENGINE_ctrl_cmd_string(e, &quot;SO_PATH&quot;, engine, 0)
+-            || !ENGINE_ctrl_cmd_string(e, &quot;LOAD&quot;, NULL, 0)) {
+-            ENGINE_free(e);
+-            e = NULL;
+-        }
+-    }
+-    return e;
+-}
+-#endif
+-
+-ENGINE *setup_engine_methods(const char *id, unsigned int methods, int debug)
+-{
+-    ENGINE *e = NULL;
+-
+-#ifndef OPENSSL_NO_ENGINE
+-    if (id != NULL) {
+-        if (strcmp(id, &quot;auto&quot;) == 0) {
+-            BIO_printf(bio_err, &quot;Enabling auto ENGINE support\n&quot;);
+-            ENGINE_register_all_complete();
+-            return NULL;
+-        }
+-        if ((e = ENGINE_by_id(id)) == NULL
+-            &amp;&amp; (e = try_load_engine(id)) == NULL) {
+-            BIO_printf(bio_err, &quot;Invalid engine \&quot;%s\&quot;\n&quot;, id);
+-            ERR_print_errors(bio_err);
+-            return NULL;
+-        }
+-        if (debug)
+-            (void)ENGINE_ctrl(e, ENGINE_CTRL_SET_LOGSTREAM, 0, bio_err, 0);
+-        if (!ENGINE_ctrl_cmd(e, &quot;SET_USER_INTERFACE&quot;, 0,
+-                             (void *)get_ui_method(), 0, 1)
+-                || !ENGINE_set_default(e, methods)) {
+-            BIO_printf(bio_err, &quot;Cannot use engine \&quot;%s\&quot;\n&quot;, ENGINE_get_id(e));
+-            ERR_print_errors(bio_err);
+-            ENGINE_free(e);
+-            return NULL;
+-        }
+-
+-        BIO_printf(bio_err, &quot;Engine \&quot;%s\&quot; set.\n&quot;, ENGINE_get_id(e));
+-    }
+-#endif
+-    return e;
+-}
+-
+-void release_engine(ENGINE *e)
+-{
+-#ifndef OPENSSL_NO_ENGINE
+-    /* Free our &quot;structural&quot; reference. */
+-    ENGINE_free(e);
+-#endif
+-}
+-
+ static unsigned long index_serial_hash(const OPENSSL_CSTRING *a)
+ {
+     const char *n;
+diff --git a/apps/lib/build.info b/apps/lib/build.info
+index 22db095c51..9930ad6212 100644
+--- a/apps/lib/build.info
++++ b/apps/lib/build.info
+@@ -9,7 +9,8 @@ ENDIF
+ 
+ # Source for libapps
+ $LIBAPPSSRC=apps.c apps_ui.c opt.c fmt.c s_cb.c s_socket.c app_rand.c \
+-        columns.c app_params.c names.c app_provider.c app_x509.c http_server.c
++        columns.c app_params.c names.c app_provider.c app_x509.c http_server.c \
++        engine.c
+ 
+ IF[{- !$disabled{apps} -}]
+   LIBS{noinst}=../libapps.a
+diff --git a/apps/lib/engine.c b/apps/lib/engine.c
+new file mode 100644
+index 0000000000..e6682f5e8f
+--- /dev/null
++++ b/apps/lib/engine.c
+@@ -0,0 +1,145 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++/*
++ * Here is a set of wrappers for the ENGINE API, which are no-ops when the
++ * ENGINE API is disabled / removed.
++ * We need to suppress deprecation warnings to make this work.
++ */
++#define OPENSSL_SUPPRESS_DEPRECATED
++
++#include &lt;openssl/types.h&gt; /* Ensure we have the ENGINE type, regardless */
++#ifndef OPENSSL_NO_ENGINE
++# include &lt;openssl/engine.h&gt;
++#endif
++#include &quot;apps.h&quot;
++
++#ifndef OPENSSL_NO_ENGINE
++/* Try to load an engine in a shareable library */
++static ENGINE *try_load_engine(const char *engine)
++{
++    ENGINE *e = NULL;
++
++    if ((e = ENGINE_by_id(&quot;dynamic&quot;)) != NULL) {
++        if (!ENGINE_ctrl_cmd_string(e, &quot;SO_PATH&quot;, engine, 0)
++            || !ENGINE_ctrl_cmd_string(e, &quot;LOAD&quot;, NULL, 0)) {
++            ENGINE_free(e);
++            e = NULL;
++        }
++    }
++    return e;
++}
++#endif
++
++ENGINE *setup_engine_methods(const char *id, unsigned int methods, int debug)
++{
++    ENGINE *e = NULL;
++
++#ifndef OPENSSL_NO_ENGINE
++    if (id != NULL) {
++        if (strcmp(id, &quot;auto&quot;) == 0) {
++            BIO_printf(bio_err, &quot;Enabling auto ENGINE support\n&quot;);
++            ENGINE_register_all_complete();
++            return NULL;
++        }
++        if ((e = ENGINE_by_id(id)) == NULL
++            &amp;&amp; (e = try_load_engine(id)) == NULL) {
++            BIO_printf(bio_err, &quot;Invalid engine \&quot;%s\&quot;\n&quot;, id);
++            ERR_print_errors(bio_err);
++            return NULL;
++        }
++        if (debug)
++            (void)ENGINE_ctrl(e, ENGINE_CTRL_SET_LOGSTREAM, 0, bio_err, 0);
++        if (!ENGINE_ctrl_cmd(e, &quot;SET_USER_INTERFACE&quot;, 0,
++                             (void *)get_ui_method(), 0, 1)
++                || !ENGINE_set_default(e, methods)) {
++            BIO_printf(bio_err, &quot;Cannot use engine \&quot;%s\&quot;\n&quot;, ENGINE_get_id(e));
++            ERR_print_errors(bio_err);
++            ENGINE_free(e);
++            return NULL;
++        }
++
++        BIO_printf(bio_err, &quot;Engine \&quot;%s\&quot; set.\n&quot;, ENGINE_get_id(e));
++    }
++#endif
++    return e;
++}
++
++void release_engine(ENGINE *e)
++{
++#ifndef OPENSSL_NO_ENGINE
++    /* Free our &quot;structural&quot; reference. */
++    ENGINE_free(e);
++#endif
++}
++
++int init_engine(ENGINE *e)
++{
++    int rv = 1;
++
++#ifndef OPENSSL_NO_ENGINE
++    rv = ENGINE_init(e);
++#endif
++    return rv;
++}
++
++int finish_engine(ENGINE *e)
++{
++    int rv = 1;
++
++#ifndef OPENSSL_NO_ENGINE
++    rv = ENGINE_finish(e);
++#endif
++    return rv;
++}
++
++EVP_PKEY *load_engine_private_key(ENGINE *e, const char *keyid,
++                                  const char *pass, const char *desc)
++{
++    EVP_PKEY *rv = NULL;
++
++#ifndef OPENSSL_NO_ENGINE
++    if (init_engine(e)) {
++        PW_CB_DATA cb_data;
++
++        cb_data.password = pass;
++        cb_data.prompt_info = keyid;
++
++        rv = ENGINE_load_private_key(e, keyid,
++                                     (UI_METHOD *)get_ui_method(), &amp;cb_data);
++        finish_engine(e);
++    }
++#else
++    BIO_printf(bio_err, &quot;Engines not supported for loading %s\n&quot;, desc);
++#endif
++    return rv;
++}
++
++EVP_PKEY *load_engine_public_key(ENGINE *e, const char *keyid,
++                                 const char *pass, const char *desc)
++{
++    EVP_PKEY *rv = NULL;
++
++#ifndef OPENSSL_NO_ENGINE
++    if (init_engine(e)) {
++        PW_CB_DATA cb_data;
++
++        cb_data.password = pass;
++        cb_data.prompt_info = keyid;
++
++        rv = ENGINE_load_public_key(e, keyid,
++                                    (UI_METHOD *)get_ui_method(), &amp;cb_data);
++        finish_engine(e);
++    }
++#else
++    BIO_printf(bio_err, &quot;Engines not supported for loading %s\n&quot;, desc);
++#endif
++    return rv;
++}
++
+diff --git a/apps/req.c b/apps/req.c
+index a3abc0b7b7..9fa3429baf 100644
+--- a/apps/req.c
++++ b/apps/req.c
+@@ -7,9 +7,6 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/* We need to use some engine deprecated APIs */
+-#define OPENSSL_SUPPRESS_DEPRECATED
+-
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;time.h&gt;
+@@ -288,7 +285,7 @@ int req_main(int argc, char **argv)
+             break;
+         case OPT_KEYGEN_ENGINE:
+ #ifndef OPENSSL_NO_ENGINE
+-            gen_eng = ENGINE_by_id(opt_arg());
++            gen_eng = setup_engine(opt_arg(), 0);
+             if (gen_eng == NULL) {
+                 BIO_printf(bio_err, &quot;Can't find keygen engine %s\n&quot;, *argv);
+                 goto opthelp;
+@@ -991,7 +988,7 @@ int req_main(int argc, char **argv)
+     lh_OPENSSL_STRING_doall(addexts, exts_cleanup);
+     lh_OPENSSL_STRING_free(addexts);
+ #ifndef OPENSSL_NO_ENGINE
+-    ENGINE_free(gen_eng);
++    release_engine(gen_eng);
+ #endif
+     OPENSSL_free(keyalgstr);
+     X509_REQ_free(req);
+@@ -1510,7 +1507,7 @@ static EVP_PKEY_CTX *set_keygen_ctx(const char *gstr,
+ 
+         EVP_PKEY_asn1_get0_info(NULL, pkey_type, NULL, NULL, NULL, ameth);
+ #ifndef OPENSSL_NO_ENGINE
+-        ENGINE_finish(tmpeng);
++        finish_engine(tmpeng);
+ #endif
+         if (*pkey_type == EVP_PKEY_RSA) {
+             if (p != NULL) {
+@@ -1571,7 +1568,7 @@ static EVP_PKEY_CTX *set_keygen_ctx(const char *gstr,
+         EVP_PKEY_asn1_get0_info(NULL, NULL, NULL, NULL, &amp;anam, ameth);
+         *palgnam = OPENSSL_strdup(anam);
+ #ifndef OPENSSL_NO_ENGINE
+-        ENGINE_finish(tmpeng);
++        finish_engine(tmpeng);
+ #endif
+     }
+ 
+diff --git a/apps/s_client.c b/apps/s_client.c
+index 513beeaa9a..512ac0547b 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -8,9 +8,6 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/* We need to use some engine deprecated APIs */
+-#define OPENSSL_SUPPRESS_DEPRECATED
+-
+ #include &quot;e_os.h&quot;
+ #include &lt;ctype.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -1204,7 +1201,7 @@ int s_client_main(int argc, char **argv)
+             break;
+         case OPT_SSL_CLIENT_ENGINE:
+ #ifndef OPENSSL_NO_ENGINE
+-            ssl_client_engine = ENGINE_by_id(opt_arg());
++            ssl_client_engine = setup_engine(opt_arg(), 0);
+             if (ssl_client_engine == NULL) {
+                 BIO_printf(bio_err, &quot;Error getting client auth engine\n&quot;);
+                 goto opthelp;
+@@ -1881,10 +1878,10 @@ int s_client_main(int argc, char **argv)
+         if (!SSL_CTX_set_client_cert_engine(ctx, ssl_client_engine)) {
+             BIO_puts(bio_err, &quot;Error setting client auth engine\n&quot;);
+             ERR_print_errors(bio_err);
+-            ENGINE_free(ssl_client_engine);
++            release_engine(ssl_client_engine);
+             goto end;
+         }
+-        ENGINE_free(ssl_client_engine);
++        release_engine(ssl_client_engine);
+     }
+ #endif
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="031118.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="031131.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31119">[ date ]</a>
+              <a href="thread.html#31119">[ thread ]</a>
+              <a href="subject.html#31119">[ subject ]</a>
+              <a href="author.html#31119">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,249 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530836439.645388.12919.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019736.html">
+   <LINK REL="Next"  HREF="019741.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530836439.645388.12919.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Fri Jul  6 00:20:39 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019736.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019741.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19737">[ date ]</a>
+              <a href="thread.html#19737">[ thread ]</a>
+              <a href="subject.html#19737">[ subject ]</a>
+              <a href="author.html#19737">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  2ddee136ec4157598b0679f9d5a5097ed77c4c01 (commit)
+      from  f27b906703bf933e2efcebfc1225a4c295abd2a0 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 2ddee136ec4157598b0679f9d5a5097ed77c4c01
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Thu Jul 5 19:57:22 2018 -0400
+
+    Reject duplicate -addext parameters
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6636">https://github.com/openssl/openssl/pull/6636</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/req.c                 | 80 ++++++++++++++++++++++++++++++++++++++++++++--
+ test/recipes/25-test_req.t | 13 +++++++-
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/apps/req.c b/apps/req.c
+index 7e7b994..3d89f20 100644
+--- a/apps/req.c
++++ b/apps/req.c
+@@ -11,6 +11,7 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;time.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;ctype.h&gt;
+ #include &quot;apps.h&quot;
+ #include &quot;progs.h&quot;
+ #include &lt;openssl/bio.h&gt;
+@@ -23,6 +24,8 @@
+ #include &lt;openssl/objects.h&gt;
+ #include &lt;openssl/pem.h&gt;
+ #include &lt;openssl/bn.h&gt;
++#include &lt;openssl/bn.h&gt;
++#include &lt;openssl/lhash.h&gt;
+ #ifndef OPENSSL_NO_RSA
+ # include &lt;openssl/rsa.h&gt;
+ #endif
+@@ -147,6 +150,68 @@ const OPTIONS req_options[] = {
+     {NULL}
+ };
+ 
++
++/*
++ * An LHASH of strings, where each string is an extension name.
++ */
++static unsigned long ext_name_hash(const OPENSSL_STRING *a)
++{
++    return OPENSSL_LH_strhash((const char *)a);
++}
++
++static int ext_name_cmp(const OPENSSL_STRING *a, const OPENSSL_STRING *b)
++{
++    return strcmp((const char *)a, (const char *)b);
++}
++
++static void exts_cleanup(OPENSSL_STRING *x)
++{
++    OPENSSL_free((char *)x);
++}
++
++/*
++ * Is the |kv| key already duplicated?  This is remarkably tricky to get
++ * right.  Return 0 if unique, -1 on runtime error; 1 if found or a syntax
++ * error.
++ */
++static int duplicated(LHASH_OF(OPENSSL_STRING) *addexts, char *kv)
++{
++    char *p;
++
++    /* Check syntax. */
++    if (strchr(kv, '=') == NULL)
++        return 1;
++
++    /* Skip leading whitespace, make a copy. */
++    while (*kv &amp;&amp; isspace(*kv))
++        if (*++kv == '\0')
++            return 1;
++    if ((kv = OPENSSL_strdup(kv)) == NULL)
++        return -1;
++
++    /* Skip trailing space before the equal sign. */
++    for (p = strchr(kv, '='); p &gt; kv; --p)
++        if (p[-1] != ' ' &amp;&amp; p[-1] != '\t')
++            break;
++    if (p == kv) {
++        OPENSSL_free(kv);
++        return 1;
++    }
++    *p = '\0';
++
++    /* Finally have a clean &quot;key&quot;; see if it's there. */
++    if (lh_OPENSSL_STRING_retrieve(addexts, (OPENSSL_STRING*)kv) != NULL) {
++        BIO_printf(bio_err, &quot;Extension \&quot;%s\&quot; repeated\n&quot;, kv);
++        OPENSSL_free(kv);
++        return 1;
++    }
++
++    /* Not found; add it. */
++    if (lh_OPENSSL_STRING_insert(addexts, (OPENSSL_STRING*)kv) == NULL)
++        return -1;
++    return 0;
++}
++
+ int req_main(int argc, char **argv)
+ {
+     ASN1_INTEGER *serial = NULL;
+@@ -155,6 +220,7 @@ int req_main(int argc, char **argv)
+     EVP_PKEY *pkey = NULL;
+     EVP_PKEY_CTX *genctx = NULL;
+     STACK_OF(OPENSSL_STRING) *pkeyopts = NULL, *sigopts = NULL;
++    LHASH_OF(OPENSSL_STRING) *addexts = NULL;
+     X509 *x509ss = NULL;
+     X509_REQ *req = NULL;
+     const EVP_CIPHER *cipher = NULL;
+@@ -324,11 +390,17 @@ int req_main(int argc, char **argv)
+             multirdn = 1;
+             break;
+         case OPT_ADDEXT:
+-            if (addext_bio == NULL) {
++            p = opt_arg();
++            if (addexts == NULL) {
++                addexts = lh_OPENSSL_STRING_new(ext_name_hash, ext_name_cmp);
+                 addext_bio = BIO_new(BIO_s_mem());
++                if (addexts == NULL || addext_bio == NULL)
++                    goto end;
+             }
+-            if (addext_bio == NULL
+-                || BIO_printf(addext_bio, &quot;%s\n&quot;, opt_arg()) &lt; 0)
++            i = duplicated(addexts, p);
++            if (i == 1)
++                goto opthelp;
++            if (i &lt; 0 || BIO_printf(addext_bio, &quot;%s\n&quot;, opt_arg()) &lt; 0)
+                 goto end;
+             break;
+         case OPT_EXTENSIONS:
+@@ -885,6 +957,8 @@ int req_main(int argc, char **argv)
+     EVP_PKEY_CTX_free(genctx);
+     sk_OPENSSL_STRING_free(pkeyopts);
+     sk_OPENSSL_STRING_free(sigopts);
++    lh_OPENSSL_STRING_doall(addexts, exts_cleanup);
++    lh_OPENSSL_STRING_free(addexts);
+ #ifndef OPENSSL_NO_ENGINE
+     ENGINE_free(gen_eng);
+ #endif
+diff --git a/test/recipes/25-test_req.t b/test/recipes/25-test_req.t
+index 82b9bf8..fa79219 100644
+--- a/test/recipes/25-test_req.t
++++ b/test/recipes/25-test_req.t
+@@ -15,13 +15,24 @@ use OpenSSL::Test qw/:DEFAULT srctop_file/;
+ 
+ setup(&quot;test_req&quot;);
+ 
+-plan tests =&gt; 4;
++plan tests =&gt; 8;
+ 
+ require_ok(srctop_file('test','recipes','tconversion.pl'));
+ 
+ open RND, &quot;&gt;&gt;&quot;, &quot;.rnd&quot;;
+ print RND &quot;string to make the random number generator think it has randomness&quot;;
+ close RND;
++
++# Check for duplicate -addext parameters
++my $val = &quot;subjectAltName=DNS:example.com&quot;;
++my $val2 = &quot; &quot; . $val;
++my $val3 = $val;
++$val3 =~ s/=/    =/;
++ok(!run(app([&quot;openssl&quot;, &quot;req&quot;, &quot;-new&quot;, &quot;-addext&quot;, $val, &quot;-addext&quot;, $val])));
++ok(!run(app([&quot;openssl&quot;, &quot;req&quot;, &quot;-new&quot;, &quot;-addext&quot;, $val, &quot;-addext&quot;, $val2])));
++ok(!run(app([&quot;openssl&quot;, &quot;req&quot;, &quot;-new&quot;, &quot;-addext&quot;, $val, &quot;-addext&quot;, $val3])));
++ok(!run(app([&quot;openssl&quot;, &quot;req&quot;, &quot;-new&quot;, &quot;-addext&quot;, $val2, &quot;-addext&quot;, $val3])));
++
+ subtest &quot;generating certificate requests&quot; =&gt; sub {
+     my @req_new;
+     if (disabled(&quot;rsa&quot;)) {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019736.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019741.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19737">[ date ]</a>
+              <a href="thread.html#19737">[ thread ]</a>
+              <a href="subject.html#19737">[ subject ]</a>
+              <a href="author.html#19737">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

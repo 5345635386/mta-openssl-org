@@ -1,0 +1,635 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1599771924.259674.18328.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030496.html">
+   <LINK REL="Next"  HREF="030798.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>matthias.st.pierre at ncp-e.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1599771924.259674.18328.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">matthias.st.pierre at ncp-e.com
+       </A><BR>
+    <I>Thu Sep 10 21:05:24 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030496.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="030798.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30592">[ date ]</a>
+              <a href="thread.html#30592">[ thread ]</a>
+              <a href="subject.html#30592">[ subject ]</a>
+              <a href="author.html#30592">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  8380f453ec81d9172b94a82c3592f78f1a612046 (commit)
+       via  958fec77928a28350f6af252ac5e8d0e6e081faa (commit)
+      from  526cf60408e1a356ec712b6c88a88864fdbe73af (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8380f453ec81d9172b94a82c3592f78f1a612046
+Author: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matthias.st.pierre at ncp-e.com</A>&gt;
+Date:   Tue Sep 1 00:55:36 2020 +0200
+
+    Revert two renamings backported from master
+    
+    The original names were more intuitive: the generate_counter counts the
+    number of generate requests, and the reseed_counter counts the number
+    of reseedings (of the principal DRBG).
+    
+        reseed_gen_counter  -&gt; generate_counter
+        reseed_prop_counter -&gt; reseed_counter
+    
+    This partially reverts commit 35a34508ef4d649ace4e373e1d019192b7e38c36.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12759">https://github.com/openssl/openssl/pull/12759</A>)
+
+commit 958fec77928a28350f6af252ac5e8d0e6e081faa
+Author: Dr. Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matthias.st.pierre at ncp-e.com</A>&gt;
+Date:   Mon Aug 31 23:36:22 2020 +0200
+
+    Fix the DRBG seed propagation
+    
+    In a nutshell, reseed propagation is a compatibility feature with the sole
+    purpose to support the traditional way of (re-)seeding manually by calling
+    'RAND_add()' before 'RAND_bytes(). It ensures that the former has an immediate
+    effect on the latter *within the same thread*, but it does not care about
+    immediate reseed propagation to other threads. The implementation is lock-free,
+    i.e., it works without taking the lock of the primary DRBG.
+    
+    Pull request #7399 not only fixed the data race issue #7394 but also changed
+    the original implementation of the seed propagation unnecessarily.
+    This commit reverts most of the changes of commit 1f98527659b8 and intends to
+    fix the data race while retaining the original simplicity of the seed propagation.
+    
+    - use atomics with relaxed semantics to load and store the seed counter
+    - add a new member drbg-&gt;enable_reseed_propagation to simplify the
+      overflow treatment of the seed propagation counter
+    - don't handle races between different threads
+    
+    This partially reverts commit 1f98527659b8290d442c4e1532452b9ba6463f1e.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12759">https://github.com/openssl/openssl/pull/12759</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/drbg_lib.c   | 54 +++++++++++++++++++++---------------------------
+ crypto/rand/rand_lib.c   |  2 --
+ crypto/rand/rand_local.h | 13 ++++++++----
+ test/drbgtest.c          | 38 +++++++++++++++++-----------------
+ 4 files changed, 52 insertions(+), 55 deletions(-)
+
+diff --git a/crypto/rand/drbg_lib.c b/crypto/rand/drbg_lib.c
+index 73fd4394a3..8c7c28c970 100644
+--- a/crypto/rand/drbg_lib.c
++++ b/crypto/rand/drbg_lib.c
+@@ -327,13 +327,6 @@ int RAND_DRBG_instantiate(RAND_DRBG *drbg,
+         max_entropylen += drbg-&gt;max_noncelen;
+     }
+ 
+-    drbg-&gt;reseed_next_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
+-    if (drbg-&gt;reseed_next_counter) {
+-        drbg-&gt;reseed_next_counter++;
+-        if (!drbg-&gt;reseed_next_counter)
+-            drbg-&gt;reseed_next_counter = 1;
+-    }
+-
+     if (drbg-&gt;get_entropy != NULL)
+         entropylen = drbg-&gt;get_entropy(drbg, &amp;entropy, min_entropy,
+                                        min_entropylen, max_entropylen, 0);
+@@ -359,9 +352,15 @@ int RAND_DRBG_instantiate(RAND_DRBG *drbg,
+     }
+ 
+     drbg-&gt;state = DRBG_READY;
+-    drbg-&gt;reseed_gen_counter = 1;
++    drbg-&gt;generate_counter = 1;
+     drbg-&gt;reseed_time = time(NULL);
+-    tsan_store(&amp;drbg-&gt;reseed_prop_counter, drbg-&gt;reseed_next_counter);
++    if (drbg-&gt;enable_reseed_propagation) {
++        if (drbg-&gt;parent == NULL)
++            tsan_counter(&amp;drbg-&gt;reseed_counter);
++        else
++            tsan_store(&amp;drbg-&gt;reseed_counter,
++                       tsan_load(&amp;drbg-&gt;parent-&gt;reseed_counter));
++    }
+ 
+  end:
+     if (entropy != NULL &amp;&amp; drbg-&gt;cleanup_entropy != NULL)
+@@ -428,14 +427,6 @@ int RAND_DRBG_reseed(RAND_DRBG *drbg,
+     }
+ 
+     drbg-&gt;state = DRBG_ERROR;
+-
+-    drbg-&gt;reseed_next_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
+-    if (drbg-&gt;reseed_next_counter) {
+-        drbg-&gt;reseed_next_counter++;
+-        if (!drbg-&gt;reseed_next_counter)
+-            drbg-&gt;reseed_next_counter = 1;
+-    }
+-
+     if (drbg-&gt;get_entropy != NULL)
+         entropylen = drbg-&gt;get_entropy(drbg, &amp;entropy, drbg-&gt;strength,
+                                        drbg-&gt;min_entropylen,
+@@ -451,9 +442,15 @@ int RAND_DRBG_reseed(RAND_DRBG *drbg,
+         goto end;
+ 
+     drbg-&gt;state = DRBG_READY;
+-    drbg-&gt;reseed_gen_counter = 1;
++    drbg-&gt;generate_counter = 1;
+     drbg-&gt;reseed_time = time(NULL);
+-    tsan_store(&amp;drbg-&gt;reseed_prop_counter, drbg-&gt;reseed_next_counter);
++    if (drbg-&gt;enable_reseed_propagation) {
++        if (drbg-&gt;parent == NULL)
++            tsan_counter(&amp;drbg-&gt;reseed_counter);
++        else
++            tsan_store(&amp;drbg-&gt;reseed_counter,
++                       tsan_load(&amp;drbg-&gt;parent-&gt;reseed_counter));
++    }
+ 
+  end:
+     if (entropy != NULL &amp;&amp; drbg-&gt;cleanup_entropy != NULL)
+@@ -614,7 +611,7 @@ int RAND_DRBG_generate(RAND_DRBG *drbg, unsigned char *out, size_t outlen,
+     }
+ 
+     if (drbg-&gt;reseed_interval &gt; 0) {
+-        if (drbg-&gt;reseed_gen_counter &gt;= drbg-&gt;reseed_interval)
++        if (drbg-&gt;generate_counter &gt;= drbg-&gt;reseed_interval)
+             reseed_required = 1;
+     }
+     if (drbg-&gt;reseed_time_interval &gt; 0) {
+@@ -623,11 +620,8 @@ int RAND_DRBG_generate(RAND_DRBG *drbg, unsigned char *out, size_t outlen,
+             || now - drbg-&gt;reseed_time &gt;= drbg-&gt;reseed_time_interval)
+             reseed_required = 1;
+     }
+-    if (drbg-&gt;parent != NULL) {
+-        unsigned int reseed_counter = tsan_load(&amp;drbg-&gt;reseed_prop_counter);
+-        if (reseed_counter &gt; 0
+-                &amp;&amp; tsan_load(&amp;drbg-&gt;parent-&gt;reseed_prop_counter)
+-                   != reseed_counter)
++    if (drbg-&gt;enable_reseed_propagation &amp;&amp; drbg-&gt;parent != NULL) {
++        if (drbg-&gt;reseed_counter != tsan_load(&amp;drbg-&gt;parent-&gt;reseed_counter))
+             reseed_required = 1;
+     }
+ 
+@@ -646,7 +640,7 @@ int RAND_DRBG_generate(RAND_DRBG *drbg, unsigned char *out, size_t outlen,
+         return 0;
+     }
+ 
+-    drbg-&gt;reseed_gen_counter++;
++    drbg-&gt;generate_counter++;
+ 
+     return 1;
+ }
+@@ -708,8 +702,7 @@ int RAND_DRBG_set_callbacks(RAND_DRBG *drbg,
+                             RAND_DRBG_get_nonce_fn get_nonce,
+                             RAND_DRBG_cleanup_nonce_fn cleanup_nonce)
+ {
+-    if (drbg-&gt;state != DRBG_UNINITIALISED
+-            || drbg-&gt;parent != NULL)
++    if (drbg-&gt;state != DRBG_UNINITIALISED)
+         return 0;
+     drbg-&gt;get_entropy = get_entropy;
+     drbg-&gt;cleanup_entropy = cleanup_entropy;
+@@ -885,8 +878,9 @@ static RAND_DRBG *drbg_setup(RAND_DRBG *parent)
+     if (parent == NULL &amp;&amp; rand_drbg_enable_locking(drbg) == 0)
+         goto err;
+ 
+-    /* enable seed propagation */
+-    tsan_store(&amp;drbg-&gt;reseed_prop_counter, 1);
++    /* enable reseed propagation */
++    drbg-&gt;enable_reseed_propagation = 1;
++    drbg-&gt;reseed_counter = 1;
+ 
+     /*
+      * Ignore instantiation error to support just-in-time instantiation.
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index ab4e9b5486..ba3a29e584 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -174,8 +174,6 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+                                    prediction_resistance,
+                                    (unsigned char *)&amp;drbg, sizeof(drbg)) != 0)
+                 bytes = bytes_needed;
+-            drbg-&gt;reseed_next_counter
+-                = tsan_load(&amp;drbg-&gt;parent-&gt;reseed_prop_counter);
+             rand_drbg_unlock(drbg-&gt;parent);
+ 
+             rand_pool_add_end(pool, bytes, 8 * bytes);
+diff --git a/crypto/rand/rand_local.h b/crypto/rand/rand_local.h
+index 0cdfb3332e..a5de5252dc 100644
+--- a/crypto/rand/rand_local.h
++++ b/crypto/rand/rand_local.h
+@@ -235,7 +235,7 @@ struct rand_drbg_st {
+     size_t max_perslen, max_adinlen;
+ 
+     /* Counts the number of generate requests since the last reseed. */
+-    unsigned int reseed_gen_counter;
++    unsigned int generate_counter;
+     /*
+      * Maximum number of generate requests until a reseed is required.
+      * This value is ignored if it is zero.
+@@ -248,9 +248,15 @@ struct rand_drbg_st {
+      * This value is ignored if it is zero.
+      */
+     time_t reseed_time_interval;
++
++    /*
++     * Enables reseed propagation (see following comment)
++     */
++    unsigned int enable_reseed_propagation;
++
+     /*
+      * Counts the number of reseeds since instantiation.
+-     * This value is ignored if it is zero.
++     * This value is ignored if enable_reseed_propagation is zero.
+      *
+      * This counter is used only for seed propagation from the &lt;master&gt; DRBG
+      * to its two children, the &lt;public&gt; and &lt;private&gt; DRBG. This feature is
+@@ -258,8 +264,7 @@ struct rand_drbg_st {
+      * is added by RAND_add() or RAND_seed() will have an immediate effect on
+      * the output of RAND_bytes() resp. RAND_priv_bytes().
+      */
+-    TSAN_QUALIFIER unsigned int reseed_prop_counter;
+-    unsigned int reseed_next_counter;
++    TSAN_QUALIFIER unsigned int reseed_counter;
+ 
+     size_t seedlen;
+     DRBG_STATUS state;
+diff --git a/test/drbgtest.c b/test/drbgtest.c
+index be001ee18e..e7a7710790 100644
+--- a/test/drbgtest.c
++++ b/test/drbgtest.c
+@@ -388,15 +388,15 @@ static int error_check(DRBG_SELFTEST_DATA *td)
+     /* Instantiate again with valid data */
+     if (!instantiate(drbg, td, &amp;t))
+         goto err;
+-    reseed_counter_tmp = drbg-&gt;reseed_gen_counter;
+-    drbg-&gt;reseed_gen_counter = drbg-&gt;reseed_interval;
++    reseed_counter_tmp = drbg-&gt;generate_counter;
++    drbg-&gt;generate_counter = drbg-&gt;reseed_interval;
+ 
+     /* Generate output and check entropy has been requested for reseed */
+     t.entropycnt = 0;
+     if (!TEST_true(RAND_DRBG_generate(drbg, buff, td-&gt;exlen, 0,
+                                       td-&gt;adin, td-&gt;adinlen))
+             || !TEST_int_eq(t.entropycnt, 1)
+-            || !TEST_int_eq(drbg-&gt;reseed_gen_counter, reseed_counter_tmp + 1)
++            || !TEST_int_eq(drbg-&gt;generate_counter, reseed_counter_tmp + 1)
+             || !uninstantiate(drbg))
+         goto err;
+ 
+@@ -413,15 +413,15 @@ static int error_check(DRBG_SELFTEST_DATA *td)
+     /* Test reseed counter works */
+     if (!instantiate(drbg, td, &amp;t))
+         goto err;
+-    reseed_counter_tmp = drbg-&gt;reseed_gen_counter;
+-    drbg-&gt;reseed_gen_counter = drbg-&gt;reseed_interval;
++    reseed_counter_tmp = drbg-&gt;generate_counter;
++    drbg-&gt;generate_counter = drbg-&gt;reseed_interval;
+ 
+     /* Generate output and check entropy has been requested for reseed */
+     t.entropycnt = 0;
+     if (!TEST_true(RAND_DRBG_generate(drbg, buff, td-&gt;exlen, 0,
+                                       td-&gt;adin, td-&gt;adinlen))
+             || !TEST_int_eq(t.entropycnt, 1)
+-            || !TEST_int_eq(drbg-&gt;reseed_gen_counter, reseed_counter_tmp + 1)
++            || !TEST_int_eq(drbg-&gt;generate_counter, reseed_counter_tmp + 1)
+             || !uninstantiate(drbg))
+         goto err;
+ 
+@@ -600,14 +600,14 @@ static int test_drbg_reseed(int expect_success,
+      */
+ 
+     /* Test whether seed propagation is enabled */
+-    if (!TEST_int_ne(master-&gt;reseed_prop_counter, 0)
+-        || !TEST_int_ne(public-&gt;reseed_prop_counter, 0)
+-        || !TEST_int_ne(private-&gt;reseed_prop_counter, 0))
++    if (!TEST_int_ne(master-&gt;reseed_counter, 0)
++        || !TEST_int_ne(public-&gt;reseed_counter, 0)
++        || !TEST_int_ne(private-&gt;reseed_counter, 0))
+         return 0;
+ 
+     /* Check whether the master DRBG's reseed counter is the largest one */
+-    if (!TEST_int_le(public-&gt;reseed_prop_counter, master-&gt;reseed_prop_counter)
+-        || !TEST_int_le(private-&gt;reseed_prop_counter, master-&gt;reseed_prop_counter))
++    if (!TEST_int_le(public-&gt;reseed_counter, master-&gt;reseed_counter)
++        || !TEST_int_le(private-&gt;reseed_counter, master-&gt;reseed_counter))
+         return 0;
+ 
+     /*
+@@ -655,8 +655,8 @@ static int test_drbg_reseed(int expect_success,
+ 
+     if (expect_success == 1) {
+         /* Test whether all three reseed counters are synchronized */
+-        if (!TEST_int_eq(public-&gt;reseed_prop_counter, master-&gt;reseed_prop_counter)
+-            || !TEST_int_eq(private-&gt;reseed_prop_counter, master-&gt;reseed_prop_counter))
++        if (!TEST_int_eq(public-&gt;reseed_counter, master-&gt;reseed_counter)
++            || !TEST_int_eq(private-&gt;reseed_counter, master-&gt;reseed_counter))
+             return 0;
+ 
+         /* Test whether reseed time of master DRBG is set correctly */
+@@ -770,7 +770,7 @@ static int test_rand_drbg_reseed(void)
+      * Test whether the public and private DRBG are both reseeded when their
+      * reseed counters differ from the master's reseed counter.
+      */
+-    master-&gt;reseed_prop_counter++;
++    master-&gt;reseed_counter++;
+     if (!TEST_true(test_drbg_reseed(1, master, public, private, 0, 1, 1, 0)))
+         goto error;
+     reset_drbg_hook_ctx();
+@@ -779,8 +779,8 @@ static int test_rand_drbg_reseed(void)
+      * Test whether the public DRBG is reseeded when its reseed counter differs
+      * from the master's reseed counter.
+      */
+-    master-&gt;reseed_prop_counter++;
+-    private-&gt;reseed_prop_counter++;
++    master-&gt;reseed_counter++;
++    private-&gt;reseed_counter++;
+     if (!TEST_true(test_drbg_reseed(1, master, public, private, 0, 1, 0, 0)))
+         goto error;
+     reset_drbg_hook_ctx();
+@@ -789,8 +789,8 @@ static int test_rand_drbg_reseed(void)
+      * Test whether the private DRBG is reseeded when its reseed counter differs
+      * from the master's reseed counter.
+      */
+-    master-&gt;reseed_prop_counter++;
+-    public-&gt;reseed_prop_counter++;
++    master-&gt;reseed_counter++;
++    public-&gt;reseed_counter++;
+     if (!TEST_true(test_drbg_reseed(1, master, public, private, 0, 0, 1, 0)))
+         goto error;
+     reset_drbg_hook_ctx();
+@@ -823,7 +823,7 @@ static int test_rand_drbg_reseed(void)
+      * Test whether none of the DRBGs is reseed if the master fails to reseed
+      */
+     master_ctx.fail = 1;
+-    master-&gt;reseed_prop_counter++;
++    master-&gt;reseed_counter++;
+     RAND_add(rand_add_buf, sizeof(rand_add_buf), sizeof(rand_add_buf));
+     if (!TEST_true(test_drbg_reseed(0, master, public, private, 0, 0, 0, 0)))
+         goto error;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030496.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="030798.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30592">[ date ]</a>
+              <a href="thread.html#30592">[ thread ]</a>
+              <a href="subject.html#30592">[ subject ]</a>
+              <a href="author.html#30592">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

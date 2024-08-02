@@ -1,0 +1,520 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530637347.406115.17266.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019716.html">
+   <LINK REL="Next"  HREF="019723.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530637347.406115.17266.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Tue Jul  3 17:02:27 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019716.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019723.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19722">[ date ]</a>
+              <a href="thread.html#19722">[ thread ]</a>
+              <a href="subject.html#19722">[ subject ]</a>
+              <a href="author.html#19722">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  d5487a454c485eb6f9aef7fb0cb1c0681a06fd25 (commit)
+       via  b068a9b914887af5cc99895754412582fbb0e10b (commit)
+      from  4cb004573a28fe5f8f8d95dc9407e0fe9df6f14c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit d5487a454c485eb6f9aef7fb0cb1c0681a06fd25
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jul 2 13:16:33 2018 +0200
+
+    chacha/asm/chacha-x86_64.pl: add dedicated path for 128-byte inputs.
+    
+    The 128-byte vectors are extensively used in chacha20_poly1305_tls_cipher
+    and dedicated code path is ~30-50% faster on most platforms.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6626">https://github.com/openssl/openssl/pull/6626</A>)
+
+commit b068a9b914887af5cc99895754412582fbb0e10b
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jul 2 13:12:49 2018 +0200
+
+    perlasm/x86_64-xlate.pl: refine symbol recognition in .xdata.
+    
+    Hexadecimals were erroneously recognized as symbols in .xdata.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6626">https://github.com/openssl/openssl/pull/6626</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/chacha/asm/chacha-x86_64.pl | 295 +++++++++++++++++++++++++++----------
+ crypto/perlasm/x86_64-xlate.pl     |   2 +-
+ 2 files changed, 222 insertions(+), 75 deletions(-)
+
+diff --git a/crypto/chacha/asm/chacha-x86_64.pl b/crypto/chacha/asm/chacha-x86_64.pl
+index 51bb6a9..b54f3b1 100755
+--- a/crypto/chacha/asm/chacha-x86_64.pl
++++ b/crypto/chacha/asm/chacha-x86_64.pl
+@@ -1,5 +1,5 @@
+ #! /usr/bin/env perl
+-# Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright 2016-2018 The OpenSSL Project Authors. All Rights Reserved.
+ #
+ # Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -28,33 +28,32 @@
+ #
+ # Performance in cycles per byte out of large buffer.
+ #
+-#		IALU/gcc 4.8(i)	1xSSSE3/SSE2	4xSSSE3	    NxAVX(v)
++#		IALU/gcc 4.8(i)	1x/2xSSSE3(ii)	4xSSSE3	    NxAVX(v)
+ #
+-# P4		9.48/+99%	-/22.7(ii)	-
+-# Core2		7.83/+55%	7.90/8.08	4.35
+-# Westmere	7.19/+50%	5.60/6.70	3.00
+-# Sandy Bridge	8.31/+42%	5.45/6.76	2.72
+-# Ivy Bridge	6.71/+46%	5.40/6.49	2.41
+-# Haswell	5.92/+43%	5.20/6.45	2.42	    1.23
+-# Skylake[-X]	5.87/+39%	4.70/-		2.31	    1.19[0.80(vi)]
+-# Silvermont	12.0/+33%	7.75/7.40	7.03(iii)
+-# Knights L	11.7/-		-		9.60(iii)   0.80
+-# Goldmont	10.6/+17%	5.10/-		3.28
+-# Sledgehammer	7.28/+52%	-/14.2(ii)	-
+-# Bulldozer	9.66/+28%	9.85/11.1	3.06(iv)
+-# Ryzen		5.96/+50%	5.19/-		2.40        2.09
+-# VIA Nano	10.5/+46%	6.72/8.60	6.05
++# P4		9.48/+99%	-		-
++# Core2		7.83/+55%	7.90/5.76	4.35
++# Westmere	7.19/+50%	5.60/4.50	3.00
++# Sandy Bridge	8.31/+42%	5.45/4.00	2.72
++# Ivy Bridge	6.71/+46%	5.40/?		2.41
++# Haswell	5.92/+43%	5.20/3.45	2.42        1.23
++# Skylake[-X]	5.87/+39%	4.70/3.22	2.31        1.19[0.80(vi)]
++# Silvermont	12.0/+33%	7.75/6.90	7.03(iii)
++# Knights L	11.7/-		?		9.60(iii)   0.80
++# Goldmont	10.6/+17%	5.10/3.52	3.28
++# Sledgehammer	7.28/+52%	-		-
++# Bulldozer	9.66/+28%	9.85/5.35(iv)	3.06(iv)
++# Ryzen		5.96/+50%	5.19/3.00	2.40        2.09
++# VIA Nano	10.5/+46%	6.72/6.88	6.05
+ #
+ # (i)	compared to older gcc 3.x one can observe &gt;2x improvement on
+ #	most platforms;
+-# (ii)	as it can be seen, SSE2 performance is too low on legacy
+-#	processors; NxSSE2 results are naturally better, but not
+-#	impressively better than IALU ones, which is why you won't
+-#	find SSE2 code below;
++# (ii)	2xSSSE3 is code path optimized specifically for 128 bytes used
++#	by chacha20_poly1305_tls_cipher, results are EVP-free;
+ # (iii)	this is not optimal result for Atom because of MSROM
+ #	limitations, SSE2 can do better, but gain is considered too
+ #	low to justify the [maintenance] effort;
+-# (iv)	Bulldozer actually executes 4xXOP code path that delivers 2.20;
++# (iv)	Bulldozer actually executes 4xXOP code path that delivers 2.20
++#	and 4.85 for 128-byte inputs;
+ # (v)	8xAVX2, 8xAVX512VL or 16xAVX512F, whichever best applicable;
+ # (vi)	even though Skylake-X can execute AVX512F code and deliver 0.57
+ #	cpb in single thread, the corresponding capability is suppressed;
+@@ -489,6 +488,7 @@ $code.=&lt;&lt;___	if ($avx);
+ ___
+ $code.=&lt;&lt;___;
+ 	cmp	\$128,$len		# we might throw away some data,
++	je	.LChaCha20_128
+ 	ja	.LChaCha20_4x		# but overall it won't be slower
+ 
+ .Ldo_sse3_after_all:
+@@ -606,6 +606,172 @@ ___
+ }
+ 
+ ########################################################################
++# SSSE3 code path that handles 128-byte inputs
++{
++my ($a,$b,$c,$d,$t,$t1,$rot16,$rot24)=map(&quot;%xmm$_&quot;,(8,9,2..7));
++my ($a1,$b1,$c1,$d1)=map(&quot;%xmm$_&quot;,(10,11,0,1));
++
++sub SSSE3ROUND_2x {
++	&amp;paddd	($a,$b);
++	&amp;pxor	($d,$a);
++	 &amp;paddd	($a1,$b1);
++	 &amp;pxor	($d1,$a1);
++	&amp;pshufb	($d,$rot16);
++	 &amp;pshufb($d1,$rot16);
++
++	&amp;paddd	($c,$d);
++	 &amp;paddd	($c1,$d1);
++	&amp;pxor	($b,$c);
++	 &amp;pxor	($b1,$c1);
++	&amp;movdqa	($t,$b);
++	&amp;psrld	($b,20);
++	 &amp;movdqa($t1,$b1);
++	&amp;pslld	($t,12);
++	 &amp;psrld	($b1,20);
++	&amp;por	($b,$t);
++	 &amp;pslld	($t1,12);
++	 &amp;por	($b1,$t1);
++
++	&amp;paddd	($a,$b);
++	&amp;pxor	($d,$a);
++	 &amp;paddd	($a1,$b1);
++	 &amp;pxor	($d1,$a1);
++	&amp;pshufb	($d,$rot24);
++	 &amp;pshufb($d1,$rot24);
++
++	&amp;paddd	($c,$d);
++	 &amp;paddd	($c1,$d1);
++	&amp;pxor	($b,$c);
++	 &amp;pxor	($b1,$c1);
++	&amp;movdqa	($t,$b);
++	&amp;psrld	($b,25);
++	 &amp;movdqa($t1,$b1);
++	&amp;pslld	($t,7);
++	 &amp;psrld	($b1,25);
++	&amp;por	($b,$t);
++	 &amp;pslld	($t1,7);
++	 &amp;por	($b1,$t1);
++}
++
++my $xframe = $win64 ? 0x68 : 8;
++
++$code.=&lt;&lt;___;
++.type	ChaCha20_128,\@function,5
++.align	32
++ChaCha20_128:
++.cfi_startproc
++.LChaCha20_128:
++	mov	%rsp,%r9		# frame pointer
++.cfi_def_cfa_register	%r9
++	sub	\$64+$xframe,%rsp
++___
++$code.=&lt;&lt;___	if ($win64);
++	movaps	%xmm6,-0x68(%r9)
++	movaps	%xmm7,-0x58(%r9)
++	movaps	%xmm8,-0x48(%r9)
++	movaps	%xmm9,-0x38(%r9)
++	movaps	%xmm10,-0x28(%r9)
++	movaps	%xmm11,-0x18(%r9)
++.L128_body:
++___
++$code.=&lt;&lt;___;
++	movdqa	.Lsigma(%rip),$a
++	movdqu	($key),$b
++	movdqu	16($key),$c
++	movdqu	($counter),$d
++	movdqa	.Lone(%rip),$d1
++	movdqa	.Lrot16(%rip),$rot16
++	movdqa	.Lrot24(%rip),$rot24
++
++	movdqa	$a,$a1
++	movdqa	$a,0x00(%rsp)
++	movdqa	$b,$b1
++	movdqa	$b,0x10(%rsp)
++	movdqa	$c,$c1
++	movdqa	$c,0x20(%rsp)
++	paddd	$d,$d1
++	movdqa	$d,0x30(%rsp)
++	mov	\$10,$counter		# reuse $counter
++	jmp	.Loop_128
++
++.align	32
++.Loop_128:
++___
++	&amp;SSSE3ROUND_2x();
++	&amp;pshufd	($c,$c,0b01001110);
++	&amp;pshufd	($b,$b,0b00111001);
++	&amp;pshufd	($d,$d,0b10010011);
++	&amp;pshufd	($c1,$c1,0b01001110);
++	&amp;pshufd	($b1,$b1,0b00111001);
++	&amp;pshufd	($d1,$d1,0b10010011);
++
++	&amp;SSSE3ROUND_2x();
++	&amp;pshufd	($c,$c,0b01001110);
++	&amp;pshufd	($b,$b,0b10010011);
++	&amp;pshufd	($d,$d,0b00111001);
++	&amp;pshufd	($c1,$c1,0b01001110);
++	&amp;pshufd	($b1,$b1,0b10010011);
++	&amp;pshufd	($d1,$d1,0b00111001);
++
++	&amp;dec	($counter);
++	&amp;jnz	(&quot;.Loop_128&quot;);
++
++$code.=&lt;&lt;___;
++	paddd	0x00(%rsp),$a
++	paddd	0x10(%rsp),$b
++	paddd	0x20(%rsp),$c
++	paddd	0x30(%rsp),$d
++	paddd	.Lone(%rip),$d1
++	paddd	0x00(%rsp),$a1
++	paddd	0x10(%rsp),$b1
++	paddd	0x20(%rsp),$c1
++	paddd	0x30(%rsp),$d1
++
++	movdqu	0x00($inp),$t
++	movdqu	0x10($inp),$t1
++	pxor	$t,$a			# xor with input
++	movdqu	0x20($inp),$t
++	pxor	$t1,$b
++	movdqu	0x30($inp),$t1
++	pxor	$t,$c
++	movdqu	0x40($inp),$t
++	pxor	$t1,$d
++	movdqu	0x50($inp),$t1
++	pxor	$t,$a1
++	movdqu	0x60($inp),$t
++	pxor	$t1,$b1
++	movdqu	0x70($inp),$t1
++	pxor	$t,$c1
++	pxor	$t1,$d1
++
++	movdqu	$a,0x00($out)		# write output
++	movdqu	$b,0x10($out)
++	movdqu	$c,0x20($out)
++	movdqu	$d,0x30($out)
++	movdqu	$a1,0x40($out)
++	movdqu	$b1,0x50($out)
++	movdqu	$c1,0x60($out)
++	movdqu	$d1,0x70($out)
++___
++$code.=&lt;&lt;___	if ($win64);
++	movaps	-0x68(%r9),%xmm6
++	movaps	-0x58(%r9),%xmm7
++	movaps	-0x48(%r9),%xmm8
++	movaps	-0x38(%r9),%xmm9
++	movaps	-0x28(%r9),%xmm10
++	movaps	-0x18(%r9),%xmm11
++___
++$code.=&lt;&lt;___;
++	lea	(%r9),%rsp
++.cfi_def_cfa_register	%rsp
++.L128_epilogue:
++	ret
++.cfi_endproc
++.size	ChaCha20_128,.-ChaCha20_128
++___
++}
++
++########################################################################
+ # SSSE3 code path that handles longer messages.
+ {
+ # assign variables to favor Atom front-end
+@@ -3674,9 +3840,9 @@ se_handler:
+ 	ret
+ .size	se_handler,.-se_handler
+ 
+-.type	ssse3_handler,\@abi-omnipotent
++.type	simd_handler,\@abi-omnipotent
+ .align	16
+-ssse3_handler:
++simd_handler:
+ 	push	%rsi
+ 	push	%rdi
+ 	push	%rbx
+@@ -3702,57 +3868,20 @@ ssse3_handler:
+ 	mov	192($context),%rax	# pull context-&gt;R9
+ 
+ 	mov	4(%r11),%r10d		# HandlerData[1]
++	mov	8(%r11),%ecx		# HandlerData[2]
+ 	lea	(%rsi,%r10),%r10	# epilogue label
+ 	cmp	%r10,%rbx		# context-&gt;Rip&gt;=epilogue label
+ 	jae	.Lcommon_seh_tail
+ 
+-	lea	-0x28(%rax),%rsi
++	neg	%rcx
++	lea	-8(%rax,%rcx),%rsi
+ 	lea	512($context),%rdi	# &amp;context.Xmm6
+-	mov	\$4,%ecx
++	neg	%ecx
++	shr	\$3,%ecx
+ 	.long	0xa548f3fc		# cld; rep movsq
+ 
+ 	jmp	.Lcommon_seh_tail
+-.size	ssse3_handler,.-ssse3_handler
+-
+-.type	full_handler,\@abi-omnipotent
+-.align	16
+-full_handler:
+-	push	%rsi
+-	push	%rdi
+-	push	%rbx
+-	push	%rbp
+-	push	%r12
+-	push	%r13
+-	push	%r14
+-	push	%r15
+-	pushfq
+-	sub	\$64,%rsp
+-
+-	mov	120($context),%rax	# pull context-&gt;Rax
+-	mov	248($context),%rbx	# pull context-&gt;Rip
+-
+-	mov	8($disp),%rsi		# disp-&gt;ImageBase
+-	mov	56($disp),%r11		# disp-&gt;HandlerData
+-
+-	mov	0(%r11),%r10d		# HandlerData[0]
+-	lea	(%rsi,%r10),%r10	# prologue label
+-	cmp	%r10,%rbx		# context-&gt;Rip&lt;prologue label
+-	jb	.Lcommon_seh_tail
+-
+-	mov	192($context),%rax	# pull context-&gt;R9
+-
+-	mov	4(%r11),%r10d		# HandlerData[1]
+-	lea	(%rsi,%r10),%r10	# epilogue label
+-	cmp	%r10,%rbx		# context-&gt;Rip&gt;=epilogue label
+-	jae	.Lcommon_seh_tail
+-
+-	lea	-0xa8(%rax),%rsi
+-	lea	512($context),%rdi	# &amp;context.Xmm6
+-	mov	\$20,%ecx
+-	.long	0xa548f3fc		# cld; rep movsq
+-
+-	jmp	.Lcommon_seh_tail
+-.size	full_handler,.-full_handler
++.size	simd_handler,.-simd_handler
+ 
+ .section	.pdata
+ .align	4
+@@ -3764,6 +3893,10 @@ full_handler:
+ 	.rva	.LSEH_end_ChaCha20_ssse3
+ 	.rva	.LSEH_info_ChaCha20_ssse3
+ 
++	.rva	.LSEH_begin_ChaCha20_128
++	.rva	.LSEH_end_ChaCha20_128
++	.rva	.LSEH_info_ChaCha20_128
++
+ 	.rva	.LSEH_begin_ChaCha20_4x
+ 	.rva	.LSEH_end_ChaCha20_4x
+ 	.rva	.LSEH_info_ChaCha20_4x
+@@ -3804,46 +3937,60 @@ $code.=&lt;&lt;___;
+ 
+ .LSEH_info_ChaCha20_ssse3:
+ 	.byte	9,0,0,0
+-	.rva	ssse3_handler
++	.rva	simd_handler
+ 	.rva	.Lssse3_body,.Lssse3_epilogue
++	.long	0x20,0
++
++.LSEH_info_ChaCha20_128:
++	.byte	9,0,0,0
++	.rva	simd_handler
++	.rva	.L128_body,.L128_epilogue
++	.long	0x60,0
+ 
+ .LSEH_info_ChaCha20_4x:
+ 	.byte	9,0,0,0
+-	.rva	full_handler
++	.rva	simd_handler
+ 	.rva	.L4x_body,.L4x_epilogue
++	.long	0xa0,0
+ ___
+ $code.=&lt;&lt;___ if ($avx);
+ .LSEH_info_ChaCha20_4xop:
+ 	.byte	9,0,0,0
+-	.rva	full_handler
++	.rva	simd_handler
+ 	.rva	.L4xop_body,.L4xop_epilogue		# HandlerData[]
++	.long	0xa0,0
+ ___
+ $code.=&lt;&lt;___ if ($avx&gt;1);
+ .LSEH_info_ChaCha20_8x:
+ 	.byte	9,0,0,0
+-	.rva	full_handler
++	.rva	simd_handler
+ 	.rva	.L8x_body,.L8x_epilogue			# HandlerData[]
++	.long	0xa0,0
+ ___
+ $code.=&lt;&lt;___ if ($avx&gt;2);
+ .LSEH_info_ChaCha20_avx512:
+ 	.byte	9,0,0,0
+-	.rva	ssse3_handler
++	.rva	simd_handler
+ 	.rva	.Lavx512_body,.Lavx512_epilogue		# HandlerData[]
++	.long	0x20,0
+ 
+ .LSEH_info_ChaCha20_avx512vl:
+ 	.byte	9,0,0,0
+-	.rva	ssse3_handler
++	.rva	simd_handler
+ 	.rva	.Lavx512vl_body,.Lavx512vl_epilogue	# HandlerData[]
++	.long	0x20,0
+ 
+ .LSEH_info_ChaCha20_16x:
+ 	.byte	9,0,0,0
+-	.rva	full_handler
++	.rva	simd_handler
+ 	.rva	.L16x_body,.L16x_epilogue		# HandlerData[]
++	.long	0xa0,0
+ 
+ .LSEH_info_ChaCha20_8xvl:
+ 	.byte	9,0,0,0
+-	.rva	full_handler
++	.rva	simd_handler
+ 	.rva	.L8xvl_body,.L8xvl_epilogue		# HandlerData[]
++	.long	0xa0,0
+ ___
+ }
+ 
+diff --git a/crypto/perlasm/x86_64-xlate.pl b/crypto/perlasm/x86_64-xlate.pl
+index eac21c1..0bde5ee 100755
+--- a/crypto/perlasm/x86_64-xlate.pl
++++ b/crypto/perlasm/x86_64-xlate.pl
+@@ -877,7 +877,7 @@ my %globals;
+ 							$var=~s/^(0b[0-1]+)/oct($1)/eig;
+ 							$var=~s/^0x([0-9a-f]+)/0$1h/ig if ($masm);
+ 							if ($sz eq &quot;D&quot; &amp;&amp; ($current_segment=~/.[px]data/ || $dir eq &quot;.rva&quot;))
+-							{ $var=~s/([_a-z\$\@][_a-z0-9\$\@]*)/$nasm?&quot;$1 wrt ..imagebase&quot;:&quot;imagerel $1&quot;/egi; }
++							{ $var=~s/^([_a-z\$\@][_a-z0-9\$\@]*)/$nasm?&quot;$1 wrt ..imagebase&quot;:&quot;imagerel $1&quot;/egi; }
+ 							$var;
+ 						    };
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019716.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019723.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19722">[ date ]</a>
+              <a href="thread.html#19722">[ thread ]</a>
+              <a href="subject.html#19722">[ subject ]</a>
+              <a href="author.html#19722">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,470 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1613726712.099242.21752.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033174.html">
+   <LINK REL="Next"  HREF="033176.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1613726712.099242.21752.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Fri Feb 19 09:25:12 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033174.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033176.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33175">[ date ]</a>
+              <a href="thread.html#33175">[ thread ]</a>
+              <a href="subject.html#33175">[ subject ]</a>
+              <a href="author.html#33175">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  576892d78f80cf9a169e7f766319c843e430f378 (commit)
+      from  ef33889e1878739a8355e8ba027b3ed21a917898 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 576892d78f80cf9a169e7f766319c843e430f378
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Wed Dec 2 17:52:24 2020 +1000
+
+    Fix d2i_AutoPrivateKey_ex so that is uses the new decoder (and produces
+    non legacy keys).
+    
+    Fixes #13522
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13591">https://github.com/openssl/openssl/pull/13591</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/d2i_pr.c                               | 100 +++++++++++----------
+ include/crypto/evp.h                               |   4 +
+ .../implementations/encode_decode/decode_der2key.c |   5 +-
+ .../implementations/encode_decode/encode_key2any.c |  24 ++++-
+ test/evp_extra_test2.c                             |  84 ++++++++++++++++-
+ 5 files changed, 162 insertions(+), 55 deletions(-)
+
+diff --git a/crypto/asn1/d2i_pr.c b/crypto/asn1/d2i_pr.c
+index dfe770cb7f..21ae90e8e2 100644
+--- a/crypto/asn1/d2i_pr.c
++++ b/crypto/asn1/d2i_pr.c
+@@ -15,15 +15,60 @@
+ #include &lt;openssl/bn.h&gt;
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/objects.h&gt;
++#include &lt;openssl/decoder.h&gt;
+ #include &lt;openssl/engine.h&gt;
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/asn1.h&gt;
+ #include &quot;crypto/asn1.h&quot;
+ #include &quot;crypto/evp.h&quot;
++#include &quot;internal/asn1.h&quot;
+ 
+-EVP_PKEY *d2i_PrivateKey_ex(int type, EVP_PKEY **a, const unsigned char **pp,
++EVP_PKEY *d2i_PrivateKey_ex(int keytype, EVP_PKEY **a, const unsigned char **pp,
+                             long length, OSSL_LIB_CTX *libctx,
+                             const char *propq)
++{
++    OSSL_DECODER_CTX *dctx = NULL;
++    size_t len = length;
++    EVP_PKEY *pkey = NULL;
++    EVP_PKEY **ppkey = &pkey;
++    const char *key_name = NULL;
++    const char *input_structures[] = { &quot;type-specific&quot;, &quot;pkcs8&quot;, NULL };
++    int i, ret;
++
++    if (keytype != EVP_PKEY_NONE) {
++        key_name = evp_pkey_type2name(keytype);
++        if (key_name == NULL)
++            return NULL;
++    }
++    if (a != NULL &amp;&amp; *a != NULL)
++        ppkey = a;
++
++    for (i = 0;  i &lt; (int)OSSL_NELEM(input_structures); ++i) {
++        dctx = OSSL_DECODER_CTX_new_by_EVP_PKEY(ppkey, &quot;DER&quot;,
++                                                input_structures[i], key_name,
++                                                EVP_PKEY_KEYPAIR, libctx, propq);
++        if (dctx == NULL)
++            return NULL;
++
++        ret = OSSL_DECODER_from_data(dctx, pp, &amp;len);
++        OSSL_DECODER_CTX_free(dctx);
++        if (ret) {
++            if (*ppkey != NULL
++                &amp;&amp; evp_keymgmt_util_has(*ppkey, OSSL_KEYMGMT_SELECT_PRIVATE_KEY))
++                return *ppkey;
++            goto err;
++        }
++    }
++    /* Fall through to error if all decodes failed */
++err:
++    if (ppkey != a)
++        EVP_PKEY_free(*ppkey);
++    return NULL;
++}
++
++EVP_PKEY *evp_privatekey_from_binary(int keytype, EVP_PKEY **a,
++                                     const unsigned char **pp, long length,
++                                     OSSL_LIB_CTX *libctx, const char *propq)
+ {
+     EVP_PKEY *ret;
+     const unsigned char *p = *pp;
+@@ -41,7 +86,7 @@ EVP_PKEY *d2i_PrivateKey_ex(int type, EVP_PKEY **a, const unsigned char **pp,
+ #endif
+     }
+ 
+-    if (!EVP_PKEY_set_type(ret, type)) {
++    if (!EVP_PKEY_set_type(ret, keytype)) {
+         ERR_raise(ERR_LIB_ASN1, ASN1_R_UNKNOWN_PUBLIC_KEY_TYPE);
+         goto err;
+     }
+@@ -67,7 +112,7 @@ EVP_PKEY *d2i_PrivateKey_ex(int type, EVP_PKEY **a, const unsigned char **pp,
+             EVP_PKEY_free(ret);
+             ret = tmp;
+             ERR_pop_to_mark();
+-            if (EVP_PKEY_type(type) != EVP_PKEY_base_id(ret))
++            if (EVP_PKEY_type(keytype) != EVP_PKEY_base_id(ret))
+                 goto err;
+         } else {
+             ERR_clear_last_mark();
+@@ -94,57 +139,14 @@ EVP_PKEY *d2i_PrivateKey(int type, EVP_PKEY **a, const unsigned char **pp,
+ }
+ 
+ /*
+- * This works like d2i_PrivateKey() except it automatically works out the
+- * type
++ * This works like d2i_PrivateKey() except it passes the keytype as
++ * EVP_PKEY_NONE, which then figures out the type during decoding.
+  */
+-
+ EVP_PKEY *d2i_AutoPrivateKey_ex(EVP_PKEY **a, const unsigned char **pp,
+                                 long length, OSSL_LIB_CTX *libctx,
+                                 const char *propq)
+ {
+-    STACK_OF(ASN1_TYPE) *inkey;
+-    const unsigned char *p;
+-    int keytype;
+-    p = *pp;
+-    /*
+-     * Dirty trick: read in the ASN1 data into a STACK_OF(ASN1_TYPE): by
+-     * analyzing it we can determine the passed structure: this assumes the
+-     * input is surrounded by an ASN1 SEQUENCE.
+-     */
+-    inkey = d2i_ASN1_SEQUENCE_ANY(NULL, &amp;p, length);
+-    p = *pp;
+-    /*
+-     * Since we only need to discern &quot;traditional format&quot; RSA and DSA keys we
+-     * can just count the elements.
+-     */
+-    if (sk_ASN1_TYPE_num(inkey) == 6) {
+-        keytype = EVP_PKEY_DSA;
+-    } else if (sk_ASN1_TYPE_num(inkey) == 4) {
+-        keytype = EVP_PKEY_EC;
+-    } else if (sk_ASN1_TYPE_num(inkey) == 3) { /* This seems to be PKCS8, not
+-                                              * traditional format */
+-        PKCS8_PRIV_KEY_INFO *p8 = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;p, length);
+-        EVP_PKEY *ret;
+-
+-        sk_ASN1_TYPE_pop_free(inkey, ASN1_TYPE_free);
+-        if (p8 == NULL) {
+-            ERR_raise(ERR_LIB_ASN1, ASN1_R_UNSUPPORTED_PUBLIC_KEY_TYPE);
+-            return NULL;
+-        }
+-        ret = EVP_PKCS82PKEY_ex(p8, libctx, propq);
+-        PKCS8_PRIV_KEY_INFO_free(p8);
+-        if (ret == NULL)
+-            return NULL;
+-        *pp = p;
+-        if (a) {
+-            *a = ret;
+-        }
+-        return ret;
+-    } else {
+-        keytype = EVP_PKEY_RSA;
+-    }
+-    sk_ASN1_TYPE_pop_free(inkey, ASN1_TYPE_free);
+-    return d2i_PrivateKey_ex(keytype, a, pp, length, libctx, propq);
++    return d2i_PrivateKey_ex(EVP_PKEY_NONE, a, pp, length, libctx, propq);
+ }
+ 
+ EVP_PKEY *d2i_AutoPrivateKey(EVP_PKEY **a, const unsigned char **pp,
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 0269d8da5a..7f28edd6c2 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -854,4 +854,8 @@ int evp_set_default_properties_int(OSSL_LIB_CTX *libctx, const char *propq,
+ 
+ void evp_md_ctx_clear_digest(EVP_MD_CTX *ctx, int force);
+ 
++EVP_PKEY *evp_privatekey_from_binary(int keytype, EVP_PKEY **a,
++                                     const unsigned char **pp, long length,
++                                     OSSL_LIB_CTX *libctx, const char *propq);
++
+ #endif /* OSSL_CRYPTO_EVP_H */
+diff --git a/providers/implementations/encode_decode/decode_der2key.c b/providers/implementations/encode_decode/decode_der2key.c
+index 4018d2021b..466a73f908 100644
+--- a/providers/implementations/encode_decode/decode_der2key.c
++++ b/providers/implementations/encode_decode/decode_der2key.c
+@@ -28,6 +28,7 @@
+ #include &quot;crypto/dh.h&quot;
+ #include &quot;crypto/dsa.h&quot;
+ #include &quot;crypto/ec.h&quot;
++#include &quot;crypto/evp.h&quot;
+ #include &quot;crypto/ecx.h&quot;
+ #include &quot;crypto/rsa.h&quot;
+ #include &quot;prov/bio.h&quot;
+@@ -321,8 +322,8 @@ static int der2key_decode(void *vctx, OSSL_CORE_BIO *cin, int selection,
+ 
+         if ((selection &amp; OSSL_KEYMGMT_SELECT_PRIVATE_KEY) != 0) {
+             derp = der;
+-            pkey = d2i_PrivateKey_ex(ctx-&gt;desc-&gt;evp_type, NULL, &amp;derp, der_len,
+-                                     libctx, NULL);
++            pkey = evp_privatekey_from_binary(ctx-&gt;desc-&gt;evp_type, NULL,
++                                              &amp;derp, der_len, libctx, NULL);
+         }
+ 
+         if (pkey == NULL
+diff --git a/providers/implementations/encode_decode/encode_key2any.c b/providers/implementations/encode_decode/encode_key2any.c
+index 883c33334d..32d99837b2 100644
+--- a/providers/implementations/encode_decode/encode_key2any.c
++++ b/providers/implementations/encode_decode/encode_key2any.c
+@@ -60,6 +60,20 @@ typedef int key_to_der_fn(BIO *out, const void *key,
+                           struct key2any_ctx_st *ctx);
+ typedef int write_bio_of_void_fn(BIO *bp, const void *x);
+ 
++
++/* Free the blob allocated during key_to_paramstring_fn */
++static void free_asn1_data(int type, void *data)
++{
++    switch(type) {
++    case V_ASN1_OBJECT:
++        ASN1_OBJECT_free(data);
++        break;
++    case V_ASN1_SEQUENCE:
++        ASN1_STRING_free(data);
++        break;
++    }
++}
++
+ static PKCS8_PRIV_KEY_INFO *key_to_p8info(const void *key, int key_nid,
+                                           void *params, int params_type,
+                                           i2d_of_void *k2d)
+@@ -70,7 +84,6 @@ static PKCS8_PRIV_KEY_INFO *key_to_p8info(const void *key, int key_nid,
+     /* The final PKCS#8 info */
+     PKCS8_PRIV_KEY_INFO *p8info = NULL;
+ 
+-
+     if ((p8info = PKCS8_PRIV_KEY_INFO_new()) == NULL
+         || (derlen = k2d(key, &amp;der)) &lt;= 0
+         || !PKCS8_pkey_set0(p8info, OBJ_nid2obj(key_nid), 0,
+@@ -113,6 +126,9 @@ static X509_SIG *key_to_encp8(const void *key, int key_nid,
+         key_to_p8info(key, key_nid, params, params_type, k2d);
+     X509_SIG *p8 = p8info_to_encp8(p8info, ctx);
+ 
++    if (p8info == NULL)
++        free_asn1_data(params_type, params);
++
+     PKCS8_PRIV_KEY_INFO_free(p8info);
+     return p8;
+ }
+@@ -174,6 +190,8 @@ static int key_to_pkcs8_der_priv_bio(BIO *out, const void *key,
+ 
+         if (p8info != NULL)
+             ret = i2d_PKCS8_PRIV_KEY_INFO_bio(out, p8info);
++        else
++            free_asn1_data(strtype, str);
+ 
+         PKCS8_PRIV_KEY_INFO_free(p8info);
+     }
+@@ -208,6 +226,8 @@ static int key_to_pkcs8_pem_priv_bio(BIO *out, const void *key,
+ 
+         if (p8info != NULL)
+             ret = PEM_write_bio_PKCS8_PRIV_KEY_INFO(out, p8info);
++        else
++            free_asn1_data(strtype, str);
+ 
+         PKCS8_PRIV_KEY_INFO_free(p8info);
+     }
+@@ -259,6 +279,8 @@ static int key_to_spki_pem_pub_bio(BIO *out, const void *key,
+ 
+     if (xpk != NULL)
+         ret = PEM_write_bio_X509_PUBKEY(out, xpk);
++    else
++        free_asn1_data(strtype, str);
+ 
+     /* Also frees |str| */
+     X509_PUBKEY_free(xpk);
+diff --git a/test/evp_extra_test2.c b/test/evp_extra_test2.c
+index 9181061247..bb8e897536 100644
+--- a/test/evp_extra_test2.c
++++ b/test/evp_extra_test2.c
+@@ -17,6 +17,7 @@
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/pem.h&gt;
+ #include &lt;openssl/provider.h&gt;
++#include &lt;openssl/core_names.h&gt;
+ #include &quot;testutil.h&quot;
+ #include &quot;internal/nelem.h&quot;
+ 
+@@ -141,6 +142,58 @@ static const unsigned char kExampleRSAKeyPKCS8[] = {
+     0x08, 0xf1, 0x2d, 0x86, 0x9d, 0xa5, 0x20, 0x1b, 0xe5, 0xdf,
+ };
+ 
++#ifndef OPENSSL_NO_DH
++static const unsigned char kExampleDHPrivateKeyDER[] = {
++    0x30, 0x82, 0x02, 0x26, 0x02, 0x01, 0x00, 0x30, 0x82, 0x01, 0x17, 0x06,
++    0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x03, 0x01, 0x30, 0x82,
++    0x01, 0x08, 0x02, 0x82, 0x01, 0x01, 0x00, 0xD8, 0x4B, 0x0F, 0x0E, 0x6B,
++    0x79, 0xE9, 0x23, 0x4E, 0xE4, 0xBE, 0x9A, 0x8F, 0x7A, 0x5C, 0xA3, 0x20,
++    0xD0, 0x86, 0x6B, 0x95, 0x78, 0x39, 0x59, 0x7A, 0x11, 0x2A, 0x5B, 0x87,
++    0xA4, 0xFB, 0x2F, 0x99, 0xD0, 0x57, 0xF5, 0xE1, 0xA3, 0xAF, 0x41, 0xD1,
++    0xCD, 0xA3, 0x94, 0xBB, 0xE5, 0x5A, 0x68, 0xE2, 0xEE, 0x69, 0x56, 0x51,
++    0xB2, 0xEE, 0xF2, 0xFE, 0x10, 0xC9, 0x55, 0xE3, 0x82, 0x3C, 0x50, 0x0D,
++    0xF5, 0x82, 0x73, 0xE4, 0xD6, 0x3E, 0x45, 0xB4, 0x89, 0x80, 0xE4, 0xF0,
++    0x99, 0x85, 0x2B, 0x4B, 0xF9, 0xB8, 0xFD, 0x2C, 0x3C, 0x49, 0x2E, 0xB3,
++    0x56, 0x7E, 0x99, 0x07, 0xD3, 0xF7, 0xD9, 0xE4, 0x0C, 0x64, 0xC5, 0x7D,
++    0x03, 0x8E, 0x05, 0x3C, 0x0A, 0x40, 0x17, 0xAD, 0xA8, 0x0F, 0x9B, 0xF4,
++    0x8B, 0xA7, 0xDB, 0x16, 0x4F, 0x4A, 0x57, 0x0B, 0x89, 0x80, 0x0B, 0x9F,
++    0x26, 0x56, 0x3F, 0x1D, 0xFA, 0x52, 0x2D, 0x1A, 0x9E, 0xDC, 0x42, 0xA3,
++    0x2E, 0xA9, 0x87, 0xE3, 0x8B, 0x45, 0x5E, 0xEE, 0x99, 0xB8, 0x30, 0x15,
++    0x58, 0xA3, 0x5F, 0xB5, 0x69, 0xD8, 0x0C, 0xE8, 0x6B, 0x36, 0xD8, 0xAB,
++    0xD8, 0xE4, 0x77, 0x46, 0x13, 0xA2, 0x15, 0xB3, 0x9C, 0xAD, 0x99, 0x91,
++    0xE5, 0xA3, 0x30, 0x7D, 0x40, 0x70, 0xB3, 0x32, 0x5E, 0xAF, 0x96, 0x8D,
++    0xE6, 0x3F, 0x47, 0xA3, 0x18, 0xDA, 0xE1, 0x9A, 0x20, 0x11, 0xE1, 0x49,
++    0x51, 0x45, 0xE3, 0x8C, 0xA5, 0x56, 0x39, 0x67, 0xCB, 0x9D, 0xCF, 0xBA,
++    0xF4, 0x46, 0x4E, 0x0A, 0xB6, 0x0B, 0xA9, 0xB4, 0xF6, 0xF1, 0x6A, 0xC8,
++    0x63, 0xE2, 0xB4, 0xB2, 0x9F, 0x44, 0xAA, 0x0A, 0xDA, 0x53, 0xF7, 0x52,
++    0x14, 0x57, 0xEE, 0x2C, 0x5D, 0x31, 0x9C, 0x27, 0x03, 0x64, 0x9E, 0xC0,
++    0x1E, 0x4B, 0x1B, 0x4F, 0xEE, 0xA6, 0x3F, 0xC1, 0x3E, 0x61, 0x93, 0x02,
++    0x01, 0x02, 0x04, 0x82, 0x01, 0x04, 0x02, 0x82, 0x01, 0x00, 0x7E, 0xC2,
++    0x04, 0xF9, 0x95, 0xC7, 0xEF, 0x96, 0xBE, 0xA0, 0x9D, 0x2D, 0xC3, 0x0C,
++    0x3A, 0x67, 0x02, 0x7C, 0x7D, 0x3B, 0xC9, 0xB1, 0xDE, 0x13, 0x97, 0x64,
++    0xEF, 0x87, 0x80, 0x4F, 0xBF, 0xA2, 0xAC, 0x18, 0x6B, 0xD5, 0xB2, 0x42,
++    0x0F, 0xDA, 0x28, 0x40, 0x93, 0x40, 0xB2, 0x1E, 0x80, 0xB0, 0x6C, 0xDE,
++    0x9C, 0x54, 0xA4, 0xB4, 0x68, 0x29, 0xE0, 0x13, 0x57, 0x1D, 0xC9, 0x87,
++    0xC0, 0xDE, 0x2F, 0x1D, 0x72, 0xF0, 0xC0, 0xE4, 0x4E, 0x04, 0x48, 0xF5,
++    0x2D, 0x8D, 0x9A, 0x1B, 0xE5, 0xEB, 0x06, 0xAB, 0x7C, 0x74, 0x10, 0x3C,
++    0xA8, 0x2D, 0x39, 0xBC, 0xE3, 0x15, 0x3E, 0x63, 0x37, 0x8C, 0x1B, 0xF1,
++    0xB3, 0x99, 0xB6, 0xAE, 0x5A, 0xEB, 0xB3, 0x3D, 0x30, 0x39, 0x69, 0xDB,
++    0xF2, 0x4F, 0x94, 0xB7, 0x71, 0xAF, 0xBA, 0x5C, 0x1F, 0xF8, 0x6B, 0xE5,
++    0xD1, 0xB1, 0x00, 0x81, 0xE2, 0x6D, 0xEC, 0x65, 0xF7, 0x7E, 0xCE, 0x03,
++    0x84, 0x68, 0x42, 0x6A, 0x8B, 0x47, 0x8E, 0x4A, 0x88, 0xDE, 0x82, 0xDD,
++    0xAF, 0xA9, 0x6F, 0x18, 0xF7, 0xC6, 0xE2, 0xB9, 0x97, 0xCE, 0x47, 0x8F,
++    0x85, 0x19, 0x61, 0x42, 0x67, 0x21, 0x7D, 0x13, 0x6E, 0xB5, 0x5A, 0x62,
++    0xF3, 0x08, 0xE2, 0x70, 0x3B, 0x0E, 0x85, 0x3C, 0xA1, 0xD3, 0xED, 0x7A,
++    0x43, 0xD6, 0xDE, 0x30, 0x5C, 0x48, 0xB2, 0x99, 0xAB, 0x3E, 0x65, 0xA6,
++    0x66, 0x80, 0x22, 0xFF, 0x92, 0xC1, 0x42, 0x1C, 0x30, 0x87, 0x74, 0x1E,
++    0x53, 0x57, 0x7C, 0xF8, 0x77, 0x51, 0xF1, 0x74, 0x16, 0xF4, 0x45, 0x26,
++    0x77, 0x0A, 0x05, 0x96, 0x13, 0x12, 0x06, 0x86, 0x2B, 0xB8, 0x49, 0x82,
++    0x69, 0x43, 0x0A, 0x57, 0xA7, 0x30, 0x19, 0x4C, 0xB8, 0x47, 0x82, 0x6E,
++    0x64, 0x7A, 0x06, 0x13, 0x5A, 0x82, 0x98, 0xD6, 0x7A, 0x09, 0xEC, 0x03,
++    0x8D, 0x03
++};
++#endif /* OPENSSL_NO_DH */
++
+ #ifndef OPENSSL_NO_EC
+ /*
+  * kExampleECKeyDER is a sample EC private key encoded as an ECPrivateKey
+@@ -183,7 +236,10 @@ static APK_DATA keydata[] = {
+     {kExampleRSAKeyPKCS8, sizeof(kExampleRSAKeyPKCS8), EVP_PKEY_RSA},
+ #ifndef OPENSSL_NO_EC
+     {kExampleECKeyDER, sizeof(kExampleECKeyDER), EVP_PKEY_EC},
+-    {kExampleECKey2DER, sizeof(kExampleECKey2DER), EVP_PKEY_EC}
++    {kExampleECKey2DER, sizeof(kExampleECKey2DER), EVP_PKEY_EC},
++#endif
++#ifndef OPENSSL_NO_DH
++    {kExampleDHPrivateKeyDER, sizeof(kExampleDHPrivateKeyDER), EVP_PKEY_DH},
+ #endif
+ };
+ 
+@@ -197,6 +253,9 @@ static int test_d2i_AutoPrivateKey_ex(int i)
+     const unsigned char *input = ak-&gt;kder;
+     size_t input_len = ak-&gt;size;
+     int expected_id = ak-&gt;evptype;
++    BIGNUM *p_bn = NULL;
++    BIGNUM *g_bn = NULL;
++    BIGNUM *priv_bn = NULL;
+ 
+     p = input;
+     if (!TEST_ptr(pkey = d2i_AutoPrivateKey_ex(NULL, &amp;p, input_len, mainctx,
+@@ -205,9 +264,28 @@ static int test_d2i_AutoPrivateKey_ex(int i)
+             || !TEST_int_eq(EVP_PKEY_id(pkey), expected_id))
+         goto done;
+ 
+-    ret = 1;
++    if (ak-&gt;evptype == EVP_PKEY_RSA) {
++        if (!TEST_true(EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D,
++                                             &amp;priv_bn)))
++            goto done;
++    } else {
++        if (!TEST_true(EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY,
++                                             &amp;priv_bn)))
++            goto done;
++    }
++
++    if (ak-&gt;evptype == EVP_PKEY_DH) {
++        if (!TEST_true(EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_FFC_P, &amp;p_bn))
++            || !TEST_true(EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_FFC_G,
++                                                &amp;g_bn)))
++            goto done;
++    }
+ 
+- done:
++    ret = 1;
++done:
++    BN_free(p_bn);
++    BN_free(g_bn);
++    BN_free(priv_bn);
+     EVP_PKEY_free(pkey);
+     return ret;
+ }
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033174.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033176.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33175">[ date ]</a>
+              <a href="thread.html#33175">[ thread ]</a>
+              <a href="subject.html#33175">[ subject ]</a>
+              <a href="author.html#33175">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

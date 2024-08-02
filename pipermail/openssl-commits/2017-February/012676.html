@@ -1,0 +1,309 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1486502843.771044.27200.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012673.html">
+   <LINK REL="Next"  HREF="012680.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1486502843.771044.27200.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Feb  7 21:27:23 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012673.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="012680.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12676">[ date ]</a>
+              <a href="thread.html#12676">[ thread ]</a>
+              <a href="subject.html#12676">[ subject ]</a>
+              <a href="author.html#12676">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  4bf73e9f86804cfe98b03accfc2dd7cb98e018d6 (commit)
+      from  a19a6c8179faa3da0dedaaf2effae385cf7dd65d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 4bf73e9f86804cfe98b03accfc2dd7cb98e018d6
+Author: Peter Wu &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">peter at lekensteyn.nl</A>&gt;
+Date:   Wed Feb 1 19:14:27 2017 +0100
+
+    apps: Add support for writing a keylog file
+    
+    The server and client demos (s_client and s_server) are extended with a
+    -keylogfile option. This is similar as setting the SSLKEYLOGFILE
+    environment variable for NSS and creates a keylog file which is suitable
+    for Wireshark.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2343">https://github.com/openssl/openssl/pull/2343</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/s_apps.h         |  1 +
+ apps/s_cb.c           | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ apps/s_client.c       | 10 ++++++++++
+ apps/s_server.c       |  9 +++++++++
+ doc/man1/s_client.pod |  5 +++++
+ doc/man1/s_server.pod |  5 +++++
+ 6 files changed, 78 insertions(+)
+
+diff --git a/apps/s_apps.h b/apps/s_apps.h
+index 4c24b2e..bcca6fa 100644
+--- a/apps/s_apps.h
++++ b/apps/s_apps.h
+@@ -99,4 +99,5 @@ int ssl_load_stores(SSL_CTX *ctx, const char *vfyCApath,
+                     const char *chCAfile, STACK_OF(X509_CRL) *crls,
+                     int crl_download);
+ void ssl_ctx_security_debug(SSL_CTX *ctx, int verbose);
++int set_keylog_file(SSL_CTX *ctx, const char *keylog_file);
+ #endif
+diff --git a/apps/s_cb.c b/apps/s_cb.c
+index 3f46156..550969d 100644
+--- a/apps/s_cb.c
++++ b/apps/s_cb.c
+@@ -32,6 +32,7 @@ VERIFY_CB_ARGS verify_args = { 0, 0, X509_V_OK, 0 };
+ static unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
+ static int cookie_initialized = 0;
+ #endif
++static BIO *bio_keylog = NULL;
+ 
+ static const char *lookup(int val, const STRINT_PAIR* list, const char* def)
+ {
+@@ -1355,3 +1356,50 @@ void ssl_ctx_security_debug(SSL_CTX *ctx, int verbose)
+     SSL_CTX_set_security_callback(ctx, security_callback_debug);
+     SSL_CTX_set0_security_ex_data(ctx, &amp;sdb);
+ }
++
++static void keylog_callback(const SSL *ssl, const char *line)
++{
++    if (bio_keylog == NULL) {
++        BIO_printf(bio_err, &quot;Keylog callback is invoked without valid file!\n&quot;);
++        return;
++    }
++
++    /*
++     * There might be concurrent writers to the keylog file, so we must ensure
++     * that the given line is written at once.
++     */
++    BIO_printf(bio_keylog, &quot;%s\n&quot;, line);
++    (void)BIO_flush(bio_keylog);
++}
++
++int set_keylog_file(SSL_CTX *ctx, const char *keylog_file)
++{
++    /* Close any open files */
++    BIO_free_all(bio_keylog);
++    bio_keylog = NULL;
++
++    if (ctx == NULL || keylog_file == NULL) {
++        /* Keylogging is disabled, OK. */
++        return 0;
++    }
++
++    /*
++     * Append rather than write in order to allow concurrent modification.
++     * Furthermore, this preserves existing keylog files which is useful when
++     * the tool is run multiple times.
++     */
++    bio_keylog = BIO_new_file(keylog_file, &quot;a&quot;);
++    if (bio_keylog == NULL) {
++        BIO_printf(bio_err, &quot;Error writing keylog file %s\n&quot;, keylog_file);
++        return 1;
++    }
++
++    /* Write a header for seekable, empty files (this excludes pipes). */
++    if (BIO_tell(bio_keylog) == 0) {
++        BIO_puts(bio_keylog,
++                 &quot;# SSL/TLS secrets log file, generated by OpenSSL\n&quot;);
++        (void)BIO_flush(bio_keylog);
++    }
++    SSL_CTX_set_keylog_callback(ctx, keylog_callback);
++    return 0;
++}
+diff --git a/apps/s_client.c b/apps/s_client.c
+index d9dbe70..ad237c3 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -549,6 +549,7 @@ typedef enum OPTION_choice {
+     OPT_SERVERINFO, OPT_STARTTLS, OPT_SERVERNAME,
+     OPT_USE_SRTP, OPT_KEYMATEXPORT, OPT_KEYMATEXPORTLEN, OPT_SMTPHOST,
+     OPT_ASYNC, OPT_SPLIT_SEND_FRAG, OPT_MAX_PIPELINES, OPT_READ_BUF,
++    OPT_KEYLOG_FILE,
+     OPT_V_ENUM,
+     OPT_X_ENUM,
+     OPT_S_ENUM,
+@@ -731,6 +732,7 @@ const OPTIONS s_client_options[] = {
+     {&quot;noct&quot;, OPT_NOCT, '-', &quot;Do not request or parse SCTs (default)&quot;},
+     {&quot;ctlogfile&quot;, OPT_CTLOG_FILE, '&lt;', &quot;CT log list CONF file&quot;},
+ #endif
++    {&quot;keylogfile&quot;, OPT_KEYLOG_FILE, '&gt;', &quot;Write TLS secrets to file&quot;},
+     {NULL, OPT_EOF, 0x00, NULL}
+ };
+ 
+@@ -890,6 +892,7 @@ int s_client_main(int argc, char **argv)
+     int c_status_req = 0;
+ #endif
+     BIO *bio_c_msg = NULL;
++    const char *keylog_file = NULL;
+ 
+     FD_ZERO(&amp;readfds);
+     FD_ZERO(&amp;writefds);
+@@ -1358,6 +1361,9 @@ int s_client_main(int argc, char **argv)
+         case OPT_READ_BUF:
+             read_buf_len = atoi(opt_arg());
+             break;
++        case OPT_KEYLOG_FILE:
++            keylog_file = opt_arg();
++            break;
+         }
+     }
+     if (count4or6 &gt;= 2) {
+@@ -1706,6 +1712,9 @@ int s_client_main(int argc, char **argv)
+         SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
+     }
+ 
++    if (set_keylog_file(ctx, keylog_file))
++        goto end;
++
+     con = SSL_new(ctx);
+     if (sess_in) {
+         SSL_SESSION *sess;
+@@ -2574,6 +2583,7 @@ int s_client_main(int argc, char **argv)
+     OPENSSL_free(next_proto.data);
+ #endif
+     SSL_CTX_free(ctx);
++    set_keylog_file(NULL, NULL);
+     X509_free(cert);
+     sk_X509_CRL_pop_free(crls, X509_CRL_free);
+     EVP_PKEY_free(key);
+diff --git a/apps/s_server.c b/apps/s_server.c
+index f349412..e064290 100644
+--- a/apps/s_server.c
++++ b/apps/s_server.c
+@@ -719,6 +719,7 @@ typedef enum OPTION_choice {
+     OPT_ID_PREFIX, OPT_RAND, OPT_SERVERNAME, OPT_SERVERNAME_FATAL,
+     OPT_CERT2, OPT_KEY2, OPT_NEXTPROTONEG, OPT_ALPN,
+     OPT_SRTP_PROFILES, OPT_KEYMATEXPORT, OPT_KEYMATEXPORTLEN,
++    OPT_KEYLOG_FILE,
+     OPT_S_ENUM,
+     OPT_V_ENUM,
+     OPT_X_ENUM
+@@ -913,6 +914,7 @@ const OPTIONS s_server_options[] = {
+ #ifndef OPENSSL_NO_ENGINE
+     {&quot;engine&quot;, OPT_ENGINE, 's', &quot;Use engine, possibly a hardware device&quot;},
+ #endif
++    {&quot;keylogfile&quot;, OPT_KEYLOG_FILE, '&gt;', &quot;Write TLS secrets to file&quot;},
+     {NULL, OPT_EOF, 0, NULL}
+ };
+ 
+@@ -988,6 +990,7 @@ int s_server_main(int argc, char *argv[])
+     int no_resume_ephemeral = 0;
+     unsigned int split_send_fragment = 0, max_pipelines = 0;
+     const char *s_serverinfo_file = NULL;
++    const char *keylog_file = NULL;
+ 
+     /* Init of few remaining global variables */
+     local_argc = argc;
+@@ -1489,6 +1492,9 @@ int s_server_main(int argc, char *argv[])
+         case OPT_READ_BUF:
+             read_buf_len = atoi(opt_arg());
+             break;
++        case OPT_KEYLOG_FILE:
++            keylog_file = opt_arg();
++            break;
+ 
+         }
+     }
+@@ -1977,6 +1983,8 @@ int s_server_main(int argc, char *argv[])
+         }
+     }
+ #endif
++    if (set_keylog_file(ctx, keylog_file))
++        goto end;
+ 
+     BIO_printf(bio_s_out, &quot;ACCEPT\n&quot;);
+     (void)BIO_flush(bio_s_out);
+@@ -1997,6 +2005,7 @@ int s_server_main(int argc, char *argv[])
+     ret = 0;
+  end:
+     SSL_CTX_free(ctx);
++    set_keylog_file(NULL, NULL);
+     X509_free(s_cert);
+     sk_X509_CRL_pop_free(crls, X509_CRL_free);
+     X509_free(s_dcert);
+diff --git a/doc/man1/s_client.pod b/doc/man1/s_client.pod
+index fb1680a..f8c4a9b 100644
+--- a/doc/man1/s_client.pod
++++ b/doc/man1/s_client.pod
+@@ -520,6 +520,11 @@ for SCTs.
+ A file containing a list of known Certificate Transparency logs. See
+ L&lt;SSL_CTX_set_ctlog_list_file(3)&gt; for the expected file format.
+ 
++=item B&lt;-keylogfile path&gt;
++
++Appends TLS secrets to the specified keylog file such that external programs
++(like Wireshark) can decrypt TLS connections.
++
+ =back
+ 
+ =head1 CONNECTED COMMANDS
+diff --git a/doc/man1/s_server.pod b/doc/man1/s_server.pod
+index f1a13dc..337dc2c 100644
+--- a/doc/man1/s_server.pod
++++ b/doc/man1/s_server.pod
+@@ -557,6 +557,11 @@ cause the client to disconnect due to a protocol violation.
+ 
+ print out some session cache status information.
+ 
++=item B&lt;-keylogfile path&gt;
++
++Appends TLS secrets to the specified keylog file such that external programs
++(like Wireshark) can decrypt TLS connections.
++
+ =back
+ 
+ =head1 NOTES
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012673.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="012680.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12676">[ date ]</a>
+              <a href="thread.html#12676">[ thread ]</a>
+              <a href="subject.html#12676">[ subject ]</a>
+              <a href="author.html#12676">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

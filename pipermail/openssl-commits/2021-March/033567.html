@@ -1,0 +1,1870 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1616409549.266013.20444.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033563.html">
+   <LINK REL="Next"  HREF="033569.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1616409549.266013.20444.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon Mar 22 10:39:09 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033563.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033569.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33567">[ date ]</a>
+              <a href="thread.html#33567">[ thread ]</a>
+              <a href="subject.html#33567">[ subject ]</a>
+              <a href="author.html#33567">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c781eb1c63c243cb64dbe3066a43dc172aaab3b8 (commit)
+      from  db89d8f04bb131bbf0e2b87eb9a1515076c893d3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c781eb1c63c243cb64dbe3066a43dc172aaab3b8
+Author: Andrey Matyukov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">andrey.matyukov at intel.com</A>&gt;
+Date:   Tue Dec 8 22:53:39 2020 +0300
+
+    Dual 1024-bit exponentiation optimization for Intel IceLake CPU
+    with AVX512_IFMA + AVX512_VL instructions, primarily for RSA CRT private key
+    operations. It uses 256-bit registers to avoid CPU frequency scaling issues.
+    The performance speedup for RSA2k signature on ICL is ~2x.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13750">https://github.com/openssl/openssl/pull/13750</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES.md                   |   5 +
+ crypto/bn/asm/rsaz-avx512.pl | 743 +++++++++++++++++++++++++++++++++++++++++++
+ crypto/bn/bn_exp.c           |  82 +++++
+ crypto/bn/build.info         |   3 +-
+ crypto/bn/rsaz_exp.h         |  21 +-
+ crypto/bn/rsaz_exp_x2.c      | 542 +++++++++++++++++++++++++++++++
+ crypto/rsa/rsa_ossl.c        |  17 +-
+ crypto/x86_64cpuid.pl        |   2 +-
+ doc/build.info               |   6 +
+ doc/man3/BN_mod_exp_mont.pod |  65 ++++
+ include/openssl/bn.h         |   5 +
+ test/exptest.c               |  95 +++++-
+ util/libcrypto.num           |   1 +
+ util/missingcrypto.txt       |   2 -
+ 14 files changed, 1576 insertions(+), 13 deletions(-)
+ create mode 100644 crypto/bn/asm/rsaz-avx512.pl
+ create mode 100644 crypto/bn/rsaz_exp_x2.c
+ create mode 100644 doc/man3/BN_mod_exp_mont.pod
+
+diff --git a/CHANGES.md b/CHANGES.md
+index f6800a337d..559f09a035 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -178,6 +178,11 @@ OpenSSL 3.0
+ 
+    *Tom&#225;&#353; Mr&#225;z*
+ 
++ * Parallel dual-prime 1024-bit modular exponentiation for AVX512_IFMA
++   capable processors.
++
++   *Ilya Albrekht, Sergey Kirillov, Andrey Matyukov (Intel Corp)*
++
+  * Combining the Configure options no-ec and no-dh no longer disables TLSv1.3.
+    Typically if OpenSSL has no EC or DH algorithms then it cannot support
+    connections with TLSv1.3. However OpenSSL now supports &quot;pluggable&quot; groups
+diff --git a/crypto/bn/asm/rsaz-avx512.pl b/crypto/bn/asm/rsaz-avx512.pl
+new file mode 100644
+index 0000000000..063b9d6b5e
+--- /dev/null
++++ b/crypto/bn/asm/rsaz-avx512.pl
+@@ -0,0 +1,743 @@
++# Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright (c) 2020, Intel Corporation. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++#
++#
++# Originally written by Ilya Albrekht, Sergey Kirillov and Andrey Matyukov
++# Intel Corporation
++#
++# December 2020
++#
++# Initial release.
++#
++# Implementation utilizes 256-bit (ymm) registers to avoid frequency scaling issues.
++#
++# IceLake-Client @ 1.3GHz
++# |---------+----------------------+--------------+-------------|
++# |         | OpenSSL 3.0.0-alpha9 | this         | Unit        |
++# |---------+----------------------+--------------+-------------|
++# | rsa2048 | 2&#160;127&#160;659            | 1&#160;015&#160;625    | cycles/sign |
++# |         | 611                  | 1280 / +109% | sign/s      |
++# |---------+----------------------+--------------+-------------|
++#
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$win64=0; $win64=1 if ($flavour =~ /[nm]asm|mingw64/ || $output =~ /\.asm$/);
++$avx512ifma=0;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}x86_64-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/x86_64-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate x86_64-xlate.pl&quot;;
++
++if (`$ENV{CC} -Wa,-v -c -o /dev/null -x assembler /dev/null 2&gt;&amp;1`
++        =~ /GNU assembler version ([2-9]\.[0-9]+)/) {
++    $avx512ifma = ($1&gt;=2.26);
++}
++
++if (!$avx512 &amp;&amp; $win64 &amp;&amp; ($flavour =~ /nasm/ || $ENV{ASM} =~ /nasm/) &amp;&amp;
++       `nasm -v 2&gt;&amp;1` =~ /NASM version ([2-9]\.[0-9]+)(?:\.([0-9]+))?/) {
++    $avx512ifma = ($1==2.11 &amp;&amp; $2&gt;=8) + ($1&gt;=2.12);
++}
++
++if (!$avx512 &amp;&amp; `$ENV{CC} -v 2&gt;&amp;1` =~ /((?:clang|LLVM) version|.*based on LLVM) ([0-9]+\.[0-9]+)/) {
++    $avx512ifma = ($2&gt;=6.0);
++}
++
++open OUT,&quot;| \&quot;$^X\&quot; \&quot;$xlate\&quot; $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++*STDOUT=*OUT;
++
++if ($avx512ifma&gt;0) {{{
+<A HREF="../../../mailman/listinfo/openssl-commits.html">+ at _6_args_universal_ABI</A> = (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;,&quot;%r9&quot;);
++
++$code.=&lt;&lt;___;
++.extern OPENSSL_ia32cap_P
++.globl  rsaz_avx512ifma_eligible
++.type   rsaz_avx512ifma_eligible,\@abi-omnipotent
++.align  32
++rsaz_avx512ifma_eligible:
++    mov OPENSSL_ia32cap_P+8(%rip), %ecx
++    xor %eax,%eax
++    and \$`1&lt;&lt;31|1&lt;&lt;21|1&lt;&lt;17|1&lt;&lt;16`, %ecx     # avx512vl + avx512ifma + avx512dq + avx512f
++    cmp \$`1&lt;&lt;31|1&lt;&lt;21|1&lt;&lt;17|1&lt;&lt;16`, %ecx
++    cmove %ecx,%eax
++    ret
++.size   rsaz_avx512ifma_eligible, .-rsaz_avx512ifma_eligible
++___
++
++###############################################################################
++# Almost Montgomery Multiplication (AMM) for 20-digit number in radix 2^52.
++#
++# AMM is defined as presented in the paper
++# &quot;Efficient Software Implementations of Modular Exponentiation&quot; by Shay Gueron.
++#
++# The input and output are presented in 2^52 radix domain, i.e.
++#   |res|, |a|, |b|, |m| are arrays of 20 64-bit qwords with 12 high bits zeroed.
++#   |k0| is a Montgomery coefficient, which is here k0 = -1/m mod 2^64
++#        (note, the implementation counts only 52 bits from it).
++#
++# NB: the AMM implementation does not perform &quot;conditional&quot; subtraction step as
++# specified in the original algorithm as according to the paper &quot;Enhanced Montgomery
++# Multiplication&quot; by Shay Gueron (see Lemma 1), the result will be always &lt; 2*2^1024
++# and can be used as a direct input to the next AMM iteration.
++# This post-condition is true, provided the correct parameter |s| is choosen, i.e.
++# s &gt;= n + 2 * k, which matches our case: 1040 &gt; 1024 + 2 * 1.
++#
++# void RSAZ_amm52x20_x1_256(BN_ULONG *res,
++#                           const BN_ULONG *a,
++#                           const BN_ULONG *b,
++#                           const BN_ULONG *m,
++#                           BN_ULONG k0);
++###############################################################################
++{
++# input parameters (&quot;%rdi&quot;,&quot;%rsi&quot;,&quot;%rdx&quot;,&quot;%rcx&quot;,&quot;%r8&quot;)
++my ($res,$a,$b,$m,$k0) = @_6_args_universal_ABI;
++
++my $mask52     = &quot;%rax&quot;;
++my $acc0_0     = &quot;%r9&quot;;
++my $acc0_0_low = &quot;%r9d&quot;;
++my $acc0_1     = &quot;%r15&quot;;
++my $acc0_1_low = &quot;%r15d&quot;;
++my $b_ptr      = &quot;%r11&quot;;
++
++my $iter = &quot;%ebx&quot;;
++
++my $zero = &quot;%ymm0&quot;;
++my ($R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0) = (&quot;%ymm1&quot;, map(&quot;%ymm$_&quot;,(16..19)));
++my ($R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1) = (&quot;%ymm2&quot;, map(&quot;%ymm$_&quot;,(20..23)));
++my $Bi = &quot;%ymm3&quot;;
++my $Yi = &quot;%ymm4&quot;;
++
++# Registers mapping for normalization.
++# We can reuse Bi, Yi registers here.
++my $TMP = $Bi;
++my $mask52x4 = $Yi;
++my ($T0,$T0h,$T1,$T1h,$T2) = map(&quot;%ymm$_&quot;, (24..28));
++
++sub amm52x20_x1() {
++# _data_offset - offset in the |a| or |m| arrays pointing to the beginning
++#                of data for corresponding AMM operation;
++# _b_offset    - offset in the |b| array pointing to the next qword digit;
++my ($_data_offset,$_b_offset,$_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2,$_k0) = @_;
++my $_R0_xmm = $_R0 =~ s/%y/%x/r;
++$code.=&lt;&lt;___;
++    movq    $_b_offset($b_ptr), %r13             # b[i]
++
++    vpbroadcastq    %r13, $Bi                    # broadcast b[i]
++    movq    $_data_offset($a), %rdx
++    mulx    %r13, %r13, %r12                     # a[0]*b[i] = (t0,t2)
++    addq    %r13, $_acc                          # acc += t0
++    movq    %r12, %r10
++    adcq    \$0, %r10                            # t2 += CF
++
++    movq    $_k0, %r13
++    imulq   $_acc, %r13                          # acc * k0
++    andq    $mask52, %r13                        # yi = (acc * k0) &amp; mask52
++
++    vpbroadcastq    %r13, $Yi                    # broadcast y[i]
++    movq    $_data_offset($m), %rdx
++    mulx    %r13, %r13, %r12                     # yi * m[0] = (t0,t1)
++    addq    %r13, $_acc                          # acc += t0
++    adcq    %r12, %r10                           # t2 += (t1 + CF)
++
++    shrq    \$52, $_acc
++    salq    \$12, %r10
++    or      %r10, $_acc                          # acc = ((acc &gt;&gt; 52) | (t2 &lt;&lt; 12))
++
++    vpmadd52luq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($a), $Bi, $_R2
++
++    vpmadd52luq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52luq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52luq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52luq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52luq `$_data_offset+64*2`($m), $Yi, $_R2
++
++    # Shift accumulators right by 1 qword, zero extending the highest one
++    valignq     \$1, $_R0, $_R0h, $_R0
++    valignq     \$1, $_R0h, $_R1, $_R0h
++    valignq     \$1, $_R1, $_R1h, $_R1
++    valignq     \$1, $_R1h, $_R2, $_R1h
++    valignq     \$1, $_R2, $zero, $_R2
++
++    vmovq   $_R0_xmm, %r13
++    addq    %r13, $_acc    # acc += R0[0]
++
++    vpmadd52huq `$_data_offset+64*0`($a), $Bi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($a), $Bi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($a), $Bi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($a), $Bi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($a), $Bi, $_R2
++
++    vpmadd52huq `$_data_offset+64*0`($m), $Yi, $_R0
++    vpmadd52huq `$_data_offset+64*0+32`($m), $Yi, $_R0h
++    vpmadd52huq `$_data_offset+64*1`($m), $Yi, $_R1
++    vpmadd52huq `$_data_offset+64*1+32`($m), $Yi, $_R1h
++    vpmadd52huq `$_data_offset+64*2`($m), $Yi, $_R2
++___
++}
++
++# Normalization routine: handles carry bits in R0..R2 QWs and
++# gets R0..R2 back to normalized 2^52 representation.
++#
++# Uses %r8-14,%e[bcd]x
++sub amm52x20_x1_norm {
++my ($_acc,$_R0,$_R0h,$_R1,$_R1h,$_R2) = @_;
++$code.=&lt;&lt;___;
++    # Put accumulator to low qword in R0
++    vpbroadcastq    $_acc, $TMP
++    vpblendd \$3, $TMP, $_R0, $_R0
++
++    # Extract &quot;carries&quot; (12 high bits) from each QW of R0..R2
++    # Save them to LSB of QWs in T0..T2
++    vpsrlq    \$52, $_R0,   $T0
++    vpsrlq    \$52, $_R0h,  $T0h
++    vpsrlq    \$52, $_R1,   $T1
++    vpsrlq    \$52, $_R1h,  $T1h
++    vpsrlq    \$52, $_R2,   $T2
++
++    # &quot;Shift left&quot; T0..T2 by 1 QW
++    valignq \$3, $T1h,  $T2,  $T2
++    valignq \$3, $T1,   $T1h, $T1h
++    valignq \$3, $T0h,  $T1,  $T1
++    valignq \$3, $T0,   $T0h, $T0h
++    valignq \$3, $zero, $T0,  $T0
++
++    # Drop &quot;carries&quot; from R0..R2 QWs
++    vpandq    $mask52x4, $_R0,  $_R0
++    vpandq    $mask52x4, $_R0h, $_R0h
++    vpandq    $mask52x4, $_R1,  $_R1
++    vpandq    $mask52x4, $_R1h, $_R1h
++    vpandq    $mask52x4, $_R2,  $_R2
++
++    # Sum R0..R2 with corresponding adjusted carries
++    vpaddq  $T0,  $_R0,  $_R0
++    vpaddq  $T0h, $_R0h, $_R0h
++    vpaddq  $T1,  $_R1,  $_R1
++    vpaddq  $T1h, $_R1h, $_R1h
++    vpaddq  $T2,  $_R2,  $_R2
++
++    # Now handle carry bits from this addition
++    # Get mask of QWs which 52-bit parts overflow...
++    vpcmpuq   \$1, $_R0,  $mask52x4, %k1 # OP=lt
++    vpcmpuq   \$1, $_R0h, $mask52x4, %k2
++    vpcmpuq   \$1, $_R1,  $mask52x4, %k3
++    vpcmpuq   \$1, $_R1h, $mask52x4, %k4
++    vpcmpuq   \$1, $_R2,  $mask52x4, %k5
++    kmovb   %k1, %r14d                   # k1
++    kmovb   %k2, %r13d                   # k1h
++    kmovb   %k3, %r12d                   # k2
++    kmovb   %k4, %r11d                   # k2h
++    kmovb   %k5, %r10d                   # k3
++
++    # ...or saturated
++    vpcmpuq   \$0, $_R0,  $mask52x4, %k1 # OP=eq
++    vpcmpuq   \$0, $_R0h, $mask52x4, %k2
++    vpcmpuq   \$0, $_R1,  $mask52x4, %k3
++    vpcmpuq   \$0, $_R1h, $mask52x4, %k4
++    vpcmpuq   \$0, $_R2,  $mask52x4, %k5
++    kmovb   %k1, %r9d                    # k4
++    kmovb   %k2, %r8d                    # k4h
++    kmovb   %k3, %ebx                    # k5
++    kmovb   %k4, %ecx                    # k5h
++    kmovb   %k5, %edx                    # k6
++
++    # Get mask of QWs where carries shall be propagated to.
++    # Merge 4-bit masks to 8-bit values to use add with carry.
++    shl   \$4, %r13b
++    or    %r13b, %r14b
++    shl   \$4, %r11b
++    or    %r11b, %r12b
++
++    add   %r14b, %r14b
++    adc   %r12b, %r12b
++    adc   %r10b, %r10b
++
++    shl   \$4, %r8b
++    or    %r8b,%r9b
++    shl   \$4, %cl
++    or    %cl, %bl
++
++    add   %r9b, %r14b
++    adc   %bl, %r12b
++    adc   %dl, %r10b
++
++    xor   %r9b, %r14b
++    xor   %bl, %r12b
++    xor   %dl, %r10b
++
++    kmovb   %r14d, %k1
++    shr     \$4, %r14b
++    kmovb   %r14d, %k2
++    kmovb   %r12d, %k3
++    shr     \$4, %r12b
++    kmovb   %r12d, %k4
++    kmovb   %r10d, %k5
++
++    # Add carries according to the obtained mask
++    vpsubq  $mask52x4, $_R0,  ${_R0}{%k1}
++    vpsubq  $mask52x4, $_R0h, ${_R0h}{%k2}
++    vpsubq  $mask52x4, $_R1,  ${_R1}{%k3}
++    vpsubq  $mask52x4, $_R1h, ${_R1h}{%k4}
++    vpsubq  $mask52x4, $_R2,  ${_R2}{%k5}
++
++    vpandq   $mask52x4, $_R0,  $_R0
++    vpandq   $mask52x4, $_R0h, $_R0h
++    vpandq   $mask52x4, $_R1,  $_R1
++    vpandq   $mask52x4, $_R1h, $_R1h
++    vpandq   $mask52x4, $_R2,  $_R2
++___
++}
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  RSAZ_amm52x20_x1_256
++.type   RSAZ_amm52x20_x1_256,\@function,5
++.align 32
++RSAZ_amm52x20_x1_256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++.Lrsaz_amm52x20_x1_256_body:
++
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++
++    xorl    $acc0_0_low, $acc0_0_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    # Loop over 20 digits unrolled by 4
++    mov     \$5, $iter
++
++.align 32
++.Lloop5:
++___
++    foreach my $idx (0..3) {
++        &amp;amm52x20_x1(0,8*$idx,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,$k0);
++    }
++$code.=&lt;&lt;___;
++    lea    `4*8`($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop5
++
++    vmovdqa64   .Lmask52x4(%rip), $mask52x4
++___
++    &amp;amm52x20_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0, ($res)
++    vmovdqu64   $R0_0h, 32($res)
++    vmovdqu64   $R1_0, 64($res)
++    vmovdqu64   $R1_0h, 96($res)
++    vmovdqu64   $R2_0, 128($res)
++
++    vzeroupper
++    mov  0(%rsp),%r15
++.cfi_restore    %r15
++    mov  8(%rsp),%r14
++.cfi_restore    %r14
++    mov  16(%rsp),%r13
++.cfi_restore    %r13
++    mov  24(%rsp),%r12
++.cfi_restore    %r12
++    mov  32(%rsp),%rbp
++.cfi_restore    %rbp
++    mov  40(%rsp),%rbx
++.cfi_restore    %rbx
++    lea  48(%rsp),%rsp
++.cfi_adjust_cfa_offset  -48
++.Lrsaz_amm52x20_x1_256_epilogue:
++    ret
++.cfi_endproc
++.size   RSAZ_amm52x20_x1_256, .-RSAZ_amm52x20_x1_256
++___
++
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lmask52x4:
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++    .quad   0xfffffffffffff
++___
++
++###############################################################################
++# Dual Almost Montgomery Multiplication for 20-digit number in radix 2^52
++#
++# See description of RSAZ_amm52x20_x1_256() above for details about Almost
++# Montgomery Multiplication algorithm and function input parameters description.
++#
++# This function does two AMMs for two independent inputs, hence dual.
++#
++# void RSAZ_amm52x20_x2_256(BN_ULONG out[2][20],
++#                           const BN_ULONG a[2][20],
++#                           const BN_ULONG b[2][20],
++#                           const BN_ULONG m[2][20],
++#                           const BN_ULONG k0[2]);
++###############################################################################
++
++$code.=&lt;&lt;___;
++.text
++
++.globl  RSAZ_amm52x20_x2_256
++.type   RSAZ_amm52x20_x2_256,\@function,5
++.align 32
++RSAZ_amm52x20_x2_256:
++.cfi_startproc
++    endbranch
++    push    %rbx
++.cfi_push   %rbx
++    push    %rbp
++.cfi_push   %rbp
++    push    %r12
++.cfi_push   %r12
++    push    %r13
++.cfi_push   %r13
++    push    %r14
++.cfi_push   %r14
++    push    %r15
++.cfi_push   %r15
++.Lrsaz_amm52x20_x2_256_body:
++
++    # Zeroing accumulators
++    vpxord   $zero, $zero, $zero
++    vmovdqa64   $zero, $R0_0
++    vmovdqa64   $zero, $R0_0h
++    vmovdqa64   $zero, $R1_0
++    vmovdqa64   $zero, $R1_0h
++    vmovdqa64   $zero, $R2_0
++    vmovdqa64   $zero, $R0_1
++    vmovdqa64   $zero, $R0_1h
++    vmovdqa64   $zero, $R1_1
++    vmovdqa64   $zero, $R1_1h
++    vmovdqa64   $zero, $R2_1
++
++    xorl    $acc0_0_low, $acc0_0_low
++    xorl    $acc0_1_low, $acc0_1_low
++
++    movq    $b, $b_ptr                       # backup address of b
++    movq    \$0xfffffffffffff, $mask52       # 52-bit mask
++
++    mov    \$20, $iter
++
++.align 32
++.Lloop20:
++___
++    &amp;amm52x20_x1(   0,   0,$acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0,&quot;($k0)&quot;);
++    # 20*8 = offset of the next dimension in two-dimension array
++    &amp;amm52x20_x1(20*8,20*8,$acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1,&quot;8($k0)&quot;);
++$code.=&lt;&lt;___;
++    lea    8($b_ptr), $b_ptr
++    dec    $iter
++    jne    .Lloop20
++
++    vmovdqa64   .Lmask52x4(%rip), $mask52x4
++___
++    &amp;amm52x20_x1_norm($acc0_0,$R0_0,$R0_0h,$R1_0,$R1_0h,$R2_0);
++    &amp;amm52x20_x1_norm($acc0_1,$R0_1,$R0_1h,$R1_1,$R1_1h,$R2_1);
++$code.=&lt;&lt;___;
++
++    vmovdqu64   $R0_0, ($res)
++    vmovdqu64   $R0_0h, 32($res)
++    vmovdqu64   $R1_0, 64($res)
++    vmovdqu64   $R1_0h, 96($res)
++    vmovdqu64   $R2_0, 128($res)
++
++    vmovdqu64   $R0_1, 160($res)
++    vmovdqu64   $R0_1h, 192($res)
++    vmovdqu64   $R1_1, 224($res)
++    vmovdqu64   $R1_1h, 256($res)
++    vmovdqu64   $R2_1, 288($res)
++
++    vzeroupper
++    mov  0(%rsp),%r15
++.cfi_restore    %r15
++    mov  8(%rsp),%r14
++.cfi_restore    %r14
++    mov  16(%rsp),%r13
++.cfi_restore    %r13
++    mov  24(%rsp),%r12
++.cfi_restore    %r12
++    mov  32(%rsp),%rbp
++.cfi_restore    %rbp
++    mov  40(%rsp),%rbx
++.cfi_restore    %rbx
++    lea  48(%rsp),%rsp
++.cfi_adjust_cfa_offset  -48
++.Lrsaz_amm52x20_x2_256_epilogue:
++    ret
++.cfi_endproc
++.size   RSAZ_amm52x20_x2_256, .-RSAZ_amm52x20_x2_256
++___
++}
++
++###############################################################################
++# Constant time extraction from the precomputed table of powers base^i, where
++#    i = 0..2^EXP_WIN_SIZE-1
++#
++# The input |red_table| contains precomputations for two independent base values,
++# so the |tbl_idx| indicates for which base shall we extract the value.
++# |red_table_idx| is a power index.
++#
++# Extracted value (output) is 20 digit number in 2^52 radix.
++#
++# void extract_multiplier_2x20_win5(BN_ULONG *red_Y,
++#                                   const BN_ULONG red_table[1 &lt;&lt; EXP_WIN_SIZE][2][20],
++#                                   int red_table_idx,
++#                                   int tbl_idx);           # 0 or 1
++#
++# EXP_WIN_SIZE = 5
++###############################################################################
++{
++# input parameters
++my ($out,$red_tbl,$red_tbl_idx,$tbl_idx) = @_6_args_universal_ABI;
++
++my ($t0,$t1,$t2,$t3,$t4) = map(&quot;%ymm$_&quot;, (0..4));
++my $t4xmm = $t4 =~ s/%y/%x/r;
++my ($tmp0,$tmp1,$tmp2,$tmp3,$tmp4) = map(&quot;%ymm$_&quot;, (16..20));
++my ($cur_idx,$idx,$ones) = map(&quot;%ymm$_&quot;, (21..23));
++
++$code.=&lt;&lt;___;
++.text
++
++.align 32
++.globl  extract_multiplier_2x20_win5
++.type   extract_multiplier_2x20_win5,\@function,4
++extract_multiplier_2x20_win5:
++.cfi_startproc
++    endbranch
++    leaq    ($tbl_idx,$tbl_idx,4), %rax
++    salq    \$5, %rax
++    addq    %rax, $red_tbl
++
++    vmovdqa64   .Lones(%rip), $ones         # broadcast ones
++    vpbroadcastq    $red_tbl_idx, $idx
++    leaq   `(1&lt;&lt;5)*2*20*8`($red_tbl), %rax  # holds end of the tbl
++
++    vpxor   $t4xmm, $t4xmm, $t4xmm
++    vmovdqa64   $t4, $t3                    # zeroing t0..4, cur_idx
++    vmovdqa64   $t4, $t2
++    vmovdqa64   $t4, $t1
++    vmovdqa64   $t4, $t0
++    vmovdqa64   $t4, $cur_idx
++
++.align 32
++.Lloop:
++    vpcmpq  \$0, $cur_idx, $idx, %k1        # mask of (idx == cur_idx)
++    addq    \$320, $red_tbl                 # 320 = 2 * 20 digits * 8 bytes
++    vpaddq  $ones, $cur_idx, $cur_idx       # increment cur_idx
++    vmovdqu64  -320($red_tbl), $tmp0        # load data from red_tbl
++    vmovdqu64  -288($red_tbl), $tmp1
++    vmovdqu64  -256($red_tbl), $tmp2
++    vmovdqu64  -224($red_tbl), $tmp3
++    vmovdqu64  -192($red_tbl), $tmp4
++    vpblendmq  $tmp0, $t0, ${t0}{%k1}       # extract data when mask is not zero
++    vpblendmq  $tmp1, $t1, ${t1}{%k1}
++    vpblendmq  $tmp2, $t2, ${t2}{%k1}
++    vpblendmq  $tmp3, $t3, ${t3}{%k1}
++    vpblendmq  $tmp4, $t4, ${t4}{%k1}
++    cmpq    $red_tbl, %rax
++    jne .Lloop
++
++    vmovdqu64   $t0, ($out)                 # store t0..4
++    vmovdqu64   $t1, 32($out)
++    vmovdqu64   $t2, 64($out)
++    vmovdqu64   $t3, 96($out)
++    vmovdqu64   $t4, 128($out)
++
++    ret
++.cfi_endproc
++.size   extract_multiplier_2x20_win5, .-extract_multiplier_2x20_win5
++___
++$code.=&lt;&lt;___;
++.data
++.align 32
++.Lones:
++    .quad   1,1,1,1
++___
++}
++
++if ($win64) {
++$rec=&quot;%rcx&quot;;
++$frame=&quot;%rdx&quot;;
++$context=&quot;%r8&quot;;
++$disp=&quot;%r9&quot;;
++
++$code.=&lt;&lt;___
++.extern     __imp_RtlVirtualUnwind
++.type   rsaz_def_handler,\@abi-omnipotent
++.align  16
++rsaz_def_handler:
++    push    %rsi
++    push    %rdi
++    push    %rbx
++    push    %rbp
++    push    %r12
++    push    %r13
++    push    %r14
++    push    %r15
++    pushfq
++    sub     \$64,%rsp
++
++    mov     120($context),%rax # pull context-&gt;Rax
++    mov     248($context),%rbx # pull context-&gt;Rip
++
++    mov     8($disp),%rsi      # disp-&gt;ImageBase
++    mov     56($disp),%r11     # disp-&gt;HandlerData
++
++    mov     0(%r11),%r10d      # HandlerData[0]
++    lea     (%rsi,%r10),%r10   # prologue label
++    cmp     %r10,%rbx          # context-&gt;Rip&lt;.Lprologue
++    jb  .Lcommon_seh_tail
++
++    mov     152($context),%rax # pull context-&gt;Rsp
++
++    mov     4(%r11),%r10d      # HandlerData[1]
++    lea     (%rsi,%r10),%r10   # epilogue label
++    cmp     %r10,%rbx          # context-&gt;Rip&gt;=.Lepilogue
++    jae     .Lcommon_seh_tail
++
++    lea     48(%rax),%rax
++
++    mov     -8(%rax),%rbx
++    mov     -16(%rax),%rbp
++    mov     -24(%rax),%r12
++    mov     -32(%rax),%r13
++    mov     -40(%rax),%r14
++    mov     -48(%rax),%r15
++    mov     %rbx,144($context) # restore context-&gt;Rbx
++    mov     %rbp,160($context) # restore context-&gt;Rbp
++    mov     %r12,216($context) # restore context-&gt;R12
++    mov     %r13,224($context) # restore context-&gt;R13
++    mov     %r14,232($context) # restore context-&gt;R14
++    mov     %r15,240($context) # restore context-&gt;R14
++
++.Lcommon_seh_tail:
++    mov     8(%rax),%rdi
++    mov     16(%rax),%rsi
++    mov     %rax,152($context) # restore context-&gt;Rsp
++    mov     %rsi,168($context) # restore context-&gt;Rsi
++    mov     %rdi,176($context) # restore context-&gt;Rdi
++
++    mov     40($disp),%rdi     # disp-&gt;ContextRecord
++    mov     $context,%rsi      # context
++    mov     \$154,%ecx         # sizeof(CONTEXT)
++    .long   0xa548f3fc         # cld; rep movsq
++
++    mov     $disp,%rsi
++    xor     %rcx,%rcx          # arg1, UNW_FLAG_NHANDLER
++    mov     8(%rsi),%rdx       # arg2, disp-&gt;ImageBase
++    mov     0(%rsi),%r8        # arg3, disp-&gt;ControlPc
++    mov     16(%rsi),%r9       # arg4, disp-&gt;FunctionEntry
++    mov     40(%rsi),%r10      # disp-&gt;ContextRecord
++    lea     56(%rsi),%r11      # &amp;disp-&gt;HandlerData
++    lea     24(%rsi),%r12      # &amp;disp-&gt;EstablisherFrame
++    mov     %r10,32(%rsp)      # arg5
++    mov     %r11,40(%rsp)      # arg6
++    mov     %r12,48(%rsp)      # arg7
++    mov     %rcx,56(%rsp)      # arg8, (NULL)
++    call    *__imp_RtlVirtualUnwind(%rip)
++
++    mov     \$1,%eax           # ExceptionContinueSearch
++    add     \$64,%rsp
++    popfq
++    pop     %r15
++    pop     %r14
++    pop     %r13
++    pop     %r12
++    pop     %rbp
++    pop     %rbx
++    pop     %rdi
++    pop     %rsi
++    ret
++.size   rsaz_def_handler,.-rsaz_def_handler
++
++.section    .pdata
++.align  4
++    .rva    .LSEH_begin_RSAZ_amm52x20_x1_256
++    .rva    .LSEH_end_RSAZ_amm52x20_x1_256
++    .rva    .LSEH_info_RSAZ_amm52x20_x1_256
++
++    .rva    .LSEH_begin_extract_multiplier_2x20_win5
++    .rva    .LSEH_end_extract_multiplier_2x20_win5
++    .rva    .LSEH_info_extract_multiplier_2x20_win5
++
++    .rva    .LSEH_begin_RSAZ_amm52x20_x2_256
++    .rva    .LSEH_end_RSAZ_amm52x20_x2_256
++    .rva    .LSEH_info_RSAZ_amm52x20_x2_256
++
++.section    .xdata
++.align  8
++.LSEH_info_RSAZ_amm52x20_x1_256:
++    .byte   9,0,0,0
++    .rva    rsaz_def_handler
++    .rva    .Lrsaz_amm52x20_x1_256_body,.Lrsaz_amm52x20_x1_256_epilogue
++.LSEH_info_extract_multiplier_2x20_win5:
++    .byte   9,0,0,0
++    .rva    rsaz_def_handler
++    .rva    .LSEH_begin_extract_multiplier_2x20_win5,.LSEH_begin_extract_multiplier_2x20_win5
++.LSEH_info_RSAZ_amm52x20_x2_256:
++    .byte   9,0,0,0
++    .rva    rsaz_def_handler
++    .rva    .Lrsaz_amm52x20_x2_256_body,.Lrsaz_amm52x20_x2_256_epilogue
++___
++}
++}}} else {{{                # fallback for old assembler
++$code.=&lt;&lt;___;
++.text
++
++.globl  rsaz_avx512ifma_eligible
++.type   rsaz_avx512ifma_eligible,\@abi-omnipotent
++rsaz_avx512ifma_eligible:
++    xor     %eax,%eax
++    ret
++.size   rsaz_avx512ifma_eligible, .-rsaz_avx512ifma_eligible
++
++.globl  RSAZ_amm52x20_x1_256
++.globl  RSAZ_amm52x20_x2_256
++.globl  extract_multiplier_2x20_win5
++.type   RSAZ_amm52x20_x1_256,\@abi-omnipotent
++RSAZ_amm52x20_x1_256:
++RSAZ_amm52x20_x2_256:
++extract_multiplier_2x20_win5:
++    .byte   0x0f,0x0b    # ud2
++    ret
++.size   RSAZ_amm52x20_x1_256, .-RSAZ_amm52x20_x1_256
++___
++}}}
++
++$code =~ s/\`([^\`]*)\`/eval $1/gem;
++print $code;
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/bn/bn_exp.c b/crypto/bn/bn_exp.c
+index 1254415a43..4f6445434b 100644
+--- a/crypto/bn/bn_exp.c
++++ b/crypto/bn/bn_exp.c
+@@ -1390,3 +1390,85 @@ int BN_mod_exp_simple(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
+     bn_check_top(r);
+     return ret;
+ }
++
++/*
++ * This is a variant of modular exponentiation optimization that does
++ * parallel 2-primes exponentiation using 256-bit (AVX512VL) AVX512_IFMA ISA
++ * in 52-bit binary redundant representation.
++ * If such instructions are not available, or input data size is not supported,
++ * it falls back to two BN_mod_exp_mont_consttime() calls.
++ */
++int BN_mod_exp_mont_consttime_x2(BIGNUM *rr1, const BIGNUM *a1, const BIGNUM *p1,
++                                 const BIGNUM *m1, BN_MONT_CTX *in_mont1,
++                                 BIGNUM *rr2, const BIGNUM *a2, const BIGNUM *p2,
++                                 const BIGNUM *m2, BN_MONT_CTX *in_mont2,
++                                 BN_CTX *ctx)
++{
++    int ret = 0;
++
++#ifdef RSAZ_ENABLED
++    BN_MONT_CTX *mont1 = NULL;
++    BN_MONT_CTX *mont2 = NULL;
++
++    if (rsaz_avx512ifma_eligible() &amp;&amp;
++        ((a1-&gt;top == 16) &amp;&amp; (p1-&gt;top == 16) &amp;&amp; (BN_num_bits(m1) == 1024) &amp;&amp;
++         (a2-&gt;top == 16) &amp;&amp; (p2-&gt;top == 16) &amp;&amp; (BN_num_bits(m2) == 1024))) {
++
++        if (bn_wexpand(rr1, 16) == NULL)
++            goto err;
++        if (bn_wexpand(rr2, 16) == NULL)
++            goto err;
++
++        /*  Ensure that montgomery contexts are initialized */
++        if (in_mont1 != NULL) {
++            mont1 = in_mont1;
++        } else {
++            if ((mont1 = BN_MONT_CTX_new()) == NULL)
++                goto err;
++            if (!BN_MONT_CTX_set(mont1, m1, ctx))
++                goto err;
++        }
++        if (in_mont2 != NULL) {
++            mont2 = in_mont2;
++        } else {
++            if ((mont2 = BN_MONT_CTX_new()) == NULL)
++                goto err;
++            if (!BN_MONT_CTX_set(mont2, m2, ctx))
++                goto err;
++        }
++
++        ret = RSAZ_mod_exp_avx512_x2(rr1-&gt;d, a1-&gt;d, p1-&gt;d, m1-&gt;d, mont1-&gt;RR.d,
++                                     mont1-&gt;n0[0],
++                                     rr2-&gt;d, a2-&gt;d, p2-&gt;d, m2-&gt;d, mont2-&gt;RR.d,
++                                     mont2-&gt;n0[0],
++                                     1024 /* factor bit size */);
++
++        rr1-&gt;top = 16;
++        rr1-&gt;neg = 0;
++        bn_correct_top(rr1);
++        bn_check_top(rr1);
++
++        rr2-&gt;top = 16;
++        rr2-&gt;neg = 0;
++        bn_correct_top(rr2);
++        bn_check_top(rr2);
++
++        goto err;
++    }
++#endif
++
++    /* rr1 = a1^p1 mod m1 */
++    ret = BN_mod_exp_mont_consttime(rr1, a1, p1, m1, ctx, in_mont1);
++    /* rr2 = a2^p2 mod m2 */
++    ret &amp;= BN_mod_exp_mont_consttime(rr2, a2, p2, m2, ctx, in_mont2);
++
++#ifdef RSAZ_ENABLED
++err:
++    if (in_mont2 == NULL)
++        BN_MONT_CTX_free(mont2);
++    if (in_mont1 == NULL)
++        BN_MONT_CTX_free(mont1);
++#endif
++
++    return ret;
++}
+diff --git a/crypto/bn/build.info b/crypto/bn/build.info
+index f732be24f8..237d5e90ed 100644
+--- a/crypto/bn/build.info
++++ b/crypto/bn/build.info
+@@ -24,7 +24,7 @@ IF[{- !$disabled{asm} -}]
+ 
+   $BNASM_x86_64=\
+           x86_64-mont.s x86_64-mont5.s x86_64-gf2m.s rsaz_exp.c rsaz-x86_64.s \
+-          rsaz-avx2.s
++          rsaz-avx2.s rsaz_exp_x2.c rsaz-avx512.s
+   IF[{- $config{target} !~ /^VC/ -}]
+     $BNASM_x86_64=asm/x86_64-gcc.c $BNASM_x86_64
+   ELSE
+@@ -154,6 +154,7 @@ GENERATE[x86_64-mont5.s]=asm/x86_64-mont5.pl
+ GENERATE[x86_64-gf2m.s]=asm/x86_64-gf2m.pl
+ GENERATE[rsaz-x86_64.s]=asm/rsaz-x86_64.pl
+ GENERATE[rsaz-avx2.s]=asm/rsaz-avx2.pl
++GENERATE[rsaz-avx512.s]=asm/rsaz-avx512.pl
+ 
+ GENERATE[bn-ia64.s]=asm/ia64.S
+ GENERATE[ia64-mont.s]=asm/ia64-mont.pl
+diff --git a/crypto/bn/rsaz_exp.h b/crypto/bn/rsaz_exp.h
+index c05a5d937e..7d3a24b0d8 100644
+--- a/crypto/bn/rsaz_exp.h
++++ b/crypto/bn/rsaz_exp.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright 2013-2018 The OpenSSL Project Authors. All Rights Reserved.
+- * Copyright (c) 2012, Intel Corporation. All Rights Reserved.
++ * Copyright 2013-2020 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright (c) 2020, Intel Corporation. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -35,6 +35,23 @@ void RSAZ_512_mod_exp(BN_ULONG result[8],
+                       const BN_ULONG m_norm[8], BN_ULONG k0,
+                       const BN_ULONG RR[8]);
+ 
++
++int rsaz_avx512ifma_eligible(void);
++
++int RSAZ_mod_exp_avx512_x2(BN_ULONG *res1,
++                           const BN_ULONG *base1,
++                           const BN_ULONG *exponent1,
++                           const BN_ULONG *m1,
++                           const BN_ULONG *RR1,
++                           BN_ULONG k0_1,
++                           BN_ULONG *res2,
++                           const BN_ULONG *base2,
++                           const BN_ULONG *exponent2,
++                           const BN_ULONG *m2,
++                           const BN_ULONG *RR2,
++                           BN_ULONG k0_2,
++                           int factor_size);
++
+ # endif
+ 
+ #endif
+diff --git a/crypto/bn/rsaz_exp_x2.c b/crypto/bn/rsaz_exp_x2.c
+new file mode 100644
+index 0000000000..f4c751bef0
+--- /dev/null
++++ b/crypto/bn/rsaz_exp_x2.c
+@@ -0,0 +1,542 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright (c) 2020, Intel Corporation. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ *
++ *
++ * Originally written by Ilya Albrekht, Sergey Kirillov and Andrey Matyukov
++ * Intel Corporation
++ *
++ */
++
++#include &lt;openssl/opensslconf.h&gt;
++#include &quot;rsaz_exp.h&quot;
++
++#ifndef RSAZ_ENABLED
++NON_EMPTY_TRANSLATION_UNIT
++#else
++# include &lt;assert.h&gt;
++# include &lt;string.h&gt;
++
++# if defined(__GNUC__)
++#  define ALIGN64 __attribute__((aligned(64)))
++# elif defined(_MSC_VER)
++#  define ALIGN64 __declspec(align(64))
++# else
++#  define ALIGN64
++# endif
++
++# define ALIGN_OF(ptr, boundary) \
++    ((unsigned char *)(ptr) + (boundary - (((size_t)(ptr)) &amp; (boundary - 1))))
++
++/* Internal radix */
++# define DIGIT_SIZE (52)
++/* 52-bit mask */
++# define DIGIT_MASK ((uint64_t)0xFFFFFFFFFFFFF)
++
++# define BITS2WORD8_SIZE(x)  (((x) + 7) &gt;&gt; 3)
++# define BITS2WORD64_SIZE(x) (((x) + 63) &gt;&gt; 6)
++
++static ossl_inline uint64_t get_digit52(const uint8_t *in, int in_len);
++static ossl_inline void put_digit52(uint8_t *out, int out_len, uint64_t digit);
++static void to_words52(BN_ULONG *out, int out_len, const BN_ULONG *in,
++                       int in_bitsize);
++static void from_words52(BN_ULONG *bn_out, int out_bitsize, const BN_ULONG *in);
++static ossl_inline void set_bit(BN_ULONG *a, int idx);
++
++/* Number of |digit_size|-bit digits in |bitsize|-bit value */
++static ossl_inline int number_of_digits(int bitsize, int digit_size)
++{
++    return (bitsize + digit_size - 1) / digit_size;
++}
++
++typedef void (*AMM52)(BN_ULONG *res, const BN_ULONG *base,
++                      const BN_ULONG *exp, const BN_ULONG *m, BN_ULONG k0);
++typedef void (*EXP52_x2)(BN_ULONG *res, const BN_ULONG *base,
++                         const BN_ULONG *exp[2], const BN_ULONG *m,
++                         const BN_ULONG *rr, const BN_ULONG k0[2]);
++
++/*
++ * For details of the methods declared below please refer to
++ *    crypto/bn/asm/rsaz-avx512.pl
++ *
++ * Naming notes:
++ *  amm = Almost Montgomery Multiplication
++ *  ams = Almost Montgomery Squaring
++ *  52x20 - data represented as array of 20 digits in 52-bit radix
++ *  _x1_/_x2_ - 1 or 2 independent inputs/outputs
++ *  _256 suffix - uses 256-bit (AVX512VL) registers
++ */
++
++/*AMM = Almost Montgomery Multiplication. */
++void RSAZ_amm52x20_x1_256(BN_ULONG *res, const BN_ULONG *base,
++                          const BN_ULONG *exp, const BN_ULONG *m,
++                          BN_ULONG k0);
++void RSAZ_exp52x20_x2_256(BN_ULONG *res, const BN_ULONG *base,
++                      const BN_ULONG *exp[2], const BN_ULONG *m,
++                      const BN_ULONG *rr, const BN_ULONG k0[2]);
++void RSAZ_amm52x20_x2_256(BN_ULONG *out, const BN_ULONG *a,
++                          const BN_ULONG *b, const BN_ULONG *m,
++                          const BN_ULONG k0[2]);
++void extract_multiplier_2x20_win5(BN_ULONG *red_Y,
++                                  const BN_ULONG *red_table,
++                                  int red_table_idx, int tbl_idx);
++
++/*
++ * Dual Montgomery modular exponentiation using prime moduli of the
++ * same bit size, optimized with AVX512 ISA.
++ *
++ * Input and output parameters for each exponentiation are independent and
++ * denoted here by index |i|, i = 1..2.
++ *
++ * Input and output are all in regular 2^64 radix.
++ *
++ * Each moduli shall be |factor_size| bit size.
++ *
++ * NOTE: currently only 2x1024 case is supported.
++ *
++ *  [out] res|i|      - result of modular exponentiation: array of qword values
++ *                      in regular (2^64) radix. Size of array shall be enough
++ *                      to hold |factor_size| bits.
++ *  [in]  base|i|     - base
++ *  [in]  exp|i|      - exponent
++ *  [in]  m|i|        - moduli
++ *  [in]  rr|i|       - Montgomery parameter RR = R^2 mod m|i|
++ *  [in]  k0_|i|      - Montgomery parameter k0 = -1/m|i| mod 2^64
++ *  [in]  factor_size - moduli bit size
++ *
++ * \return 0 in case of failure,
++ *         1 in case of success.
++ */
++int RSAZ_mod_exp_avx512_x2(BN_ULONG *res1,
++                           const BN_ULONG *base1,
++                           const BN_ULONG *exp1,
++                           const BN_ULONG *m1,
++                           const BN_ULONG *rr1,
++                           BN_ULONG k0_1,
++                           BN_ULONG *res2,
++                           const BN_ULONG *base2,
++                           const BN_ULONG *exp2,
++                           const BN_ULONG *m2,
++                           const BN_ULONG *rr2,
++                           BN_ULONG k0_2,
++                           int factor_size)
++{
++    int ret = 0;
++
++    /*
++     * Number of word-size (BN_ULONG) digits to store exponent in redundant
++     * representation.
++     */
++    int exp_digits = number_of_digits(factor_size + 2, DIGIT_SIZE);
++    int coeff_pow = 4 * (DIGIT_SIZE * exp_digits - factor_size);
++    BN_ULONG *base1_red, *m1_red, *rr1_red;
++    BN_ULONG *base2_red, *m2_red, *rr2_red;
++    BN_ULONG *coeff_red;
++    BN_ULONG *storage = NULL;
++    BN_ULONG *storage_aligned = NULL;
++    BN_ULONG storage_len_bytes = 7 * exp_digits * sizeof(BN_ULONG);
++
++    /* AMM = Almost Montgomery Multiplication */
++    AMM52 amm = NULL;
++    /* Dual (2-exps in parallel) exponentiation */
++    EXP52_x2 exp_x2 = NULL;
++
++    const BN_ULONG *exp[2] = {0};
++    BN_ULONG k0[2] = {0};
++
++    /* Only 1024-bit factor size is supported now */
++    switch (factor_size) {
++    case 1024:
++        amm = RSAZ_amm52x20_x1_256;
++        exp_x2 = RSAZ_exp52x20_x2_256;
++        break;
++    default:
++        goto err;
++    }
++
++    storage = (BN_ULONG *)OPENSSL_malloc(storage_len_bytes + 64);
++    if (storage == NULL)
++        goto err;
++    storage_aligned = (BN_ULONG *)ALIGN_OF(storage, 64);
++
++    /* Memory layout for red(undant) representations */
++    base1_red = storage_aligned;
++    base2_red = storage_aligned + 1 * exp_digits;
++    m1_red    = storage_aligned + 2 * exp_digits;
++    m2_red    = storage_aligned + 3 * exp_digits;
++    rr1_red   = storage_aligned + 4 * exp_digits;
++    rr2_red   = storage_aligned + 5 * exp_digits;
++    coeff_red = storage_aligned + 6 * exp_digits;
++
++    /* Convert base_i, m_i, rr_i, from regular to 52-bit radix */
++    to_words52(base1_red, exp_digits, base1, factor_size);
++    to_words52(base2_red, exp_digits, base2, factor_size);
++    to_words52(m1_red, exp_digits, m1, factor_size);
++    to_words52(m2_red, exp_digits, m2, factor_size);
++    to_words52(rr1_red, exp_digits, rr1, factor_size);
++    to_words52(rr2_red, exp_digits, rr2, factor_size);
++
++    /*
++     * Compute target domain Montgomery converters RR' for each modulus
++     * based on precomputed original domain's RR.
++     *
++     * RR -&gt; RR' transformation steps:
++     *  (1) coeff = 2^k
++     *  (2) t = AMM(RR,RR) = RR^2 / R' mod m
++     *  (3) RR' = AMM(t, coeff) = RR^2 * 2^k / R'^2 mod m
++     * where
++     *  k = 4 * (52 * digits52 - modlen)
++     *  R  = 2^(64 * ceil(modlen/64)) mod m
++     *  RR = R^2 mod M
++     *  R' = 2^(52 * ceil(modlen/52)) mod m
++     *
++     *  modlen = 1024: k = 64, RR = 2^2048 mod m, RR' = 2^2080 mod m
++     */
++    memset(coeff_red, 0, exp_digits * sizeof(BN_ULONG));
++    /* (1) in reduced domain representation */
++    set_bit(coeff_red, 64 * (int)(coeff_pow / 52) + coeff_pow % 52);
++
++    amm(rr1_red, rr1_red, rr1_red, m1_red, k0_1);     /* (2) for m1 */
++    amm(rr1_red, rr1_red, coeff_red, m1_red, k0_1);   /* (3) for m1 */
++
++    amm(rr2_red, rr2_red, rr2_red, m2_red, k0_2);     /* (2) for m2 */
++    amm(rr2_red, rr2_red, coeff_red, m2_red, k0_2);   /* (3) for m2 */
++
++    exp[0] = exp1;
++    exp[1] = exp2;
++
++    k0[0] = k0_1;
++    k0[1] = k0_2;
++
++    exp_x2(rr1_red, base1_red, exp, m1_red, rr1_red, k0);
++
++    /* Convert rr_i back to regular radix */
++    from_words52(res1, factor_size, rr1_red);
++    from_words52(res2, factor_size, rr2_red);
++
++    ret = 1;
++err:
++    if (storage != NULL) {
++        OPENSSL_cleanse(storage, storage_len_bytes);
++        OPENSSL_free(storage);
++    }
++    return ret;
++}
++
++/*
++ * Dual 1024-bit w-ary modular exponentiation using prime moduli of the same
++ * bit size using Almost Montgomery Multiplication, optimized with AVX512_IFMA
++ * ISA.
++ *
++ * The parameter w (window size) = 5.
++ *
++ *  [out] res      - result of modular exponentiation: 2x20 qword
++ *                   values in 2^52 radix.
++ *  [in]  base     - base (2x20 qword values in 2^52 radix)
++ *  [in]  exp      - array of 2 pointers to 16 qword values in 2^64 radix.
++ *                   Exponent is not converted to redundant representation.
++ *  [in]  m        - moduli (2x20 qword values in 2^52 radix)
++ *  [in]  rr       - Montgomery parameter for 2 moduli: RR = 2^2080 mod m.
++ *                   (2x20 qword values in 2^52 radix)
++ *  [in]  k0       - Montgomery parameter for 2 moduli: k0 = -1/m mod 2^64
++ *
++ * \return (void).
++ */
++void RSAZ_exp52x20_x2_256(BN_ULONG *out,          /* [2][20] */
++                          const BN_ULONG *base,   /* [2][20] */
++                          const BN_ULONG *exp[2], /* 2x16    */
++                          const BN_ULONG *m,      /* [2][20] */
++                          const BN_ULONG *rr,     /* [2][20] */
++                          const BN_ULONG k0[2])
++{
++# define BITSIZE_MODULUS (1024)
++# define EXP_WIN_SIZE (5)
++# define EXP_WIN_MASK ((1U &lt;&lt; EXP_WIN_SIZE) - 1)
++/*
++ * Number of digits (64-bit words) in redundant representation to handle
++ * modulus bits
++ */
++# define RED_DIGITS (20)
++# define EXP_DIGITS (16)
++# define DAMM RSAZ_amm52x20_x2_256
++/*
++ * Squaring is done using multiplication now. That can be a subject of
++ * optimization in future.
++ */
++# define DAMS(r,a,m,k0) \
++              RSAZ_amm52x20_x2_256((r),(a),(a),(m),(k0))
++
++    /* Allocate stack for red(undant) result Y and multiplier X */
++    ALIGN64 BN_ULONG red_Y[2][RED_DIGITS];
++    ALIGN64 BN_ULONG red_X[2][RED_DIGITS];
++
++    /* Allocate expanded exponent */
++    ALIGN64 BN_ULONG expz[2][EXP_DIGITS + 1];
++
++    /* Pre-computed table of base powers */
++    ALIGN64 BN_ULONG red_table[1U &lt;&lt; EXP_WIN_SIZE][2][RED_DIGITS];
++
++    int idx;
++
++    memset(red_Y, 0, sizeof(red_Y));
++    memset(red_table, 0, sizeof(red_table));
++    memset(red_X, 0, sizeof(red_X));
++
++    /*
++     * Compute table of powers base^i, i = 0, ..., (2^EXP_WIN_SIZE) - 1
++     *   table[0] = mont(x^0) = mont(1)
++     *   table[1] = mont(x^1) = mont(x)
++     */
++    red_X[0][0] = 1;
++    red_X[1][0] = 1;
++    DAMM(red_table[0][0], (const BN_ULONG*)red_X, rr, m, k0);
++    DAMM(red_table[1][0], base,  rr, m, k0);
++
++    for (idx = 1; idx &lt; (int)((1U &lt;&lt; EXP_WIN_SIZE) / 2); idx++) {
++        DAMS(red_table[2 * idx + 0][0], red_table[1 * idx][0], m, k0);
++        DAMM(red_table[2 * idx + 1][0], red_table[2 * idx][0], red_table[1][0], m, k0);
++    }
++
++    /* Copy and expand exponents */
++    memcpy(expz[0], exp[0], EXP_DIGITS * sizeof(BN_ULONG));
++    expz[0][EXP_DIGITS] = 0;
++    memcpy(expz[1], exp[1], EXP_DIGITS * sizeof(BN_ULONG));
++    expz[1][EXP_DIGITS] = 0;
++
++    /* Exponentiation */
++    {
++        int rem = BITSIZE_MODULUS % EXP_WIN_SIZE;
++        int delta = rem ? rem : EXP_WIN_SIZE;
++        BN_ULONG table_idx_mask = EXP_WIN_MASK;
++
++        int exp_bit_no = BITSIZE_MODULUS - delta;
++        int exp_chunk_no = exp_bit_no / 64;
++        int exp_chunk_shift = exp_bit_no % 64;
++
++        /* Process 1-st exp window - just init result */
++        BN_ULONG red_table_idx_0 = expz[0][exp_chunk_no];
++        BN_ULONG red_table_idx_1 = expz[1][exp_chunk_no];
++        /*
++         * The function operates with fixed moduli sizes divisible by 64,
++         * thus table index here is always in supported range [0, EXP_WIN_SIZE).
++         */
++        red_table_idx_0 &gt;&gt;= exp_chunk_shift;
++        red_table_idx_1 &gt;&gt;= exp_chunk_shift;
++
++        extract_multiplier_2x20_win5(red_Y[0], (const BN_ULONG*)red_table, (int)red_table_idx_0, 0);
++        extract_multiplier_2x20_win5(red_Y[1], (const BN_ULONG*)red_table, (int)red_table_idx_1, 1);
++
++        /* Process other exp windows */
++        for (exp_bit_no -= EXP_WIN_SIZE; exp_bit_no &gt;= 0; exp_bit_no -= EXP_WIN_SIZE) {
++            /* Extract pre-computed multiplier from the table */
++            {
++                BN_ULONG T;
++
++                exp_chunk_no = exp_bit_no / 64;
++                exp_chunk_shift = exp_bit_no % 64;
++                {
++                    red_table_idx_0 = expz[0][exp_chunk_no];
++                    T = expz[0][exp_chunk_no + 1];
++
++                    red_table_idx_0 &gt;&gt;= exp_chunk_shift;
++                    /*
++                     * Get additional bits from then next quadword
++                     * when 64-bit boundaries are crossed.
++                     */
++                    if (exp_chunk_shift &gt; 64 - EXP_WIN_SIZE) {
++                        T &lt;&lt;= (64 - exp_chunk_shift);
++                        red_table_idx_0 ^= T;
++                    }
++                    red_table_idx_0 &amp;= table_idx_mask;
++
++                    extract_multiplier_2x20_win5(red_X[0], (const BN_ULONG*)red_table, (int)red_table_idx_0, 0);
++                }
++                {
++                    red_table_idx_1 = expz[1][exp_chunk_no];
++                    T = expz[1][exp_chunk_no + 1];
++
++                    red_table_idx_1 &gt;&gt;= exp_chunk_shift;
++                    /*
++                     * Get additional bits from then next quadword
++                     * when 64-bit boundaries are crossed.
++                     */
++                    if (exp_chunk_shift &gt; 64 - EXP_WIN_SIZE) {
++                        T &lt;&lt;= (64 - exp_chunk_shift);
++                        red_table_idx_1 ^= T;
++                    }
++                    red_table_idx_1 &amp;= table_idx_mask;
++
++                    extract_multiplier_2x20_win5(red_X[1], (const BN_ULONG*)red_table, (int)red_table_idx_1, 1);
++                }
++            }
++
++            /* Series of squaring */
++            DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
++            DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
++            DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
++            DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
++            DAMS((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, m, k0);
++
++            DAMM((BN_ULONG*)red_Y, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
++        }
++    }
++
++    /*
++     *
++     * NB: After the last AMM of exponentiation in Montgomery domain, the result
++     * may be 1025-bit, but the conversion out of Montgomery domain performs an
++     * AMM(x,1) which guarantees that the final result is less than |m|, so no
++     * conditional subtraction is needed here. See &quot;Efficient Software
++     * Implementations of Modular Exponentiation&quot; (by Shay Gueron) paper for details.
++     */
++
++    /* Convert result back in regular 2^52 domain */
++    memset(red_X, 0, sizeof(red_X));
++    red_X[0][0] = 1;
++    red_X[1][0] = 1;
++    DAMM(out, (const BN_ULONG*)red_Y, (const BN_ULONG*)red_X, m, k0);
++
++    /* Clear exponents */
++    OPENSSL_cleanse(expz, sizeof(expz));
++    OPENSSL_cleanse(red_Y, sizeof(red_Y));
++
++# undef DAMS
++# undef DAMM
++# undef EXP_DIGITS
++# undef RED_DIGITS
++# undef EXP_WIN_MASK
++# undef EXP_WIN_SIZE
++# undef BITSIZE_MODULUS
++}
++
++static ossl_inline uint64_t get_digit52(const uint8_t *in, int in_len)
++{
++    uint64_t digit = 0;
++
++    assert(in != NULL);
++
++    for (; in_len &gt; 0; in_len--) {
++        digit &lt;&lt;= 8;
++        digit += (uint64_t)(in[in_len - 1]);
++    }
++    return digit;
++}
++
++/*
++ * Convert array of words in regular (base=2^64) representation to array of
++ * words in redundant (base=2^52) one.
++ */
++static void to_words52(BN_ULONG *out, int out_len,
++                       const BN_ULONG *in, int in_bitsize)
++{
++    uint8_t *in_str = NULL;
++
++    assert(out != NULL);
++    assert(in != NULL);
++    /* Check destination buffer capacity */
++    assert(out_len &gt;= number_of_digits(in_bitsize, DIGIT_SIZE));
++
++    in_str = (uint8_t *)in;
++
++    for (; in_bitsize &gt;= (2 * DIGIT_SIZE); in_bitsize -= (2 * DIGIT_SIZE), out += 2) {
++        out[0] = (*(uint64_t *)in_str) &amp; DIGIT_MASK;
++        in_str += 6;
++        out[1] = ((*(uint64_t *)in_str) &gt;&gt; 4) &amp; DIGIT_MASK;
++        in_str += 7;
++        out_len -= 2;
++    }
++
++    if (in_bitsize &gt; DIGIT_SIZE) {
++        uint64_t digit = get_digit52(in_str, 7);
++
++        out[0] = digit &amp; DIGIT_MASK;
++        in_str += 6;
++        in_bitsize -= DIGIT_SIZE;
++        digit = get_digit52(in_str, BITS2WORD8_SIZE(in_bitsize));
++        out[1] = digit &gt;&gt; 4;
++        out += 2;
++        out_len -= 2;
++    } else if (in_bitsize &gt; 0) {
++        out[0] = get_digit52(in_str, BITS2WORD8_SIZE(in_bitsize));
++        out++;
++        out_len--;
++    }
++
++    while (out_len &gt; 0) {
++        *out = 0;
++        out_len--;
++        out++;
++    }
++}
++
++static ossl_inline void put_digit52(uint8_t *pStr, int strLen, uint64_t digit)
++{
++    assert(pStr != NULL);
++
++    for (; strLen &gt; 0; strLen--) {
++        *pStr++ = (uint8_t)(digit &amp; 0xFF);
++        digit &gt;&gt;= 8;
++    }
++}
++
++/*
++ * Convert array of words in redundant (base=2^52) representation to array of
++ * words in regular (base=2^64) one.
++ */
++static void from_words52(BN_ULONG *out, int out_bitsize, const BN_ULONG *in)
++{
++    int i;
++    int out_len = BITS2WORD64_SIZE(out_bitsize);
++
++    assert(out != NULL);
++    assert(in != NULL);
++
++    for (i = 0; i &lt; out_len; i++)
++        out[i] = 0;
++
++    {
++        uint8_t *out_str = (uint8_t *)out;
++
++        for (; out_bitsize &gt;= (2 * DIGIT_SIZE); out_bitsize -= (2 * DIGIT_SIZE), in += 2) {
++            (*(uint64_t *)out_str) = in[0];
++            out_str += 6;
++            (*(uint64_t *)out_str) ^= in[1] &lt;&lt; 4;
++            out_str += 7;
++        }
++
++        if (out_bitsize &gt; DIGIT_SIZE) {
++            put_digit52(out_str, 7, in[0]);
++            out_str += 6;
++            out_bitsize -= DIGIT_SIZE;
++            put_digit52(out_str, BITS2WORD8_SIZE(out_bitsize),
++                        (in[1] &lt;&lt; 4 | in[0] &gt;&gt; 48));
++        } else if (out_bitsize) {
++            put_digit52(out_str, BITS2WORD8_SIZE(out_bitsize), in[0]);
++        }
++    }
++}
++
++/*
++ * Set bit at index |idx| in the words array |a|.
++ * It does not do any boundaries checks, make sure the index is valid before
++ * calling the function.
++ */
++static ossl_inline void set_bit(BN_ULONG *a, int idx)
++{
++    assert(a != NULL);
++
++    {
++        int i, j;
++
++        i = idx / BN_BITS2;
++        j = idx % BN_BITS2;
++        a[i] |= (((BN_ULONG)1) &lt;&lt; j);
++    }
++}
++
++#endif
+diff --git a/crypto/rsa/rsa_ossl.c b/crypto/rsa/rsa_ossl.c
+index 9f98c037c8..1817392e76 100644
+--- a/crypto/rsa/rsa_ossl.c
++++ b/crypto/rsa/rsa_ossl.c
+@@ -688,15 +688,20 @@ static int rsa_ossl_mod_exp(BIGNUM *r0, const BIGNUM *I, RSA *rsa, BN_CTX *ctx)
+         if (/* m1 = I moq q */
+             !bn_from_mont_fixed_top(m1, I, rsa-&gt;_method_mod_q, ctx)
+             || !bn_to_mont_fixed_top(m1, m1, rsa-&gt;_method_mod_q, ctx)
+-            /* m1 = m1^dmq1 mod q */
+-            || !BN_mod_exp_mont_consttime(m1, m1, rsa-&gt;dmq1, rsa-&gt;q, ctx,
+-                                          rsa-&gt;_method_mod_q)
+             /* r1 = I mod p */
+             || !bn_from_mont_fixed_top(r1, I, rsa-&gt;_method_mod_p, ctx)
+             || !bn_to_mont_fixed_top(r1, r1, rsa-&gt;_method_mod_p, ctx)
+-            /* r1 = r1^dmp1 mod p */
+-            || !BN_mod_exp_mont_consttime(r1, r1, rsa-&gt;dmp1, rsa-&gt;p, ctx,
+-                                          rsa-&gt;_method_mod_p)
++            /*
++             * Use parallel exponentiations optimization if possible,
++             * otherwise fallback to two sequential exponentiations:
++             *    m1 = m1^dmq1 mod q
++             *    r1 = r1^dmp1 mod p
++             */
++            || !BN_mod_exp_mont_consttime_x2(m1, m1, rsa-&gt;dmq1, rsa-&gt;q,
++                                             rsa-&gt;_method_mod_q,
++                                             r1, r1, rsa-&gt;dmp1, rsa-&gt;p,
++                                             rsa-&gt;_method_mod_p,
++                                             ctx)
+             /* r1 = (r1 - m1) mod p */
+             /*
+              * bn_mod_sub_fixed_top is not regular modular subtraction,
+diff --git a/crypto/x86_64cpuid.pl b/crypto/x86_64cpuid.pl
+index d3e2b9145a..9f7a1b092f 100644
+--- a/crypto/x86_64cpuid.pl
++++ b/crypto/x86_64cpuid.pl
+@@ -215,7 +215,7 @@ OPENSSL_ia32_cpuid:
+ 	cmp	\$0xe6,%eax
+ 	je	.Ldone
+ 	andl	\$0x3fdeffff,8(%rdi)	# ~(1&lt;&lt;31|1&lt;&lt;30|1&lt;&lt;21|1&lt;&lt;16)
+-					# clear AVX512F+BW+VL+FIMA, all of
++					# clear AVX512F+BW+VL+IFMA, all of
+ 					# them are EVEX-encoded, which requires
+ 					# ZMM state support even if one uses
+ 					# only XMM and YMM :-(
+diff --git a/doc/build.info b/doc/build.info
+index 0a13f26927..95627bed4d 100644
+--- a/doc/build.info
++++ b/doc/build.info
+@@ -698,6 +698,10 @@ DEPEND[html/man3/BN_generate_prime.html]=man3/BN_generate_prime.pod
+ GENERATE[html/man3/BN_generate_prime.html]=man3/BN_generate_prime.pod
+ DEPEND[man/man3/BN_generate_prime.3]=man3/BN_generate_prime.pod
+ GENERATE[man/man3/BN_generate_prime.3]=man3/BN_generate_prime.pod
++DEPEND[html/man3/BN_mod_exp_mont.html]=man3/BN_mod_exp_mont.pod
++GENERATE[html/man3/BN_mod_exp_mont.html]=man3/BN_mod_exp_mont.pod
++DEPEND[man/man3/BN_mod_exp_mont.3]=man3/BN_mod_exp_mont.pod
++GENERATE[man/man3/BN_mod_exp_mont.3]=man3/BN_mod_exp_mont.pod
+ DEPEND[html/man3/BN_mod_inverse.html]=man3/BN_mod_inverse.pod
+ GENERATE[html/man3/BN_mod_inverse.html]=man3/BN_mod_inverse.pod
+ DEPEND[man/man3/BN_mod_inverse.3]=man3/BN_mod_inverse.pod
+@@ -2808,6 +2812,7 @@ html/man3/BN_bn2bin.html \
+ html/man3/BN_cmp.html \
+ html/man3/BN_copy.html \
+ html/man3/BN_generate_prime.html \
++html/man3/BN_mod_exp_mont.html \
+ html/man3/BN_mod_inverse.html \
+ html/man3/BN_mod_mul_montgomery.html \
+ html/man3/BN_mod_mul_reciprocal.html \
+@@ -3379,6 +3384,7 @@ man/man3/BN_bn2bin.3 \
+ man/man3/BN_cmp.3 \
+ man/man3/BN_copy.3 \
+ man/man3/BN_generate_prime.3 \
++man/man3/BN_mod_exp_mont.3 \
+ man/man3/BN_mod_inverse.3 \
+ man/man3/BN_mod_mul_montgomery.3 \
+ man/man3/BN_mod_mul_reciprocal.3 \
+diff --git a/doc/man3/BN_mod_exp_mont.pod b/doc/man3/BN_mod_exp_mont.pod
+new file mode 100644
+index 0000000000..3c76e5bcbc
+--- /dev/null
++++ b/doc/man3/BN_mod_exp_mont.pod
+@@ -0,0 +1,65 @@
++=pod
++
++=head1 NAME
++
++BN_mod_exp_mont, BN_mod_exp_mont_consttime, BN_mod_exp_mont_consttime_x2 -
++Montgomery exponentiation
++
++=head1 SYNOPSIS
++
++ #include &lt;openssl/bn.h&gt;
++
++ int BN_mod_exp_mont(BIGNUM *rr, const BIGNUM *a, const BIGNUM *p,
++                     const BIGNUM *m, BN_CTX *ctx, BN_MONT_CTX *in_mont);
++
++ int BN_mod_exp_mont_consttime(BIGNUM *rr, const BIGNUM *a, const BIGNUM *p,
++                               const BIGNUM *m, BN_CTX *ctx,
++                               BN_MONT_CTX *in_mont);
++
++ int BN_mod_exp_mont_consttime_x2(BIGNUM *rr1, const BIGNUM *a1,
++                                  const BIGNUM *p1, const BIGNUM *m1,
++                                  BN_MONT_CTX *in_mont1, BIGNUM *rr2,
++                                  const BIGNUM *a2, const BIGNUM *p2,
++                                  const BIGNUM *m2, BN_MONT_CTX *in_mont2,
++                                  BN_CTX *ctx);
++
++=head1 DESCRIPTION
++
++BN_mod_exp_mont() computes I&lt;a&gt; to the I&lt;p&gt;-th power modulo I&lt;m&gt; (C&lt;rr=a^p % m&gt;)
++using Montgomery multiplication. I&lt;in_mont&gt; is a Montgomery context and can be
++NULL. In the case I&lt;in_mont&gt; is NULL, it will be initialized within the
++function, so you can save time on initialization if you provide it in advance.
++
++BN_mod_exp_mont_consttime() computes I&lt;a&gt; to the I&lt;p&gt;-th power modulo I&lt;m&gt;
++(C&lt;rr=a^p % m&gt;) using Montgomery multiplication. It is a variant of
++L&lt;BN_mod_exp_mont(3)&gt; that uses fixed windows and the special precomputation
++memory layout to limit data-dependency to a minimum to protect secret exponents.
++It is called automatically when L&lt;BN_mod_exp_mont(3)&gt; is called with parameters
++I&lt;a&gt;, I&lt;p&gt;, I&lt;m&gt;, any of which have B&lt;BN_FLG_CONSTTIME&gt; flag.
++
++BN_mod_exp_mont_consttime_x2() computes two independent exponentiations I&lt;a1&gt; to
++the I&lt;p1&gt;-th power modulo I&lt;m1&gt; (C&lt;rr1=a1^p1 % m1&gt;) and I&lt;a2&gt; to the I&lt;p2&gt;-th
++power modulo I&lt;m2&gt; (C&lt;rr2=a2^p2 % m2&gt;) using Montgomery multiplication. For some
++fixed and equal modulus sizes I&lt;m1&gt; and I&lt;m2&gt; it uses optimizations that allow
++to speedup two exponentiations. In all other cases the function reduces to two
++calls of L&lt;BN_mod_exp_mont_consttime(3)&gt;.
++
++=head1 RETURN VALUES
++
++For all functions 1 is returned for success, 0 on error.
++The error codes can be obtained by L&lt;ERR_get_error(3)&gt;.
++
++=head1 SEE ALSO
++
++L&lt;ERR_get_error(3)&gt;, L&lt;BN_mod_exp_mont(3)&gt;
++
++=head1 COPYRIGHT
++
++Copyright 2000-2020 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L&lt;<A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>&gt;.
++
++=cut
+diff --git a/include/openssl/bn.h b/include/openssl/bn.h
+index 1e4b27bf02..2217ec0857 100644
+--- a/include/openssl/bn.h
++++ b/include/openssl/bn.h
+@@ -312,6 +312,11 @@ int BN_mod_exp2_mont(BIGNUM *r, const BIGNUM *a1, const BIGNUM *p1,
+                      BN_CTX *ctx, BN_MONT_CTX *m_ctx);
+ int BN_mod_exp_simple(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
+                       const BIGNUM *m, BN_CTX *ctx);
++int BN_mod_exp_mont_consttime_x2(BIGNUM *rr1, const BIGNUM *a1, const BIGNUM *p1,
++                                 const BIGNUM *m1, BN_MONT_CTX *in_mont1,
++                                 BIGNUM *rr2, const BIGNUM *a2, const BIGNUM *p2,
++                                 const BIGNUM *m2, BN_MONT_CTX *in_mont2,
++                                 BN_CTX *ctx);
+ 
+ int BN_mask_bits(BIGNUM *a, int n);
+ # ifndef OPENSSL_NO_STDIO
+diff --git a/test/exptest.c b/test/exptest.c
+index 2b2d3fd549..a1ac44e909 100644
+--- a/test/exptest.c
++++ b/test/exptest.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -198,9 +198,102 @@ static int test_mod_exp(int round)
+     return ret;
+ }
+ 
++static int test_mod_exp_x2(int idx)
++{
++    BN_CTX *ctx;
++    int ret = 0;
++    BIGNUM *r_mont_const_x2_1 = NULL;
++    BIGNUM *r_mont_const_x2_2 = NULL;
++    BIGNUM *r_simple1 = NULL;
++    BIGNUM *r_simple2 = NULL;
++    BIGNUM *a1 = NULL;
++    BIGNUM *b1 = NULL;
++    BIGNUM *m1 = NULL;
++    BIGNUM *a2 = NULL;
++    BIGNUM *b2 = NULL;
++    BIGNUM *m2 = NULL;
++    int factor_size = 0;
++
++    /*
++     * Currently only 1024-bit factor size is supported.
++     */
++    if (idx &lt;= 100)
++        factor_size = 1024;
++
++    if (!TEST_ptr(ctx = BN_CTX_new()))
++        goto err;
++
++    if (!TEST_ptr(r_mont_const_x2_1 = BN_new())
++        || !TEST_ptr(r_mont_const_x2_2 = BN_new())
++        || !TEST_ptr(r_simple1 = BN_new())
++        || !TEST_ptr(r_simple2 = BN_new())
++        || !TEST_ptr(a1 = BN_new())
++        || !TEST_ptr(b1 = BN_new())
++        || !TEST_ptr(m1 = BN_new())
++        || !TEST_ptr(a2 = BN_new())
++        || !TEST_ptr(b2 = BN_new())
++        || !TEST_ptr(m2 = BN_new()))
++        goto err;
++
++    BN_rand(a1, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
++    BN_rand(b1, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
++    BN_rand(m1, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
++    BN_rand(a2, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
++    BN_rand(b2, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY);
++    BN_rand(m2, factor_size, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD);
++
++    if (!TEST_true(BN_mod(a1, a1, m1, ctx))
++        || !TEST_true(BN_mod(b1, b1, m1, ctx))
++        || !TEST_true(BN_mod(a2, a2, m2, ctx))
++        || !TEST_true(BN_mod(b2, b2, m2, ctx))
++        || !TEST_true(BN_mod_exp_simple(r_simple1, a1, b1, m1, ctx))
++        || !TEST_true(BN_mod_exp_simple(r_simple2, a2, b2, m2, ctx))
++        || !TEST_true(BN_mod_exp_mont_consttime_x2(r_mont_const_x2_1, a1, b1, m1, NULL,
++                                                   r_mont_const_x2_2, a2, b2, m2, NULL,
++                                                   ctx)))
++        goto err;
++
++    if (!TEST_BN_eq(r_simple1, r_mont_const_x2_1)
++        || !TEST_BN_eq(r_simple2, r_mont_const_x2_2)) {
++        if (BN_cmp(r_simple1, r_mont_const_x2_1) != 0)
++            TEST_info(&quot;simple and mont const time x2 (#1) results differ&quot;);
++        if (BN_cmp(r_simple2, r_mont_const_x2_2) != 0)
++            TEST_info(&quot;simple and mont const time x2 (#2) results differ&quot;);
++
++        BN_print_var(a1);
++        BN_print_var(b1);
++        BN_print_var(m1);
++        BN_print_var(a2);
++        BN_print_var(b2);
++        BN_print_var(m2);
++        BN_print_var(r_simple1);
++        BN_print_var(r_simple2);
++        BN_print_var(r_mont_const_x2_1);
++        BN_print_var(r_mont_const_x2_2);
++        goto err;
++    }
++
++    ret = 1;
++ err:
++    BN_free(r_mont_const_x2_1);
++    BN_free(r_mont_const_x2_2);
++    BN_free(r_simple1);
++    BN_free(r_simple2);
++    BN_free(a1);
++    BN_free(b1);
++    BN_free(m1);
++    BN_free(a2);
++    BN_free(b2);
++    BN_free(m2);
++    BN_CTX_free(ctx);
++
++    return ret;
++}
++
+ int setup_tests(void)
+ {
+     ADD_TEST(test_mod_exp_zero);
+     ADD_ALL_TESTS(test_mod_exp, 200);
++    ADD_ALL_TESTS(test_mod_exp_x2, 100);
+     return 1;
+ }
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 3fd2e665f2..523971f1f4 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -5313,6 +5313,7 @@ EVP_RAND_CTX_gettable_params            ?	3_0_0	EXIST::FUNCTION:
+ EVP_RAND_CTX_settable_params            ?	3_0_0	EXIST::FUNCTION:
+ RAND_set_DRBG_type                      ?	3_0_0	EXIST::FUNCTION:
+ RAND_set_seed_source_type               ?	3_0_0	EXIST::FUNCTION:
++BN_mod_exp_mont_consttime_x2            ?	3_0_0	EXIST::FUNCTION:
+ BIO_f_readbuffer                        ?	3_0_0	EXIST::FUNCTION:
+ EVP_DigestInit_ex2                      ?	3_0_0	EXIST::FUNCTION:
+ EVP_EncryptInit_ex2                     ?	3_0_0	EXIST::FUNCTION:
+diff --git a/util/missingcrypto.txt b/util/missingcrypto.txt
+index d062ff03c0..bb1f775977 100644
+--- a/util/missingcrypto.txt
++++ b/util/missingcrypto.txt
+@@ -261,8 +261,6 @@ BN_is_negative(3)
+ BN_kronecker(3)
+ BN_mod_add_quick(3)
+ BN_mod_exp2_mont(3)
+-BN_mod_exp_mont(3)
+-BN_mod_exp_mont_consttime(3)
+ BN_mod_exp_mont_word(3)
+ BN_mod_exp_recp(3)
+ BN_mod_exp_simple(3)
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033563.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033569.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33567">[ date ]</a>
+              <a href="thread.html#33567">[ thread ]</a>
+              <a href="subject.html#33567">[ subject ]</a>
+              <a href="author.html#33567">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

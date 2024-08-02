@@ -1,0 +1,840 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1472032009.026375.9377.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010167.html">
+   <LINK REL="Next"  HREF="010169.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1472032009.026375.9377.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Aug 24 09:46:49 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010167.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="010169.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10168">[ date ]</a>
+              <a href="thread.html#10168">[ thread ]</a>
+              <a href="subject.html#10168">[ subject ]</a>
+              <a href="author.html#10168">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dfde4219fdebbb5a8a17602fea036f7690e517ea (commit)
+       via  b62b2454fadfccaf5e055a1810d72174c2633b8f (commit)
+      from  9e421962e1cd58e302ebd8aca5d5a44198194243 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dfde4219fdebbb5a8a17602fea036f7690e517ea
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sat Aug 20 22:10:24 2016 +0200
+
+    ec/asm/ecp_nistz256-*.pl: addition to perform stricter reduction.
+    
+    Addition was not preserving inputs' property of being fully reduced.
+    
+    Thanks to Brian Smith for reporting this.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit b62b2454fadfccaf5e055a1810d72174c2633b8f
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Sat Aug 20 22:04:21 2016 +0200
+
+    ec/asm/ecp_nistz256-x86_64.pl: addition to perform stricter reduction.
+    
+    Addition was not preserving inputs' property of being fully reduced.
+    
+    Thanks to Brian Smith for reporting this.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/asm/ecp_nistz256-armv4.pl   | 124 ++++++++++++++++++++--------------
+ crypto/ec/asm/ecp_nistz256-armv8.pl   |  12 ++--
+ crypto/ec/asm/ecp_nistz256-sparcv9.pl |  80 ++++++++++++++--------
+ crypto/ec/asm/ecp_nistz256-x86.pl     |  31 +++++++--
+ crypto/ec/asm/ecp_nistz256-x86_64.pl  | 115 ++++++++++++++++---------------
+ crypto/ec/ecp_nistz256.c              |  31 +++++++--
+ 6 files changed, 242 insertions(+), 151 deletions(-)
+
+diff --git a/crypto/ec/asm/ecp_nistz256-armv4.pl b/crypto/ec/asm/ecp_nistz256-armv4.pl
+index 73b7a55..de3cd5c 100755
+--- a/crypto/ec/asm/ecp_nistz256-armv4.pl
++++ b/crypto/ec/asm/ecp_nistz256-armv4.pl
+@@ -174,10 +174,7 @@ __ecp_nistz256_mul_by_2:
+ 	adcs	$a6,$a6,$a6
+ 	mov	$ff,#0
+ 	adcs	$a7,$a7,$a7
+-#ifdef	__thumb2__
+-	it	cs
+-#endif
+-	movcs	$ff,#-1			@ $ff = carry ? -1 : 0
++	adc	$ff,$ff,#0
+ 
+ 	b	.Lreduce_by_sub
+ .size	__ecp_nistz256_mul_by_2,.-__ecp_nistz256_mul_by_2
+@@ -228,35 +225,45 @@ __ecp_nistz256_add:
+ 	adcs	$a6,$a6,$t2
+ 	mov	$ff,#0
+ 	adcs	$a7,$a7,$t3
+-#ifdef	__thumb2__
+-	it	cs
+-#endif
+-	movcs	$ff,#-1			@ $ff = carry ? -1 : 0, &quot;broadcast&quot; carry
++	adc	$ff,$ff,#0
+ 	ldr	lr,[sp],#4		@ pop lr
+ 
+ .Lreduce_by_sub:
+ 
+-	@ if a+b carries, subtract modulus.
++	@ if a+b &gt;= modulus, subtract modulus.
+ 	@
++	@ But since comparison implies subtraction, we subtract
++	@ modulus and then add it back if subraction borrowed.
++
++	subs	$a0,$a0,#-1
++	sbcs	$a1,$a1,#-1
++	sbcs	$a2,$a2,#-1
++	sbcs	$a3,$a3,#0
++	sbcs	$a4,$a4,#0
++	sbcs	$a5,$a5,#0
++	sbcs	$a6,$a6,#1
++	sbcs	$a7,$a7,#-1
++	sbc	$ff,$ff,#0
++
+ 	@ Note that because mod has special form, i.e. consists of
+ 	@ 0xffffffff, 1 and 0s, we can conditionally synthesize it by
+-	@ using value of broadcasted carry as a whole or extracting
+-	@ single bit. Follow $ff register...
++	@ using value of borrow as a whole or extracting single bit.
++	@ Follow $ff register...
+ 
+-	subs	$a0,$a0,$ff		@ subtract synthesized modulus
+-	sbcs	$a1,$a1,$ff
++	adds	$a0,$a0,$ff		@ add synthesized modulus
++	adcs	$a1,$a1,$ff
+ 	str	$a0,[$r_ptr,#0]
+-	sbcs	$a2,$a2,$ff
++	adcs	$a2,$a2,$ff
+ 	str	$a1,[$r_ptr,#4]
+-	sbcs	$a3,$a3,#0
++	adcs	$a3,$a3,#0
+ 	str	$a2,[$r_ptr,#8]
+-	sbcs	$a4,$a4,#0
++	adcs	$a4,$a4,#0
+ 	str	$a3,[$r_ptr,#12]
+-	sbcs	$a5,$a5,#0
++	adcs	$a5,$a5,#0
+ 	str	$a4,[$r_ptr,#16]
+-	sbcs	$a6,$a6,$ff,lsr#31
++	adcs	$a6,$a6,$ff,lsr#31
+ 	str	$a5,[$r_ptr,#20]
+-	sbcs	$a7,$a7,$ff
++	adcs	$a7,$a7,$ff
+ 	str	$a6,[$r_ptr,#24]
+ 	str	$a7,[$r_ptr,#28]
+ 
+@@ -304,26 +311,29 @@ __ecp_nistz256_mul_by_3:
+ 	adcs	$a6,$a6,$a6
+ 	mov	$ff,#0
+ 	adcs	$a7,$a7,$a7
+-#ifdef	__thumb2__
+-	it	cs
+-#endif
+-	movcs	$ff,#-1			@ $ff = carry ? -1 : 0, &quot;broadcast&quot; carry
+-
+-	subs	$a0,$a0,$ff		@ subtract synthesized modulus, see
+-					@ .Lreduce_by_sub for details, except
+-					@ that we don't write anything to
+-					@ memory, but keep intermediate
+-					@ results in registers...
+-	sbcs	$a1,$a1,$ff
+-	sbcs	$a2,$a2,$ff
++	adc	$ff,$ff,#0
++
++	subs	$a0,$a0,#-1		@ .Lreduce_by_sub but without stores
++	sbcs	$a1,$a1,#-1
++	sbcs	$a2,$a2,#-1
+ 	sbcs	$a3,$a3,#0
+ 	sbcs	$a4,$a4,#0
+-	 ldr	$b_ptr,[$a_ptr,#0]
+ 	sbcs	$a5,$a5,#0
++	sbcs	$a6,$a6,#1
++	sbcs	$a7,$a7,#-1
++	sbc	$ff,$ff,#0
++
++	adds	$a0,$a0,$ff		@ add synthesized modulus
++	adcs	$a1,$a1,$ff
++	adcs	$a2,$a2,$ff
++	adcs	$a3,$a3,#0
++	adcs	$a4,$a4,#0
++	 ldr	$b_ptr,[$a_ptr,#0]
++	adcs	$a5,$a5,#0
+ 	 ldr	$t1,[$a_ptr,#4]
+-	sbcs	$a6,$a6,$ff,lsr#31
++	adcs	$a6,$a6,$ff,lsr#31
+ 	 ldr	$t2,[$a_ptr,#8]
+-	sbcs	$a7,$a7,$ff
++	adc	$a7,$a7,$ff
+ 
+ 	ldr	$t0,[$a_ptr,#12]
+ 	adds	$a0,$a0,$b_ptr		@ 2*a[0:7]+=a[0:7]
+@@ -339,10 +349,7 @@ __ecp_nistz256_mul_by_3:
+ 	adcs	$a6,$a6,$t2
+ 	mov	$ff,#0
+ 	adcs	$a7,$a7,$t3
+-#ifdef	__thumb2__
+-	it	cs
+-#endif
+-	movcs	$ff,#-1			@ $ff = carry ? -1 : 0, &quot;broadcast&quot; carry
++	adc	$ff,$ff,#0
+ 	ldr	lr,[sp],#4		@ pop lr
+ 
+ 	b	.Lreduce_by_sub
+@@ -1210,25 +1217,42 @@ __ecp_nistz256_add_self:
+ 	adcs	$a6,$a6,$a6
+ 	mov	$ff,#0
+ 	adcs	$a7,$a7,$a7
+-#ifdef	__thumb2__
+-	it	cs
+-#endif
+-	movcs	$ff,#-1			@ $ff = carry ? -1 : 0
++	adc	$ff,$ff,#0
++
++	@ if a+b &gt;= modulus, subtract modulus.
++	@
++	@ But since comparison implies subtraction, we subtract
++	@ modulus and then add it back if subraction borrowed.
++
++	subs	$a0,$a0,#-1
++	sbcs	$a1,$a1,#-1
++	sbcs	$a2,$a2,#-1
++	sbcs	$a3,$a3,#0
++	sbcs	$a4,$a4,#0
++	sbcs	$a5,$a5,#0
++	sbcs	$a6,$a6,#1
++	sbcs	$a7,$a7,#-1
++	sbc	$ff,$ff,#0
+ 
+-	subs	$a0,$a0,$ff		@ subtract synthesized modulus
+-	sbcs	$a1,$a1,$ff
++	@ Note that because mod has special form, i.e. consists of
++	@ 0xffffffff, 1 and 0s, we can conditionally synthesize it by
++	@ using value of borrow as a whole or extracting single bit.
++	@ Follow $ff register...
++
++	adds	$a0,$a0,$ff		@ add synthesized modulus
++	adcs	$a1,$a1,$ff
+ 	str	$a0,[$r_ptr,#0]
+-	sbcs	$a2,$a2,$ff
++	adcs	$a2,$a2,$ff
+ 	str	$a1,[$r_ptr,#4]
+-	sbcs	$a3,$a3,#0
++	adcs	$a3,$a3,#0
+ 	str	$a2,[$r_ptr,#8]
+-	sbcs	$a4,$a4,#0
++	adcs	$a4,$a4,#0
+ 	str	$a3,[$r_ptr,#12]
+-	sbcs	$a5,$a5,#0
++	adcs	$a5,$a5,#0
+ 	str	$a4,[$r_ptr,#16]
+-	sbcs	$a6,$a6,$ff,lsr#31
++	adcs	$a6,$a6,$ff,lsr#31
+ 	str	$a5,[$r_ptr,#20]
+-	sbcs	$a7,$a7,$ff
++	adcs	$a7,$a7,$ff
+ 	str	$a6,[$r_ptr,#24]
+ 	str	$a7,[$r_ptr,#28]
+ 
+diff --git a/crypto/ec/asm/ecp_nistz256-armv8.pl b/crypto/ec/asm/ecp_nistz256-armv8.pl
+index c5c1280..1362586 100644
+--- a/crypto/ec/asm/ecp_nistz256-armv8.pl
++++ b/crypto/ec/asm/ecp_nistz256-armv8.pl
+@@ -583,14 +583,14 @@ __ecp_nistz256_add:
+ 	adds	$t0,$acc0,#1		// subs	$t0,$a0,#-1 // tmp = ret-modulus
+ 	sbcs	$t1,$acc1,$poly1
+ 	sbcs	$t2,$acc2,xzr
+-	sbc	$t3,$acc3,$poly3
+-	cmp	$ap,xzr			// did addition carry?
++	sbcs	$t3,$acc3,$poly3
++	sbcs	xzr,$ap,xzr		// did subtraction borrow?
+ 
+-	csel	$acc0,$acc0,$t0,eq	// ret = carry ? ret-modulus : ret
+-	csel	$acc1,$acc1,$t1,eq
+-	csel	$acc2,$acc2,$t2,eq
++	csel	$acc0,$acc0,$t0,lo	// ret = borrow ? ret : ret-modulus
++	csel	$acc1,$acc1,$t1,lo
++	csel	$acc2,$acc2,$t2,lo
+ 	stp	$acc0,$acc1,[$rp]
+-	csel	$acc3,$acc3,$t3,eq
++	csel	$acc3,$acc3,$t3,lo
+ 	stp	$acc2,$acc3,[$rp,#16]
+ 
+ 	ret
+diff --git a/crypto/ec/asm/ecp_nistz256-sparcv9.pl b/crypto/ec/asm/ecp_nistz256-sparcv9.pl
+index 3f39088..3c7ff50 100755
+--- a/crypto/ec/asm/ecp_nistz256-sparcv9.pl
++++ b/crypto/ec/asm/ecp_nistz256-sparcv9.pl
+@@ -406,33 +406,44 @@ __ecp_nistz256_add:
+ 	addccc	@acc[5],$<A HREF="../../../mailman/listinfo/openssl-commits.html">t5, at acc</A>[5]
+ 	addccc	@acc[6],$<A HREF="../../../mailman/listinfo/openssl-commits.html">t6, at acc</A>[6]
+ 	addccc	@acc[7],$<A HREF="../../../mailman/listinfo/openssl-commits.html">t7, at acc</A>[7]
+-	subc	%g0,%g0,$carry		! broadcast carry bit
++	addc	%g0,%g0,$carry
+ 
+ .Lreduce_by_sub:
+ 
+-	! if a+b carries, subtract modulus.
++	! if a+b &gt;= modulus, subtract modulus.
+ 	!
++	! But since comparison implies subtraction, we subtract
++	! modulus and then add it back if subraction borrowed.
++
++	subcc	@acc[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">,-1, at acc</A>[0]
++	subccc	@acc[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">,-1, at acc</A>[1]
++	subccc	@acc[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">,-1, at acc</A>[2]
++	subccc	@acc[3], <A HREF="../../../mailman/listinfo/openssl-commits.html">0, at acc</A>[3]
++	subccc	@acc[4], <A HREF="../../../mailman/listinfo/openssl-commits.html">0, at acc</A>[4]
++	subccc	@acc[5], <A HREF="../../../mailman/listinfo/openssl-commits.html">0, at acc</A>[5]
++	subccc	@acc[6], <A HREF="../../../mailman/listinfo/openssl-commits.html">1, at acc</A>[6]
++	subccc	@acc[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">,-1, at acc</A>[7]
++	subc	$carry,0,$carry
++
+ 	! Note that because mod has special form, i.e. consists of
+ 	! 0xffffffff, 1 and 0s, we can conditionally synthesize it by
+-	! using value of broadcasted borrow and the borrow bit itself.
+-	! To minimize dependency chain we first broadcast and then
+-	! extract the bit by negating (follow $bi).
++	! using value of borrow and its negative.
+ 
+-	subcc	@acc[0],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[0]	! subtract synthesized modulus
+-	subccc	@acc[1],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[1]
++	addcc	@acc[0],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[0]	! add synthesized modulus
++	addccc	@acc[1],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[1]
+ 	neg	$carry,$bi
+ 	st	@acc[0],[$rp]
+-	subccc	@acc[2],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[2]
++	addccc	@acc[2],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[2]
+ 	st	@acc[1],[$rp+4]
+-	subccc	@acc[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[3]
++	addccc	@acc[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[3]
+ 	st	@acc[2],[$rp+8]
+-	subccc	@acc[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[4]
++	addccc	@acc[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[4]
+ 	st	@acc[3],[$rp+12]
+-	subccc	@acc[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[5]
++	addccc	@acc[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">,0, at acc</A>[5]
+ 	st	@acc[4],[$rp+16]
+-	subccc	@acc[6],$<A HREF="../../../mailman/listinfo/openssl-commits.html">bi, at acc</A>[6]
++	addccc	@acc[6],$<A HREF="../../../mailman/listinfo/openssl-commits.html">bi, at acc</A>[6]
+ 	st	@acc[5],[$rp+20]
+-	subc	@acc[7],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[7]
++	addc	@acc[7],$<A HREF="../../../mailman/listinfo/openssl-commits.html">carry, at acc</A>[7]
+ 	st	@acc[6],[$rp+24]
+ 	retl
+ 	st	@acc[7],[$rp+28]
+@@ -469,7 +480,7 @@ __ecp_nistz256_mul_by_2:
+ 	addccc	@acc[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[6]
+ 	addccc	@acc[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[7]
+ 	b	.Lreduce_by_sub
+-	subc	%g0,%g0,$carry		! broadcast carry bit
++	addc	%g0,%g0,$carry
+ .type	__ecp_nistz256_mul_by_2,#function
+ .size	__ecp_nistz256_mul_by_2,.-__ecp_nistz256_mul_by_2
+ 
+@@ -502,17 +513,27 @@ __ecp_nistz256_mul_by_3:
+ 	addccc	@acc[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[5],$t5
+ 	addccc	@acc[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[6],$t6
+ 	addccc	@acc[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[7],$t7
+-	subc	%g0,%g0,$carry		! broadcast carry bit
++	addc	%g0,%g0,$carry
+ 
+-	subcc	$t0,$carry,$t0		! .Lreduce_by_sub but without stores
++	subcc	$t0,-1,$t0		! .Lreduce_by_sub but without stores
++	subccc	$t1,-1,$t1
++	subccc	$t2,-1,$t2
++	subccc	$t3, 0,$t3
++	subccc	$t4, 0,$t4
++	subccc	$t5, 0,$t5
++	subccc	$t6, 1,$t6
++	subccc	$t7,-1,$t7
++	subc	$carry,0,$carry
++
++	addcc	$t0,$carry,$t0		! add synthesized modulus
++	addccc	$t1,$carry,$t1
+ 	neg	$carry,$bi
+-	subccc	$t1,$carry,$t1
+-	subccc	$t2,$carry,$t2
+-	subccc	$t3,0,$t3
+-	subccc	$t4,0,$t4
+-	subccc	$t5,0,$t5
+-	subccc	$t6,$bi,$t6
+-	subc	$t7,$carry,$t7
++	addccc	$t2,$carry,$t2
++	addccc	$t3,0,$t3
++	addccc	$t4,0,$t4
++	addccc	$t5,0,$t5
++	addccc	$t6,$bi,$t6
++	addc	$t7,$carry,$t7
+ 
+ 	addcc	$<A HREF="../../../mailman/listinfo/openssl-commits.html">t0, at acc</A>[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[0]	! 2*a+a=3*a
+ 	addccc	$<A HREF="../../../mailman/listinfo/openssl-commits.html">t1, at acc</A>[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[1]
+@@ -523,7 +544,7 @@ __ecp_nistz256_mul_by_3:
+ 	addccc	$<A HREF="../../../mailman/listinfo/openssl-commits.html">t6, at acc</A>[6]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[6]
+ 	addccc	$<A HREF="../../../mailman/listinfo/openssl-commits.html">t7, at acc</A>[7]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at acc</A>[7]
+ 	b	.Lreduce_by_sub
+-	subc	%g0,%g0,$carry		! broadcast carry bit
++	addc	%g0,%g0,$carry
+ .type	__ecp_nistz256_mul_by_3,#function
+ .size	__ecp_nistz256_mul_by_3,.-__ecp_nistz256_mul_by_3
+ 
+@@ -1662,14 +1683,15 @@ __ecp_nistz256_add_noload_vis3:
+ 	addcc	$acc0,1,$t0		! add -modulus, i.e. subtract
+ 	addxccc	$acc1,$poly1,$t1
+ 	addxccc	$acc2,$minus1,$t2
+-	addxc	$acc3,$poly3,$t3
++	addxccc	$acc3,$poly3,$t3
++	addxc	$acc4,$minus1,$acc4
+ 
+-	movrnz	$acc4,$t0,$acc0		! if a+b carried, ret = ret-mod
+-	movrnz	$acc4,$t1,$acc1
++	movrz	$acc4,$t0,$acc0		! ret = borrow ? ret : ret-modulus
++	movrz	$acc4,$t1,$acc1
+ 	stx	$acc0,[$rp]
+-	movrnz	$acc4,$t2,$acc2
++	movrz	$acc4,$t2,$acc2
+ 	stx	$acc1,[$rp+8]
+-	movrnz	$acc4,$t3,$acc3
++	movrz	$acc4,$t3,$acc3
+ 	stx	$acc2,[$rp+16]
+ 	retl
+ 	stx	$acc3,[$rp+24]
+diff --git a/crypto/ec/asm/ecp_nistz256-x86.pl b/crypto/ec/asm/ecp_nistz256-x86.pl
+index e9fa038..b96b1aa 100755
+--- a/crypto/ec/asm/ecp_nistz256-x86.pl
++++ b/crypto/ec/asm/ecp_nistz256-x86.pl
+@@ -284,18 +284,41 @@ for(1..37) {
+ 	&amp;mov	(&amp;DWP(16,&quot;edi&quot;),&quot;eax&quot;);
+ 	&amp;adc	(&quot;ecx&quot;,&amp;DWP(24,&quot;ebp&quot;));
+ 	&amp;mov	(&amp;DWP(20,&quot;edi&quot;),&quot;ebx&quot;);
++	&amp;mov	(&quot;esi&quot;,0);
+ 	&amp;adc	(&quot;edx&quot;,&amp;DWP(28,&quot;ebp&quot;));
+ 	&amp;mov	(&amp;DWP(24,&quot;edi&quot;),&quot;ecx&quot;);
+-	&amp;sbb	(&quot;esi&quot;,&quot;esi&quot;);			# broadcast carry bit
++	&amp;adc	(&quot;esi&quot;,0);
+ 	&amp;mov	(&amp;DWP(28,&quot;edi&quot;),&quot;edx&quot;);
+ 
+-	# if a+b carries, subtract modulus.
++	# if a+b &gt;= modulus, subtract modulus.
+ 	#
++	# But since comparison implies subtraction, we subtract modulus
++	# to see if it borrows, and then subtract it for real if
++	# subtraction didn't borrow.
++
++	&amp;mov	(&quot;eax&quot;,&amp;DWP(0,&quot;edi&quot;));
++	&amp;mov	(&quot;ebx&quot;,&amp;DWP(4,&quot;edi&quot;));
++	&amp;mov	(&quot;ecx&quot;,&amp;DWP(8,&quot;edi&quot;));
++	&amp;sub	(&quot;eax&quot;,-1);
++	&amp;mov	(&quot;edx&quot;,&amp;DWP(12,&quot;edi&quot;));
++	&amp;sbb	(&quot;ebx&quot;,-1);
++	&amp;mov	(&quot;eax&quot;,&amp;DWP(16,&quot;edi&quot;));
++	&amp;sbb	(&quot;ecx&quot;,-1);
++	&amp;mov	(&quot;ebx&quot;,&amp;DWP(20,&quot;edi&quot;));
++	&amp;sbb	(&quot;edx&quot;,0);
++	&amp;mov	(&quot;ecx&quot;,&amp;DWP(24,&quot;edi&quot;));
++	&amp;sbb	(&quot;eax&quot;,0);
++	&amp;mov	(&quot;edx&quot;,&amp;DWP(28,&quot;edi&quot;));
++	&amp;sbb	(&quot;ebx&quot;,0);
++	&amp;sbb	(&quot;ecx&quot;,1);
++	&amp;sbb	(&quot;edx&quot;,-1);
++	&amp;sbb	(&quot;esi&quot;,0);
++
+ 	# Note that because mod has special form, i.e. consists of
+ 	# 0xffffffff, 1 and 0s, we can conditionally synthesize it by
+-	# assigning carry bit to one register, %ebp, and its negative
+-	# to another, %esi. But we started by calculating %esi...
++	# by using borrow.
+ 
++	&amp;not	(&quot;esi&quot;);
+ 	&amp;mov	(&quot;eax&quot;,&amp;DWP(0,&quot;edi&quot;));
+ 	&amp;mov	(&quot;ebp&quot;,&quot;esi&quot;);
+ 	&amp;mov	(&quot;ebx&quot;,&amp;DWP(4,&quot;edi&quot;));
+diff --git a/crypto/ec/asm/ecp_nistz256-x86_64.pl b/crypto/ec/asm/ecp_nistz256-x86_64.pl
+index cce92b9..cc7b976 100755
+--- a/crypto/ec/asm/ecp_nistz256-x86_64.pl
++++ b/crypto/ec/asm/ecp_nistz256-x86_64.pl
+@@ -135,6 +135,7 @@ ecp_nistz256_mul_by_2:
+ 	push	%r13
+ 
+ 	mov	8*0($a_ptr), $a0
++	xor	$t4,$t4
+ 	mov	8*1($a_ptr), $a1
+ 	add	$a0, $a0		# a0:a3+a0:a3
+ 	mov	8*2($a_ptr), $a2
+@@ -145,7 +146,7 @@ ecp_nistz256_mul_by_2:
+ 	adc	$a2, $a2
+ 	adc	$a3, $a3
+ 	 mov	$a1, $t1
+-	sbb	$t4, $t4
++	adc	\$0, $t4
+ 
+ 	sub	8*0($a_ptr), $a0
+ 	 mov	$a2, $t2
+@@ -153,14 +154,14 @@ ecp_nistz256_mul_by_2:
+ 	sbb	8*2($a_ptr), $a2
+ 	 mov	$a3, $t3
+ 	sbb	8*3($a_ptr), $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovz	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovz	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -257,12 +258,12 @@ ecp_nistz256_mul_by_3:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	.Lpoly+8*3(%rip), $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
+-	cmovz	$t2, $a2
+-	cmovz	$t3, $a3
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
++	cmovb	$t2, $a2
++	cmovb	$t3, $a3
+ 
+ 	xor	$t4, $t4
+ 	add	8*0($a_ptr), $a0	# a0:a3+=a_ptr[0:3]
+@@ -279,14 +280,14 @@ ecp_nistz256_mul_by_3:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	.Lpoly+8*3(%rip), $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovz	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovz	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -325,14 +326,14 @@ ecp_nistz256_add:
+ 	sbb	8*2($a_ptr), $a2
+ 	 mov	$a3, $t3
+ 	sbb	8*3($a_ptr), $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovz	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovz	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -1890,13 +1891,14 @@ $code.=&lt;&lt;___;
+ .type	__ecp_nistz256_add_toq,\@abi-omnipotent
+ .align	32
+ __ecp_nistz256_add_toq:
++	xor	$t4,$t4
+ 	add	8*0($b_ptr), $a0
+ 	adc	8*1($b_ptr), $a1
+ 	 mov	$a0, $t0
+ 	adc	8*2($b_ptr), $a2
+ 	adc	8*3($b_ptr), $a3
+ 	 mov	$a1, $t1
+-	sbb	$t4, $t4
++	adc	\$0, $t4
+ 
+ 	sub	\$-1, $a0
+ 	 mov	$a2, $t2
+@@ -1904,14 +1906,14 @@ __ecp_nistz256_add_toq:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	$poly3, $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovz	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovz	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -1979,13 +1981,14 @@ __ecp_nistz256_subq:
+ .type	__ecp_nistz256_mul_by_2q,\@abi-omnipotent
+ .align	32
+ __ecp_nistz256_mul_by_2q:
++	xor	$t4, $t4
+ 	add	$a0, $a0		# a0:a3+a0:a3
+ 	adc	$a1, $a1
+ 	 mov	$a0, $t0
+ 	adc	$a2, $a2
+ 	adc	$a3, $a3
+ 	 mov	$a1, $t1
+-	sbb	$t4, $t4
++	adc	\$0, $t4
+ 
+ 	sub	\$-1, $a0
+ 	 mov	$a2, $t2
+@@ -1993,14 +1996,14 @@ __ecp_nistz256_mul_by_2q:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	$poly3, $a3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $a0
+-	cmovz	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovz	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovz	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -2455,6 +2458,7 @@ $code.=&lt;&lt;___;
+ 	#lea	$Hsqr(%rsp), $r_ptr	# 2*U1*H^2
+ 	#call	__ecp_nistz256_mul_by_2	# ecp_nistz256_mul_by_2(Hsqr, U2);
+ 
++	xor	$t4, $t4
+ 	add	$acc0, $acc0		# a0:a3+a0:a3
+ 	lea	$Rsqr(%rsp), $a_ptr
+ 	adc	$acc1, $acc1
+@@ -2462,7 +2466,7 @@ $code.=&lt;&lt;___;
+ 	adc	$acc2, $acc2
+ 	adc	$acc3, $acc3
+ 	 mov	$acc1, $t1
+-	sbb	$t4, $t4
++	adc	\$0, $t4
+ 
+ 	sub	\$-1, $acc0
+ 	 mov	$acc2, $t2
+@@ -2470,15 +2474,15 @@ $code.=&lt;&lt;___;
+ 	sbb	\$0, $acc2
+ 	 mov	$acc3, $t3
+ 	sbb	$poly3, $acc3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $acc0
++	cmovb	$t0, $acc0
+ 	mov	8*0($a_ptr), $t0
+-	cmovz	$t1, $acc1
++	cmovb	$t1, $acc1
+ 	mov	8*1($a_ptr), $t1
+-	cmovz	$t2, $acc2
++	cmovb	$t2, $acc2
+ 	mov	8*2($a_ptr), $t2
+-	cmovz	$t3, $acc3
++	cmovb	$t3, $acc3
+ 	mov	8*3($a_ptr), $t3
+ 
+ 	call	__ecp_nistz256_sub$x		# p256_sub(res_x, Rsqr, Hsqr);
+@@ -2760,6 +2764,7 @@ $code.=&lt;&lt;___;
+ 	#lea	$Hsqr(%rsp), $r_ptr	# 2*U1*H^2
+ 	#call	__ecp_nistz256_mul_by_2	# ecp_nistz256_mul_by_2(Hsqr, U2);
+ 
++	xor	$t4, $t4
+ 	add	$acc0, $acc0		# a0:a3+a0:a3
+ 	lea	$Rsqr(%rsp), $a_ptr
+ 	adc	$acc1, $acc1
+@@ -2767,7 +2772,7 @@ $code.=&lt;&lt;___;
+ 	adc	$acc2, $acc2
+ 	adc	$acc3, $acc3
+ 	 mov	$acc1, $t1
+-	sbb	$t4, $t4
++	adc	\$0, $t4
+ 
+ 	sub	\$-1, $acc0
+ 	 mov	$acc2, $t2
+@@ -2775,15 +2780,15 @@ $code.=&lt;&lt;___;
+ 	sbb	\$0, $acc2
+ 	 mov	$acc3, $t3
+ 	sbb	$poly3, $acc3
+-	test	$t4, $t4
++	sbb	\$0, $t4
+ 
+-	cmovz	$t0, $acc0
++	cmovb	$t0, $acc0
+ 	mov	8*0($a_ptr), $t0
+-	cmovz	$t1, $acc1
++	cmovb	$t1, $acc1
+ 	mov	8*1($a_ptr), $t1
+-	cmovz	$t2, $acc2
++	cmovb	$t2, $acc2
+ 	mov	8*2($a_ptr), $t2
+-	cmovz	$t3, $acc3
++	cmovb	$t3, $acc3
+ 	mov	8*3($a_ptr), $t3
+ 
+ 	call	__ecp_nistz256_sub$x		# p256_sub(res_x, Rsqr, Hsqr);
+@@ -2935,14 +2940,14 @@ __ecp_nistz256_add_tox:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	$poly3, $a3
++	sbb	\$0, $t4
+ 
+-	bt	\$0, $t4
+-	cmovnc	$t0, $a0
+-	cmovnc	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovnc	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovnc	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+@@ -3030,14 +3035,14 @@ __ecp_nistz256_mul_by_2x:
+ 	sbb	\$0, $a2
+ 	 mov	$a3, $t3
+ 	sbb	$poly3, $a3
++	sbb	\$0, $t4
+ 
+-	bt	\$0, $t4
+-	cmovnc	$t0, $a0
+-	cmovnc	$t1, $a1
++	cmovb	$t0, $a0
++	cmovb	$t1, $a1
+ 	mov	$a0, 8*0($r_ptr)
+-	cmovnc	$t2, $a2
++	cmovb	$t2, $a2
+ 	mov	$a1, 8*1($r_ptr)
+-	cmovnc	$t3, $a3
++	cmovb	$t3, $a3
+ 	mov	$a2, 8*2($r_ptr)
+ 	mov	$a3, 8*3($r_ptr)
+ 
+diff --git a/crypto/ec/ecp_nistz256.c b/crypto/ec/ecp_nistz256.c
+index d2fabe5..564a889 100644
+--- a/crypto/ec/ecp_nistz256.c
++++ b/crypto/ec/ecp_nistz256.c
+@@ -89,19 +89,36 @@ struct nistz256_pre_comp_st {
+ };
+ 
+ /* Functions implemented in assembly */
++/*
++ * Most of below mentioned functions *preserve* the property of inputs
++ * being fully reduced, i.e. being in [0, modulus) range. Simply put if
++ * inputs are fully reduced, then output is too. Note that reverse is
++ * not true, in sense that given partially reduced inputs output can be
++ * either, not unlikely reduced. And &quot;most&quot; in first sentence refers to
++ * the fact that given the calculations flow one can tolerate that
++ * addition, 1st function below, produces partially reduced result *if*
++ * multiplications by 2 and 3, which customarily use addition, fully
++ * reduce it. This effectively gives two options: a) addition produces
++ * fully reduced result [as long as inputs are, just like remaining
++ * functions]; b) addition is allowed to produce partially reduced
++ * result, but multiplications by 2 and 3 perform additional reduction
++ * step. Choice between the two can be platform-specific, but it was a)
++ * in all cases so far...
++ */
++/* Modular add: res = a+b mod P   */
++void ecp_nistz256_add(BN_ULONG res[P256_LIMBS],
++                      const BN_ULONG a[P256_LIMBS],
++                      const BN_ULONG b[P256_LIMBS]);
+ /* Modular mul by 2: res = 2*a mod P */
+ void ecp_nistz256_mul_by_2(BN_ULONG res[P256_LIMBS],
+                            const BN_ULONG a[P256_LIMBS]);
+-/* Modular div by 2: res = a/2 mod P */
+-void ecp_nistz256_div_by_2(BN_ULONG res[P256_LIMBS],
+-                           const BN_ULONG a[P256_LIMBS]);
+ /* Modular mul by 3: res = 3*a mod P */
+ void ecp_nistz256_mul_by_3(BN_ULONG res[P256_LIMBS],
+                            const BN_ULONG a[P256_LIMBS]);
+-/* Modular add: res = a+b mod P   */
+-void ecp_nistz256_add(BN_ULONG res[P256_LIMBS],
+-                      const BN_ULONG a[P256_LIMBS],
+-                      const BN_ULONG b[P256_LIMBS]);
++
++/* Modular div by 2: res = a/2 mod P */
++void ecp_nistz256_div_by_2(BN_ULONG res[P256_LIMBS],
++                           const BN_ULONG a[P256_LIMBS]);
+ /* Modular sub: res = a-b mod P   */
+ void ecp_nistz256_sub(BN_ULONG res[P256_LIMBS],
+                       const BN_ULONG a[P256_LIMBS],
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010167.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="010169.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10168">[ date ]</a>
+              <a href="thread.html#10168">[ thread ]</a>
+              <a href="subject.html#10168">[ subject ]</a>
+              <a href="author.html#10168">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

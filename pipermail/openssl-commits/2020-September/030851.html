@@ -1,0 +1,200 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1600814404.424896.28900.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030837.html">
+   <LINK REL="Next"  HREF="030852.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1600814404.424896.28900.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Tue Sep 22 22:40:04 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030837.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030852.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30851">[ date ]</a>
+              <a href="thread.html#30851">[ thread ]</a>
+              <a href="subject.html#30851">[ subject ]</a>
+              <a href="author.html#30851">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  4640cd00c36f0535d297d1ed10665597c4e2c7f2 (commit)
+      from  8e3a64fdb6e1e2826a334b095147d3ebe1acac2a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 4640cd00c36f0535d297d1ed10665597c4e2c7f2
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Wed Sep 16 11:10:01 2020 +1000
+
+    rand: reference count the EVP_RAND contexts.
+    
+    This is required before the RAND/DRBG framework can be made user mutable.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12904">https://github.com/openssl/openssl/pull/12904</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_local.h |  3 +++
+ crypto/evp/evp_rand.c  | 38 +++++++++++++++++++++++++++++++++-----
+ doc/man3/EVP_RAND.pod  |  1 +
+ 3 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/crypto/evp/evp_local.h b/crypto/evp/evp_local.h
+index 3268aa4109..285c69103b 100644
+--- a/crypto/evp/evp_local.h
++++ b/crypto/evp/evp_local.h
+@@ -69,6 +69,9 @@ struct evp_kdf_ctx_st {
+ struct evp_rand_ctx_st {
+     EVP_RAND *meth;             /* Method structure */
+     void *data;                 /* Algorithm-specific data */
++    EVP_RAND_CTX *parent;       /* Parent EVP_RAND or NULL if none */
++    CRYPTO_REF_COUNT refcnt;    /* Context reference count */
++    CRYPTO_RWLOCK *refcnt_lock;
+ } /* EVP_RAND_CTX */ ;
+ 
+ struct evp_keymgmt_st {
+diff --git a/crypto/evp/evp_rand.c b/crypto/evp/evp_rand.c
+index 0e5e8c11f9..2e4edfff34 100644
+--- a/crypto/evp/evp_rand.c
++++ b/crypto/evp/evp_rand.c
+@@ -308,6 +308,13 @@ int EVP_RAND_get_params(EVP_RAND *rand, OSSL_PARAM params[])
+     return 1;
+ }
+ 
++static int evp_rand_ctx_up_ref(EVP_RAND_CTX *ctx)
++{
++    int ref = 0;
++
++    return CRYPTO_UP_REF(&amp;ctx-&gt;refcnt, &amp;ref, ctx-&gt;refcnt_lock);
++}
++
+ EVP_RAND_CTX *EVP_RAND_CTX_new(EVP_RAND *rand, EVP_RAND_CTX *parent)
+ {
+     EVP_RAND_CTX *ctx;
+@@ -320,13 +327,21 @@ EVP_RAND_CTX *EVP_RAND_CTX_new(EVP_RAND *rand, EVP_RAND_CTX *parent)
+     }
+ 
+     ctx = OPENSSL_zalloc(sizeof(*ctx));
+-    if (ctx == NULL) {
++    if (ctx == NULL || (ctx-&gt;refcnt_lock = CRYPTO_THREAD_lock_new()) == NULL) {
++        OPENSSL_free(ctx);
+         EVPerr(0, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+     if (parent != NULL) {
+         if (!EVP_RAND_enable_locking(parent)) {
+             EVPerr(0, EVP_R_UNABLE_TO_ENABLE_PARENT_LOCKING);
++            CRYPTO_THREAD_lock_free(ctx-&gt;refcnt_lock);
++            OPENSSL_free(ctx);
++            return NULL;
++        }
++        if (!evp_rand_ctx_up_ref(parent)) {
++            EVPerr(0, ERR_R_INTERNAL_ERROR);
++            CRYPTO_THREAD_lock_free(ctx-&gt;refcnt_lock);
+             OPENSSL_free(ctx);
+             return NULL;
+         }
+@@ -338,20 +353,33 @@ EVP_RAND_CTX *EVP_RAND_CTX_new(EVP_RAND *rand, EVP_RAND_CTX *parent)
+             || !EVP_RAND_up_ref(rand)) {
+         EVPerr(0, ERR_R_MALLOC_FAILURE);
+         rand-&gt;freectx(ctx-&gt;data);
++        CRYPTO_THREAD_lock_free(ctx-&gt;refcnt_lock);
+         OPENSSL_free(ctx);
++        EVP_RAND_CTX_free(parent);
+         return NULL;
+     }
+     ctx-&gt;meth = rand;
++    ctx-&gt;parent = parent;
++    ctx-&gt;refcnt = 1;
+     return ctx;
+ }
+ 
+ void EVP_RAND_CTX_free(EVP_RAND_CTX *ctx)
+ {
+     if (ctx != NULL) {
+-        ctx-&gt;meth-&gt;freectx(ctx-&gt;data);
+-        ctx-&gt;data = NULL;
+-        EVP_RAND_free(ctx-&gt;meth);
+-        OPENSSL_free(ctx);
++        int ref = 0;
++
++        CRYPTO_DOWN_REF(&amp;ctx-&gt;refcnt, &amp;ref, ctx-&gt;refcnt_lock);
++        if (ref &lt;= 0) {
++            EVP_RAND_CTX *parent = ctx-&gt;parent;
++
++            ctx-&gt;meth-&gt;freectx(ctx-&gt;data);
++            ctx-&gt;data = NULL;
++            EVP_RAND_free(ctx-&gt;meth);
++            CRYPTO_THREAD_lock_free(ctx-&gt;refcnt_lock);
++            OPENSSL_free(ctx);
++            EVP_RAND_CTX_free(parent);
++        }
+     }
+ }
+ 
+diff --git a/doc/man3/EVP_RAND.pod b/doc/man3/EVP_RAND.pod
+index dfd2a7eb4c..b7b836f03e 100644
+--- a/doc/man3/EVP_RAND.pod
++++ b/doc/man3/EVP_RAND.pod
+@@ -85,6 +85,7 @@ cryptographically secure random bytes.
+ B&lt;EVP_RAND&gt; is a type that holds the implementation of a RAND.
+ 
+ B&lt;EVP_RAND_CTX&gt; is a context type that holds the algorithm inputs.
++B&lt;EVP_RAND_CTX&gt; structures are reference counted.
+ 
+ =head2 Algorithm implementation fetching
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030837.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030852.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30851">[ date ]</a>
+              <a href="thread.html#30851">[ thread ]</a>
+              <a href="subject.html#30851">[ subject ]</a>
+              <a href="author.html#30851">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

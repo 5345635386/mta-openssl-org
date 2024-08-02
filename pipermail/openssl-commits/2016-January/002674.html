@@ -1,0 +1,464 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452214930.592398.30325.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002669.html">
+   <LINK REL="Next"  HREF="002678.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452214930.592398.30325.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Fri Jan  8 01:02:10 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002669.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002678.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2674">[ date ]</a>
+              <a href="thread.html#2674">[ thread ]</a>
+              <a href="subject.html#2674">[ subject ]</a>
+              <a href="author.html#2674">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cddd424a5bda94e238e4ff06c0efc80cff3b07d1 (commit)
+      from  0c1badc8af7b92170fbb23be8119072facfdad07 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cddd424a5bda94e238e4ff06c0efc80cff3b07d1
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Tue Dec 29 14:25:50 2015 -0500
+
+    DANE s_client support
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/s_client.c       | 224 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ doc/apps/s_client.pod |  41 +++++++++
+ 2 files changed, 263 insertions(+), 2 deletions(-)
+
+diff --git a/apps/s_client.c b/apps/s_client.c
+index 2f98966..441da24 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -138,6 +138,7 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;errno.h&gt;
+ #include &lt;openssl/e_os2.h&gt;
+ 
+ /*
+@@ -183,6 +184,7 @@ extern int verify_error;
+ extern int verify_return_error;
+ extern int verify_quiet;
+ 
++static char *prog;
+ static int async = 0;
+ static int c_nbio = 0;
+ static int c_tlsextdebug = 0;
+@@ -202,6 +204,21 @@ static int c_brief = 0;
+ static void print_stuff(BIO *berr, SSL *con, int full);
+ static int ocsp_resp_cb(SSL *s, void *arg);
+ 
++static int saved_errno;
++
++static void save_errno(void)
++{
++    saved_errno = errno;
++    errno = 0;
++}
++
++static int restore_errno(void)
++{
++    int ret = errno;
++    errno = saved_errno;
++    return ret;
++}
++
+ #ifndef OPENSSL_NO_PSK
+ /* Default PSK identity and key */
+ static char *psk_identity = &quot;Client_identity&quot;;
+@@ -455,6 +472,143 @@ static int serverinfo_cli_parse_cb(SSL *s, unsigned int ext_type,
+     return 1;
+ }
+ 
++/*
++ * Hex decoder that tolerates optional whitespace.  Returns number of bytes
++ * produced, advances inptr to end of input string.
++ */
++static ossl_ssize_t hexdecode(const char **inptr, void *result)
++{
++    unsigned char **out = (unsigned char **)result;
++    const char *in = *inptr;
++    unsigned char *ret = OPENSSL_malloc(strlen(in)/2);
++    unsigned char *cp = ret;
++    uint8_t byte;
++    int nibble = 0;
++
++    if (ret == NULL)
++        return -1;
++
++    for (byte = 0; *in; ++in) {
++        char c;
++
++        if (isspace(*in))
++            continue;
++        c = tolower(*in);
++        if ('0' &lt;= c &amp;&amp; c &lt;= '9') {
++            byte |= c - '0';
++        } else if ('a' &lt;= c &amp;&amp; c &lt;= 'f') {
++            byte |= c - 'a' + 10;
++        } else {
++            OPENSSL_free(ret);
++            return 0;
++        }
++        if ((nibble ^= 1) == 0) {
++            *cp++ = byte;
++            byte = 0;
++        } else {
++            byte &lt;&lt;= 4;
++        }
++    }
++    if (nibble != 0) {
++        OPENSSL_free(ret);
++        return 0;
++    }
++    *inptr = in;
++
++    return cp - (*out = ret);
++}
++
++/*
++ * Decode unsigned 0..255, returns 1 on success, &lt;= 0 on failure. Advances
++ * inptr to next field skipping leading whitespace.
++ */
++static ossl_ssize_t checked_uint8(const char **inptr, void *out)
++{
++    uint8_t *result = (uint8_t *)out;
++    const char *in = *inptr;
++    char *endp;
++    long v;
++    int e;
++
++    save_errno();
++    v = strtol(in, &amp;endp, 10);
++    e = restore_errno();
++
++    if (((v == LONG_MIN || v == LONG_MAX) &amp;&amp; e == ERANGE) ||
++        endp == in || !isspace(*endp) ||
++        v != (*result = (uint8_t) v)) {
++        return -1;
++    }
++    for (in = endp; isspace(*in); ++in)
++        continue;
++
++    *inptr = in;
++    return 1;
++}
++
++static int tlsa_import_rr(SSL *con, const char *rrdata)
++{
++    int ret;
++    uint8_t usage;
++    uint8_t selector;
++    uint8_t mtype;
++    unsigned char *data = NULL;
++    const char *cp = rrdata;
++    ossl_ssize_t len = 0;
++    struct tlsa_field {
++        void *var;
++        const char *name;
++        ossl_ssize_t (*parser)(const char **, void *);
++    } tlsa_fields[] = {
++        { &amp;usage, &quot;usage&quot;, checked_uint8 },
++        { &amp;selector, &quot;selector&quot;, checked_uint8 },
++        { &amp;mtype, &quot;mtype&quot;, checked_uint8 },
++        { &amp;data, &quot;data&quot;, hexdecode },
++        { NULL, }
++    };
++    struct tlsa_field *f;
++
++    for (f = tlsa_fields; f-&gt;var; ++f) {
++        /* Returns number of bytes produced, advances cp to next field */
++        if ((len = f-&gt;parser(&amp;cp, f-&gt;var)) &lt;= 0) {
++            BIO_printf(bio_err, &quot;%s: warning: bad TLSA %s field in: %s\n&quot;,
++                       prog, f-&gt;name, rrdata);
++            return 0;
++        }
++    }
++    /* The data field is last, so len is its length */
++    ret = SSL_dane_tlsa_add(con, usage, selector, mtype, data, len);
++    OPENSSL_free(data);
++
++    if (ret == 0) {
++        ERR_print_errors(bio_err);
++        BIO_printf(bio_err, &quot;%s: warning: unusable TLSA rrdata: %s\n&quot;,
++                   prog, rrdata);
++        return 0;
++    }
++    if (ret &lt; 0) {
++        ERR_print_errors(bio_err);
++        BIO_printf(bio_err, &quot;%s: warning: error loading TLSA rrdata: %s\n&quot;,
++                   prog, rrdata);
++        return 0;
++    }
++    return ret;
++}
++
++static int tlsa_import_rrset(SSL *con, STACK_OF(OPENSSL_STRING) *rrset)
++{
++    int num = sk_OPENSSL_STRING_num(rrset);
++    int count = 0;
++    int i;
++
++    for (i = 0; i &lt; num; ++i) {
++        char *rrdata = sk_OPENSSL_STRING_value(rrset, i);
++        if (tlsa_import_rr(con, rrdata) &gt; 0)
++            ++count;
++    }
++    return count &gt; 0;
++}
++
+ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+     OPT_HOST, OPT_PORT, OPT_CONNECT, OPT_UNIX, OPT_XMPPHOST, OPT_VERIFY,
+@@ -478,7 +632,8 @@ typedef enum OPTION_choice {
+     OPT_V_ENUM,
+     OPT_X_ENUM,
+     OPT_S_ENUM,
+-    OPT_FALLBACKSCSV, OPT_NOCMDS, OPT_PROXY
++    OPT_FALLBACKSCSV, OPT_NOCMDS, OPT_PROXY, OPT_DANE_TLSA_DOMAIN,
++    OPT_DANE_TLSA_RRDATA
+ } OPTION_CHOICE;
+ 
+ OPTIONS s_client_options[] = {
+@@ -503,6 +658,9 @@ OPTIONS s_client_options[] = {
+      &quot;Do not load the default certificates file&quot;},
+     {&quot;no-CApath&quot;, OPT_NOCAPATH, '-',
+      &quot;Do not load certificates from the default certificates directory&quot;},
++    {&quot;dane_tlsa_domain&quot;, OPT_DANE_TLSA_DOMAIN, 's', &quot;DANE TLSA base domain&quot;},
++    {&quot;dane_tlsa_rrdata&quot;, OPT_DANE_TLSA_RRDATA, 's',
++     &quot;DANE TLSA rrdata presentation form&quot;},
+     {&quot;reconnect&quot;, OPT_RECONNECT, '-',
+      &quot;Drop and re-make the connection with the same Session-ID&quot;},
+     {&quot;pause&quot;, OPT_PAUSE, '-', &quot;Sleep  after each read and write system call&quot;},
+@@ -648,11 +806,13 @@ int s_client_main(int argc, char **argv)
+     SSL_EXCERT *exc = NULL;
+     SSL_CONF_CTX *cctx = NULL;
+     STACK_OF(OPENSSL_STRING) *ssl_args = NULL;
++    char *dane_tlsa_domain = NULL;
++    STACK_OF(OPENSSL_STRING) *dane_tlsa_rrset = NULL;
+     STACK_OF(X509_CRL) *crls = NULL;
+     const SSL_METHOD *meth = TLS_client_method();
+     char *CApath = NULL, *CAfile = NULL, *cbuf = NULL, *sbuf = NULL;
+     char *mbuf = NULL, *proxystr = NULL, *connectstr = NULL;
+-    char *cert_file = NULL, *key_file = NULL, *chain_file = NULL, *prog;
++    char *cert_file = NULL, *key_file = NULL, *chain_file = NULL;
+     char *chCApath = NULL, *chCAfile = NULL, *host = SSL_HOST_NAME;
+     char *inrand = NULL;
+     char *passarg = NULL, *pass = NULL, *vfyCApath = NULL, *vfyCAfile = NULL;
+@@ -1032,6 +1192,18 @@ int s_client_main(int argc, char **argv)
+         case OPT_VERIFYCAFILE:
+             vfyCAfile = opt_arg();
+             break;
++        case OPT_DANE_TLSA_DOMAIN:
++            dane_tlsa_domain = opt_arg();
++            break;
++        case OPT_DANE_TLSA_RRDATA:
++            if (dane_tlsa_rrset == NULL)
++                dane_tlsa_rrset = sk_OPENSSL_STRING_new_null();
++            if (dane_tlsa_rrset == NULL ||
++                !sk_OPENSSL_STRING_push(dane_tlsa_rrset, opt_arg())) {
++                BIO_printf(bio_err, &quot;%s: Memory allocation failure\n&quot;, prog);
++                goto end;
++            }
++            break;
+         case OPT_NEXTPROTONEG:
+             next_proto_neg_in = opt_arg();
+             break;
+@@ -1336,6 +1508,15 @@ int s_client_main(int argc, char **argv)
+     }
+ # endif
+ 
++    if (dane_tlsa_domain != NULL) {
++        if (SSL_CTX_dane_enable(ctx) &lt;= 0) {
++            BIO_printf(bio_err,
++                       &quot;%s: Error enabling DANE TLSA authentication.\n&quot;, prog);
++            ERR_print_errors(bio_err);
++            goto end;
++        }
++    }
++
+     con = SSL_new(ctx);
+     if (sess_in) {
+         SSL_SESSION *sess;
+@@ -1371,6 +1552,29 @@ int s_client_main(int argc, char **argv)
+         }
+     }
+ 
++    if (dane_tlsa_domain != NULL) {
++        if (SSL_dane_enable(con, dane_tlsa_domain) &lt;= 0) {
++            BIO_printf(bio_err, &quot;%s: Error enabling DANE TLSA &quot;
++                       &quot;authentication.\n&quot;, prog);
++            ERR_print_errors(bio_err);
++            goto end;
++        }
++        if (dane_tlsa_rrset == NULL) {
++            BIO_printf(bio_err, &quot;%s: DANE TLSA authentication requires at &quot;
++                       &quot;least one -dane_tlsa_rrset option.\n&quot;, prog);
++            goto end;
++        }
++        if (tlsa_import_rrset(con, dane_tlsa_rrset) &lt;= 0) {
++            BIO_printf(bio_err, &quot;%s: Failed to import any TLSA &quot;
++                       &quot;records.\n&quot;, prog);
++            goto end;
++        }
++    } else if (dane_tlsa_rrset != NULL) {
++            BIO_printf(bio_err, &quot;%s: DANE TLSA authentication requires the &quot;
++                       &quot;-dane_tlsa_domain option.\n&quot;, prog);
++            goto end;
++    }
++
+  re_start:
+ #ifdef NO_SYS_UN_H
+     if (init_client(&amp;s, host, port, socket_type) == 0)
+@@ -2133,6 +2337,7 @@ int s_client_main(int argc, char **argv)
+     X509_VERIFY_PARAM_free(vpm);
+     ssl_excert_free(exc);
+     sk_OPENSSL_STRING_free(ssl_args);
++    sk_OPENSSL_STRING_free(dane_tlsa_rrset);
+     SSL_CONF_CTX_free(cctx);
+     OPENSSL_clear_free(cbuf, BUFSIZZ);
+     OPENSSL_clear_free(sbuf, BUFSIZZ);
+@@ -2153,6 +2358,9 @@ static void print_stuff(BIO *bio, SSL *s, int full)
+     const SSL_CIPHER *c;
+     X509_NAME *xn;
+     int i;
++    int mdpth;
++    EVP_PKEY *mspki;
++    const char *peername;
+ #ifndef OPENSSL_NO_COMP
+     const COMP_METHOD *comp, *expansion;
+ #endif
+@@ -2214,6 +2422,18 @@ static void print_stuff(BIO *bio, SSL *s, int full)
+                    BIO_number_read(SSL_get_rbio(s)),
+                    BIO_number_written(SSL_get_wbio(s)));
+     }
++    if ((mdpth = SSL_get0_dane_authority(s, NULL, &amp;mspki)) &gt;= 0) {
++        uint8_t usage, selector, mtype;
++        (void) SSL_get0_dane_tlsa(s, &amp;usage, &amp;selector, &amp;mtype, NULL, NULL);
++        BIO_printf(bio, &quot;DANE TLSA %d %d %d %s at depth %d\n&quot;,
++                   usage, selector, mtype,
++                   (mspki != NULL) ? &quot;TA public key verified certificate&quot; :
++                   mdpth ? &quot;matched TA certificate&quot; : &quot;matched EE certificate&quot;,
++                   mdpth);
++    }
++    if (SSL_get_verify_result(s) == X509_V_OK &amp;&amp;
++        (peername = SSL_get0_peername(s)) != NULL)
++        BIO_printf(bio, &quot;Verified peername: %s\n&quot;, peername);
+     BIO_printf(bio, (SSL_cache_hit(s) ? &quot;---\nReused, &quot; : &quot;---\nNew, &quot;));
+     c = SSL_get_current_cipher(s);
+     BIO_printf(bio, &quot;%s, Cipher is %s\n&quot;,
+diff --git a/doc/apps/s_client.pod b/doc/apps/s_client.pod
+index afcba28..e69c730 100644
+--- a/doc/apps/s_client.pod
++++ b/doc/apps/s_client.pod
+@@ -22,6 +22,8 @@ B&lt;openssl&gt; B&lt;s_client&gt;
+ [B&lt;-CAfile filename&gt;]
+ [B&lt;-no-CAfile&gt;]
+ [B&lt;-no-CApath&gt;]
++[B&lt;-dane_tlsa_domain domain&gt;]
++[B&lt;-dane_tlsa_rrdata rrdata&gt;]
+ [B&lt;-attime timestamp&gt;]
+ [B&lt;-check_ss_sig&gt;]
+ [B&lt;-crl_check&gt;]
+@@ -169,6 +171,45 @@ Do not load the trusted CA certificates from the default file location
+ 
+ Do not load the trusted CA certificates from the default directory location
+ 
++=item B&lt;-dane_tlsa_domain domain&gt;
++
++Enable RFC6698/RFC7671 DANE TLSA authentication and specify the
++TLSA base domain which becomes the default SNI hint and the primary
++reference identifier for hostname checks.  This must be used in
++combination with at least one instance of the B&lt;-dane_tlsa_rrdata&gt;
++option below.
++
++When DANE authentication succeeds, the diagnostic output will include
++the lowest (closest to 0) depth at which a TLSA record authenticated
++a chain certificate.  When that TLSA record is a &quot;2 1 0&quot; trust
++anchor public key that signed (rather than matched) the top-most
++certificate of the chain, the result is reported as &quot;TA public key
++verified&quot;.  Otherwise, either the TLSA record &quot;matched TA certificate&quot;
++at a positive depth or else &quot;matched EE certificate&quot; at depth 0.
++
++=item B&lt;-dane_tlsa_rrdata rrdata&gt;
++
++Use one or more times to specify the RRDATA fields of the DANE TLSA
++RRset associated with the target service.  The B&lt;rrdata&gt; value is
++specied in &quot;presentation form&quot;, that is four whitespace separated
++fields that specify the usage, selector, matching type and associated
++data, with the last of these encoded in hexadecimal.  Optional
++whitespace is ignored in the associated data field.  For example:
++
++  $ openssl s_client -starttls smtp -connect smtp.example.com:25 \
++    -dane_tlsa_domain smtp.example.com \
++    -dane_tlsa_rrdata &quot;2 1 1
++      B111DD8A1C2091A89BD4FD60C57F0716CCE50FEEFF8137CDBEE0326E 02CF362B&quot; \
++    -dane_tlsa_rrdata &quot;2 1 1
++      60B87575447DCBA2A36B7D11AC09FB24A9DB406FEE12D2CC90180517 616E8A18&quot;
++  CONNECTED(00000003)
++  ...
++  DANE TLSA 2 1 1 matched TA certificate at depth 1
++  Verified peername: smtp.example.com
++  ...
++      Verify return code: 0 (ok)
++  ...
++
+ =item B&lt;-attime&gt;, B&lt;-check_ss_sig&gt;, B&lt;-crl_check&gt;, B&lt;-crl_check_all&gt;,
+ B&lt;explicit_policy&gt;, B&lt;-extended_crl&gt;, B&lt;-ignore_critical&gt;, B&lt;-inhibit_any&gt;,
+ B&lt;-inhibit_map&gt;, B&lt;-issuer_checks&gt;, B&lt;-partial_chain&gt;, B&lt;-policy&gt;,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002669.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002678.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2674">[ date ]</a>
+              <a href="thread.html#2674">[ thread ]</a>
+              <a href="subject.html#2674">[ subject ]</a>
+              <a href="author.html#2674">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1024 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1467130659.815163.17874.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008698.html">
+   <LINK REL="Next"  HREF="008701.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1467130659.815163.17874.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Tue Jun 28 16:17:39 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008698.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="008701.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8700">[ date ]</a>
+              <a href="thread.html#8700">[ thread ]</a>
+              <a href="subject.html#8700">[ subject ]</a>
+              <a href="author.html#8700">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  d2b23cd2b077de8507c49f632e20dfcdb653a35b (commit)
+      from  2cdce3e32f0f70470d676352410557b626bc9d01 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit d2b23cd2b077de8507c49f632e20dfcdb653a35b
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Mon Jun 20 17:20:25 2016 +0200
+
+    SSL test framework: port SNI tests
+    
+    Observe that the old tests were partly ill-defined:
+    setting sn_server1 but not sn_server2 in ssltest_old.c does not enable
+    the SNI callback.
+    
+    Fix this, and also explicitly test both flavours of SNI mismatch (ignore
+    / fatal alert). Tests still pass.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/README.ssltest.md               |   7 ++
+ test/handshake_helper.c              |  77 +++++++++++++--
+ test/recipes/80-test_ssl_old.t       |  21 +---
+ test/ssl-tests/05-sni.conf           | 180 ++++++++++++++++++++++++++++++++---
+ test/ssl-tests/05-sni.conf.in        |  57 ++++++++++-
+ test/ssl-tests/06-sni-ticket.conf    |  32 +++++++
+ test/ssl-tests/06-sni-ticket.conf.in |   3 +
+ test/ssl_test.c                      |  35 +++----
+ test/ssl_test_ctx.c                  |  44 +++++++++
+ test/ssl_test_ctx.h                  |  24 ++++-
+ test/ssl_test_ctx_test.c             |  16 ++++
+ test/ssl_test_ctx_test.conf          |   6 +-
+ 12 files changed, 441 insertions(+), 61 deletions(-)
+
+diff --git a/test/README.ssltest.md b/test/README.ssltest.md
+index 5797cf6..ea90efc 100644
+--- a/test/README.ssltest.md
++++ b/test/README.ssltest.md
+@@ -61,6 +61,7 @@ The test section supports the following options:
+ 
+ * ClientVerifyCallback - the client's custom certificate verify callback.
+   Used to test callback behaviour. One of
++  - None - no custom callback (default)
+   - AcceptAll - accepts all certificates.
+   - RejectAll - rejects all certificates.
+ 
+@@ -70,6 +71,12 @@ The test section supports the following options:
+   - None - do not use SNI (default)
+   - server1 - the initial context
+   - server2 - the secondary context
++  - invalid - an unknown context
++
++* ServerNameCallback - the SNI switching callback to use
++  - None - no callback (default)
++  - IgnoreMismatch - continue the handshake on SNI mismatch
++  - RejectMismatch - abort the handshake on SNI mismatch
+ 
+ * SessionTicketExpected - whether or not a session ticket is expected
+   - Ignore - do not check for a session ticket (default)
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index a60c9c6..8a8dab0 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -24,6 +24,7 @@ typedef struct handshake_ex_data {
+     int alert_sent;
+     int alert_received;
+     int session_ticket_do_not_call;
++    ssl_servername_t servername;
+ } HANDSHAKE_EX_DATA;
+ 
+ static int ex_data_idx;
+@@ -41,10 +42,25 @@ static void info_cb(const SSL *s, int where, int ret)
+     }
+ }
+ 
+-static int servername_cb(SSL *s, int *ad, void *arg)
++/*
++ * Select the appropriate server CTX.
++ * Returns SSL_TLSEXT_ERR_OK if a match was found.
++ * If |ignore| is 1, returns SSL_TLSEXT_ERR_NOACK on mismatch.
++ * Otherwise, returns SSL_TLSEXT_ERR_ALERT_FATAL on mismatch.
++ * An empty SNI extension also returns SSL_TSLEXT_ERR_NOACK.
++ */
++static int select_server_ctx(SSL *s, void *arg, int ignore)
+ {
+     const char *servername = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
+-    if (servername != NULL &amp;&amp; !strcmp(servername, &quot;server2&quot;)) {
++    HANDSHAKE_EX_DATA *ex_data =
++        (HANDSHAKE_EX_DATA*)(SSL_get_ex_data(s, ex_data_idx));
++
++    if (servername == NULL) {
++        ex_data-&gt;servername = SSL_TEST_SERVERNAME_SERVER1;
++        return SSL_TLSEXT_ERR_NOACK;
++    }
++
++    if (strcmp(servername, &quot;server2&quot;) == 0) {
+         SSL_CTX *new_ctx = (SSL_CTX*)arg;
+         SSL_set_SSL_CTX(s, new_ctx);
+         /*
+@@ -54,8 +70,40 @@ static int servername_cb(SSL *s, int *ad, void *arg)
+          */
+         SSL_clear_options(s, 0xFFFFFFFFL);
+         SSL_set_options(s, SSL_CTX_get_options(new_ctx));
++
++        ex_data-&gt;servername = SSL_TEST_SERVERNAME_SERVER2;
++        return SSL_TLSEXT_ERR_OK;
++    } else if (strcmp(servername, &quot;server1&quot;) == 0) {
++        ex_data-&gt;servername = SSL_TEST_SERVERNAME_SERVER1;
++        return SSL_TLSEXT_ERR_OK;
++    } else if (ignore) {
++        ex_data-&gt;servername = SSL_TEST_SERVERNAME_SERVER1;
++        return SSL_TLSEXT_ERR_NOACK;
++    } else {
++        /* Don't set an explicit alert, to test library defaults. */
++        return SSL_TLSEXT_ERR_ALERT_FATAL;
+     }
+-    return SSL_TLSEXT_ERR_OK;
++}
++
++/*
++ * (RFC 6066):
++ *  If the server understood the ClientHello extension but
++ *  does not recognize the server name, the server SHOULD take one of two
++ *  actions: either abort the handshake by sending a fatal-level
++ *  unrecognized_name(112) alert or continue the handshake.
++ *
++ * This behaviour is up to the application to configure; we test both
++ * configurations to ensure the state machine propagates the result
++ * correctly.
++ */
++static int servername_ignore_cb(SSL *s, int *ad, void *arg)
++{
++    return select_server_ctx(s, arg, 1);
++}
++
++static int servername_reject_cb(SSL *s, int *ad, void *arg)
++{
++    return select_server_ctx(s, arg, 0);
+ }
+ 
+ static int verify_reject_cb(X509_STORE_CTX *ctx, void *arg) {
+@@ -106,14 +154,27 @@ static void configure_handshake_ctx(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     }
+ 
+     /* link the two contexts for SNI purposes */
+-    SSL_CTX_set_tlsext_servername_callback(server_ctx, servername_cb);
+-    SSL_CTX_set_tlsext_servername_arg(server_ctx, server2_ctx);
++    switch (test_ctx-&gt;servername_callback) {
++    case SSL_TEST_SERVERNAME_IGNORE_MISMATCH:
++        SSL_CTX_set_tlsext_servername_callback(server_ctx, servername_ignore_cb);
++        SSL_CTX_set_tlsext_servername_arg(server_ctx, server2_ctx);
++        break;
++    case SSL_TEST_SERVERNAME_REJECT_MISMATCH:
++        SSL_CTX_set_tlsext_servername_callback(server_ctx, servername_reject_cb);
++        SSL_CTX_set_tlsext_servername_arg(server_ctx, server2_ctx);
++        break;
++    default:
++        break;
++    }
++
+     /*
+      * The initial_ctx/session_ctx always handles the encrypt/decrypt of the
+      * session ticket. This ticket_key callback is assigned to the second
+      * session (assigned via SNI), and should never be invoked
+      */
+-    SSL_CTX_set_tlsext_ticket_key_cb(server2_ctx, do_not_call_session_ticket_cb);
++    if (server2_ctx != NULL)
++        SSL_CTX_set_tlsext_ticket_key_cb(server2_ctx,
++                                         do_not_call_session_ticket_cb);
+ 
+     if (test_ctx-&gt;session_ticket_expected == SSL_TEST_SESSION_TICKET_BROKEN) {
+         SSL_CTX_set_tlsext_ticket_key_cb(server_ctx, broken_session_ticket_cb);
+@@ -333,9 +394,7 @@ HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     ret.client_alert_received = server_ex_data.alert_received;
+     ret.server_protocol = SSL_version(server);
+     ret.client_protocol = SSL_version(client);
+-    ret.servername = ((SSL_get_SSL_CTX(server) == server_ctx)
+-                      ? SSL_TEST_SERVERNAME_SERVER1
+-                      : SSL_TEST_SERVERNAME_SERVER2);
++    ret.servername = server_ex_data.servername;
+     if ((sess = SSL_get0_session(client)) != NULL)
+         SSL_SESSION_get0_ticket(sess, &amp;tick, &amp;len);
+     if (tick == NULL || len == 0)
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index 716f23b..becfbae 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -79,7 +79,7 @@ my $client_sess=&quot;client.ss&quot;;
+ # new format in ssl_test.c and add recipes to 80-test_ssl_new.t instead.
+ plan tests =&gt;
+     1				# For testss
+-    + 13			# For the first testssl
++    + 12			# For the first testssl
+     ;
+ 
+ subtest 'test_ss' =&gt; sub {
+@@ -579,25 +579,6 @@ sub testssl {
+ 	}
+     };
+ 
+-    subtest 'SNI tests' =&gt; sub {
+-
+-	plan tests =&gt; 7;
+-
+-      SKIP: {
+-	  skip &quot;TLSv1.x is not supported by this OpenSSL build&quot;, 7
+-	      if $no_tls1 &amp;&amp; $no_tls1_1 &amp;&amp; $no_tls1_2;
+-
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;foo&quot;])));
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_server1&quot;, &quot;foo&quot;])));
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;foo&quot;, &quot;-sn_server1&quot;, &quot;foo&quot;, &quot;-sn_expect1&quot;])));
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;foo&quot;, &quot;-sn_server1&quot;, &quot;bar&quot;, &quot;-sn_expect1&quot;])));
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;foo&quot;, &quot;-sn_server1&quot;, &quot;foo&quot;, &quot;-sn_server2&quot;, &quot;bar&quot;, &quot;-sn_expect1&quot;])));
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;bar&quot;, &quot;-sn_server1&quot;, &quot;foo&quot;, &quot;-sn_server2&quot;, &quot;bar&quot;, &quot;-sn_expect2&quot;])));
+-	  # Negative test - make sure it doesn't crash, and doesn't switch contexts
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-sn_client&quot;, &quot;foobar&quot;, &quot;-sn_server1&quot;, &quot;foo&quot;, &quot;-sn_server2&quot;, &quot;bar&quot;, &quot;-sn_expect1&quot;])));
+-	}
+-    };
+-
+     subtest 'ALPN tests' =&gt; sub {
+ 	######################################################################
+ 
+diff --git a/test/ssl-tests/05-sni.conf b/test/ssl-tests/05-sni.conf
+index be219d5..ef6db27 100644
+--- a/test/ssl-tests/05-sni.conf
++++ b/test/ssl-tests/05-sni.conf
+@@ -1,35 +1,193 @@
+ # Generated with generate_ssl_tests.pl
+ 
+-num_tests = 1
++num_tests = 6
+ 
+-test-0 = 0-SNI-default
++test-0 = 0-SNI-switch-context
++test-1 = 1-SNI-keep-context
++test-2 = 2-SNI-no-server-support
++test-3 = 3-SNI-no-client-support
++test-4 = 4-SNI-bad-sni-ignore-mismatch
++test-5 = 5-SNI-bad-sni-reject-mismatch
+ # ===========================================================
+ 
+-[0-SNI-default]
+-ssl_conf = 0-SNI-default-ssl
++[0-SNI-switch-context]
++ssl_conf = 0-SNI-switch-context-ssl
+ 
+-[0-SNI-default-ssl]
+-server = 0-SNI-default-server
+-server2 = 0-SNI-default-server2
+-client = 0-SNI-default-client
++[0-SNI-switch-context-ssl]
++server = 0-SNI-switch-context-server
++server2 = 0-SNI-switch-context-server2
++client = 0-SNI-switch-context-client
+ 
+-[0-SNI-default-server]
++[0-SNI-switch-context-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[0-SNI-default-server2]
++[0-SNI-switch-context-server2]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[0-SNI-default-client]
++[0-SNI-switch-context-client]
+ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+ [test-0]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
++
++
++# ===========================================================
++
++[1-SNI-keep-context]
++ssl_conf = 1-SNI-keep-context-ssl
++
++[1-SNI-keep-context-ssl]
++server = 1-SNI-keep-context-server
++server2 = 1-SNI-keep-context-server2
++client = 1-SNI-keep-context-client
++
++[1-SNI-keep-context-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[1-SNI-keep-context-server2]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[1-SNI-keep-context-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-1]
++ExpectedResult = Success
++ExpectedServerName = server1
++ServerName = server1
++ServerNameCallback = IgnoreMismatch
++
++
++# ===========================================================
++
++[2-SNI-no-server-support]
++ssl_conf = 2-SNI-no-server-support-ssl
++
++[2-SNI-no-server-support-ssl]
++server = 2-SNI-no-server-support-server
++client = 2-SNI-no-server-support-client
++
++[2-SNI-no-server-support-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[2-SNI-no-server-support-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-2]
++ExpectedResult = Success
++ServerName = server1
++
++
++# ===========================================================
++
++[3-SNI-no-client-support]
++ssl_conf = 3-SNI-no-client-support-ssl
++
++[3-SNI-no-client-support-ssl]
++server = 3-SNI-no-client-support-server
++server2 = 3-SNI-no-client-support-server2
++client = 3-SNI-no-client-support-client
++
++[3-SNI-no-client-support-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[3-SNI-no-client-support-server2]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[3-SNI-no-client-support-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-3]
++ExpectedResult = Success
++ExpectedServerName = server1
++ServerNameCallback = IgnoreMismatch
++
++
++# ===========================================================
++
++[4-SNI-bad-sni-ignore-mismatch]
++ssl_conf = 4-SNI-bad-sni-ignore-mismatch-ssl
++
++[4-SNI-bad-sni-ignore-mismatch-ssl]
++server = 4-SNI-bad-sni-ignore-mismatch-server
++server2 = 4-SNI-bad-sni-ignore-mismatch-server2
++client = 4-SNI-bad-sni-ignore-mismatch-client
++
++[4-SNI-bad-sni-ignore-mismatch-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[4-SNI-bad-sni-ignore-mismatch-server2]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[4-SNI-bad-sni-ignore-mismatch-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-4]
++ExpectedResult = Success
++ExpectedServerName = server1
++ServerName = invalid
++ServerNameCallback = IgnoreMismatch
++
++
++# ===========================================================
++
++[5-SNI-bad-sni-reject-mismatch]
++ssl_conf = 5-SNI-bad-sni-reject-mismatch-ssl
++
++[5-SNI-bad-sni-reject-mismatch-ssl]
++server = 5-SNI-bad-sni-reject-mismatch-server
++server2 = 5-SNI-bad-sni-reject-mismatch-server2
++client = 5-SNI-bad-sni-reject-mismatch-client
++
++[5-SNI-bad-sni-reject-mismatch-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[5-SNI-bad-sni-reject-mismatch-server2]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[5-SNI-bad-sni-reject-mismatch-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-5]
++ExpectedResult = ServerFail
++ServerAlert = UnrecognizedName
++ServerName = invalid
++ServerNameCallback = RejectMismatch
+ 
+ 
+diff --git a/test/ssl-tests/05-sni.conf.in b/test/ssl-tests/05-sni.conf.in
+index de8dc77..635ce9a 100644
+--- a/test/ssl-tests/05-sni.conf.in
++++ b/test/ssl-tests/05-sni.conf.in
+@@ -16,11 +16,64 @@ package ssltests;
+ 
+ our @tests = (
+     {
+-        name =&gt; &quot;SNI-default&quot;,
++        name =&gt; &quot;SNI-switch-context&quot;,
+         server =&gt; { },
+         server2 =&gt; { },
+         client =&gt; { },
+         test   =&gt; { &quot;ServerName&quot; =&gt; &quot;server2&quot;,
+-		    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++                    &quot;ExpectedServerName&quot; =&gt; &quot;server2&quot;,
++                    &quot;ServerNameCallback&quot; =&gt; &quot;IgnoreMismatch&quot;,
++                    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++    {
++        name =&gt; &quot;SNI-keep-context&quot;,
++        server =&gt; { },
++        server2 =&gt; { },
++        client =&gt; { },
++        test   =&gt; { &quot;ServerName&quot; =&gt; &quot;server1&quot;,
++                    &quot;ExpectedServerName&quot; =&gt; &quot;server1&quot;,
++                    &quot;ServerNameCallback&quot; =&gt; &quot;IgnoreMismatch&quot;,
++                    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++    {
++        name =&gt; &quot;SNI-no-server-support&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test   =&gt; { &quot;ServerName&quot; =&gt; &quot;server1&quot;,
++                    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++    {
++        name =&gt; &quot;SNI-no-client-support&quot;,
++        server =&gt; { },
++        server2 =&gt; { },
++        client =&gt; { },
++        test   =&gt; {
++            # We expect that the callback is still called
++            # to let the application decide whether they tolerate
++            # missing SNI (as our test callback does).
++            &quot;ExpectedServerName&quot; =&gt; &quot;server1&quot;,
++            &quot;ServerNameCallback&quot; =&gt; &quot;IgnoreMismatch&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;
++        },
++    },
++    {
++        name =&gt; &quot;SNI-bad-sni-ignore-mismatch&quot;,
++        server =&gt; { },
++        server2 =&gt; { },
++        client =&gt; { },
++        test   =&gt; { &quot;ServerName&quot; =&gt; &quot;invalid&quot;,
++                    &quot;ExpectedServerName&quot; =&gt; &quot;server1&quot;,
++                    &quot;ServerNameCallback&quot; =&gt; &quot;IgnoreMismatch&quot;,
++                    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++    {
++        name =&gt; &quot;SNI-bad-sni-reject-mismatch&quot;,
++        server =&gt; { },
++        server2 =&gt; { },
++        client =&gt; { },
++        test   =&gt; { &quot;ServerName&quot; =&gt; &quot;invalid&quot;,
++                    &quot;ServerNameCallback&quot; =&gt; &quot;RejectMismatch&quot;,
++                    &quot;ExpectedResult&quot; =&gt; &quot;ServerFail&quot;,
++                    &quot;ServerAlert&quot; =&gt; &quot;UnrecognizedName&quot;},
+     },
+ );
+diff --git a/test/ssl-tests/06-sni-ticket.conf b/test/ssl-tests/06-sni-ticket.conf
+index 99484ed..b3bfda0 100644
+--- a/test/ssl-tests/06-sni-ticket.conf
++++ b/test/ssl-tests/06-sni-ticket.conf
+@@ -83,7 +83,9 @@ VerifyMode = Peer
+ 
+ [test-1]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = Yes
+ 
+ 
+@@ -117,7 +119,9 @@ VerifyMode = Peer
+ 
+ [test-2]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = Yes
+ 
+ 
+@@ -151,7 +155,9 @@ VerifyMode = Peer
+ 
+ [test-3]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = Yes
+ 
+ 
+@@ -185,7 +191,9 @@ VerifyMode = Peer
+ 
+ [test-4]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -219,7 +227,9 @@ VerifyMode = Peer
+ 
+ [test-5]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -253,7 +263,9 @@ VerifyMode = Peer
+ 
+ [test-6]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -287,7 +299,9 @@ VerifyMode = Peer
+ 
+ [test-7]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -321,7 +335,9 @@ VerifyMode = Peer
+ 
+ [test-8]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -355,7 +371,9 @@ VerifyMode = Peer
+ 
+ [test-9]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -389,7 +407,9 @@ VerifyMode = Peer
+ 
+ [test-10]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -423,7 +443,9 @@ VerifyMode = Peer
+ 
+ [test-11]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -457,7 +479,9 @@ VerifyMode = Peer
+ 
+ [test-12]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -491,7 +515,9 @@ VerifyMode = Peer
+ 
+ [test-13]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -525,7 +551,9 @@ VerifyMode = Peer
+ 
+ [test-14]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -559,7 +587,9 @@ VerifyMode = Peer
+ 
+ [test-15]
+ ExpectedResult = Success
++ExpectedServerName = server1
+ ServerName = server1
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+@@ -593,7 +623,9 @@ VerifyMode = Peer
+ 
+ [test-16]
+ ExpectedResult = Success
++ExpectedServerName = server2
+ ServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = No
+ 
+ 
+diff --git a/test/ssl-tests/06-sni-ticket.conf.in b/test/ssl-tests/06-sni-ticket.conf.in
+index 6cd57b6..8c95827 100644
+--- a/test/ssl-tests/06-sni-ticket.conf.in
++++ b/test/ssl-tests/06-sni-ticket.conf.in
+@@ -36,6 +36,9 @@ sub generate_tests() {
+ 			},
+                         &quot;test&quot; =&gt; {
+                             &quot;ServerName&quot; =&gt; $n,
++                            &quot;ExpectedServerName&quot; =&gt; $n,
++                            # We don't test mismatch here.
++                            &quot;ServerNameCallback&quot; =&gt; &quot;IgnoreMismatch&quot;,
+                             &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;,
+ 			    &quot;SessionTicketExpected&quot; =&gt; $result,
+                         }
+diff --git a/test/ssl_test.c b/test/ssl_test.c
+index 537d4b0..060f73e 100644
+--- a/test/ssl_test.c
++++ b/test/ssl_test.c
+@@ -125,14 +125,13 @@ static int check_protocol(HANDSHAKE_RESULT result, SSL_TEST_CTX *test_ctx)
+ 
+ static int check_servername(HANDSHAKE_RESULT result, SSL_TEST_CTX *test_ctx)
+ {
+-    if (test_ctx-&gt;servername != SSL_TEST_SERVERNAME_NONE
+-        &amp;&amp; result.servername != test_ctx-&gt;servername) {
+-        fprintf(stderr, &quot;Client ServerName mismatch, expected %s, got %s\n.&quot;,
+-                ssl_servername_name(test_ctx-&gt;servername),
+-                ssl_servername_name(result.servername));
+-        return 0;
++    if (result.servername != test_ctx-&gt;expected_servername) {
++      fprintf(stderr, &quot;Client ServerName mismatch, expected %s, got %s\n.&quot;,
++              ssl_servername_name(test_ctx-&gt;expected_servername),
++              ssl_servername_name(result.servername));
++      return 0;
+     }
+-    return 1;
++  return 1;
+ }
+ 
+ static int check_session_ticket(HANDSHAKE_RESULT result, SSL_TEST_CTX *test_ctx)
+@@ -176,40 +175,42 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+     SSL_CTX *server_ctx = NULL, *server2_ctx = NULL, *client_ctx = NULL;
+     SSL_TEST_CTX *test_ctx = NULL;
+     HANDSHAKE_RESULT result;
+-    const char *server2;
+ 
+     test_ctx = SSL_TEST_CTX_create(conf, fixture.test_app);
+     if (test_ctx == NULL)
+         goto err;
+ 
+-    /* Use ServerName to detect if we're testing SNI. */
+-    server2 = (test_ctx-&gt;servername != SSL_TEST_SERVERNAME_NONE) ? &quot;server2&quot;
+-        : &quot;server&quot;;
+-
+ #ifndef OPENSSL_NO_DTLS
+     if (test_ctx-&gt;method == SSL_TEST_METHOD_DTLS) {
+         server_ctx = SSL_CTX_new(DTLS_server_method());
+-        server2_ctx = SSL_CTX_new(DTLS_server_method());
++        if (test_ctx-&gt;servername_callback != SSL_TEST_SERVERNAME_CB_NONE) {
++            server2_ctx = SSL_CTX_new(DTLS_server_method());
++            OPENSSL_assert(server2_ctx != NULL);
++        }
+         client_ctx = SSL_CTX_new(DTLS_client_method());
+     }
+ #endif
+     if (test_ctx-&gt;method == SSL_TEST_METHOD_TLS) {
+         server_ctx = SSL_CTX_new(TLS_server_method());
+-        server2_ctx = SSL_CTX_new(TLS_server_method());
++        if (test_ctx-&gt;servername_callback != SSL_TEST_SERVERNAME_CB_NONE) {
++            server2_ctx = SSL_CTX_new(TLS_server_method());
++            OPENSSL_assert(server2_ctx != NULL);
++        }
+         client_ctx = SSL_CTX_new(TLS_client_method());
+     }
+ 
+-    OPENSSL_assert(server_ctx != NULL &amp;&amp; server2_ctx != NULL &amp;&amp;
+-                   client_ctx != NULL);
++    OPENSSL_assert(server_ctx != NULL &amp;&amp; client_ctx != NULL);
+ 
+     OPENSSL_assert(CONF_modules_load(conf, fixture.test_app, 0) &gt; 0);
+ 
+     if (!SSL_CTX_config(server_ctx, &quot;server&quot;)
+-        || !SSL_CTX_config(server2_ctx, server2)
+         || !SSL_CTX_config(client_ctx, &quot;client&quot;)) {
+         goto err;
+     }
+ 
++    if (server2_ctx != NULL &amp;&amp; !SSL_CTX_config(server2_ctx, &quot;server2&quot;))
++        goto err;
++
+     result = do_handshake(server_ctx, server2_ctx, client_ctx, test_ctx);
+ 
+     ret = check_test(result, test_ctx);
+diff --git a/test/ssl_test_ctx.c b/test/ssl_test_ctx.c
+index d6e2843..b06ab48 100644
+--- a/test/ssl_test_ctx.c
++++ b/test/ssl_test_ctx.c
+@@ -82,6 +82,7 @@ const char *ssl_test_result_name(ssl_test_result_t result)
+ static const test_enum ssl_alerts[] = {
+     {&quot;UnknownCA&quot;, SSL_AD_UNKNOWN_CA},
+     {&quot;HandshakeFailure&quot;, SSL_AD_HANDSHAKE_FAILURE},
++    {&quot;UnrecognizedName&quot;, SSL_AD_UNRECOGNIZED_NAME},
+ };
+ 
+ __owur static int parse_alert(int *alert, const char *value)
+@@ -164,6 +165,7 @@ static const test_enum ssl_servername[] = {
+     {&quot;None&quot;, SSL_TEST_SERVERNAME_NONE},
+     {&quot;server1&quot;, SSL_TEST_SERVERNAME_SERVER1},
+     {&quot;server2&quot;, SSL_TEST_SERVERNAME_SERVER2},
++    {&quot;invalid&quot;, SSL_TEST_SERVERNAME_INVALID},
+ };
+ 
+ __owur static int parse_servername(SSL_TEST_CTX *test_ctx,
+@@ -178,12 +180,52 @@ __owur static int parse_servername(SSL_TEST_CTX *test_ctx,
+     return 1;
+ }
+ 
++__owur static int parse_expected_servername(SSL_TEST_CTX *test_ctx,
++                                            const char *value)
++{
++    int ret_value;
++    if (!parse_enum(ssl_servername, OSSL_NELEM(ssl_servername),
++                    &amp;ret_value, value)) {
++        return 0;
++    }
++    test_ctx-&gt;expected_servername = ret_value;
++    return 1;
++}
++
+ const char *ssl_servername_name(ssl_servername_t server)
+ {
+     return enum_name(ssl_servername, OSSL_NELEM(ssl_servername),
+                      server);
+ }
+ 
++/***********************/
++/* ServerNameCallback. */
++/***********************/
++
++static const test_enum ssl_servername_callbacks[] = {
++    {&quot;None&quot;, SSL_TEST_SERVERNAME_CB_NONE},
++    {&quot;IgnoreMismatch&quot;, SSL_TEST_SERVERNAME_IGNORE_MISMATCH},
++    {&quot;RejectMismatch&quot;, SSL_TEST_SERVERNAME_REJECT_MISMATCH},
++};
++
++__owur static int parse_servername_callback(SSL_TEST_CTX *test_ctx,
++                                              const char *value)
++{
++    int ret_value;
++    if (!parse_enum(ssl_servername_callbacks,
++                    OSSL_NELEM(ssl_servername_callbacks), &amp;ret_value, value)) {
++        return 0;
++    }
++    test_ctx-&gt;servername_callback = ret_value;
++    return 1;
++}
++
++const char *ssl_servername_callback_name(ssl_servername_callback_t callback)
++{
++    return enum_name(ssl_servername_callbacks,
++                     OSSL_NELEM(ssl_servername_callbacks), callback);
++}
++
+ /*************************/
+ /* SessionTicketExpected */
+ /*************************/
+@@ -254,6 +296,8 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
+     { &quot;Protocol&quot;, &amp;parse_protocol },
+     { &quot;ClientVerifyCallback&quot;, &amp;parse_client_verify_callback },
+     { &quot;ServerName&quot;, &amp;parse_servername },
++    { &quot;ExpectedServerName&quot;, &amp;parse_expected_servername },
++    { &quot;ServerNameCallback&quot;, &amp;parse_servername_callback },
+     { &quot;SessionTicketExpected&quot;, &amp;parse_session_ticket },
+     { &quot;Method&quot;, &amp;parse_test_method },
+ };
+diff --git a/test/ssl_test_ctx.h b/test/ssl_test_ctx.h
+index 492d1d7..c551a9b 100644
+--- a/test/ssl_test_ctx.h
++++ b/test/ssl_test_ctx.h
+@@ -29,10 +29,18 @@ typedef enum {
+ typedef enum {
+     SSL_TEST_SERVERNAME_NONE = 0, /* Default */
+     SSL_TEST_SERVERNAME_SERVER1,
+-    SSL_TEST_SERVERNAME_SERVER2
++    SSL_TEST_SERVERNAME_SERVER2,
++    SSL_TEST_SERVERNAME_INVALID
+ } ssl_servername_t;
+ 
+ typedef enum {
++    SSL_TEST_SERVERNAME_CB_NONE = 0,  /* Default */
++    SSL_TEST_SERVERNAME_IGNORE_MISMATCH,
++    SSL_TEST_SERVERNAME_REJECT_MISMATCH
++} ssl_servername_callback_t;
++
++
++typedef enum {
+     SSL_TEST_SESSION_TICKET_IGNORE = 0, /* Default */
+     SSL_TEST_SESSION_TICKET_YES,
+     SSL_TEST_SESSION_TICKET_NO,
+@@ -61,6 +69,18 @@ typedef struct ssl_test_ctx {
+     ssl_verify_callback_t client_verify_callback;
+     /* One of a number of predefined server names use by the client */
+     ssl_servername_t servername;
++    /*
++     * The expected SNI context to use.
++     * We test server-side that the server switched to the expected context.
++     * Set by the callback upon success, so if the callback wasn't called or
++     * terminated with an alert, the servername will match with
++     * SSL_TEST_SERVERNAME_NONE.
++     * Note: in the event that the servername was accepted, the client should
++     * also receive an empty SNI extension back but we have no way of probing
++     * client-side via the API that this was the case.
++     */
++    ssl_servername_t expected_servername;
++    ssl_servername_callback_t servername_callback;
+     ssl_session_ticket_t session_ticket_expected;
+     /* Whether the server/client CTX should use DTLS or TLS. */
+     ssl_test_method_t method;
+@@ -71,6 +91,8 @@ const char *ssl_alert_name(int alert);
+ const char *ssl_protocol_name(int protocol);
+ const char *ssl_verify_callback_name(ssl_verify_callback_t verify_callback);
+ const char *ssl_servername_name(ssl_servername_t server);
++const char *ssl_servername_callback_name(ssl_servername_callback_t
++                                         servername_callback);
+ const char *ssl_session_ticket_name(ssl_session_ticket_t server);
+ const char *ssl_test_method_name(ssl_test_method_t method);
+ 
+diff --git a/test/ssl_test_ctx_test.c b/test/ssl_test_ctx_test.c
+index 9824d66..3818ba5 100644
+--- a/test/ssl_test_ctx_test.c
++++ b/test/ssl_test_ctx_test.c
+@@ -70,6 +70,18 @@ static int SSL_TEST_CTX_equal(SSL_TEST_CTX *ctx, SSL_TEST_CTX *ctx2)
+                 ssl_servername_name(ctx2-&gt;servername));
+         return 0;
+     }
++    if (ctx-&gt;expected_servername != ctx2-&gt;expected_servername) {
++        fprintf(stderr, &quot;ExpectedServerName mismatch: %s vs %s.\n&quot;,
++                ssl_servername_name(ctx-&gt;expected_servername),
++                ssl_servername_name(ctx2-&gt;expected_servername));
++        return 0;
++    }
++    if (ctx-&gt;servername_callback != ctx2-&gt;servername_callback) {
++        fprintf(stderr, &quot;ServerNameCallback mismatch: %s vs %s.\n&quot;,
++                ssl_servername_callback_name(ctx-&gt;servername_callback),
++                ssl_servername_callback_name(ctx2-&gt;servername_callback));
++        return 0;
++    }
+     if (ctx-&gt;session_ticket_expected != ctx2-&gt;session_ticket_expected) {
+         fprintf(stderr, &quot;SessionTicketExpected mismatch: %s vs %s.\n&quot;,
+                 ssl_session_ticket_name(ctx-&gt;session_ticket_expected),
+@@ -155,6 +167,9 @@ static int test_good_configuration()
+     fixture.expected_ctx-&gt;protocol = TLS1_1_VERSION;
+     fixture.expected_ctx-&gt;client_verify_callback = SSL_TEST_VERIFY_REJECT_ALL;
+     fixture.expected_ctx-&gt;servername = SSL_TEST_SERVERNAME_SERVER2;
++    fixture.expected_ctx-&gt;expected_servername = SSL_TEST_SERVERNAME_SERVER2;
++    fixture.expected_ctx-&gt;servername_callback =
++        SSL_TEST_SERVERNAME_IGNORE_MISMATCH;
+     fixture.expected_ctx-&gt;session_ticket_expected = SSL_TEST_SESSION_TICKET_YES;
+     fixture.expected_ctx-&gt;method = SSL_TEST_METHOD_DTLS;
+     EXECUTE_SSL_TEST_CTX_TEST();
+@@ -167,6 +182,7 @@ static const char *bad_configurations[] = {
+     &quot;ssltest_unknown_protocol&quot;,
+     &quot;ssltest_unknown_verify_callback&quot;,
+     &quot;ssltest_unknown_servername&quot;,
++    &quot;ssltest_unknown_servername_callback&quot;,
+     &quot;ssltest_unknown_session_ticket_expected&quot;,
+     &quot;ssltest_unknown_method&quot;,
+ };
+diff --git a/test/ssl_test_ctx_test.conf b/test/ssl_test_ctx_test.conf
+index 9c1057d..2fa54b5 100644
+--- a/test/ssl_test_ctx_test.conf
++++ b/test/ssl_test_ctx_test.conf
+@@ -6,6 +6,8 @@ ClientAlert = UnknownCA
+ Protocol = TLSv1.1
+ ClientVerifyCallback = RejectAll
+ ServerName = server2
++ExpectedServerName = server2
++ServerNameCallback = IgnoreMismatch
+ SessionTicketExpected = Yes
+ Method = DTLS
+ 
+@@ -27,9 +29,11 @@ ClientVerifyCallback = Foo
+ [ssltest_unknown_servername]
+ ServerName = Foo
+ 
++[ssltest_unknown_servername_callback]
++ServerNameCallback = Foo
++
+ [ssltest_unknown_session_ticket_expected]
+ SessionTicketExpected = Foo
+ 
+ [ssltest_unknown_method]
+ Method = TLS2
+-
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008698.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="008701.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8700">[ date ]</a>
+              <a href="thread.html#8700">[ thread ]</a>
+              <a href="subject.html#8700">[ subject ]</a>
+              <a href="author.html#8700">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

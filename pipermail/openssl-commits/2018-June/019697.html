@@ -1,0 +1,311 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530268803.225346.30959.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019696.html">
+   <LINK REL="Next"  HREF="019478.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1530268803.225346.30959.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Fri Jun 29 10:40:03 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019696.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019478.html">[openssl-commits] Build failed: openssl master.18263
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19697">[ date ]</a>
+              <a href="thread.html#19697">[ thread ]</a>
+              <a href="subject.html#19697">[ subject ]</a>
+              <a href="author.html#19697">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a091e212fc55244fe03a4c7db7d8978c5b5014cb (commit)
+      from  249330de0250bc598d20d383bab37d150cdad239 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a091e212fc55244fe03a4c7db7d8978c5b5014cb
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Wed Jun 27 12:16:52 2018 +0200
+
+    evp/e_chacha20_poly1305.c: improve performance for short TLS records.
+    
+    Inputs not longer than 64 bytes are processed ~10% faster, longer
+    lengths not divisble by 64, e.g. 255, up to ~20%. Unfortunately it's
+    impossible to measure with apps/speed.c, -aead benchmarks TLS-like
+    call sequence, but not exact. It took specially crafted code path...
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6597">https://github.com/openssl/openssl/pull/6597</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/e_chacha20_poly1305.c | 158 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 148 insertions(+), 10 deletions(-)
+
+diff --git a/crypto/evp/e_chacha20_poly1305.c b/crypto/evp/e_chacha20_poly1305.c
+index 9bf98f1..47d5e50 100644
+--- a/crypto/evp/e_chacha20_poly1305.c
++++ b/crypto/evp/e_chacha20_poly1305.c
+@@ -150,6 +150,7 @@ typedef struct {
+     EVP_CHACHA_KEY key;
+     unsigned int nonce[12/4];
+     unsigned char tag[POLY1305_BLOCK_SIZE];
++    unsigned char tls_aad[POLY1305_BLOCK_SIZE];
+     struct { uint64_t aad, text; } len;
+     int aad, mac_inited, tag_len, nonce_len;
+     size_t tls_payload_length;
+@@ -179,7 +180,8 @@ static int chacha20_poly1305_init_key(EVP_CIPHER_CTX *ctx,
+ 
+         /* pad on the left */
+         if (actx-&gt;nonce_len &lt;= CHACHA_CTR_SIZE)
+-            memcpy(temp + CHACHA_CTR_SIZE - actx-&gt;nonce_len, iv, actx-&gt;nonce_len);
++            memcpy(temp + CHACHA_CTR_SIZE - actx-&gt;nonce_len, iv,
++                   actx-&gt;nonce_len);
+ 
+         chacha_init_key(ctx, inkey, temp, enc);
+ 
+@@ -193,23 +195,158 @@ static int chacha20_poly1305_init_key(EVP_CIPHER_CTX *ctx,
+     return 1;
+ }
+ 
++#  if !defined(OPENSSL_SMALL_FOOTPRINT)
++static const unsigned char zero[2 * CHACHA_BLK_SIZE] = { 0 };
++
++static int chacha20_poly1305_tls_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
++                                        const unsigned char *in, size_t len)
++{
++    EVP_CHACHA_AEAD_CTX *actx = aead_data(ctx);
++    size_t i, tail, tohash_len, plen = actx-&gt;tls_payload_length;
++    unsigned char *buf, *tohash, *ctr, storage[2 * CHACHA_BLK_SIZE + 32];
++
++    if (len != plen + POLY1305_BLOCK_SIZE)
++        return -1;
++
++    buf = storage + ((0 - (size_t)storage) &amp; 15);   /* align */
++    ctr = buf + CHACHA_BLK_SIZE;
++    tohash = buf + CHACHA_BLK_SIZE - POLY1305_BLOCK_SIZE;
++
++    if (plen &lt;= CHACHA_BLK_SIZE) {
++        actx-&gt;key.counter[0] = 0;
++        ChaCha20_ctr32(buf, zero, 2 * CHACHA_BLK_SIZE, actx-&gt;key.key.d,
++                       actx-&gt;key.counter);
++        Poly1305_Init(POLY1305_ctx(actx), buf);
++        actx-&gt;key.partial_len = 0;
++        memcpy(tohash, actx-&gt;tls_aad, POLY1305_BLOCK_SIZE);
++        tohash_len = POLY1305_BLOCK_SIZE;
++        actx-&gt;len.aad = EVP_AEAD_TLS1_AAD_LEN;
++        actx-&gt;len.text = plen;
++
++        if (ctx-&gt;encrypt) {
++            for (i = 0; i &lt; plen; i++) {
++                out[i] = ctr[i] ^= in[i];
++            }
++        } else {
++            for (i = 0; i &lt; plen; i++) {
++                unsigned char c = in[i];
++                out[i] = ctr[i] ^ c;
++                ctr[i] = c;
++            }
++        }
++
++        in += i;
++        out += i;
++
++        tail = (0 - i) &amp; (POLY1305_BLOCK_SIZE - 1);
++        memset(ctr + i, 0, tail);
++        ctr += i + tail;
++        tohash_len += i + tail;
++    } else {
++        actx-&gt;key.counter[0] = 0;
++        ChaCha20_ctr32(buf, zero, CHACHA_BLK_SIZE, actx-&gt;key.key.d,
++                       actx-&gt;key.counter);
++        Poly1305_Init(POLY1305_ctx(actx), buf);
++        actx-&gt;key.counter[0] = 1;
++        actx-&gt;key.partial_len = 0;
++        Poly1305_Update(POLY1305_ctx(actx), actx-&gt;tls_aad, POLY1305_BLOCK_SIZE);
++        tohash = ctr;
++        tohash_len = 0;
++        actx-&gt;len.aad = EVP_AEAD_TLS1_AAD_LEN;
++        actx-&gt;len.text = plen;
++
++        if (ctx-&gt;encrypt) {
++            ChaCha20_ctr32(out, in, plen, actx-&gt;key.key.d, actx-&gt;key.counter);
++            Poly1305_Update(POLY1305_ctx(actx), out, plen);
++        } else {
++            Poly1305_Update(POLY1305_ctx(actx), in, plen);
++            ChaCha20_ctr32(out, in, plen, actx-&gt;key.key.d, actx-&gt;key.counter);
++        }
++
++        in += plen;
++        out += plen;
++        tail = (0 - plen) &amp; (POLY1305_BLOCK_SIZE - 1);
++        Poly1305_Update(POLY1305_ctx(actx), zero, tail);
++    }
++
++    {
++        const union {
++            long one;
++            char little;
++        } is_endian = { 1 };
++
++        if (is_endian.little) {
++            memcpy(ctr, (unsigned char *)&amp;actx-&gt;len, POLY1305_BLOCK_SIZE);
++        } else {
++            ctr[0]  = (unsigned char)(actx-&gt;len.aad);
++            ctr[1]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;8);
++            ctr[2]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;16);
++            ctr[3]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;24);
++            ctr[4]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;32);
++            ctr[5]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;40);
++            ctr[6]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;48);
++            ctr[7]  = (unsigned char)(actx-&gt;len.aad&gt;&gt;56);
++
++            ctr[8]  = (unsigned char)(actx-&gt;len.text);
++            ctr[9]  = (unsigned char)(actx-&gt;len.text&gt;&gt;8);
++            ctr[10] = (unsigned char)(actx-&gt;len.text&gt;&gt;16);
++            ctr[11] = (unsigned char)(actx-&gt;len.text&gt;&gt;24);
++            ctr[12] = (unsigned char)(actx-&gt;len.text&gt;&gt;32);
++            ctr[13] = (unsigned char)(actx-&gt;len.text&gt;&gt;40);
++            ctr[14] = (unsigned char)(actx-&gt;len.text&gt;&gt;48);
++            ctr[15] = (unsigned char)(actx-&gt;len.text&gt;&gt;56);
++        }
++        tohash_len += POLY1305_BLOCK_SIZE;
++    }
++
++    Poly1305_Update(POLY1305_ctx(actx), tohash, tohash_len);
++    OPENSSL_cleanse(buf, 2 * CHACHA_BLK_SIZE);
++    Poly1305_Final(POLY1305_ctx(actx), ctx-&gt;encrypt ? actx-&gt;tag
++                                                    : tohash);
++
++    actx-&gt;tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++
++    if (ctx-&gt;encrypt) {
++        memcpy(out, actx-&gt;tag, POLY1305_BLOCK_SIZE);
++    } else {
++        if (CRYPTO_memcmp(tohash, in, POLY1305_BLOCK_SIZE)) {
++            memset(out - (len - POLY1305_BLOCK_SIZE), 0,
++                   len - POLY1305_BLOCK_SIZE);
++            return -1;
++        }
++    }
++
++    return len;
++}
++#  else
++static const unsigned char zero[CHACHA_BLK_SIZE] = { 0 };
++#  endif
++
+ static int chacha20_poly1305_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                                     const unsigned char *in, size_t len)
+ {
+     EVP_CHACHA_AEAD_CTX *actx = aead_data(ctx);
+     size_t rem, plen = actx-&gt;tls_payload_length;
+-    static const unsigned char zero[POLY1305_BLOCK_SIZE] = { 0 };
+ 
+     if (!actx-&gt;mac_inited) {
++#  if !defined(OPENSSL_SMALL_FOOTPRINT)
++        if (plen != NO_TLS_PAYLOAD_LENGTH &amp;&amp; out != NULL)
++            return chacha20_poly1305_tls_cipher(ctx, out, in, len);
++#  endif
+         actx-&gt;key.counter[0] = 0;
+-        memset(actx-&gt;key.buf, 0, sizeof(actx-&gt;key.buf));
+-        ChaCha20_ctr32(actx-&gt;key.buf, actx-&gt;key.buf, CHACHA_BLK_SIZE,
++        ChaCha20_ctr32(actx-&gt;key.buf, zero, CHACHA_BLK_SIZE,
+                        actx-&gt;key.key.d, actx-&gt;key.counter);
+         Poly1305_Init(POLY1305_ctx(actx), actx-&gt;key.buf);
+         actx-&gt;key.counter[0] = 1;
+         actx-&gt;key.partial_len = 0;
+         actx-&gt;len.aad = actx-&gt;len.text = 0;
+         actx-&gt;mac_inited = 1;
++        if (plen != NO_TLS_PAYLOAD_LENGTH) {
++            Poly1305_Update(POLY1305_ctx(actx), actx-&gt;tls_aad,
++                            EVP_AEAD_TLS1_AAD_LEN);
++            actx-&gt;len.aad = EVP_AEAD_TLS1_AAD_LEN;
++            actx-&gt;aad = 1;
++        }
+     }
+ 
+     if (in) {                                   /* aad or text */
+@@ -341,6 +478,7 @@ static int chacha20_poly1305_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg,
+         actx-&gt;tag_len = 0;
+         actx-&gt;nonce_len = 12;
+         actx-&gt;tls_payload_length = NO_TLS_PAYLOAD_LENGTH;
++        memset(actx-&gt;tls_aad, 0, POLY1305_BLOCK_SIZE);
+         return 1;
+ 
+     case EVP_CTRL_COPY:
+@@ -393,18 +531,18 @@ static int chacha20_poly1305_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg,
+             return 0;
+         {
+             unsigned int len;
+-            unsigned char *aad = ptr, temp[POLY1305_BLOCK_SIZE];
++            unsigned char *aad = ptr;
+ 
++            memcpy(actx-&gt;tls_aad, ptr, EVP_AEAD_TLS1_AAD_LEN);
+             len = aad[EVP_AEAD_TLS1_AAD_LEN - 2] &lt;&lt; 8 |
+                   aad[EVP_AEAD_TLS1_AAD_LEN - 1];
++            aad = actx-&gt;tls_aad;
+             if (!ctx-&gt;encrypt) {
+                 if (len &lt; POLY1305_BLOCK_SIZE)
+                     return 0;
+                 len -= POLY1305_BLOCK_SIZE;     /* discount attached tag */
+-                memcpy(temp, aad, EVP_AEAD_TLS1_AAD_LEN - 2);
+-                aad = temp;
+-                temp[EVP_AEAD_TLS1_AAD_LEN - 2] = (unsigned char)(len &gt;&gt; 8);
+-                temp[EVP_AEAD_TLS1_AAD_LEN - 1] = (unsigned char)len;
++                aad[EVP_AEAD_TLS1_AAD_LEN - 2] = (unsigned char)(len &gt;&gt; 8);
++                aad[EVP_AEAD_TLS1_AAD_LEN - 1] = (unsigned char)len;
+             }
+             actx-&gt;tls_payload_length = len;
+ 
+@@ -415,7 +553,7 @@ static int chacha20_poly1305_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg,
+             actx-&gt;key.counter[2] = actx-&gt;nonce[1] ^ CHACHA_U8TOU32(aad);
+             actx-&gt;key.counter[3] = actx-&gt;nonce[2] ^ CHACHA_U8TOU32(aad+4);
+             actx-&gt;mac_inited = 0;
+-            chacha20_poly1305_cipher(ctx, NULL, aad, EVP_AEAD_TLS1_AAD_LEN);
++
+             return POLY1305_BLOCK_SIZE;         /* tag length */
+         }
+ 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019696.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019478.html">[openssl-commits] Build failed: openssl master.18263
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19697">[ date ]</a>
+              <a href="thread.html#19697">[ thread ]</a>
+              <a href="subject.html#19697">[ subject ]</a>
+              <a href="author.html#19697">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

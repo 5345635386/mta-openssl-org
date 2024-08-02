@@ -1,0 +1,714 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1448651069.907101.2173.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002229.html">
+   <LINK REL="Next"  HREF="002231.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1448651069.907101.2173.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Fri Nov 27 19:04:29 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002229.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002231.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2230">[ date ]</a>
+              <a href="thread.html#2230">[ thread ]</a>
+              <a href="subject.html#2230">[ subject ]</a>
+              <a href="author.html#2230">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  28ba2541f9f5e61ddef548d3bead494ff6946db2 (commit)
+      from  2a9b96548afc0d540ab873a31dc1a72c66cba434 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 28ba2541f9f5e61ddef548d3bead494ff6946db2
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Wed Nov 25 18:20:50 2015 +0000
+
+    PRF and handshake hash revision.
+    
+    Change handshake hash array into a single digest context simplifying the
+    handhake hash code. Use EVP_md5_sha1() if needed for handshake hashes in
+    TLS 1.1 and earlier.
+    
+    Simplify PRF code to also use a single digest and treat EVP_md5_sha1()
+    as a special case.
+    
+    Modify algorithm2 field of ciphers to use a single index value for handshake
+    hash and PRF instead of a bitmap.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_enc.c   | 144 +++++++++++++--------------------------------------------
+ ssl/ssl_algs.c |   3 ++
+ ssl/ssl_ciph.c |  48 ++++++++-----------
+ ssl/ssl_lib.c  |  26 ++++-------
+ ssl/ssl_locl.h |  67 ++++++++++++++++-----------
+ ssl/t1_enc.c   |  81 ++++++++++++++------------------
+ 6 files changed, 138 insertions(+), 231 deletions(-)
+
+diff --git a/ssl/s3_enc.c b/ssl/s3_enc.c
+index b801d05..bb900e9 100644
+--- a/ssl/s3_enc.c
++++ b/ssl/s3_enc.c
+@@ -140,26 +140,6 @@
+ #include &lt;openssl/evp.h&gt;
+ #include &lt;openssl/md5.h&gt;
+ 
+-static const unsigned char ssl3_pad_1[48] = {
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36,
+-    0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36
+-};
+-
+-static const unsigned char ssl3_pad_2[48] = {
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
+-    0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c
+-};
+-
+-static int ssl3_handshake_mac(SSL *s, int md_nid,
+-                              const char *sender, int len, unsigned char *p);
+ static int ssl3_generate_key_block(SSL *s, unsigned char *km, int num)
+ {
+     EVP_MD_CTX m5;
+@@ -488,69 +468,48 @@ void ssl3_init_finished_mac(SSL *s)
+ 
+ void ssl3_free_digest_list(SSL *s)
+ {
+-    int i;
+     BIO_free(s-&gt;s3-&gt;handshake_buffer);
+     s-&gt;s3-&gt;handshake_buffer = NULL;
+-    if (!s-&gt;s3-&gt;handshake_dgst)
+-        return;
+-    for (i = 0; i &lt; SSL_MAX_DIGEST; i++) {
+-        if (s-&gt;s3-&gt;handshake_dgst[i])
+-            EVP_MD_CTX_destroy(s-&gt;s3-&gt;handshake_dgst[i]);
+-    }
+-    OPENSSL_free(s-&gt;s3-&gt;handshake_dgst);
++    EVP_MD_CTX_destroy(s-&gt;s3-&gt;handshake_dgst);
+     s-&gt;s3-&gt;handshake_dgst = NULL;
+ }
+ 
+ void ssl3_finish_mac(SSL *s, const unsigned char *buf, int len)
+ {
+-    if (s-&gt;s3-&gt;handshake_dgst == NULL) {
++    if (s-&gt;s3-&gt;handshake_dgst == NULL)
+         BIO_write(s-&gt;s3-&gt;handshake_buffer, (void *)buf, len);
+-    } else {
+-        int i;
+-        for (i = 0; i &lt; SSL_MAX_DIGEST; i++) {
+-            if (s-&gt;s3-&gt;handshake_dgst[i] != NULL)
+-                EVP_DigestUpdate(s-&gt;s3-&gt;handshake_dgst[i], buf, len);
+-        }
+-    }
++    else
++        EVP_DigestUpdate(s-&gt;s3-&gt;handshake_dgst, buf, len);
+ }
+ 
+ int ssl3_digest_cached_records(SSL *s, int keep)
+ {
+-    int i;
+-    long mask;
+     const EVP_MD *md;
+     long hdatalen;
+     void *hdata;
+ 
+     if (s-&gt;s3-&gt;handshake_dgst == NULL) {
+-        /* Allocate handshake_dgst array */
+-        s-&gt;s3-&gt;handshake_dgst =
+-            OPENSSL_malloc(sizeof(*s-&gt;s3-&gt;handshake_dgst) * SSL_MAX_DIGEST);
+-        if (s-&gt;s3-&gt;handshake_dgst == NULL) {
+-            SSLerr(SSL_F_SSL3_DIGEST_CACHED_RECORDS, ERR_R_MALLOC_FAILURE);
+-            return 0;
+-        }
+         hdatalen = BIO_get_mem_data(s-&gt;s3-&gt;handshake_buffer, &amp;hdata);
+         if (hdatalen &lt;= 0) {
+             SSLerr(SSL_F_SSL3_DIGEST_CACHED_RECORDS, SSL_R_BAD_HANDSHAKE_LENGTH);
+             return 0;
+         }
+ 
+-        /* Loop through bits of algorithm2 field and create MD_CTX-es */
+-        for (i = 0; ssl_get_handshake_digest(i, &amp;mask, &amp;md); i++) {
+-            if ((mask &amp; ssl_get_algorithm2(s)) &amp;&amp; md) {
+-                s-&gt;s3-&gt;handshake_dgst[i] = EVP_MD_CTX_create();
+-                if (EVP_MD_nid(md) == NID_md5) {
+-                    EVP_MD_CTX_set_flags(s-&gt;s3-&gt;handshake_dgst[i],
+-                                         EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+-                }
+-                EVP_DigestInit_ex(s-&gt;s3-&gt;handshake_dgst[i], md, NULL);
+-                EVP_DigestUpdate(s-&gt;s3-&gt;handshake_dgst[i], hdata, hdatalen);
+-            } else {
+-                s-&gt;s3-&gt;handshake_dgst[i] = NULL;
+-            }
++        s-&gt;s3-&gt;handshake_dgst = EVP_MD_CTX_create();
++        if (s-&gt;s3-&gt;handshake_dgst == NULL) {
++            SSLerr(SSL_F_SSL3_DIGEST_CACHED_RECORDS, ERR_R_MALLOC_FAILURE);
++            return 0;
+         }
+ 
++        md = ssl_handshake_md(s);
++        if (md == NULL) {
++            SSLerr(SSL_F_SSL3_DIGEST_CACHED_RECORDS, ERR_R_INTERNAL_ERROR);
++            return 0;
++        }
++
++        EVP_DigestInit_ex(s-&gt;s3-&gt;handshake_dgst, md, NULL);
++        EVP_DigestUpdate(s-&gt;s3-&gt;handshake_dgst, hdata, hdatalen);
++
+     }
+     if (keep == 0) {
+         BIO_free(s-&gt;s3-&gt;handshake_buffer);
+@@ -560,77 +519,40 @@ int ssl3_digest_cached_records(SSL *s, int keep)
+     return 1;
+ }
+ 
+-int ssl3_final_finish_mac(SSL *s,
+-                          const char *sender, int len, unsigned char *p)
++int ssl3_final_finish_mac(SSL *s, const char *sender, int len, unsigned char *p)
+ {
+-    int ret, sha1len;
+-    ret = ssl3_handshake_mac(s, NID_md5, sender, len, p);
+-    if (ret == 0)
+-        return 0;
+-
+-    p += ret;
+-
+-    sha1len = ssl3_handshake_mac(s, NID_sha1, sender, len, p);
+-    if (sha1len == 0)
+-        return 0;
+-
+-    ret += sha1len;
+-    return (ret);
+-}
+-
+-static int ssl3_handshake_mac(SSL *s, int md_nid,
+-                              const char *sender, int len, unsigned char *p)
+-{
+-    unsigned int ret;
+-    int npad, n;
+-    unsigned int i;
+-    unsigned char md_buf[EVP_MAX_MD_SIZE];
+-    EVP_MD_CTX ctx, *d = NULL;
++    int ret;
++    EVP_MD_CTX ctx;
+ 
+     if (!ssl3_digest_cached_records(s, 0))
+         return 0;
+ 
+-    /*
+-     * Search for digest of specified type in the handshake_dgst array
+-     */
+-    for (i = 0; i &lt; SSL_MAX_DIGEST; i++) {
+-        if (s-&gt;s3-&gt;handshake_dgst[i]
+-            &amp;&amp; EVP_MD_CTX_type(s-&gt;s3-&gt;handshake_dgst[i]) == md_nid) {
+-            d = s-&gt;s3-&gt;handshake_dgst[i];
+-            break;
+-        }
+-    }
+-    if (!d) {
++    if (EVP_MD_CTX_type(s-&gt;s3-&gt;handshake_dgst) != NID_md5_sha1) {
+         SSLerr(SSL_F_SSL3_HANDSHAKE_MAC, SSL_R_NO_REQUIRED_DIGEST);
+         return 0;
+     }
++
+     EVP_MD_CTX_init(&amp;ctx);
+-    EVP_MD_CTX_set_flags(&amp;ctx, EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+-    EVP_MD_CTX_copy_ex(&amp;ctx, d);
+-    n = EVP_MD_CTX_size(&amp;ctx);
+-    if (n &lt; 0)
++    EVP_MD_CTX_copy_ex(&amp;ctx, s-&gt;s3-&gt;handshake_dgst);
++
++    ret = EVP_MD_CTX_size(&amp;ctx);
++    if (ret &lt; 0) {
++        EVP_MD_CTX_cleanup(&amp;ctx);
+         return 0;
++    }
+ 
+-    npad = (48 / n) * n;
+     if ((sender != NULL &amp;&amp; EVP_DigestUpdate(&amp;ctx, sender, len) &lt;= 0)
+-            || EVP_DigestUpdate(&amp;ctx, s-&gt;session-&gt;master_key,
+-                                s-&gt;session-&gt;master_key_length) &lt;= 0
+-            || EVP_DigestUpdate(&amp;ctx, ssl3_pad_1, npad) &lt;= 0
+-            || EVP_DigestFinal_ex(&amp;ctx, md_buf, &amp;i) &lt;= 0
+-
+-            || EVP_DigestInit_ex(&amp;ctx, EVP_MD_CTX_md(&amp;ctx), NULL) &lt;= 0
+-            || EVP_DigestUpdate(&amp;ctx, s-&gt;session-&gt;master_key,
+-                                s-&gt;session-&gt;master_key_length) &lt;= 0
+-            || EVP_DigestUpdate(&amp;ctx, ssl3_pad_2, npad) &lt;= 0
+-            || EVP_DigestUpdate(&amp;ctx, md_buf, i) &lt;= 0
+-            || EVP_DigestFinal_ex(&amp;ctx, p, &amp;ret) &lt;= 0) {
++            || EVP_MD_CTX_ctrl(&amp;ctx, EVP_CTRL_SSL3_MASTER_SECRET,
++                               s-&gt;session-&gt;master_key_length,
++                               s-&gt;session-&gt;master_key) &lt;= 0
++            || EVP_DigestFinal_ex(&amp;ctx, p, NULL) &lt;= 0) {
+         SSLerr(SSL_F_SSL3_HANDSHAKE_MAC, ERR_R_INTERNAL_ERROR);
+         ret = 0;
+     }
+ 
+     EVP_MD_CTX_cleanup(&amp;ctx);
+ 
+-    return ((int)ret);
++    return ret;
+ }
+ 
+ int ssl3_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p,
+diff --git a/ssl/ssl_algs.c b/ssl/ssl_algs.c
+index f4827fd..9c12e19 100644
+--- a/ssl/ssl_algs.c
++++ b/ssl/ssl_algs.c
+@@ -110,6 +110,9 @@ int SSL_library_init(void)
+ #ifndef OPENSSL_NO_MD5
+     EVP_add_digest(EVP_md5());
+     EVP_add_digest_alias(SN_md5, &quot;ssl3-md5&quot;);
++# ifndef OPENSSL_NO_SHA
++    EVP_add_digest(EVP_md5_sha1());
++# endif
+ #endif
+     EVP_add_digest(EVP_sha1()); /* RSA with sha1 */
+     EVP_add_digest_alias(SN_sha1, &quot;ssl3-sha1&quot;);
+diff --git a/ssl/ssl_ciph.c b/ssl/ssl_ciph.c
+index 47f5e0f..4e3c1e5 100644
+--- a/ssl/ssl_ciph.c
++++ b/ssl/ssl_ciph.c
+@@ -212,15 +212,6 @@ static const EVP_CIPHER *ssl_cipher_methods[SSL_ENC_NUM_IDX] = {
+ 
+ static STACK_OF(SSL_COMP) *ssl_comp_methods = NULL;
+ 
+-#define SSL_MD_MD5_IDX  0
+-#define SSL_MD_SHA1_IDX 1
+-#define SSL_MD_GOST94_IDX 2
+-#define SSL_MD_GOST89MAC_IDX 3
+-#define SSL_MD_SHA256_IDX 4
+-#define SSL_MD_SHA384_IDX 5
+-#define SSL_MD_GOST12_256_IDX  6
+-#define SSL_MD_GOST89MAC12_IDX 7
+-#define SSL_MD_GOST12_512_IDX  8
+ /*
+  * Constant SSL_MAX_DIGEST equal to size of digests array should be defined
+  * in the ssl_locl.h
+@@ -238,11 +229,12 @@ static const ssl_cipher_table ssl_cipher_table_mac[SSL_MD_NUM_IDX] = {
+     {SSL_SHA384, NID_sha384},   /* SSL_MD_SHA384_IDX 5 */
+     {SSL_GOST12_256, NID_id_GostR3411_2012_256},  /* SSL_MD_GOST12_256_IDX 6 */
+     {SSL_GOST89MAC12, NID_gost_mac_12},           /* SSL_MD_GOST89MAC12_IDX 7 */
+-    {SSL_GOST12_512, NID_id_GostR3411_2012_512}   /* SSL_MD_GOST12_512_IDX 8 */
++    {SSL_GOST12_512, NID_id_GostR3411_2012_512},  /* SSL_MD_GOST12_512_IDX 8 */
++    {0, NID_md5_sha1}           /* SSL_MD_MD5_SHA1_IDX 9 */
+ };
+ 
+ static const EVP_MD *ssl_digest_methods[SSL_MD_NUM_IDX] = {
+-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
++    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+ };
+ 
+ /* Utility function for table lookup */
+@@ -275,14 +267,7 @@ static int ssl_mac_pkey_id[SSL_MD_NUM_IDX] = {
+ };
+ 
+ static int ssl_mac_secret_size[SSL_MD_NUM_IDX] = {
+-    0, 0, 0, 0, 0, 0, 0, 0, 0
+-};
+-
+-static const int ssl_handshake_digest_flag[SSL_MD_NUM_IDX] = {
+-    SSL_HANDSHAKE_MAC_MD5, SSL_HANDSHAKE_MAC_SHA,
+-    SSL_HANDSHAKE_MAC_GOST94, 0, SSL_HANDSHAKE_MAC_SHA256,
+-    SSL_HANDSHAKE_MAC_SHA384, SSL_HANDSHAKE_MAC_GOST12_256, 0,
+-    SSL_HANDSHAKE_MAC_GOST12_512,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+ };
+ 
+ #define CIPHER_ADD      1
+@@ -727,17 +712,22 @@ int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
+         return (0);
+ }
+ 
+-int ssl_get_handshake_digest(int idx, long *mask, const EVP_MD **md)
++static const EVP_MD *ssl_cipher_table_idx(int idx)
+ {
+-    if (idx &lt; 0 || idx &gt;= SSL_MD_NUM_IDX) {
+-        return 0;
+-    }
+-    *mask = ssl_handshake_digest_flag[idx];
+-    if (*mask)
+-        *md = ssl_digest_methods[idx];
+-    else
+-        *md = NULL;
+-    return 1;
++    idx &amp;= SSL_HANDSHAKE_MAC_MASK;
++    if (idx &lt; 0 || idx &gt;= SSL_MD_NUM_IDX)
++        return NULL;
++    return ssl_digest_methods[idx];
++}
++
++const EVP_MD *ssl_handshake_md(SSL *s)
++{
++    return ssl_cipher_table_idx(ssl_get_algorithm2(s));
++}
++
++const EVP_MD *ssl_prf_md(SSL *s)
++{
++    return ssl_cipher_table_idx(ssl_get_algorithm2(s) &gt;&gt; TLS1_PRF_DGST_SHIFT);
+ }
+ 
+ #define ITEM_SEP(a) \
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index a9370dc..12ae35c 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -3335,27 +3335,17 @@ void ssl_clear_hash_ctx(EVP_MD_CTX **hash)
+ /* Retrieve handshake hashes */
+ int ssl_handshake_hash(SSL *s, unsigned char *out, int outlen)
+ {
+-    unsigned char *p = out;
+-    int idx, ret = 0;
+-    long mask;
+     EVP_MD_CTX ctx;
+-    const EVP_MD *md;
++    EVP_MD_CTX *hdgst = s-&gt;s3-&gt;handshake_dgst;
++    int ret = EVP_MD_CTX_size(hdgst);
+     EVP_MD_CTX_init(&amp;ctx);
+-    for (idx = 0; ssl_get_handshake_digest(idx, &amp;mask, &amp;md); idx++) {
+-        if (mask &amp; ssl_get_algorithm2(s)) {
+-            int hashsize = EVP_MD_size(md);
+-            EVP_MD_CTX *hdgst = s-&gt;s3-&gt;handshake_dgst[idx];
+-            if (!hdgst || hashsize &lt; 0 || hashsize &gt; outlen)
+-                goto err;
+-            if (!EVP_MD_CTX_copy_ex(&amp;ctx, hdgst))
+-                goto err;
+-            if (!EVP_DigestFinal_ex(&amp;ctx, p, NULL))
+-                goto err;
+-            p += hashsize;
+-            outlen -= hashsize;
+-        }
++    if (ret &lt; 0 || ret &gt; outlen) {
++        ret = 0;
++        goto err;
+     }
+-    ret = p - out;
++    if (!EVP_MD_CTX_copy_ex(&amp;ctx, hdgst)
++        || EVP_DigestFinal_ex(&amp;ctx, out, NULL) &lt;= 0)
++        ret = 0;
+  err:
+     EVP_MD_CTX_cleanup(&amp;ctx);
+     return ret;
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 70689bc..0cbb3cc 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -391,38 +391,50 @@
+ # define SSL_TLSV1               0x00000004U
+ # define SSL_TLSV1_2             0x00000008U
+ 
+-/* Bits for algorithm2 (handshake digests and other extra flags) */
+-
+-# define SSL_HANDSHAKE_MAC_MD5 0x10
+-# define SSL_HANDSHAKE_MAC_SHA 0x20
+-# define SSL_HANDSHAKE_MAC_GOST94 0x40
+-# define SSL_HANDSHAKE_MAC_SHA256 0x80
+-# define SSL_HANDSHAKE_MAC_SHA384 0x100
+-# define SSL_HANDSHAKE_MAC_GOST12_256 0x200
+-# define SSL_HANDSHAKE_MAC_GOST12_512 0x400
+-# define SSL_HANDSHAKE_MAC_DEFAULT (SSL_HANDSHAKE_MAC_MD5 | SSL_HANDSHAKE_MAC_SHA)
+-
+ /*
+  * When adding new digest in the ssl_ciph.c and increment SSL_MD_NUM_IDX make
+  * sure to update this constant too
+  */
+-# define SSL_MAX_DIGEST 9
+-
+-# define TLS1_PRF_DGST_SHIFT 10
+-# define TLS1_PRF_MD5 (SSL_HANDSHAKE_MAC_MD5 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_SHA1 (SSL_HANDSHAKE_MAC_SHA &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_SHA256 (SSL_HANDSHAKE_MAC_SHA256 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_SHA384 (SSL_HANDSHAKE_MAC_SHA384 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_GOST94 (SSL_HANDSHAKE_MAC_GOST94 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_GOST12_256 (SSL_HANDSHAKE_MAC_GOST12_256 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF_GOST12_512 (SSL_HANDSHAKE_MAC_GOST12_512 &lt;&lt; TLS1_PRF_DGST_SHIFT)
+-# define TLS1_PRF (TLS1_PRF_MD5 | TLS1_PRF_SHA1)
++
++# define SSL_MD_MD5_IDX  0
++# define SSL_MD_SHA1_IDX 1
++# define SSL_MD_GOST94_IDX 2
++# define SSL_MD_GOST89MAC_IDX 3
++# define SSL_MD_SHA256_IDX 4
++# define SSL_MD_SHA384_IDX 5
++# define SSL_MD_GOST12_256_IDX  6
++# define SSL_MD_GOST89MAC12_IDX 7
++# define SSL_MD_GOST12_512_IDX  8
++# define SSL_MD_MD5_SHA1_IDX 9
++# define SSL_MAX_DIGEST 10
++
++/* Bits for algorithm2 (handshake digests and other extra flags) */
++
++/* Bits 0-7 are handshake MAC */
++# define SSL_HANDSHAKE_MAC_MASK  0xFF
++# define SSL_HANDSHAKE_MAC_MD5_SHA1 SSL_MD_MD5_SHA1_IDX
++# define SSL_HANDSHAKE_MAC_SHA256   SSL_MD_SHA256_IDX
++# define SSL_HANDSHAKE_MAC_SHA384   SSL_MD_SHA384_IDX
++# define SSL_HANDSHAKE_MAC_GOST94 SSL_MD_GOST94_IDX
++# define SSL_HANDSHAKE_MAC_GOST12_256 SSL_MD_GOST12_256_IDX
++# define SSL_HANDSHAKE_MAC_GOST12_512 SSL_MD_GOST12_512_IDX
++# define SSL_HANDSHAKE_MAC_DEFAULT  SSL_HANDSHAKE_MAC_MD5_SHA1
++
++/* Bits 8-15 bits are PRF */
++# define TLS1_PRF_DGST_SHIFT 8
++# define TLS1_PRF_SHA1_MD5 (SSL_MD_MD5_SHA1_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF_SHA256 (SSL_MD_SHA256_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF_SHA384 (SSL_MD_SHA384_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF_GOST94 (SSL_MD_GOST94_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF_GOST12_256 (SSL_MD_GOST12_256_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF_GOST12_512 (SSL_MD_GOST12_512_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
++# define TLS1_PRF            (SSL_MD_MD5_SHA1_IDX &lt;&lt; TLS1_PRF_DGST_SHIFT)
+ 
+ /*
+  * Stream MAC for GOST ciphersuites from cryptopro draft (currently this also
+  * goes into algorithm2)
+  */
+-# define TLS1_STREAM_MAC 0x04
++# define TLS1_STREAM_MAC 0x10000
+ 
+ /*
+  * Export and cipher strength information. For each cipher we have to decide
+@@ -1239,10 +1251,10 @@ typedef struct ssl3_state_st {
+     /* used during startup, digest all incoming/outgoing packets */
+     BIO *handshake_buffer;
+     /*
+-     * When set of handshake digests is determined, buffer is hashed and
+-     * freed and MD_CTX-es for all required digests are stored in this array
++     * When handshake digest is determined, buffer is hashed and
++     * freed and MD_CTX for the required digest is stored here.
+      */
+-    EVP_MD_CTX **handshake_dgst;
++    EVP_MD_CTX *handshake_dgst;
+     /*
+      * Set whenever an expected ChangeCipherSpec message is processed.
+      * Unset when the peer's Finished message is received.
+@@ -1890,7 +1902,6 @@ void ssl_update_cache(SSL *s, int mode);
+ __owur int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
+                        const EVP_MD **md, int *mac_pkey_type,
+                        int *mac_secret_size, SSL_COMP **comp, int use_etm);
+-__owur int ssl_get_handshake_digest(int i, long *mask, const EVP_MD **md);
+ __owur int ssl_cipher_get_cert_index(const SSL_CIPHER *c);
+ __owur const SSL_CIPHER *ssl_get_cipher_by_char(SSL *ssl, const unsigned char *ptr);
+ __owur int ssl_cert_set0_chain(SSL *s, SSL_CTX *ctx, STACK_OF(X509) *chain);
+@@ -2128,6 +2139,8 @@ __owur int ssl_add_serverhello_use_srtp_ext(SSL *s, unsigned char *p, int *len,
+ __owur int ssl_parse_serverhello_use_srtp_ext(SSL *s, PACKET *pkt, int *al);
+ 
+ __owur int ssl_handshake_hash(SSL *s, unsigned char *out, int outlen);
++__owur const EVP_MD *ssl_handshake_md(SSL *s);
++__owur const EVP_MD *ssl_prf_md(SSL *s);
+ 
+ /* s3_cbc.c */
+ __owur char ssl3_cbc_record_digest_supported(const EVP_MD_CTX *ctx);
+diff --git a/ssl/t1_enc.c b/ssl/t1_enc.c
+index 906029c..ae1d36c 100644
+--- a/ssl/t1_enc.c
++++ b/ssl/t1_enc.c
+@@ -236,7 +236,7 @@ static int tls1_P_hash(const EVP_MD *md, const unsigned char *sec,
+ }
+ 
+ /* seed1 through seed5 are virtually concatenated */
+-static int tls1_PRF(long digest_mask,
++static int tls1_PRF(SSL *s,
+                     const void *seed1, int seed1_len,
+                     const void *seed2, int seed2_len,
+                     const void *seed3, int seed3_len,
+@@ -245,55 +245,44 @@ static int tls1_PRF(long digest_mask,
+                     const unsigned char *sec, int slen,
+                     unsigned char *out1, unsigned char *out2, int olen)
+ {
+-    int len, i, idx, count;
+-    const unsigned char *S1;
+-    long m;
+-    const EVP_MD *md;
+-    int ret = 0;
++    const EVP_MD *md = ssl_prf_md(s);
+ 
+-    /* Count number of digests and partition sec evenly */
+-    count = 0;
+-    for (idx = 0; ssl_get_handshake_digest(idx, &amp;m, &amp;md); idx++) {
+-        if ((m &lt;&lt; TLS1_PRF_DGST_SHIFT) &amp; digest_mask)
+-            count++;
+-    }
+-    if (!count) {
++    if (md == NULL) {
+         /* Should never happen */
+         SSLerr(SSL_F_TLS1_PRF, ERR_R_INTERNAL_ERROR);
+-        goto err;
++        return 0;
+     }
+-    len = slen / count;
+-    if (count == 1)
+-        slen = 0;
+-    S1 = sec;
+-    memset(out1, 0, olen);
+-    for (idx = 0; ssl_get_handshake_digest(idx, &amp;m, &amp;md); idx++) {
+-        if ((m &lt;&lt; TLS1_PRF_DGST_SHIFT) &amp; digest_mask) {
+-            if (!md) {
+-                SSLerr(SSL_F_TLS1_PRF, SSL_R_UNSUPPORTED_DIGEST_TYPE);
+-                goto err;
+-            }
+-            if (!tls1_P_hash(md, S1, len + (slen &amp; 1),
+-                             seed1, seed1_len, seed2, seed2_len, seed3,
+-                             seed3_len, seed4, seed4_len, seed5, seed5_len,
+-                             out2, olen))
+-                goto err;
+-            S1 += len;
+-            for (i = 0; i &lt; olen; i++) {
+-                out1[i] ^= out2[i];
+-            }
+-        }
++    if (EVP_MD_type(md) == NID_md5_sha1) {
++        int i;
++        if (!tls1_P_hash(EVP_md5(), sec, slen/2 + (slen &amp; 1),
++                         seed1, seed1_len, seed2, seed2_len, seed3,
++                         seed3_len, seed4, seed4_len, seed5, seed5_len,
++                         out1, olen))
++            return 0;
++        if (!tls1_P_hash(EVP_sha1(), sec + slen/2, slen/2 + (slen &amp; 1),
++                         seed1, seed1_len, seed2, seed2_len, seed3,
++                         seed3_len, seed4, seed4_len, seed5, seed5_len,
++                         out2, olen))
++            return 0;
++        for (i = 0; i &lt; olen; i++)
++            out1[i] ^= out2[i];
++        return 1;
+     }
+-    ret = 1;
+- err:
+-    return ret;
++    memset(out2, 0, olen);
++    if (!tls1_P_hash(md, sec, slen,
++                     seed1, seed1_len, seed2, seed2_len, seed3,
++                     seed3_len, seed4, seed4_len, seed5, seed5_len,
++                     out1, olen))
++        return 0;
++
++    return 1;
+ }
+ 
+ static int tls1_generate_key_block(SSL *s, unsigned char *km,
+                                    unsigned char *tmp, int num)
+ {
+     int ret;
+-    ret = tls1_PRF(ssl_get_algorithm2(s),
++    ret = tls1_PRF(s,
+                    TLS_MD_KEY_EXPANSION_CONST,
+                    TLS_MD_KEY_EXPANSION_CONST_SIZE, s-&gt;s3-&gt;server_random,
+                    SSL3_RANDOM_SIZE, s-&gt;s3-&gt;client_random, SSL3_RANDOM_SIZE,
+@@ -489,7 +478,7 @@ int tls1_change_cipher_state(SSL *s, int which)
+          * In here I set both the read and write key/iv to the same value
+          * since only the correct one will be used :-).
+          */
+-        if (!tls1_PRF(ssl_get_algorithm2(s),
++        if (!tls1_PRF(s,
+                       exp_label, exp_label_len,
+                       s-&gt;s3-&gt;client_random, SSL3_RANDOM_SIZE,
+                       s-&gt;s3-&gt;server_random, SSL3_RANDOM_SIZE,
+@@ -499,7 +488,7 @@ int tls1_change_cipher_state(SSL *s, int which)
+         key = tmp1;
+ 
+         if (k &gt; 0) {
+-            if (!tls1_PRF(ssl_get_algorithm2(s),
++            if (!tls1_PRF(s,
+                           TLS_MD_IV_BLOCK_CONST, TLS_MD_IV_BLOCK_CONST_SIZE,
+                           s-&gt;s3-&gt;client_random, SSL3_RANDOM_SIZE,
+                           s-&gt;s3-&gt;server_random, SSL3_RANDOM_SIZE,
+@@ -702,7 +691,7 @@ int tls1_final_finish_mac(SSL *s, const char *str, int slen,
+                           unsigned char *out)
+ {
+     int hashlen;
+-    unsigned char hash[2 * EVP_MAX_MD_SIZE];
++    unsigned char hash[EVP_MAX_MD_SIZE];
+     unsigned char buf2[12];
+ 
+     if (!ssl3_digest_cached_records(s, 0))
+@@ -713,7 +702,7 @@ int tls1_final_finish_mac(SSL *s, const char *str, int slen,
+     if (hashlen == 0)
+         return 0;
+ 
+-    if (!tls1_PRF(ssl_get_algorithm2(s),
++    if (!tls1_PRF(s,
+                   str, slen, hash, hashlen, NULL, 0, NULL, 0, NULL, 0,
+                   s-&gt;session-&gt;master_key, s-&gt;session-&gt;master_key_length,
+                   out, buf2, sizeof buf2))
+@@ -743,7 +732,7 @@ int tls1_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p,
+         fprintf(stderr, &quot;Handshake hashes:\n&quot;);
+         BIO_dump_fp(stderr, (char *)hash, hashlen);
+ #endif
+-        tls1_PRF(ssl_get_algorithm2(s),
++        tls1_PRF(s,
+                  TLS_MD_EXTENDED_MASTER_SECRET_CONST,
+                  TLS_MD_EXTENDED_MASTER_SECRET_CONST_SIZE,
+                  hash, hashlen,
+@@ -752,7 +741,7 @@ int tls1_generate_master_secret(SSL *s, unsigned char *out, unsigned char *p,
+                  NULL, 0, p, len, s-&gt;session-&gt;master_key, buff, sizeof buff);
+         OPENSSL_cleanse(hash, hashlen);
+     } else {
+-        tls1_PRF(ssl_get_algorithm2(s),
++        tls1_PRF(s,
+                  TLS_MD_MASTER_SECRET_CONST,
+                  TLS_MD_MASTER_SECRET_CONST_SIZE,
+                  s-&gt;s3-&gt;client_random, SSL3_RANDOM_SIZE,
+@@ -858,7 +847,7 @@ int tls1_export_keying_material(SSL *s, unsigned char *out, size_t olen,
+                TLS_MD_KEY_EXPANSION_CONST_SIZE) == 0)
+         goto err1;
+ 
+-    rv = tls1_PRF(ssl_get_algorithm2(s),
++    rv = tls1_PRF(s,
+                   val, vallen,
+                   NULL, 0,
+                   NULL, 0,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002229.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002231.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2230">[ date ]</a>
+              <a href="thread.html#2230">[ thread ]</a>
+              <a href="subject.html#2230">[ subject ]</a>
+              <a href="author.html#2230">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,332 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1638370253.980107.2404325.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035777.html">
+   <LINK REL="Next"  HREF="035782.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>beldmit at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1638370253.980107.2404325.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">beldmit at gmail.com
+       </A><BR>
+    <I>Wed Dec  1 14:50:53 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="035777.html">[openssl]  master update
+</A></li>
+        <LI>Next message (by thread): <A HREF="035782.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35780">[ date ]</a>
+              <a href="thread.html#35780">[ thread ]</a>
+              <a href="subject.html#35780">[ subject ]</a>
+              <a href="author.html#35780">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  07ba69483a7d8005a53284cbde55b9dac8c5c554 (commit)
+      from  a632bfaa4ee3339749f7a6a07ab4d0abee4eaaef (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 07ba69483a7d8005a53284cbde55b9dac8c5c554
+Author: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+Date:   Mon Nov 22 10:14:27 2021 +0100
+
+    Refactor: a separate func for provider activation from config
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/17099">https://github.com/openssl/openssl/pull/17099</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/provider_conf.c | 140 ++++++++++++++++++++++++++-----------------------
+ 1 file changed, 75 insertions(+), 65 deletions(-)
+
+diff --git a/crypto/provider_conf.c b/crypto/provider_conf.c
+index c13c887c3d..6a62f0df60 100644
+--- a/crypto/provider_conf.c
++++ b/crypto/provider_conf.c
+@@ -136,13 +136,86 @@ static int prov_already_activated(const char *name,
+     return 0;
+ }
+ 
++static int provider_conf_activate(OSSL_LIB_CTX *libctx, const char *name,
++                                  const char *value, const char *path,
++                                  int soft, const CONF *cnf)
++{
++    PROVIDER_CONF_GLOBAL *pcgbl
++        = ossl_lib_ctx_get_data(libctx, OSSL_LIB_CTX_PROVIDER_CONF_INDEX,
++                                &amp;provider_conf_ossl_ctx_method);
++    OSSL_PROVIDER *prov = NULL, *actual = NULL;
++    int ok = 0;
++
++    if (pcgbl == NULL || !CRYPTO_THREAD_write_lock(pcgbl-&gt;lock)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    if (!prov_already_activated(name, pcgbl-&gt;activated_providers)) {
++        /*
++        * There is an attempt to activate a provider, so we should disable
++        * loading of fallbacks. Otherwise a misconfiguration could mean the
++        * intended provider does not get loaded. Subsequent fetches could
++        * then fallback to the default provider - which may be the wrong
++        * thing.
++        */
++        if (!ossl_provider_disable_fallback_loading(libctx)) {
++            CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
++            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
++            return 0;
++        }
++        prov = ossl_provider_find(libctx, name, 1);
++        if (prov == NULL)
++            prov = ossl_provider_new(libctx, name, NULL, 1);
++        if (prov == NULL) {
++            CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
++            if (soft)
++                ERR_clear_error();
++            return 0;
++        }
++
++        if (path != NULL)
++            ossl_provider_set_module_path(prov, path);
++
++        ok = provider_conf_params(prov, NULL, NULL, value, cnf);
++
++        if (ok) {
++            if (!ossl_provider_activate(prov, 1, 0)) {
++                ok = 0;
++            } else if (!ossl_provider_add_to_store(prov, &amp;actual, 0)) {
++                ossl_provider_deactivate(prov, 1);
++                ok = 0;
++            } else if (actual != prov
++                       &amp;&amp; !ossl_provider_activate(actual, 1, 0)) {
++                ossl_provider_free(actual);
++                ok = 0;
++            } else {
++                if (pcgbl-&gt;activated_providers == NULL)
++                    pcgbl-&gt;activated_providers = sk_OSSL_PROVIDER_new_null();
++                if (pcgbl-&gt;activated_providers == NULL
++                    || !sk_OSSL_PROVIDER_push(pcgbl-&gt;activated_providers,
++                                              actual)) {
++                    ossl_provider_deactivate(actual, 1);
++                    ossl_provider_free(actual);
++                    ok = 0;
++                } else {
++                    ok = 1;
++                }
++            }
++        }
++        if (!ok)
++            ossl_provider_free(prov);
++    }
++    CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
++
++    return ok;
++}
++
+ static int provider_conf_load(OSSL_LIB_CTX *libctx, const char *name,
+                               const char *value, const CONF *cnf)
+ {
+     int i;
+     STACK_OF(CONF_VALUE) *ecmds;
+     int soft = 0;
+-    OSSL_PROVIDER *prov = NULL, *actual = NULL;
+     const char *path = NULL;
+     long activate = 0;
+     int ok = 0;
+@@ -182,70 +255,7 @@ static int provider_conf_load(OSSL_LIB_CTX *libctx, const char *name,
+     }
+ 
+     if (activate) {
+-        PROVIDER_CONF_GLOBAL *pcgbl
+-            = ossl_lib_ctx_get_data(libctx, OSSL_LIB_CTX_PROVIDER_CONF_INDEX,
+-                                    &amp;provider_conf_ossl_ctx_method);
+-
+-        if (pcgbl == NULL || !CRYPTO_THREAD_write_lock(pcgbl-&gt;lock)) {
+-            ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+-            return 0;
+-        }
+-        if (!prov_already_activated(name, pcgbl-&gt;activated_providers)) {
+-            /*
+-            * There is an attempt to activate a provider, so we should disable
+-            * loading of fallbacks. Otherwise a misconfiguration could mean the
+-            * intended provider does not get loaded. Subsequent fetches could
+-            * then fallback to the default provider - which may be the wrong
+-            * thing.
+-            */
+-            if (!ossl_provider_disable_fallback_loading(libctx)) {
+-                CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
+-                ERR_raise(ERR_LIB_CRYPTO, ERR_R_INTERNAL_ERROR);
+-                return 0;
+-            }
+-            prov = ossl_provider_find(libctx, name, 1);
+-            if (prov == NULL)
+-                prov = ossl_provider_new(libctx, name, NULL, 1);
+-            if (prov == NULL) {
+-                CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
+-                if (soft)
+-                    ERR_clear_error();
+-                return 0;
+-            }
+-
+-            if (path != NULL)
+-                ossl_provider_set_module_path(prov, path);
+-
+-            ok = provider_conf_params(prov, NULL, NULL, value, cnf);
+-
+-            if (ok) {
+-                if (!ossl_provider_activate(prov, 1, 0)) {
+-                    ok = 0;
+-                } else if (!ossl_provider_add_to_store(prov, &amp;actual, 0)) {
+-                    ossl_provider_deactivate(prov, 1);
+-                    ok = 0;
+-                } else if (actual != prov
+-                           &amp;&amp; !ossl_provider_activate(actual, 1, 0)) {
+-                    ossl_provider_free(actual);
+-                    ok = 0;
+-                } else {
+-                    if (pcgbl-&gt;activated_providers == NULL)
+-                        pcgbl-&gt;activated_providers = sk_OSSL_PROVIDER_new_null();
+-                    if (pcgbl-&gt;activated_providers == NULL
+-                        || !sk_OSSL_PROVIDER_push(pcgbl-&gt;activated_providers,
+-                                                  actual)) {
+-                        ossl_provider_deactivate(actual, 1);
+-                        ossl_provider_free(actual);
+-                        ok = 0;
+-                    } else {
+-                        ok = 1;
+-                    }
+-                }
+-            }
+-            if (!ok)
+-                ossl_provider_free(prov);
+-        }
+-        CRYPTO_THREAD_unlock(pcgbl-&gt;lock);
++        ok = provider_conf_activate(libctx, name, value, path, soft, cnf);
+     } else {
+         OSSL_PROVIDER_INFO entry;
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="035777.html">[openssl]  master update
+</A></li>
+	<LI>Next message (by thread): <A HREF="035782.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35780">[ date ]</a>
+              <a href="thread.html#35780">[ thread ]</a>
+              <a href="subject.html#35780">[ subject ]</a>
+              <a href="author.html#35780">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

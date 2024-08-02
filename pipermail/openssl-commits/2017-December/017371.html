@@ -1,0 +1,618 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1514486535.932192.22983.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017369.html">
+   <LINK REL="Next"  HREF="017375.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1514486535.932192.22983.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Thu Dec 28 18:42:15 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017369.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="017375.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17371">[ date ]</a>
+              <a href="thread.html#17371">[ thread ]</a>
+              <a href="subject.html#17371">[ subject ]</a>
+              <a href="author.html#17371">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cfc32a1efb464205885e18e503bcb7051c307008 (commit)
+      from  c6a623adaa0ac4ea6b148172aaa466f287b1d8ae (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cfc32a1efb464205885e18e503bcb7051c307008
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Wed Dec 27 11:55:34 2017 +0100
+
+    ec/curve25519.c: &quot;double&quot; ecdhx25519 performance on 64-bit platforms.
+    
+    &quot;Double&quot; is in quotes because improvement coefficient varies
+    significantly depending on platform and compiler. You're likely
+    to measure ~2x improvement on popular desktop and server processors,
+    but not so much on mobile ones, even minor regression on ARM
+    Cortex series. Latter is because they have rather &quot;weak&quot; umulh
+    instruction. On low-end x86_64 problem is that contemporary gcc
+    and clang tend to opt for double-precision shift for &gt;&gt;51, which
+    can be devastatingly slow on some processors.
+    
+    Just in case for reference, trick is to use 2^51 radix [currently
+    only for DH].
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/curve25519.c | 488 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 482 insertions(+), 6 deletions(-)
+
+diff --git a/crypto/ec/curve25519.c b/crypto/ec/curve25519.c
+index ee0634f..d1c725f 100644
+--- a/crypto/ec/curve25519.c
++++ b/crypto/ec/curve25519.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2016-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -7,15 +7,489 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/* This code is mostly taken from the ref10 version of Ed25519 in SUPERCOP
+- * 20141124 (<A HREF="http://bench.cr.yp.to/supercop.html">http://bench.cr.yp.to/supercop.html</A>).
+- *
+- * The field functions are shared by Ed25519 and X25519 where possible. */
+-
+ #include &lt;string.h&gt;
+ #include &quot;ec_lcl.h&quot;
+ #include &lt;openssl/sha.h&gt;
+ 
++#if !defined(PEDANTIC) &amp;&amp; \
++    (defined(__SIZEOF_INT128__) &amp;&amp; __SIZEOF_INT128__==16)
++/*
++ * Base 2^51 implementation.
++ */
++# define BASE_2_51_IMPLEMENTED
++
++typedef uint64_t fe51[5];
++typedef unsigned __int128 u128;
++
++static const uint64_t MASK51 = 0x7ffffffffffff;
++
++static uint64_t load_7(const uint8_t *in)
++{
++    uint64_t result;
++
++    result = in[0];
++    result |= ((uint64_t)in[1]) &lt;&lt; 8;
++    result |= ((uint64_t)in[2]) &lt;&lt; 16;
++    result |= ((uint64_t)in[3]) &lt;&lt; 24;
++    result |= ((uint64_t)in[4]) &lt;&lt; 32;
++    result |= ((uint64_t)in[5]) &lt;&lt; 40;
++    result |= ((uint64_t)in[6]) &lt;&lt; 48;
++
++    return result;
++}
++
++static uint64_t load_6(const uint8_t *in)
++{
++    uint64_t result;
++
++    result = in[0];
++    result |= ((uint64_t)in[1]) &lt;&lt; 8;
++    result |= ((uint64_t)in[2]) &lt;&lt; 16;
++    result |= ((uint64_t)in[3]) &lt;&lt; 24;
++    result |= ((uint64_t)in[4]) &lt;&lt; 32;
++    result |= ((uint64_t)in[5]) &lt;&lt; 40;
++
++    return result;
++}
++
++static void fe51_frombytes(fe51 h, const uint8_t *s)
++{
++    uint64_t h0 = load_7(s);                                /* 56 bits */
++    uint64_t h1 = load_6(s + 7) &lt;&lt; 5;                       /* 53 bits */
++    uint64_t h2 = load_7(s + 13) &lt;&lt; 2;                      /* 58 bits */
++    uint64_t h3 = load_6(s + 20) &lt;&lt; 7;                      /* 55 bits */
++    uint64_t h4 = (load_6(s + 26) &amp; 0x7fffffffffff) &lt;&lt; 4;   /* 51 bits */
++
++    h1 |= h0 &gt;&gt; 51; h0 &amp;= MASK51;
++    h2 |= h1 &gt;&gt; 51; h1 &amp;= MASK51;
++    h3 |= h2 &gt;&gt; 51; h2 &amp;= MASK51;
++    h4 |= h3 &gt;&gt; 51; h3 &amp;= MASK51;
++
++    h[0] = h0;
++    h[1] = h1;
++    h[2] = h2;
++    h[3] = h3;
++    h[4] = h4;
++}
++
++static void fe51_tobytes(uint8_t *s, const fe51 h)
++{
++    uint64_t h0 = h[0];
++    uint64_t h1 = h[1];
++    uint64_t h2 = h[2];
++    uint64_t h3 = h[3];
++    uint64_t h4 = h[4];
++    uint64_t q;
++
++    /* compare to modulus */
++    q = (h0 + 19) &gt;&gt; 51;
++    q = (h1 + q) &gt;&gt; 51;
++    q = (h2 + q) &gt;&gt; 51;
++    q = (h3 + q) &gt;&gt; 51;
++    q = (h4 + q) &gt;&gt; 51;
++
++    /* full reduce */
++    h0 += 19 * q;
++    h1 += h0 &gt;&gt; 51; h0 &amp;= MASK51;
++    h2 += h1 &gt;&gt; 51; h1 &amp;= MASK51;
++    h3 += h2 &gt;&gt; 51; h2 &amp;= MASK51;
++    h4 += h3 &gt;&gt; 51; h3 &amp;= MASK51;
++                    h4 &amp;= MASK51;
++
++    /* smash */
++    s[0] = h0 &gt;&gt; 0;
++    s[1] = h0 &gt;&gt; 8;
++    s[2] = h0 &gt;&gt; 16;
++    s[3] = h0 &gt;&gt; 24;
++    s[4] = h0 &gt;&gt; 32;
++    s[5] = h0 &gt;&gt; 40;
++    s[6] = (h0 &gt;&gt; 48) | ((uint32_t)h1 &lt;&lt; 3);
++    s[7] = h1 &gt;&gt; 5;
++    s[8] = h1 &gt;&gt; 13;
++    s[9] = h1 &gt;&gt; 21;
++    s[10] = h1 &gt;&gt; 29;
++    s[11] = h1 &gt;&gt; 37;
++    s[12] = (h1 &gt;&gt; 45) | ((uint32_t)h2 &lt;&lt; 6);
++    s[13] = h2 &gt;&gt; 2;
++    s[14] = h2 &gt;&gt; 10;
++    s[15] = h2 &gt;&gt; 18;
++    s[16] = h2 &gt;&gt; 26;
++    s[17] = h2 &gt;&gt; 34;
++    s[18] = h2 &gt;&gt; 42;
++    s[19] = (h2 &gt;&gt; 50) | ((uint32_t)h3 &lt;&lt; 1);
++    s[20] = h3 &gt;&gt; 7;
++    s[21] = h3 &gt;&gt; 15;
++    s[22] = h3 &gt;&gt; 23;
++    s[23] = h3 &gt;&gt; 31;
++    s[24] = h3 &gt;&gt; 39;
++    s[25] = (h3 &gt;&gt; 47) | ((uint32_t)h4 &lt;&lt; 4);
++    s[26] = h4 &gt;&gt; 4;
++    s[27] = h4 &gt;&gt; 12;
++    s[28] = h4 &gt;&gt; 20;
++    s[29] = h4 &gt;&gt; 28;
++    s[30] = h4 &gt;&gt; 36;
++    s[31] = h4 &gt;&gt; 44;
++}
++
++static void fe51_mul(fe51 h, const fe51 f, const fe51 g)
++{
++    u128 h0, h1, h2, h3, h4;
++    uint64_t f_i, g0, g1, g2, g3, g4;
++
++    f_i = f[0];
++    h0 = (u128)f_i * (g0 = g[0]);
++    h1 = (u128)f_i * (g1 = g[1]);
++    h2 = (u128)f_i * (g2 = g[2]);
++    h3 = (u128)f_i * (g3 = g[3]);
++    h4 = (u128)f_i * (g4 = g[4]);
++
++    f_i = f[1];
++    h0 += (u128)f_i * (g4 *= 19);
++    h1 += (u128)f_i * g0;
++    h2 += (u128)f_i * g1;
++    h3 += (u128)f_i * g2;
++    h4 += (u128)f_i * g3;
++
++    f_i = f[2];
++    h0 += (u128)f_i * (g3 *= 19);
++    h1 += (u128)f_i * g4;
++    h2 += (u128)f_i * g0;
++    h3 += (u128)f_i * g1;
++    h4 += (u128)f_i * g2;
++
++    f_i = f[3];
++    h0 += (u128)f_i * (g2 *= 19);
++    h1 += (u128)f_i * g3;
++    h2 += (u128)f_i * g4;
++    h3 += (u128)f_i * g0;
++    h4 += (u128)f_i * g1;
++
++    f_i = f[4];
++    h0 += (u128)f_i * (g1 *= 19);
++    h1 += (u128)f_i * g2;
++    h2 += (u128)f_i * g3;
++    h3 += (u128)f_i * g4;
++    h4 += (u128)f_i * g0;
++
++    /* partial [lazy] reduction */
++    h3 += (uint64_t)(h2 &gt;&gt; 51); g2 = (uint64_t)h2 &amp; MASK51;
++    h1 += (uint64_t)(h0 &gt;&gt; 51); g0 = (uint64_t)h0 &amp; MASK51;
++
++    h4 += (uint64_t)(h3 &gt;&gt; 51); g3 = (uint64_t)h3 &amp; MASK51;
++    g2 += (uint64_t)(h1 &gt;&gt; 51); g1 = (uint64_t)h1 &amp; MASK51;
++
++    g0 += (uint64_t)(h4 &gt;&gt; 51) * 19; g4 = (uint64_t)h4 &amp; MASK51;
++    g3 += g2 &gt;&gt; 51; g2 &amp;= MASK51;
++    g1 += g0 &gt;&gt; 51; g0 &amp;= MASK51;
++
++    h[0] = g0;
++    h[1] = g1;
++    h[2] = g2;
++    h[3] = g3;
++    h[4] = g4;
++}
++
++static void fe51_sq(fe51 h, const fe51 f)
++{
++# if defined(OPENSSL_SMALL_FOOTPRINT)
++    fe51_mul(h, f, f);
++# else
++    /* dedicated squaring gives 16-25% overall improvement */
++    uint64_t g0 = f[0];
++    uint64_t g1 = f[1];
++    uint64_t g2 = f[2];
++    uint64_t g3 = f[3];
++    uint64_t g4 = f[4];
++    u128 h0, h1, h2, h3, h4;
++
++    h0 = (u128)g0 * g0;     g0 *= 2;
++    h1 = (u128)g0 * g1;
++    h2 = (u128)g0 * g2;
++    h3 = (u128)g0 * g3;
++    h4 = (u128)g0 * g4;
++
++    g0 = g4;                /* borrow g0 */
++    h3 += (u128)g0 * (g4 *= 19);
++
++    h2 += (u128)g1 * g1;    g1 *= 2;
++    h3 += (u128)g1 * g2;
++    h4 += (u128)g1 * g3;
++    h0 += (u128)g1 * g4;
++
++    g0 = g3;                /* borrow g0 */
++    h1 += (u128)g0 * (g3 *= 19);
++    h2 += (u128)(g0 * 2) * g4;
++
++    h4 += (u128)g2 * g2;    g2 *= 2;
++    h0 += (u128)g2 * g3;
++    h1 += (u128)g2 * g4;
++
++    /* partial [lazy] reduction */
++    h3 += (uint64_t)(h2 &gt;&gt; 51); g2 = (uint64_t)h2 &amp; MASK51;
++    h1 += (uint64_t)(h0 &gt;&gt; 51); g0 = (uint64_t)h0 &amp; MASK51;
++
++    h4 += (uint64_t)(h3 &gt;&gt; 51); g3 = (uint64_t)h3 &amp; MASK51;
++    g2 += (uint64_t)(h1 &gt;&gt; 51); g1 = (uint64_t)h1 &amp; MASK51;
++
++    g0 += (uint64_t)(h4 &gt;&gt; 51) * 19; g4 = (uint64_t)h4 &amp; MASK51;
++    g3 += g2 &gt;&gt; 51; g2 &amp;= MASK51;
++    g1 += g0 &gt;&gt; 51; g0 &amp;= MASK51;
++
++    h[0] = g0;
++    h[1] = g1;
++    h[2] = g2;
++    h[3] = g3;
++    h[4] = g4;
++# endif
++}
++
++static void fe51_add(fe51 h, const fe51 f, const fe51 g)
++{
++    h[0] = f[0] + g[0];
++    h[1] = f[1] + g[1];
++    h[2] = f[2] + g[2];
++    h[3] = f[3] + g[3];
++    h[4] = f[4] + g[4];
++}
++
++static void fe51_sub(fe51 h, const fe51 f, const fe51 g)
++{
++    /*
++     * Add 2*modulus to ensure that result remains positive
++     * even if subtrahend is partially reduced.
++     */
++    h[0] = (f[0] + 0xfffffffffffda) - g[0];
++    h[1] = (f[1] + 0xffffffffffffe) - g[1];
++    h[2] = (f[2] + 0xffffffffffffe) - g[2];
++    h[3] = (f[3] + 0xffffffffffffe) - g[3];
++    h[4] = (f[4] + 0xffffffffffffe) - g[4];
++}
++
++static void fe51_0(fe51 h)
++{
++    h[0] = 0;
++    h[1] = 0;
++    h[2] = 0;
++    h[3] = 0;
++    h[4] = 0;
++}
++
++static void fe51_1(fe51 h)
++{
++    h[0] = 1;
++    h[1] = 0;
++    h[2] = 0;
++    h[3] = 0;
++    h[4] = 0;
++}
++
++static void fe51_copy(fe51 h, const fe51 f)
++{
++    h[0] = f[0];
++    h[1] = f[1];
++    h[2] = f[2];
++    h[3] = f[3];
++    h[4] = f[4];
++}
++
++static void fe51_cswap(fe51 f, fe51 g, unsigned int b)
++{
++    int i;
++    uint64_t mask = 0 - (uint64_t)b;
++
++    for (i = 0; i &lt; 5; i++) {
++        int64_t x = f[i] ^ g[i];
++        x &amp;= mask;
++        f[i] ^= x;
++        g[i] ^= x;
++    }
++}
++
++static void fe51_invert(fe51 out, const fe51 z)
++{
++    fe51 t0;
++    fe51 t1;
++    fe51 t2;
++    fe51 t3;
++    int i;
++
++    /*
++     * Compute z ** -1 = z ** (2 ** 255 - 19 - 2) with the exponent as
++     * 2 ** 255 - 21 = (2 ** 5) * (2 ** 250 - 1) + 11.
++     */
++
++    /* t0 = z ** 2 */
++    fe51_sq(t0, z);
++
++    /* t1 = t0 ** (2 ** 2) = z ** 8 */
++    fe51_sq(t1, t0);
++    fe51_sq(t1, t1);
++
++    /* t1 = z * t1 = z ** 9 */
++    fe51_mul(t1, z, t1);
++    /* t0 = t0 * t1 = z ** 11 -- stash t0 away for the end. */
++    fe51_mul(t0, t0, t1);
++
++    /* t2 = t0 ** 2 = z ** 22 */
++    fe51_sq(t2, t0);
++
++    /* t1 = t1 * t2 = z ** (2 ** 5 - 1) */
++    fe51_mul(t1, t1, t2);
++
++    /* t2 = t1 ** (2 ** 5) = z ** ((2 ** 5) * (2 ** 5 - 1)) */
++    fe51_sq(t2, t1);
++    for (i = 1; i &lt; 5; ++i)
++        fe51_sq(t2, t2);
++
++    /* t1 = t1 * t2 = z ** ((2 ** 5 + 1) * (2 ** 5 - 1)) = z ** (2 ** 10 - 1) */
++    fe51_mul(t1, t2, t1);
++
++    /* Continuing similarly... */
++
++    /* t2 = z ** (2 ** 20 - 1) */
++    fe51_sq(t2, t1);
++    for (i = 1; i &lt; 10; ++i)
++        fe51_sq(t2, t2);
++
++    fe51_mul(t2, t2, t1);
++
++    /* t2 = z ** (2 ** 40 - 1) */
++    fe51_sq(t3, t2);
++    for (i = 1; i &lt; 20; ++i)
++        fe51_sq(t3, t3);
++
++    fe51_mul(t2, t3, t2);
++
++    /* t2 = z ** (2 ** 10) * (2 ** 40 - 1) */
++    for (i = 0; i &lt; 10; ++i)
++        fe51_sq(t2, t2);
++
++    /* t1 = z ** (2 ** 50 - 1) */
++    fe51_mul(t1, t2, t1);
++
++    /* t2 = z ** (2 ** 100 - 1) */
++    fe51_sq(t2, t1);
++    for (i = 1; i &lt; 50; ++i)
++        fe51_sq(t2, t2);
++
++    fe51_mul(t2, t2, t1);
++
++    /* t2 = z ** (2 ** 200 - 1) */
++    fe51_sq(t3, t2);
++    for (i = 1; i &lt; 100; ++i)
++        fe51_sq(t3, t3);
++
++    fe51_mul(t2, t3, t2);
++
++    /* t2 = z ** ((2 ** 50) * (2 ** 200 - 1) */
++    for (i = 0; i &lt; 50; ++i)
++        fe51_sq(t2, t2);
++
++    /* t1 = z ** (2 ** 250 - 1) */
++    fe51_mul(t1, t2, t1);
++
++    /* t1 = z ** ((2 ** 5) * (2 ** 250 - 1)) */
++    for (i = 0; i &lt; 5; ++i)
++        fe51_sq(t1, t1);
++
++    /* Recall t0 = z ** 11; out = z ** (2 ** 255 - 21) */
++    fe51_mul(out, t1, t0);
++}
++
++static void fe51_mul121666(fe51 h, fe51 f)
++{
++    u128 h0 = f[0] * (u128)121666;
++    u128 h1 = f[1] * (u128)121666;
++    u128 h2 = f[2] * (u128)121666;
++    u128 h3 = f[3] * (u128)121666;
++    u128 h4 = f[4] * (u128)121666;
++    uint64_t g0, g1, g2, g3, g4;
++
++    h3 += (uint64_t)(h2 &gt;&gt; 51); g2 = (uint64_t)h2 &amp; MASK51;
++    h1 += (uint64_t)(h0 &gt;&gt; 51); g0 = (uint64_t)h0 &amp; MASK51;
++
++    h4 += (uint64_t)(h3 &gt;&gt; 51); g3 = (uint64_t)h3 &amp; MASK51;
++    g2 += (uint64_t)(h1 &gt;&gt; 51); g1 = (uint64_t)h1 &amp; MASK51;
++
++    g0 += (uint64_t)(h4 &gt;&gt; 51) * 19; g4 = (uint64_t)h4 &amp; MASK51;
++    g3 += g2 &gt;&gt; 51; g2 &amp;= MASK51;
++    g1 += g0 &gt;&gt; 51; g0 &amp;= MASK51;
++
++    h[0] = g0;
++    h[1] = g1;
++    h[2] = g2;
++    h[3] = g3;
++    h[4] = g4;
++}
++
++/*
++ * Duplicate of original x25519_scalar_mult_generic, but using
++ * fe51_* subroutines.
++ */
++static void x25519_scalar_mult(uint8_t out[32], const uint8_t scalar[32],
++                               const uint8_t point[32])
++{
++    fe51 x1, x2, z2, x3, z3, tmp0, tmp1;
++    uint8_t e[32];
++    unsigned swap = 0;
++    int pos;
++
++    memcpy(e, scalar, 32);
++    e[0]  &amp;= 0xf8;
++    e[31] &amp;= 0x7f;
++    e[31] |= 0x40;
++    fe51_frombytes(x1, point);
++    fe51_1(x2);
++    fe51_0(z2);
++    fe51_copy(x3, x1);
++    fe51_1(z3);
++
++    for (pos = 254; pos &gt;= 0; --pos) {
++        unsigned int b = 1 &amp; (e[pos / 8] &gt;&gt; (pos &amp; 7));
++
++        swap ^= b;
++        fe51_cswap(x2, x3, swap);
++        fe51_cswap(z2, z3, swap);
++        swap = b;
++        fe51_sub(tmp0, x3, z3);
++        fe51_sub(tmp1, x2, z2);
++        fe51_add(x2, x2, z2);
++        fe51_add(z2, x3, z3);
++        fe51_mul(z3, tmp0, x2);
++        fe51_mul(z2, z2, tmp1);
++        fe51_sq(tmp0, tmp1);
++        fe51_sq(tmp1, x2);
++        fe51_add(x3, z3, z2);
++        fe51_sub(z2, z3, z2);
++        fe51_mul(x2, tmp1, tmp0);
++        fe51_sub(tmp1, tmp1, tmp0);
++        fe51_sq(z2, z2);
++        fe51_mul121666(z3, tmp1);
++        fe51_sq(x3, x3);
++        fe51_add(tmp0, tmp0, z3);
++        fe51_mul(z3, x1, z2);
++        fe51_mul(z2, tmp1, tmp0);
++    }
++    fe51_cswap(x2, x3, swap);
++    fe51_cswap(z2, z3, swap);
++
++    fe51_invert(z2, z2);
++    fe51_mul(x2, x2, z2);
++    fe51_tobytes(out, x2);
++
++    OPENSSL_cleanse(e, sizeof(e));
++}
++#endif
++
++/*
++ * Reference base 2^25.5 implementation.
++ */
++/*
++ * This code is mostly taken from the ref10 version of Ed25519 in SUPERCOP
++ * 20141124 (<A HREF="http://bench.cr.yp.to/supercop.html">http://bench.cr.yp.to/supercop.html</A>).
++ *
++ * The field functions are shared by Ed25519 and X25519 where possible.
++ */
+ 
+ /* fe means field element. Here the field is \Z/(2^255-19). An element t,
+  * entries t[0]...t[9], represents the integer t[0]+2^26 t[1]+2^51 t[2]+2^77
+@@ -3452,6 +3926,7 @@ static void ge_scalarmult_base(ge_p3 *h, const uint8_t *a) {
+   OPENSSL_cleanse(e, sizeof(e));
+ }
+ 
++#if !defined(BASE_2_51_IMPLEMENTED)
+ /* Replace (f,g) with (g,f) if b == 1;
+  * replace (f,g) with (f,g) if b == 0.
+  *
+@@ -3588,6 +4063,7 @@ static void x25519_scalar_mult(uint8_t out[32], const uint8_t scalar[32],
+                                const uint8_t point[32]) {
+   x25519_scalar_mult_generic(out, scalar, point);
+ }
++#endif
+ 
+ static void slide(signed char *r, const uint8_t *a) {
+   int i;
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017369.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="017375.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17371">[ date ]</a>
+              <a href="thread.html#17371">[ thread ]</a>
+              <a href="subject.html#17371">[ subject ]</a>
+              <a href="author.html#17371">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

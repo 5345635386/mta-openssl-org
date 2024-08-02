@@ -1,0 +1,1614 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1454528267.771909.627.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003547.html">
+   <LINK REL="Next"  HREF="003552.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1454528267.771909.627.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Feb  3 19:37:47 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003547.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="003552.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3550">[ date ]</a>
+              <a href="thread.html#3550">[ thread ]</a>
+              <a href="subject.html#3550">[ subject ]</a>
+              <a href="author.html#3550">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  72b65aa4cb7fd9a41935a2e057e44cb40fb4faa2 (commit)
+       via  ab69ac00f3c7a04151662813794ac82bc591a89b (commit)
+      from  d858c87653257185ead1c5baf3d84cd7276dd912 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 72b65aa4cb7fd9a41935a2e057e44cb40fb4faa2
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 3 00:57:30 2016 +0100
+
+    Refactoring BIO: add a simple networking test of s_client and s_server
+    
+    This makes use of TLSProxy, which was expanded to use IO::Socket::IP
+    (which is a core perl module) or IO::Socket::INET6 (which is said to
+    be more popular) instead IO::Socket::INET if one of them is installed.
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+
+commit ab69ac00f3c7a04151662813794ac82bc591a89b
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 3 00:47:42 2016 +0100
+
+    Refactoring BIO: Adapt s_client and s_server
+    
+    s_socket.c gets brutally cleaned out and now consists of only two
+    functions, one for client and the other for server.  They both handle
+    AF_INET, AF_INET6 and additionally AF_UNIX where supported.  The rest
+    is just easy adaptation.
+    
+    Both s_client and s_server get the new flags -4 and -6 to force the
+    use of IPv4 or IPv6 only.
+    
+    Also, the default host &quot;localhost&quot; in s_client is removed.  It's not
+    certain that this host is set up for both IPv4 and IPv6.  For example,
+    Debian has &quot;ip6-localhost&quot; as the default hostname for [::1].  The
+    better way is to default |host| to NULL and rely on BIO_lookup() to
+    return a BIO_ADDRINFO with the appropriate loopback address for IPv4
+    or IPv6 as indicated by the |family| parameter.
+    
+    Reviewed-by: Kurt Roeckx &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">kurt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/s_apps.h                                      |  23 +-
+ apps/s_client.c                                    | 117 +++-
+ apps/s_server.c                                    | 131 ++--
+ apps/s_socket.c                                    | 698 +++++----------------
+ ...70-test_sslskewith0p.t =&gt; 90-test_networking.t} |  67 +-
+ util/TLSProxy/Proxy.pm                             |  72 ++-
+ 6 files changed, 458 insertions(+), 650 deletions(-)
+ copy test/recipes/{70-test_sslskewith0p.t =&gt; 90-test_networking.t} (72%)
+ mode change 100755 =&gt; 100644
+
+diff --git a/apps/s_apps.h b/apps/s_apps.h
+index 9339b41..e9b6f40 100644
+--- a/apps/s_apps.h
++++ b/apps/s_apps.h
+@@ -146,20 +146,14 @@ typedef fd_mask fd_set;
+ # define FD_ZERO(p)      memset((p), 0, sizeof(*(p)))
+ #endif
+ 
+-#define PORT            4433
+-#define PORT_STR        &quot;4433&quot;
++#define PORT            &quot;4433&quot;
+ #define PROTOCOL        &quot;tcp&quot;
+ 
+-int do_server(int port, int type, int *ret,
+-              int (*cb) (char *hostname, int s, int stype,
++int do_server(int *accept_sock, const char *host, const char *port,
++              int family, int type,
++              int (*cb) (const char *hostname, int s, int stype,
+                          unsigned char *context), unsigned char *context,
+               int naccept);
+-#ifndef NO_SYS_UN_H
+-int do_server_unix(const char *path, int *ret,
+-                   int (*cb) (char *hostname, int s, int stype,
+-                              unsigned char *context), unsigned char *context,
+-                   int naccept);
+-#endif
+ #ifdef HEADER_X509_H
+ int verify_callback(int ok, X509_STORE_CTX *ctx);
+ #endif
+@@ -172,14 +166,9 @@ int ssl_print_point_formats(BIO *out, SSL *s);
+ int ssl_print_curves(BIO *out, SSL *s, int noshared);
+ #endif
+ int ssl_print_tmp_key(BIO *out, SSL *s);
+-int init_client(int *sock, const char *server, int port, int type);
+-#ifndef NO_SYS_UN_H
+-int init_client_unix(int *sock, const char *server);
+-#endif
++int init_client(int *sock, const char *host, const char *port,
++                int family, int type);
+ int should_retry(int i);
+-int extract_port(const char *str, unsigned short *port_ptr);
+-int extract_host_port(char *str, char **host_ptr, unsigned char *ip,
+-                      unsigned short *p);
+ 
+ long bio_dump_callback(BIO *bio, int cmd, const char *argp,
+                        int argi, long argl, long ret);
+diff --git a/apps/s_client.c b/apps/s_client.c
+index fe402ae..d6797f5 100644
+--- a/apps/s_client.c
++++ b/apps/s_client.c
+@@ -173,8 +173,6 @@ typedef unsigned int u_int;
+ # undef FIONBIO
+ #endif
+ 
+-#define SSL_HOST_NAME   &quot;localhost&quot;
+-
+ #undef BUFSIZZ
+ #define BUFSIZZ 1024*8
+ #define S_CLIENT_IRC_READ_TIMEOUT 8
+@@ -634,7 +632,8 @@ static int tlsa_import_rrset(SSL *con, STACK_OF(OPENSSL_STRING) *rrset)
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+-    OPT_HOST, OPT_PORT, OPT_CONNECT, OPT_UNIX, OPT_XMPPHOST, OPT_VERIFY,
++    OPT_4, OPT_6, OPT_HOST, OPT_PORT, OPT_CONNECT, OPT_UNIX,
++    OPT_XMPPHOST, OPT_VERIFY,
+     OPT_CERT, OPT_CRL, OPT_CRL_DOWNLOAD, OPT_SESS_OUT, OPT_SESS_IN,
+     OPT_CERTFORM, OPT_CRLFORM, OPT_VERIFY_RET_ERROR, OPT_VERIFY_QUIET,
+     OPT_BRIEF, OPT_PREXIT, OPT_CRLF, OPT_QUIET, OPT_NBIO,
+@@ -664,10 +663,14 @@ OPTIONS s_client_options[] = {
+     {&quot;host&quot;, OPT_HOST, 's', &quot;Use -connect instead&quot;},
+     {&quot;port&quot;, OPT_PORT, 'p', &quot;Use -connect instead&quot;},
+     {&quot;connect&quot;, OPT_CONNECT, 's',
+-     &quot;TCP/IP where to connect (default is &quot; SSL_HOST_NAME &quot;:&quot; PORT_STR &quot;)&quot;},
++     &quot;TCP/IP where to connect (default is :&quot; PORT &quot;)&quot;},
+     {&quot;proxy&quot;, OPT_PROXY, 's',
+      &quot;Connect to via specified proxy to the real server&quot;},
++#ifdef AF_UNIX
+     {&quot;unix&quot;, OPT_UNIX, 's', &quot;Connect over unix domain sockets&quot;},
++#endif
++    {&quot;4&quot;, OPT_4, '-', &quot;Use IPv4 only&quot;},
++    {&quot;6&quot;, OPT_6, '-', &quot;Use IPv6 only&quot;},
+     {&quot;verify&quot;, OPT_VERIFY, 'p', &quot;Turn on peer certificate verification&quot;},
+     {&quot;cert&quot;, OPT_CERT, '&lt;', &quot;Certificate file to use, PEM format assumed&quot;},
+     {&quot;certform&quot;, OPT_CERTFORM, 'F',
+@@ -845,12 +848,12 @@ int s_client_main(int argc, char **argv)
+     char *CApath = NULL, *CAfile = NULL, *cbuf = NULL, *sbuf = NULL;
+     char *mbuf = NULL, *proxystr = NULL, *connectstr = NULL;
+     char *cert_file = NULL, *key_file = NULL, *chain_file = NULL;
+-    char *chCApath = NULL, *chCAfile = NULL, *host = SSL_HOST_NAME;
++    char *chCApath = NULL, *chCAfile = NULL, *host = NULL;
++    char *port = BUF_strdup(PORT);
+     char *inrand = NULL;
+     char *passarg = NULL, *pass = NULL, *vfyCApath = NULL, *vfyCAfile = NULL;
+     char *sess_in = NULL, *sess_out = NULL, *crl_file = NULL, *p;
+     char *jpake_secret = NULL, *xmpphost = NULL;
+-    const char *unix_path = NULL;
+     const char *ehlo = &quot;mail.example.com&quot;;
+     struct sockaddr peer;
+     struct timeval timeout, *timeoutp;
+@@ -862,12 +865,12 @@ int s_client_main(int argc, char **argv)
+     int enable_timeouts = 0, sdebug = 0, peerlen = sizeof peer;
+     int reconnect = 0, verify = SSL_VERIFY_NONE, vpmtouched = 0;
+     int ret = 1, in_init = 1, i, nbio_test = 0, s = -1, k, width, state = 0;
+-    int sbuf_len, sbuf_off, socket_type = SOCK_STREAM, cmdletters = 1;
++    int sbuf_len, sbuf_off, cmdletters = 1;
++    int socket_family = AF_UNSPEC, socket_type = SOCK_STREAM;
+     int starttls_proto = PROTO_OFF, crl_format = FORMAT_PEM, crl_download = 0;
+     int write_tty, read_tty, write_ssl, read_ssl, tty_on, ssl_pending;
+     int fallback_scsv = 0;
+     long socket_mtu = 0, randamt = 0;
+-    unsigned short port = PORT;
+     OPTION_CHOICE o;
+ #ifndef OPENSSL_NO_ENGINE
+     ENGINE *ssl_client_engine = NULL;
+@@ -926,22 +929,72 @@ int s_client_main(int argc, char **argv)
+             opt_help(s_client_options);
+             ret = 0;
+             goto end;
++        case OPT_4:
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                OPENSSL_free(host); host = NULL;
++                OPENSSL_free(port); port = NULL;
++            }
++#endif
++            socket_family = AF_INET;
++            break;
++        case OPT_6:
++            if (1) {
++#ifdef AF_INET6
++#ifdef AF_UNIX
++                if (socket_family == AF_UNIX) {
++                    OPENSSL_free(host); host = NULL;
++                    OPENSSL_free(port); port = NULL;
++                }
++#endif
++                socket_family = AF_INET6;
++            } else {
++#endif
++                BIO_printf(bio_err, &quot;%s: IPv6 domain sockets unsupported\n&quot;, prog);
++                goto end;
++            }
++            break;
+         case OPT_HOST:
+-            host = opt_arg();
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                OPENSSL_free(host); host = NULL;
++                OPENSSL_free(port); port = NULL;
++                socket_family = AF_UNSPEC;
++            }
++#endif
++            OPENSSL_free(host); host = BUF_strdup(opt_arg());
+             break;
+         case OPT_PORT:
+-            port = atoi(opt_arg());
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                OPENSSL_free(host); host = NULL;
++                OPENSSL_free(port); port = NULL;
++                socket_family = AF_UNSPEC;
++            }
++#endif
++            OPENSSL_free(port); port = BUF_strdup(opt_arg());
+             break;
+         case OPT_CONNECT:
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                socket_family = AF_UNSPEC;
++            }
++#endif
++            OPENSSL_free(host); host = NULL;
++            OPENSSL_free(port); port = NULL;
+             connectstr = opt_arg();
+             break;
+         case OPT_PROXY:
+             proxystr = opt_arg();
+             starttls_proto = PROTO_CONNECT;
+             break;
++#ifdef AF_UNIX
+         case OPT_UNIX:
+-            unix_path = opt_arg();
++            socket_family = AF_UNIX;
++            OPENSSL_free(host); host = BUF_strdup(opt_arg());
++            OPENSSL_free(port); port = NULL;
+             break;
++#endif
+         case OPT_XMPPHOST:
+             xmpphost = opt_arg();
+             break;
+@@ -1286,18 +1339,41 @@ int s_client_main(int argc, char **argv)
+     argv = opt_rest();
+ 
+     if (proxystr) {
++        int res;
++        char *tmp_host = host, *tmp_port = port;
+         if (connectstr == NULL) {
+             BIO_printf(bio_err, &quot;%s: -proxy requires use of -connect\n&quot;, prog);
+             goto opthelp;
+         }
+-        if (!extract_host_port(proxystr, &amp;host, NULL, &amp;port))
++        res = BIO_parse_hostserv(proxystr, &amp;host, &amp;port, BIO_PARSE_PRIO_HOST);
++        if (tmp_host != host)
++            OPENSSL_free(tmp_host);
++        if (tmp_port != port)
++            OPENSSL_free(tmp_port);
++        if (!res) {
++            BIO_printf(bio_err, &quot;%s: -proxy argument malformed or ambiguous\n&quot;,
++                       prog);
++            goto end;
++        }
++    } else {
++        int res = 1;
++        char *tmp_host = host, *tmp_port = port;
++        if (connectstr != NULL)
++            res = BIO_parse_hostserv(connectstr, &amp;host, &amp;port,
++                                     BIO_PARSE_PRIO_HOST);
++        if (tmp_host != host)
++            OPENSSL_free(tmp_host);
++        if (tmp_port != port)
++            OPENSSL_free(tmp_port);
++        if (!res) {
++            BIO_printf(bio_err,
++                       &quot;%s: -connect argument malformed or ambiguous\n&quot;,
++                       prog);
+             goto end;
++        }
+     }
+-    else if (connectstr != NULL
+-            &amp;&amp; !extract_host_port(connectstr, &amp;host, NULL, &amp;port))
+-        goto end;
+ 
+-    if (unix_path &amp;&amp; (socket_type != SOCK_STREAM)) {
++    if (socket_family == AF_UNIX &amp;&amp; socket_type != SOCK_STREAM) {
+         BIO_printf(bio_err,
+                    &quot;Can't use unix sockets and datagrams together\n&quot;);
+         goto end;
+@@ -1610,12 +1686,7 @@ int s_client_main(int argc, char **argv)
+     }
+ 
+  re_start:
+-#ifdef NO_SYS_UN_H
+-    if (init_client(&amp;s, host, port, socket_type) == 0)
+-#else
+-    if ((!unix_path &amp;&amp; (init_client(&amp;s, host, port, socket_type) == 0)) ||
+-        (unix_path &amp;&amp; (init_client_unix(&amp;s, unix_path) == 0)))
+-#endif
++    if (init_client(&amp;s, host, port, socket_family, socket_type) == 0)
+     {
+         BIO_printf(bio_err, &quot;connect:errno=%d\n&quot;, get_last_socket_error());
+         SHUTDOWN(s);
+@@ -2364,6 +2435,8 @@ int s_client_main(int argc, char **argv)
+ #ifndef OPENSSL_NO_SRP
+     OPENSSL_free(srp_arg.srppassin);
+ #endif
++    OPENSSL_free(host);
++    OPENSSL_free(port);
+     X509_VERIFY_PARAM_free(vpm);
+     ssl_excert_free(exc);
+     sk_OPENSSL_STRING_free(ssl_args);
+diff --git a/apps/s_server.c b/apps/s_server.c
+index 848ba1f..1a54f08 100644
+--- a/apps/s_server.c
++++ b/apps/s_server.c
+@@ -191,9 +191,12 @@ typedef unsigned int u_int;
+ #endif
+ 
+ static int not_resumable_sess_cb(SSL *s, int is_forward_secure);
+-static int sv_body(char *hostname, int s, int stype, unsigned char *context);
+-static int www_body(char *hostname, int s, int stype, unsigned char *context);
+-static int rev_body(char *hostname, int s, int stype, unsigned char *context);
++static int sv_body(const char *hostname, int s, int stype,
++                   unsigned char *context);
++static int www_body(const char *hostname, int s, int stype,
++                    unsigned char *context);
++static int rev_body(const char *hostname, int s, int stype,
++                    unsigned char *context);
+ static void close_accept_socket(void);
+ static int init_ssl_connection(SSL *s);
+ static void print_stats(BIO *bp, SSL_CTX *ctx);
+@@ -791,8 +794,8 @@ static char *srtp_profiles = NULL;
+ #endif
+ 
+ typedef enum OPTION_choice {
+-    OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+-    OPT_ENGINE, OPT_PORT, OPT_UNIX, OPT_UNLINK, OPT_NACCEPT,
++    OPT_ERR = -1, OPT_EOF = 0, OPT_HELP, OPT_ENGINE,
++    OPT_4, OPT_6, OPT_ACCEPT, OPT_PORT, OPT_UNIX, OPT_UNLINK, OPT_NACCEPT,
+     OPT_VERIFY, OPT_UPPER_V_VERIFY, OPT_CONTEXT, OPT_CERT, OPT_CRL,
+     OPT_CRL_DOWNLOAD, OPT_SERVERINFO, OPT_CERTFORM, OPT_KEY, OPT_KEYFORM,
+     OPT_PASS, OPT_CERT_CHAIN, OPT_DHPARAM, OPT_DCERTFORM, OPT_DCERT,
+@@ -821,9 +824,13 @@ typedef enum OPTION_choice {
+ OPTIONS s_server_options[] = {
+     {&quot;help&quot;, OPT_HELP, '-', &quot;Display this summary&quot;},
+     {&quot;port&quot;, OPT_PORT, 'p'},
+-    {&quot;accept&quot;, OPT_PORT, 'p',
+-     &quot;TCP/IP port to accept on (default is &quot; PORT_STR &quot;)&quot;},
++    {&quot;accept&quot;, OPT_ACCEPT, 's',
++     &quot;TCP/IP port or service to accept on (default is &quot; PORT &quot;)&quot;},
++#ifdef AF_UNIX
+     {&quot;unix&quot;, OPT_UNIX, 's', &quot;Unix domain socket to accept on&quot;},
++#endif
++    {&quot;4&quot;, OPT_4, '-', &quot;Use IPv4 only&quot;},
++    {&quot;6&quot;, OPT_6, '-', &quot;Use IPv6 only&quot;},
+     {&quot;unlink&quot;, OPT_UNLINK, '-', &quot;For -unix, unlink existing socket first&quot;},
+     {&quot;context&quot;, OPT_CONTEXT, 's', &quot;Set session ID context&quot;},
+     {&quot;verify&quot;, OPT_VERIFY, 'n', &quot;Turn on peer certificate verification&quot;},
+@@ -998,11 +1005,10 @@ int s_server_main(int argc, char *argv[])
+ #ifndef OPENSSL_NO_PSK
+     char *p;
+ #endif
+-    const char *unix_path = NULL;
+-#ifndef NO_SYS_UN_H
++#ifdef AF_UNIX
+     int unlink_unix_path = 0;
+ #endif
+-    int (*server_cb) (char *hostname, int s, int stype,
++    int (*server_cb) (const char *hostname, int s, int stype,
+                       unsigned char *context);
+     int vpmtouched = 0, build_chain = 0, no_cache = 0, ext_cache = 0;
+ #ifndef OPENSSL_NO_DH
+@@ -1012,9 +1018,11 @@ int s_server_main(int argc, char *argv[])
+     int noCApath = 0, noCAfile = 0;
+     int s_cert_format = FORMAT_PEM, s_key_format = FORMAT_PEM;
+     int s_dcert_format = FORMAT_PEM, s_dkey_format = FORMAT_PEM;
+-    int rev = 0, naccept = -1, sdebug = 0, socket_type = SOCK_STREAM;
++    int rev = 0, naccept = -1, sdebug = 0;
++    int socket_family = AF_UNSPEC, socket_type = SOCK_STREAM;
+     int state = 0, crl_format = FORMAT_PEM, crl_download = 0;
+-    unsigned short port = PORT;
++    char *host = NULL;
++    char *port = BUF_strdup(PORT);
+     unsigned char *context = NULL;
+     OPTION_CHOICE o;
+     EVP_PKEY *s_key2 = NULL;
+@@ -1059,26 +1067,71 @@ int s_server_main(int argc, char *argv[])
+             ret = 0;
+             goto end;
+ 
++        case OPT_4:
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                OPENSSL_free(host); host = NULL;
++                OPENSSL_free(port); port = NULL;
++            }
++#endif
++            socket_family = AF_INET;
++            break;
++        case OPT_6:
++            if (1) {
++#ifdef AF_INET6
++#ifdef AF_UNIX
++                if (socket_family == AF_UNIX) {
++                    OPENSSL_free(host); host = NULL;
++                    OPENSSL_free(port); port = NULL;
++                }
++#endif
++                socket_family = AF_INET6;
++            } else {
++#endif
++                BIO_printf(bio_err, &quot;%s: IPv6 domain sockets unsupported\n&quot;, prog);
++                goto end;
++            }
++            break;
+         case OPT_PORT:
+-            if (!extract_port(opt_arg(), &amp;port))
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                socket_family = AF_UNSPEC;
++            }
++#endif
++            OPENSSL_free(port); port = NULL;
++            OPENSSL_free(host); host = NULL;
++            if (BIO_parse_hostserv(opt_arg(), NULL, &amp;port, BIO_PARSE_PRIO_SERV) &lt; 1) {
++                BIO_printf(bio_err,
++                           &quot;%s: -port argument malformed or ambiguous\n&quot;,
++                           port);
++                goto end;
++            }
++            break;
++        case OPT_ACCEPT:
++#ifdef AF_UNIX
++            if (socket_family == AF_UNIX) {
++                socket_family = AF_UNSPEC;
++            }
++#endif
++            OPENSSL_free(port); port = NULL;
++            OPENSSL_free(host); host = NULL;
++            if (BIO_parse_hostserv(opt_arg(), &amp;host, &amp;port, BIO_PARSE_PRIO_SERV) &lt; 1) {
++                BIO_printf(bio_err,
++                           &quot;%s: -accept argument malformed or ambiguous\n&quot;,
++                           port);
+                 goto end;
++            }
+             break;
++#ifdef AF_UNIX
+         case OPT_UNIX:
+-#ifdef NO_SYS_UN_H
+-            BIO_printf(bio_err, &quot;unix domain sockets unsupported\n&quot;);
+-            goto end;
+-#else
+-            unix_path = opt_arg();
+-#endif
++            socket_family = AF_UNIX;
++            OPENSSL_free(host); host = BUF_strdup(opt_arg());
++            OPENSSL_free(port); port = NULL;
+             break;
+         case OPT_UNLINK:
+-#ifdef NO_SYS_UN_H
+-            BIO_printf(bio_err, &quot;unix domain sockets unsupported\n&quot;);
+-            goto end;
+-#else
+             unlink_unix_path = 1;
+-#endif
+             break;
++#endif
+         case OPT_NACCEPT:
+             naccept = atol(opt_arg());
+             break;
+@@ -1462,11 +1515,13 @@ int s_server_main(int argc, char *argv[])
+     }
+ #endif
+ 
+-    if (unix_path &amp;&amp; (socket_type != SOCK_STREAM)) {
++#ifdef AF_UNIX
++    if (socket_family == AF_UNIX &amp;&amp; socket_type != SOCK_STREAM) {
+         BIO_printf(bio_err,
+                    &quot;Can't use unix sockets and datagrams together\n&quot;);
+         goto end;
+     }
++#endif
+ #if !defined(OPENSSL_NO_JPAKE) &amp;&amp; !defined(OPENSSL_NO_PSK)
+     if (jpake_secret) {
+         if (psk_key) {
+@@ -1929,16 +1984,13 @@ int s_server_main(int argc, char *argv[])
+         server_cb = www_body;
+     else
+         server_cb = sv_body;
+-#ifndef NO_SYS_UN_H
+-    if (unix_path) {
+-        if (unlink_unix_path)
+-            unlink(unix_path);
+-        do_server_unix(unix_path, &amp;accept_socket, server_cb, context,
+-                       naccept);
+-    } else
++#ifdef AF_UNIX
++    if (socket_family == AF_UNIX
++        &amp;&amp; unlink_unix_path)
++        unlink(host);
+ #endif
+-        do_server(port, socket_type, &amp;accept_socket, server_cb, context,
+-                  naccept);
++    do_server(&amp;accept_socket, host, port, socket_family, socket_type,
++              server_cb, context, naccept);
+     print_stats(bio_s_out, ctx);
+     ret = 0;
+  end:
+@@ -1952,6 +2004,8 @@ int s_server_main(int argc, char *argv[])
+     sk_X509_pop_free(s_dchain, X509_free);
+     OPENSSL_free(pass);
+     OPENSSL_free(dpass);
++    OPENSSL_free(host);
++    OPENSSL_free(port);
+     X509_VERIFY_PARAM_free(vpm);
+     free_sessions();
+     OPENSSL_free(tlscstatp.host);
+@@ -2006,7 +2060,8 @@ static void print_stats(BIO *bio, SSL_CTX *ssl_ctx)
+                SSL_CTX_sess_get_cache_size(ssl_ctx));
+ }
+ 
+-static int sv_body(char *hostname, int s, int stype, unsigned char *context)
++static int sv_body(const char *hostname, int s, int stype,
++                   unsigned char *context)
+ {
+     char *buf = NULL;
+     fd_set readfds;
+@@ -2599,7 +2654,8 @@ static DH *load_dh_param(const char *dhfile)
+ }
+ #endif
+ 
+-static int www_body(char *hostname, int s, int stype, unsigned char *context)
++static int www_body(const char *hostname, int s, int stype,
++                    unsigned char *context)
+ {
+     char *buf = NULL;
+     int ret = 1;
+@@ -2986,7 +3042,8 @@ static int www_body(char *hostname, int s, int stype, unsigned char *context)
+     return (ret);
+ }
+ 
+-static int rev_body(char *hostname, int s, int stype, unsigned char *context)
++static int rev_body(const char *hostname, int s, int stype,
++                    unsigned char *context)
+ {
+     char *buf = NULL;
+     int i;
+diff --git a/apps/s_socket.c b/apps/s_socket.c
+index 75053e9..b816cee 100644
+--- a/apps/s_socket.c
++++ b/apps/s_socket.c
+@@ -121,573 +121,213 @@
+ typedef unsigned int u_int;
+ #endif
+ 
+-#define USE_SOCKETS
+-#include &quot;apps.h&quot;
+-#undef USE_SOCKETS
+-#include &quot;s_apps.h&quot;
+-#include &lt;openssl/ssl.h&gt;
+-
+-#ifdef FLAT_INC
+-# include &quot;e_os.h&quot;
+-#else
+-# include &quot;../e_os.h&quot;
+-#endif
+-
+ #ifndef OPENSSL_NO_SOCK
+ 
+-# if defined(OPENSSL_SYS_NETWARE) &amp;&amp; defined(NETWARE_BSDSOCK)
+-#  include &quot;netdb.h&quot;
+-# endif
++# define USE_SOCKETS
++# include &quot;apps.h&quot;
++# undef USE_SOCKETS
++# include &quot;s_apps.h&quot;
+ 
+-# if defined(OPENSSL_SYS_WINDOWS) || (defined(OPENSSL_SYS_NETWARE) &amp;&amp; !defined(NETWARE_BSDSOCK))
+-static void ssl_sock_cleanup(void);
+-# endif
+-static int ssl_sock_init(void);
+-static int init_client_ip(int *sock, const unsigned char ip[4], int port,
+-                          int type);
+-static int init_server(int *sock, int port, int type);
+-static int init_server_long(int *sock, int port, char *ip, int type);
+-static int do_accept(int acc_sock, int *sock, char **host);
+-static int host_ip(const char *str, unsigned char ip[4]);
+-# ifndef NO_SYS_UN_H
+-static int init_server_unix(int *sock, const char *path);
+-static int do_accept_unix(int acc_sock, int *sock);
+-# endif
++# include &lt;openssl/bio.h&gt;
++# include &lt;openssl/err.h&gt;
+ 
+-# if defined(OPENSSL_SYS_NETWARE) &amp;&amp; !defined(NETWARE_BSDSOCK)
+-static int wsa_init_done = 0;
+-# endif
+-
+-# ifdef OPENSSL_SYS_WINDOWS
+-static struct WSAData wsa_state;
+-static int wsa_init_done = 0;
+-
+-# endif                         /* OPENSSL_SYS_WINDOWS */
+-
+-# ifdef OPENSSL_SYS_WINDOWS
+-static void ssl_sock_cleanup(void)
+-{
+-    if (wsa_init_done) {
+-        wsa_init_done = 0;
+-#  ifndef OPENSSL_SYS_WINCE
+-        WSACancelBlockingCall();
+-#  endif
+-        WSACleanup();
+-    }
+-}
+-# elif defined(OPENSSL_SYS_NETWARE) &amp;&amp; !defined(NETWARE_BSDSOCK)
+-static void sock_cleanup(void)
++/*
++ * init_client - helper routine to set up socket communication
++ * @sock: pointer to storage of resulting socket.
++ * @host: the host name or path (for AF_UNIX) to connect to.
++ * @port: the port to connect to (ignored for AF_UNIX).
++ * @family: desired socket family, may be AF_INET, AF_INET6, AF_UNIX or
++ *  AF_UNSPEC
++ * @type: socket type, must be SOCK_STREAM or SOCK_DGRAM
++ *
++ * This will create a socket and use it to connect to a host:port, or if
++ * family == AF_UNIX, to the path found in host.
++ *
++ * If the host has more than one address, it will try them one by one until
++ * a successful connection is established.  The resulting socket will be
++ * found in *sock on success, it will be given INVALID_SOCKET otherwise.
++ *
++ * Returns 1 on success, 0 on failure.
++ */
++int init_client(int *sock, const char *host, const char *port,
++                int family, int type)
+ {
+-    if (wsa_init_done) {
+-        wsa_init_done = 0;
+-        WSACleanup();
+-    }
+-}
+-# endif
++    BIO_ADDRINFO *res = NULL;
++    const BIO_ADDRINFO *ai = NULL;
++    int ret;
+ 
+-static int ssl_sock_init(void)
+-{
+-# ifdef WATT32
+-    extern int _watt_do_exit;
+-    _watt_do_exit = 0;
+-    if (sock_init())
+-        return (0);
+-# elif defined(OPENSSL_SYS_WINDOWS)
+-    if (!wsa_init_done) {
+-        int err;
++    if (!BIO_sock_init())
++        return 0;
+ 
+-#  ifdef SIGINT
+-        signal(SIGINT, (void (*)(int))ssl_sock_cleanup);
+-#  endif
+-        wsa_init_done = 1;
+-        memset(&amp;wsa_state, 0, sizeof(wsa_state));
+-        if (WSAStartup(0x0101, &amp;wsa_state) != 0) {
+-            err = WSAGetLastError();
+-            BIO_printf(bio_err, &quot;unable to start WINSOCK, error code=%d\n&quot;,
+-                       err);
+-            return (0);
+-        }
++    ret = BIO_lookup(host, port, BIO_LOOKUP_CLIENT, family, type, &amp;res);
++    if (ret == 0) {
++        ERR_print_errors(bio_err);
++        return 0;
+     }
+-# elif defined(OPENSSL_SYS_NETWARE) &amp;&amp; !defined(NETWARE_BSDSOCK)
+-    WORD wVerReq;
+-    WSADATA wsaData;
+-    int err;
+-
+-    if (!wsa_init_done) {
+-
+-#  ifdef SIGINT
+-        signal(SIGINT, (void (*)(int))sock_cleanup);
+-#  endif
+ 
+-        wsa_init_done = 1;
+-        wVerReq = MAKEWORD(2, 0);
+-        err = WSAStartup(wVerReq, &amp;wsaData);
+-        if (err != 0) {
+-            BIO_printf(bio_err, &quot;unable to start WINSOCK2, error code=%d\n&quot;,
+-                       err);
+-            return (0);
+-        }
+-    }
++    ret = 0;
++    for (ai = res; ai != NULL; ai = BIO_ADDRINFO_next(ai)) {
++        int protocol = (type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
++# ifdef AF_UNIX
++        if (BIO_ADDRINFO_family(ai) == AF_UNIX)
++            protocol = 0;
+ # endif
+-    return (1);
+-}
+-
+-int init_client(int *sock, const char *host, int port, int type)
+-{
+-    unsigned char ip[4];
+-
+-    ip[0] = ip[1] = ip[2] = ip[3] = 0;
+-    if (!host_ip(host, &amp;(ip[0])))
+-        return 0;
+-    return init_client_ip(sock, ip, port, type);
+-}
+-
+-static int init_client_ip(int *sock, const unsigned char ip[4], int port,
+-                          int type)
+-{
+-    unsigned long addr;
+-    struct sockaddr_in them;
+-    int s, i;
+-
+-    if (!ssl_sock_init())
+-        return (0);
+-
+-    memset(&amp;them, 0, sizeof(them));
+-    them.sin_family = AF_INET;
+-    them.sin_port = htons((unsigned short)port);
+-    addr = (unsigned long)
+-        ((unsigned long)ip[0] &lt;&lt; 24L) |
+-        ((unsigned long)ip[1] &lt;&lt; 16L) |
+-        ((unsigned long)ip[2] &lt;&lt; 8L) | ((unsigned long)ip[3]);
+-    them.sin_addr.s_addr = htonl(addr);
+-
+-    if (type == SOCK_STREAM)
+-        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+-    else                        /* ( type == SOCK_DGRAM) */
+-        s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+-
+-    if (s == (int)INVALID_SOCKET) {
+-        perror(&quot;socket&quot;);
+-        return (0);
+-    }
+-# if defined(SO_KEEPALIVE)
+-    if (type == SOCK_STREAM) {
+-        i = 0;
+-        i = setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char *)&amp;i, sizeof(i));
+-        if (i &lt; 0) {
+-            closesocket(s);
+-            perror(&quot;keepalive&quot;);
+-            return (0);
++        /* Admitedly, these checks are quite paranoid, we should
++           not get anything in the BIO_ADDRINFO chain that we haven't
++           asked for */
++        OPENSSL_assert((family == AF_UNSPEC || family == BIO_ADDRINFO_family(res))
++                       &amp;&amp; (type == 0 || type == BIO_ADDRINFO_socktype(res))
++                       &amp;&amp; (protocol == BIO_ADDRINFO_protocol(res)));
++
++        *sock = BIO_socket(BIO_ADDRINFO_family(ai), BIO_ADDRINFO_socktype(ai),
++                           BIO_ADDRINFO_protocol(ai), 0);
++        if (*sock == INVALID_SOCKET) {
++            /* Maybe the kernel doesn't support the socket family, even if
++             * BIO_lookup() added it in the returned result...
++             */
++            continue;
++        }
++        if (!BIO_connect(*sock, BIO_ADDRINFO_address(ai), 0)) {
++            BIO_closesocket(*sock);
++            *sock = INVALID_SOCKET;
++            continue;
+         }
+-    }
+-# endif
+-
+-    if (connect(s, (struct sockaddr *)&amp;them, sizeof(them)) == -1) {
+-        closesocket(s);
+-        perror(&quot;connect&quot;);
+-        return (0);
+-    }
+-    *sock = s;
+-    return (1);
+-}
+-
+-# ifndef NO_SYS_UN_H
+-int init_client_unix(int *sock, const char *server)
+-{
+-    struct sockaddr_un them;
+-    int s;
+-
+-    if (strlen(server) &gt; (UNIX_PATH_MAX + 1))
+-        return (0);
+-    if (!ssl_sock_init())
+-        return (0);
+ 
+-    s = socket(AF_UNIX, SOCK_STREAM, 0);
+-    if (s == (int)INVALID_SOCKET) {
+-        perror(&quot;socket&quot;);
+-        return (0);
++        /* Success, don't try any more addresses */
++        break;
+     }
+ 
+-    memset(&amp;them, 0, sizeof(them));
+-    them.sun_family = AF_UNIX;
+-    strcpy(them.sun_path, server);
+-
+-    if (connect(s, (struct sockaddr *)&amp;them, sizeof(them)) == -1) {
+-        closesocket(s);
+-        perror(&quot;connect&quot;);
+-        return (0);
++    if (*sock == INVALID_SOCKET) {
++        ERR_print_errors(bio_err);
++    } else {
++        ret = 1;
+     }
+-    *sock = s;
+-    return (1);
++    BIO_ADDRINFO_free(res);
++    return ret;
+ }
+-# endif
+ 
+-int do_server(int port, int type, int *ret,
+-              int (*cb) (char *hostname, int s, int stype,
++/*
++ * do_server - helper routine to perform a server operation
++ * @accept_sock: pointer to storage of resulting socket.
++ * @host: the host name or path (for AF_UNIX) to connect to.
++ * @port: the port to connect to (ignored for AF_UNIX).
++ * @family: desired socket family, may be AF_INET, AF_INET6, AF_UNIX or
++ *  AF_UNSPEC
++ * @type: socket type, must be SOCK_STREAM or SOCK_DGRAM
++ * @cb: pointer to a function that receives the accepted socket and
++ *  should perform the communication with the connecting client.
++ * @context: pointer to memory that's passed verbatim to the cb function.
++ * @naccept: number of times an incoming connect should be accepted.  If -1,
++ *  unlimited number.
++ *
++ * This will create a socket and use it to listen to a host:port, or if
++ * family == AF_UNIX, to the path found in host, then start accepting
++ * incoming connections and run cb on the resulting socket.
++ *
++ * 0 on failure, something other on success.
++ */
++int do_server(int *accept_sock, const char *host, const char *port,
++              int family, int type,
++              int (*cb) (const char *hostname, int s, int stype,
+                          unsigned char *context), unsigned char *context,
+               int naccept)
+ {
++    int asock = 0;
+     int sock;
+-    char *name = NULL;
+-    int accept_socket = 0;
+     int i;
++    BIO_ADDRINFO *res = NULL;
++    int ret = 0;
++    int protocol = (type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
++
++    if (!BIO_sock_init())
++        return 0;
++
++    if (!BIO_lookup(host, port, BIO_LOOKUP_SERVER, family, type, &amp;res)) {
++        ERR_print_errors(bio_err);
++        return 0;
++    }
+ 
+-    if (!init_server(&amp;accept_socket, port, type))
+-        return (0);
++# ifdef AF_UNIX
++    if (BIO_ADDRINFO_family(res) == AF_UNIX)
++        protocol = 0;
++# endif
++    /* Admitedly, these checks are quite paranoid, we should
++       not get anything in the BIO_ADDRINFO chain that we haven't
++       asked for */
++    OPENSSL_assert((family == AF_UNSPEC || family == BIO_ADDRINFO_family(res))
++                   &amp;&amp; (type == 0 || type == BIO_ADDRINFO_socktype(res))
++                   &amp;&amp; (protocol == BIO_ADDRINFO_protocol(res)));
++
++    asock = BIO_socket(BIO_ADDRINFO_family(res), BIO_ADDRINFO_socktype(res),
++                       BIO_ADDRINFO_protocol(res), 0);
++    if (asock == INVALID_SOCKET
++        || !BIO_listen(asock, BIO_ADDRINFO_address(res), BIO_SOCK_REUSEADDR)) {
++        BIO_ADDRINFO_free(res);
++        ERR_print_errors(bio_err);
++        if (asock != INVALID_SOCKET)
++            BIO_closesocket(asock);
++        goto end;
++    }
+ 
+-    if (ret != NULL) {
+-        *ret = accept_socket;
+-        /* return(1); */
++    BIO_ADDRINFO_free(res);
++
++    if (accept_sock != NULL) {
++        *accept_sock = asock;
+     }
+     for (;;) {
++        BIO_ADDR *accepted_addr = NULL;
++        char *name = NULL;
+         if (type == SOCK_STREAM) {
+-# ifdef OPENSSL_SSL_DEBUG_BROKEN_PROTOCOL
+-            if (do_accept(accept_socket, &amp;sock, NULL) == 0)
+-# else
+-            if (do_accept(accept_socket, &amp;sock, &amp;name) == 0)
+-# endif
+-            {
+-                SHUTDOWN(accept_socket);
+-                return (0);
++            if ((accepted_addr = BIO_ADDR_new()) == NULL) {
++                BIO_closesocket(asock);
++                return 0;
++            }
++         redoit:
++            sock = BIO_accept_ex(asock, accepted_addr, 0);
++            if (sock &lt; 0) {
++                if (BIO_sock_should_retry(ret)) {
++                    goto redoit;
++                } else {
++                    ERR_print_errors(bio_err);
++                    BIO_ADDR_free(accepted_addr);
++                    SHUTDOWN(asock);
++                    break;
++                }
+             }
+-        } else
+-            sock = accept_socket;
++        } else {
++            sock = asock;
++        }
++
++        /* accepted_addr is NULL if we're dealing with SOCK_DGRAM
++         * this means that for SOCK_DGRAM, name will be NULL
++         */
++        if (accepted_addr != NULL) {
++#ifdef AF_UNIX
++            if (family == AF_UNIX)
++                name = BIO_ADDR_path_string(accepted_addr);
++            else
++#endif
++                name = BIO_ADDR_hostname_string(accepted_addr, 0);
++        }
+         i = (*cb) (name, sock, type, context);
+         OPENSSL_free(name);
++        BIO_ADDR_free(accepted_addr);
+         if (type == SOCK_STREAM)
+             SHUTDOWN2(sock);
+         if (naccept != -1)
+             naccept--;
+         if (i &lt; 0 || naccept == 0) {
+-            SHUTDOWN2(accept_socket);
+-            return (i);
+-        }
+-    }
+-}
+-
+-# ifndef NO_SYS_UN_H
+-int do_server_unix(const char *path, int *ret,
+-                   int (*cb) (char *hostname, int s, int stype,
+-                              unsigned char *context), unsigned char *context,
+-                   int naccept)
+-{
+-    int sock;
+-    int accept_socket = 0;
+-    int i;
+-
+-    if (!init_server_unix(&amp;accept_socket, path))
+-        return (0);
+-
+-    if (ret != NULL)
+-        *ret = accept_socket;
+-    for (;;) {
+-        if (do_accept_unix(accept_socket, &amp;sock) == 0) {
+-            SHUTDOWN(accept_socket);
+-            i = 0;
+-            goto out;
+-        }
+-        i = (*cb) (NULL, sock, 0, context);
+-        SHUTDOWN2(sock);
+-        if (naccept != -1)
+-            naccept--;
+-        if (i &lt; 0 || naccept == 0) {
+-            SHUTDOWN2(accept_socket);
+-            goto out;
+-        }
+-    }
+- out:
+-    unlink(path);
+-    return (i);
+-}
+-# endif
+-
+-static int init_server_long(int *sock, int port, char *ip, int type)
+-{
+-    int ret = 0;
+-    struct sockaddr_in server;
+-    int s = -1;
+-
+-    if (!ssl_sock_init())
+-        return (0);
+-
+-    memset(&amp;server, 0, sizeof(server));
+-    server.sin_family = AF_INET;
+-    server.sin_port = htons((unsigned short)port);
+-    if (ip == NULL)
+-        server.sin_addr.s_addr = INADDR_ANY;
+-    else
+-/* Added for T3E, address-of fails on bit field (<A HREF="../../../mailman/listinfo/openssl-commits.html">beckman at acl.lanl.gov</A>) */
+-# ifndef BIT_FIELD_LIMITS
+-        memcpy(&amp;server.sin_addr.s_addr, ip, 4);
+-# else
+-        memcpy(&amp;server.sin_addr, ip, 4);
+-# endif
+-
+-    if (type == SOCK_STREAM)
+-        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+-    else                        /* type == SOCK_DGRAM */
+-        s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+-
+-    if (s == (int)INVALID_SOCKET)
+-        goto err;
+-# if defined SOL_SOCKET &amp;&amp; defined SO_REUSEADDR
+-    {
+-        int j = 1;
+-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (void *)&amp;j, sizeof j);
+-    }
+-# endif
+-    if (bind(s, (struct sockaddr *)&amp;server, sizeof(server)) == -1) {
+-# ifndef OPENSSL_SYS_WINDOWS
+-        perror(&quot;bind&quot;);
+-# endif
+-        goto err;
+-    }
+-    /* Make it 128 for linux */
+-    if (type == SOCK_STREAM &amp;&amp; listen(s, 128) == -1)
+-        goto err;
+-    *sock = s;
+-    ret = 1;
+- err:
+-    if ((ret == 0) &amp;&amp; (s != -1)) {
+-        SHUTDOWN(s);
+-    }
+-    return (ret);
+-}
+-
+-static int init_server(int *sock, int port, int type)
+-{
+-    return (init_server_long(sock, port, NULL, type));
+-}
+-
+-# ifndef NO_SYS_UN_H
+-static int init_server_unix(int *sock, const char *path)
+-{
+-    int ret = 0;
+-    struct sockaddr_un server;
+-    int s = -1;
+-
+-    if (strlen(path) &gt; (UNIX_PATH_MAX + 1))
+-        return (0);
+-    if (!ssl_sock_init())
+-        return (0);
+-
+-    s = socket(AF_UNIX, SOCK_STREAM, 0);
+-    if (s == (int)INVALID_SOCKET)
+-        goto err;
+-
+-    memset(&amp;server, 0, sizeof(server));
+-    server.sun_family = AF_UNIX;
+-    strcpy(server.sun_path, path);
+-
+-    if (bind(s, (struct sockaddr *)&amp;server, sizeof(server)) == -1) {
+-#  ifndef OPENSSL_SYS_WINDOWS
+-        perror(&quot;bind&quot;);
+-#  endif
+-        goto err;
+-    }
+-    /* Make it 128 for linux */
+-    if (listen(s, 128) == -1) {
+-#  ifndef OPENSSL_SYS_WINDOWS
+-        perror(&quot;listen&quot;);
+-#  endif
+-        unlink(path);
+-        goto err;
+-    }
+-    *sock = s;
+-    ret = 1;
+- err:
+-    if ((ret == 0) &amp;&amp; (s != -1)) {
+-        SHUTDOWN(s);
+-    }
+-    return (ret);
+-}
+-# endif
+-
+-static int do_accept(int acc_sock, int *sock, char **host)
+-{
+-    int ret;
+-    struct hostent *h1, *h2;
+-    static struct sockaddr_in from;
+-    int len;
+-/*      struct linger ling; */
+-
+-    if (!ssl_sock_init())
+-        return (0);
+-
+-# ifndef OPENSSL_SYS_WINDOWS
+- redoit:
+-# endif
+-
+-    memset(&amp;from, 0, sizeof(from));
+-    len = sizeof(from);
+-    /*
+-     * Note: under VMS with SOCKETSHR the fourth parameter is currently of
+-     * type (int *) whereas under other systems it is (void *) if you don't
+-     * have a cast it will choke the compiler: if you do have a cast then you
+-     * can either go for (int *) or (void *).
+-     */
+-    ret = accept(acc_sock, (struct sockaddr *)&amp;from, (void *)&amp;len);
+-    if (ret == (int)INVALID_SOCKET) {
+-# if defined(OPENSSL_SYS_WINDOWS) || (defined(OPENSSL_SYS_NETWARE) &amp;&amp; !defined(NETWARE_BSDSOCK))
+-        int i;
+-        i = WSAGetLastError();
+-        BIO_printf(bio_err, &quot;accept error %d\n&quot;, i);
+-# else
+-        if (errno == EINTR) {
+-            /*
+-             * check_timeout();
+-             */
+-            goto redoit;
+-        }
+-        BIO_printf(bio_err, &quot;accept errno=%d, %s\n&quot;, errno, strerror(errno));
+-# endif
+-        return (0);
+-    }
+-
+-    if (host == NULL)
+-        goto end;
+-# ifndef BIT_FIELD_LIMITS
+-    /* I should use WSAAsyncGetHostByName() under windows */
+-    h1 = gethostbyaddr((char *)&amp;from.sin_addr.s_addr,
+-                       sizeof(from.sin_addr.s_addr), AF_INET);
+-# else
+-    h1 = gethostbyaddr((char *)&amp;from.sin_addr,
+-                       sizeof(struct in_addr), AF_INET);
+-# endif
+-    if (h1 == NULL) {
+-        BIO_printf(bio_err, &quot;bad gethostbyaddr\n&quot;);
+-        *host = NULL;
+-        /* return(0); */
+-    } else {
+-        *host = app_malloc(strlen(h1-&gt;h_name) + 1, &quot;copy hostname&quot;);
+-        OPENSSL_strlcpy(*host, h1-&gt;h_name, strlen(h1-&gt;h_name) + 1);
+-
+-        h2 = gethostbyname(*host);
+-        if (h2 == NULL) {
+-            BIO_printf(bio_err, &quot;gethostbyname failure\n&quot;);
+-            closesocket(ret);
+-            return (0);
+-        }
+-        if (h2-&gt;h_addrtype != AF_INET) {
+-            BIO_printf(bio_err, &quot;gethostbyname addr is not AF_INET\n&quot;);
+-            closesocket(ret);
+-            return (0);
++            SHUTDOWN2(asock);
++            ret = i;
++            break;
+         }
+     }
+  end:
+-    *sock = ret;
+-    return (1);
+-}
+-
+-# ifndef NO_SYS_UN_H
+-static int do_accept_unix(int acc_sock, int *sock)
+-{
+-    int ret;
+-
+-    if (!ssl_sock_init())
+-        return (0);
+-
+- redoit:
+-    ret = accept(acc_sock, NULL, NULL);
+-    if (ret == (int)INVALID_SOCKET) {
+-        if (errno == EINTR) {
+-            /*
+-             * check_timeout();
+-             */
+-            goto redoit;
+-        }
+-        BIO_printf(bio_err, &quot;accept errno=%d, %s\n&quot;, errno, strerror(errno));
+-        return (0);
+-    }
+-
+-    *sock = ret;
+-    return (1);
+-}
++# ifdef AF_UNIX
++    if (family == AF_UNIX)
++        unlink(host);
+ # endif
+-
+-int extract_host_port(char *str, char **host_ptr, unsigned char *ip,
+-                      unsigned short *port_ptr)
+-{
+-    char *h, *p;
+-
+-    h = str;
+-    p = strchr(str, ':');
+-    if (p == NULL) {
+-        BIO_printf(bio_err, &quot;no port defined\n&quot;);
+-        return (0);
+-    }
+-    *(p++) = '\0';
+-
+-    if ((ip != NULL) &amp;&amp; !host_ip(str, ip))
+-        goto err;
+-    if (host_ptr != NULL)
+-        *host_ptr = h;
+-
+-    if (!extract_port(p, port_ptr))
+-        goto err;
+-    return (1);
+- err:
+-    return (0);
+-}
+-
+-static int host_ip(const char *str, unsigned char ip[4])
+-{
+-    unsigned int in[4];
+-    int i;
+-
+-    if (sscanf(str, &quot;%u.%u.%u.%u&quot;, &amp;(in[0]), &amp;(in[1]), &amp;(in[2]), &amp;(in[3])) ==
+-        4) {
+-        for (i = 0; i &lt; 4; i++)
+-            if (in[i] &gt; 255) {
+-                BIO_printf(bio_err, &quot;invalid IP address\n&quot;);
+-                goto err;
+-            }
+-        ip[0] = in[0];
+-        ip[1] = in[1];
+-        ip[2] = in[2];
+-        ip[3] = in[3];
+-    } else {                    /* do a gethostbyname */
+-        struct hostent *he;
+-
+-        if (!ssl_sock_init())
+-            return (0);
+-
+-        he = gethostbyname(str);
+-        if (he == NULL) {
+-            BIO_printf(bio_err, &quot;gethostbyname failure\n&quot;);
+-            goto err;
+-        }
+-        if (he-&gt;h_addrtype != AF_INET) {
+-            BIO_printf(bio_err, &quot;gethostbyname addr is not AF_INET\n&quot;);
+-            return (0);
+-        }
+-        ip[0] = he-&gt;h_addr_list[0][0];
+-        ip[1] = he-&gt;h_addr_list[0][1];
+-        ip[2] = he-&gt;h_addr_list[0][2];
+-        ip[3] = he-&gt;h_addr_list[0][3];
+-    }
+-    return (1);
+- err:
+-    return (0);
++    return ret;
+ }
+ 
+-int extract_port(const char *str, unsigned short *port_ptr)
+-{
+-    int i;
+-    struct servent *s;
+-
+-    i = atoi(str);
+-    if (i != 0)
+-        *port_ptr = (unsigned short)i;
+-    else {
+-        s = getservbyname(str, &quot;tcp&quot;);
+-        if (s == NULL) {
+-            BIO_printf(bio_err, &quot;getservbyname failure for %s\n&quot;, str);
+-            return (0);
+-        }
+-        *port_ptr = ntohs((unsigned short)s-&gt;s_port);
+-    }
+-    return (1);
+-}
+-
+-#endif
++#endif  /* OPENSSL_NO_SOCK */
+diff --git a/test/recipes/70-test_sslskewith0p.t b/test/recipes/90-test_networking.t
+old mode 100755
+new mode 100644
+similarity index 72%
+copy from test/recipes/70-test_sslskewith0p.t
+copy to test/recipes/90-test_networking.t
+index 8261238..f8377c9
+--- a/test/recipes/70-test_sslskewith0p.t
++++ b/test/recipes/90-test_networking.t
+@@ -1,7 +1,7 @@
+ #!/usr/bin/perl
+-# Written by Matt Caswell for the OpenSSL project.
++# Written by Richard Levitte for the OpenSSL project.
+ # ====================================================================
+-# Copyright (c) 1998-2015 The OpenSSL Project.  All rights reserved.
++# Copyright (c) 2015-2016 The OpenSSL Project.  All rights reserved.
+ #
+ # Redistribution and use in source and binary forms, with or without
+ # modification, are permitted provided that the following conditions
+@@ -54,56 +54,55 @@
+ 
+ use strict;
+ use OpenSSL::Test qw/:DEFAULT cmdstr top_file top_dir/;
+-use OpenSSL::Test::Utils;
+ use TLSProxy::Proxy;
+ 
+-my $test_name = &quot;test_sslskewith0p&quot;;
++my $test_name = &quot;test_networking&quot;;
+ setup($test_name);
+ 
+-plan skip_all =&gt; &quot;TLSProxy isn't usable on $^O&quot;
+-    if $^O =~ /^VMS$/;
+-
+-plan skip_all =&gt; &quot;$test_name needs the engine feature enabled&quot;
+-    if disabled(&quot;engine&quot;);
+-
+ plan skip_all =&gt; &quot;$test_name can only be performed with OpenSSL configured shared&quot;
+-    if disabled(&quot;shared&quot;);
+-
+-plan skip_all =&gt; &quot;dh is not supported by this OpenSSL build&quot;
+-    if disabled(&quot;dh&quot;);
++    unless (map { s/\R//; s/^SHARED_LIBS=\s*//; $_ }
++	    grep { /^SHARED_LIBS=/ }
++	    do { local @ARGV = ( top_file(&quot;Makefile&quot;) ); &lt;&gt; })[0] ne &quot;&quot;;
+ 
+ $ENV{OPENSSL_ENGINES} = top_dir(&quot;engines&quot;);
+ $ENV{OPENSSL_ia32cap} = '~0x200000200000000';
++
+ my $proxy = TLSProxy::Proxy-&gt;new(
+-    \&amp;ske_0_p_filter,
++    undef,
+     cmdstr(app([&quot;openssl&quot;])),
+     top_file(&quot;apps&quot;, &quot;server.pem&quot;)
+ );
+ 
+-plan tests =&gt; 1;
++plan tests =&gt; 2;
+ 
+-#We must use an anon DHE cipher for this test
+-$proxy-&gt;cipherc('ADH-AES128-SHA:@SECLEVEL=0');
+-$proxy-&gt;ciphers('ADH-AES128-SHA:@SECLEVEL=0');
++#Test 1: Try IPv4
++$proxy-&gt;clear();
++$proxy-&gt;serverflags(&quot;-4&quot;);
++$proxy-&gt;clientflags(&quot;-4&quot;);
++$proxy-&gt;server_addr(&quot;127.0.0.1&quot;);
++$proxy-&gt;proxy_addr(&quot;127.0.0.1&quot;);
++ok(check_connection(), &quot;Trying IPv4&quot;);
+ 
+-$proxy-&gt;start();
+-ok(TLSProxy::Message-&gt;fail, &quot;ServerKeyExchange with 0 p&quot;);
++ SKIP: {
++     skip &quot;No IPv6 support&quot;, 1 unless $proxy-&gt;supports_IPv6();
+ 
+-sub ske_0_p_filter
++     #Test 2: Try IPv6
++     $proxy-&gt;clear();
++     $proxy-&gt;serverflags(&quot;-6&quot;);
++     $proxy-&gt;clientflags(&quot;-6&quot;);
++     $proxy-&gt;server_addr(&quot;[::1]&quot;);
++     $proxy-&gt;proxy_addr(&quot;[::1]&quot;);
++     ok(check_connection(), &quot;Trying IPv6&quot;);
++}
++
++sub check_connection
+ {
+-    my $proxy = shift;
++    eval { $proxy-&gt;start(); };
+ 
+-    # We're only interested in the SKE - always in flight 1
+-    if ($proxy-&gt;flight != 1) {
+-        return;
++    if ($@ ne &quot;&quot;) {
++	print STDERR &quot;Proxy connection failed: $@\n&quot;;
++	return 0;
+     }
+ 
+-    foreach my $message (@{$proxy-&gt;message_list}) {
+-        if ($message-&gt;mt == TLSProxy::Message::MT_SERVER_KEY_EXCHANGE) {
+-            #Set p to a value of 0
+-            $message-&gt;p(pack('C', 0));
+-
+-            $message-&gt;repack();
+-        }
+-    }
++    1;
+ }
+diff --git a/util/TLSProxy/Proxy.pm b/util/TLSProxy/Proxy.pm
+index 8d18dcc..7082486 100644
+--- a/util/TLSProxy/Proxy.pm
++++ b/util/TLSProxy/Proxy.pm
+@@ -65,6 +65,9 @@ use TLSProxy::ServerHello;
+ use TLSProxy::ServerKeyExchange;
+ use TLSProxy::NewSessionTicket;
+ 
++my $have_IPv6 = 0;
++my $IP_factory;
++
+ sub new
+ {
+     my $class = shift;
+@@ -95,6 +98,44 @@ sub new
+         message_list =&gt; [],
+     };
+ 
++    eval {
++        require IO::Socket::IP;
++        my $s = IO::Socket::IP-&gt;new(
++            LocalAddr =&gt; &quot;::1&quot;,
++            LocalPort =&gt; 0,
++            Listen=&gt;1,
++            );
++        $s or die &quot;\n&quot;;
++        $s-&gt;close();
++    };
++    if ($@ eq &quot;&quot;) {
++        # IO::Socket::IP supports IPv6 and is in the core modules list
++        $IP_factory = sub { IO::Socket::IP-&gt;new(@_); };
++        $have_IPv6 = 1;
++    } else {
++        eval {
++            require IO::Socket::INET6;
++            my $s = IO::Socket::INET6-&gt;new(
++                LocalAddr =&gt; &quot;::1&quot;,
++                LocalPort =&gt; 0,
++                Listen=&gt;1,
++                );
++            $s or die &quot;\n&quot;;
++            $s-&gt;close();
++        };
++        if ($@ eq &quot;&quot;) {
++            # IO::Socket::INET6 supports IPv6 but isn't on the core modules list
++            # However, it's a bit older and said to be more widely deployed
++            # at the time of writing this comment.
++            $IP_factory = sub { IO::Socket::INET6-&gt;new(@_); };
++            $have_IPv6 = 1;
++        } else {
++            # IO::Socket::INET doesn't support IPv6 but is a fallback in case
++            # we have no other.
++            $IP_factory = sub { IO::Socket::INET-&gt;new(@_); };
++        }
++    }
++
+     return bless $self, $class;
+ }
+ 
+@@ -139,7 +180,7 @@ sub start
+     $pid = fork();
+     if ($pid == 0) {
+         open(STDOUT, &quot;&gt;&quot;, File::Spec-&gt;devnull())
+-            or die &quot;Failed to redirect stdout&quot;;
++            or die &quot;Failed to redirect stdout: $!&quot;;
+         open(STDERR, &quot;&gt;&amp;STDOUT&quot;);
+         my $execcmd = $self-&gt;execute
+             .&quot; s_server -rev -engine ossltest -accept &quot;
+@@ -168,8 +209,10 @@ sub clientstart
+     }
+ 
+     # Create the Proxy socket
+-    my $proxy_sock = new IO::Socket::INET(
+-        LocalHost   =&gt; $self-&gt;proxy_addr,
++    my $proxaddr = $self-&gt;server_addr;
++    $proxaddr =~ s/[\[\]]//g; # Remove [ and ]
++    my $proxy_sock = $IP_factory-&gt;(
++        LocalHost   =&gt; $proxaddr,
+         LocalPort   =&gt; $self-&gt;proxy_port,
+         Proto       =&gt; &quot;tcp&quot;,
+         Listen      =&gt; SOMAXCONN,
+@@ -179,14 +222,14 @@ sub clientstart
+     if ($proxy_sock) {
+         print &quot;Proxy started on port &quot;.$self-&gt;proxy_port.&quot;\n&quot;;
+     } else {
+-        die &quot;Failed creating proxy socket\n&quot;;
++        die &quot;Failed creating proxy socket (&quot;.$proxaddr.&quot;,&quot;.$self-&gt;proxy_port.&quot;): $!\n&quot;;
+     }
+ 
+     if ($self-&gt;execute) {
+         my $pid = fork();
+         if ($pid == 0) {
+             open(STDOUT, &quot;&gt;&quot;, File::Spec-&gt;devnull())
+-                or die &quot;Failed to redirect stdout&quot;;
++                or die &quot;Failed to redirect stdout: $!&quot;;
+             open(STDERR, &quot;&gt;&amp;STDOUT&quot;);
+             my $execcmd = &quot;echo test | &quot;.$self-&gt;execute
+                  .&quot; s_client -engine ossltest -connect &quot;
+@@ -202,8 +245,8 @@ sub clientstart
+     }
+ 
+     # Wait for incoming connection from client
+-    my $client_sock = $proxy_sock-&gt;accept() 
+-        or die &quot;Failed accepting incoming connection\n&quot;;
++    my $client_sock = $proxy_sock-&gt;accept()
++        or die &quot;Failed accepting incoming connection: $!\n&quot;;
+ 
+     print &quot;Connection opened\n&quot;;
+ 
+@@ -213,11 +256,13 @@ sub clientstart
+     #We loop over this a few times because sometimes s_server can take a while
+     #to start up
+     do {
+-        $server_sock = new IO::Socket::INET(
+-            PeerAddr =&gt; $self-&gt;server_addr,
++        my $servaddr = $self-&gt;server_addr;
++        $servaddr =~ s/[\[\]]//g; # Remove [ and ]
++        $server_sock = $IP_factory-&gt;(
++            PeerAddr =&gt; $servaddr,
+             PeerPort =&gt; $self-&gt;server_port,
+             Proto =&gt; 'tcp'
+-        ); 
++        );
+ 
+         $retry--;
+         if (!$server_sock) {
+@@ -225,7 +270,7 @@ sub clientstart
+                 #Sleep for a short while
+                 select(undef, undef, undef, 0.1);
+             } else {
+-                die &quot;Failed to start up server\n&quot;;
++                die &quot;Failed to start up server (&quot;.$servaddr.&quot;,&quot;.$self-&gt;server_port.&quot;): $!\n&quot;;
+             }
+         }
+     } while (!$server_sock);
+@@ -353,6 +398,11 @@ sub end
+     my $self = shift;
+     return $self-&gt;{end};
+ }
++sub supports_IPv6
++{
++    my $self = shift;
++    return $have_IPv6;
++}
+ 
+ #Read/write accessors
+ sub proxy_addr
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003547.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="003552.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3550">[ date ]</a>
+              <a href="thread.html#3550">[ thread ]</a>
+              <a href="subject.html#3550">[ subject ]</a>
+              <a href="author.html#3550">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

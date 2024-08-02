@@ -1,0 +1,247 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1478534737.790061.27233.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011371.html">
+   <LINK REL="Next"  HREF="011378.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_1_0-stable%20update&In-Reply-To=%3C1478534737.790061.27233.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update">matt at openssl.org
+       </A><BR>
+    <I>Mon Nov  7 16:05:37 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011371.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+        <LI>Next message: <A HREF="011378.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11376">[ date ]</a>
+              <a href="thread.html#11376">[ thread ]</a>
+              <a href="subject.html#11376">[ subject ]</a>
+              <a href="author.html#11376">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_0-stable has been updated
+       via  929cc3fa6bceba1c6d9c362c56b89cbf2acf40bc (commit)
+      from  992b3740a1f7b24771ccf29a52b0141c51b95933 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 929cc3fa6bceba1c6d9c362c56b89cbf2acf40bc
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Oct 27 10:46:25 2016 +0100
+
+    Partial revert of &quot;Fix client verify mode to check SSL_VERIFY_PEER&quot;
+    
+    This partially reverts commit c636c1c47. It also tweaks the documentation
+    and comments in this area. On the client side the documented interface for
+    SSL_CTX_set_verify()/SSL_set_verify() is that setting the flag
+    SSL_VERIFY_PEER causes verfication of the server certificate to take place.
+    Previously what was implemented was that if *any* flag was set then
+    verification would take place. The above commit improved the semantics to
+    be as per the documented interface.
+    
+    However, we have had a report of at least one application where an
+    application was incorrectly using the interface and used *only*
+    SSL_VERIFY_FAIL_IF_NO_PEER_CERT on the client side. In OpenSSL prior to
+    the above commit this still caused verification of the server certificate
+    to take place. After this commit the application silently failed to verify
+    the server certificate.
+    
+    Ideally SSL_CTX_set_verify()/SSL_set_verify() could be modified to indicate
+    if invalid flags were being used. However these are void functions!
+    
+    The simplest short term solution is to revert to the previous behaviour
+    which at least means we &quot;fail closed&quot; rather than &quot;fail open&quot;.
+    
+    Thanks to Cory Benfield for reporting this issue.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (cherry picked from commit c8e2f98c97ff3327784843946c2d62761572e5d5)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ doc/ssl/SSL_CTX_set_verify.pod |  7 +++++++
+ ssl/statem/statem_clnt.c       | 16 +++++++++++++++-
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/doc/ssl/SSL_CTX_set_verify.pod b/doc/ssl/SSL_CTX_set_verify.pod
+index 96a98ac..d2d3d03 100644
+--- a/doc/ssl/SSL_CTX_set_verify.pod
++++ b/doc/ssl/SSL_CTX_set_verify.pod
+@@ -145,6 +145,13 @@ Its return value is identical to B&lt;preverify_ok&gt;, so that any verification
+ failure will lead to a termination of the TLS/SSL handshake with an
+ alert message, if SSL_VERIFY_PEER is set.
+ 
++=head1 BUGS
++
++In client mode, it is not checked whether the SSL_VERIFY_PEER flag
++is set, but whether any flags are set. This can lead to
++unexpected behaviour if SSL_VERIFY_PEER and other flags are not used as
++required.
++
+ =head1 RETURN VALUES
+ 
+ The SSL*_set_verify*() functions do not provide diagnostic information.
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 692544b..e90a63c 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1224,7 +1224,21 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+     }
+ 
+     i = ssl_verify_cert_chain(s, sk);
+-    if ((s-&gt;verify_mode &amp; SSL_VERIFY_PEER) &amp;&amp; i &lt;= 0) {
++    /*
++     * The documented interface is that SSL_VERIFY_PEER should be set in order
++     * for client side verification of the server certificate to take place.
++     * However, historically the code has only checked that *any* flag is set
++     * to cause server verification to take place. Use of the other flags makes
++     * no sense in client mode. An attempt to clean up the semantics was
++     * reverted because at least one application *only* set
++     * SSL_VERIFY_FAIL_IF_NO_PEER_CERT. Prior to the clean up this still caused
++     * server verification to take place, after the clean up it silently did
++     * nothing. SSL_CTX_set_verify()/SSL_set_verify() cannot validate the flags
++     * sent to them because they are void functions. Therefore, we now use the
++     * (less clean) historic behaviour of performing validation if any flag is
++     * set. The *documented* interface remains the same.
++     */
++    if (s-&gt;verify_mode != SSL_VERIFY_NONE &amp;&amp; i &lt;= 0) {
+         al = ssl_verify_alarm_type(s-&gt;verify_result);
+         SSLerr(SSL_F_TLS_PROCESS_SERVER_CERTIFICATE,
+                SSL_R_CERTIFICATE_VERIFY_FAILED);
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011371.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+	<LI>Next message: <A HREF="011378.html">[openssl-commits] [openssl]  OpenSSL_1_1_0-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11376">[ date ]</a>
+              <a href="thread.html#11376">[ thread ]</a>
+              <a href="subject.html#11376">[ subject ]</a>
+              <a href="author.html#11376">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

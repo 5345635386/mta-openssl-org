@@ -1,0 +1,217 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432278662.341661.5879.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001132.html">
+   <LINK REL="Next"  HREF="001134.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432278662.341661.5879.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri May 22 07:11:02 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001132.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001134.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1133">[ date ]</a>
+              <a href="thread.html#1133">[ thread ]</a>
+              <a href="subject.html#1133">[ subject ]</a>
+              <a href="author.html#1133">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6b41b3f5eacc6b1bb851c9dce22d6e893f32ea7d (commit)
+      from  3a752c85ee38a92d7777b8fe1cce2e54bf619529 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6b41b3f5eacc6b1bb851c9dce22d6e893f32ea7d
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu May 21 14:06:52 2015 +0100
+
+    Fix a memory leak in compression
+    
+    The function RECORD_LAYER_clear() is supposed to clear the contents of the
+    RECORD_LAYER structure, but retain certain data such as buffers that are
+    allocated. Unfortunately one buffer (for compression) got missed and was
+    inadvertently being wiped, thus causing a memory leak.
+    
+    In part this is due to the fact that RECORD_LAYER_clear() was reaching
+    inside SSL3_BUFFERs and SSL3_RECORDs, which it really shouldn't. So, I've
+    rewritten it to only clear the data it knows about, and to defer clearing
+    of SSL3_RECORD and SSL3_BUFFER structures to SSL_RECORD_clear() and the
+    new function SSL3_BUFFER_clear().
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/record/rec_layer_s3.c | 49 +++++++++++++++++++++++------------------------
+ ssl/record/record_locl.h  |  1 +
+ ssl/record/ssl3_buffer.c  | 13 +++++++++++++
+ ssl/record/ssl3_record.c  |  8 +++++++-
+ 4 files changed, 45 insertions(+), 26 deletions(-)
+
+diff --git a/ssl/record/rec_layer_s3.c b/ssl/record/rec_layer_s3.c
+index 456fac4..47a021d 100644
+--- a/ssl/record/rec_layer_s3.c
++++ b/ssl/record/rec_layer_s3.c
+@@ -142,35 +142,34 @@ void RECORD_LAYER_init(RECORD_LAYER *rl, SSL *s)
+ 
+ void RECORD_LAYER_clear(RECORD_LAYER *rl)
+ {
+-    unsigned char *rp, *wp;
+-    size_t rlen, wlen;
+-    int read_ahead;
+-    SSL *s;
+-    DTLS_RECORD_LAYER *d;
+-
+-    s = rl-&gt;s;
+-    d = rl-&gt;d;
+-    read_ahead = rl-&gt;read_ahead;
+-    rp = SSL3_BUFFER_get_buf(&amp;rl-&gt;rbuf);
+-    rlen = SSL3_BUFFER_get_len(&amp;rl-&gt;rbuf);
+-    wp = SSL3_BUFFER_get_buf(&amp;rl-&gt;wbuf);
+-    wlen = SSL3_BUFFER_get_len(&amp;rl-&gt;wbuf);
+-    memset(rl, 0, sizeof(*rl));
+-    SSL3_BUFFER_set_buf(&amp;rl-&gt;rbuf, rp);
+-    SSL3_BUFFER_set_len(&amp;rl-&gt;rbuf, rlen);
+-    SSL3_BUFFER_set_buf(&amp;rl-&gt;wbuf, wp);
+-    SSL3_BUFFER_set_len(&amp;rl-&gt;wbuf, wlen);
+-
+-    /* Do I need to do this? As far as I can tell read_ahead did not
++    rl-&gt;rstate = SSL_ST_READ_HEADER;
++
++    /* Do I need to clear read_ahead? As far as I can tell read_ahead did not
+      * previously get reset by SSL_clear...so I'll keep it that way..but is
+      * that right?
+      */
+-    rl-&gt;read_ahead = read_ahead;
+-    rl-&gt;rstate = SSL_ST_READ_HEADER;
+-    rl-&gt;s = s;
+-    rl-&gt;d = d;
++
++    rl-&gt;packet = NULL;
++    rl-&gt;packet_length = 0;
++    rl-&gt;wnum = 0;
++    memset(rl-&gt;alert_fragment, 0, sizeof(rl-&gt;alert_fragment));
++    rl-&gt;alert_fragment_len = 0;
++    memset(rl-&gt;handshake_fragment, 0, sizeof(rl-&gt;handshake_fragment));
++    rl-&gt;handshake_fragment_len = 0;
++    rl-&gt;wpend_tot = 0;
++    rl-&gt;wpend_type = 0;
++    rl-&gt;wpend_ret = 0;
++    rl-&gt;wpend_buf = NULL;
++
++    SSL3_BUFFER_clear(&amp;rl-&gt;rbuf);
++    SSL3_BUFFER_clear(&amp;rl-&gt;wbuf);
++    SSL3_RECORD_clear(&amp;rl-&gt;rrec);
++    SSL3_RECORD_clear(&amp;rl-&gt;wrec);
++
++    memset(rl-&gt;read_sequence, 0, sizeof(rl-&gt;read_sequence));
++    memset(rl-&gt;write_sequence, 0, sizeof(rl-&gt;write_sequence));
+     
+-    if (d)
++    if (rl-&gt;d)
+         DTLS_RECORD_LAYER_clear(rl);
+ }
+ 
+diff --git a/ssl/record/record_locl.h b/ssl/record/record_locl.h
+index b2222d7..f92e89d 100644
+--- a/ssl/record/record_locl.h
++++ b/ssl/record/record_locl.h
+@@ -162,6 +162,7 @@ void dtls1_record_bitmap_update(SSL *s, DTLS1_BITMAP *bitmap);
+ #define SSL3_BUFFER_add_offset(b, o)        ((b)-&gt;offset += (o))
+ #define SSL3_BUFFER_is_initialised(b)       ((b)-&gt;buf != NULL)
+ 
++void SSL3_BUFFER_clear(SSL3_BUFFER *b);
+ void SSL3_BUFFER_set_data(SSL3_BUFFER *b, const unsigned char *d, int n);
+ void SSL3_BUFFER_release(SSL3_BUFFER *b);
+ __owur int ssl3_setup_read_buffer(SSL *s);
+diff --git a/ssl/record/ssl3_buffer.c b/ssl/record/ssl3_buffer.c
+index 5a8d34c..66fb721 100644
+--- a/ssl/record/ssl3_buffer.c
++++ b/ssl/record/ssl3_buffer.c
+@@ -120,6 +120,19 @@ void SSL3_BUFFER_set_data(SSL3_BUFFER *b, const unsigned char *d, int n)
+     b-&gt;offset = 0;
+ }
+ 
++/*
++ * Clear the contents of an SSL3_BUFFER but retain any memory allocated
++ */
++void SSL3_BUFFER_clear(SSL3_BUFFER *b)
++{
++    unsigned char *buf = b-&gt;buf;
++    size_t len = b-&gt;len;
++
++    memset(b, 0, sizeof(*b));
++    b-&gt;buf = buf;
++    b-&gt;len = len;
++}
++
+ void SSL3_BUFFER_release(SSL3_BUFFER *b)
+ {
+     OPENSSL_free(b-&gt;buf);
+diff --git a/ssl/record/ssl3_record.c b/ssl/record/ssl3_record.c
+index b0eb7cc..5070bc3 100644
+--- a/ssl/record/ssl3_record.c
++++ b/ssl/record/ssl3_record.c
+@@ -132,9 +132,15 @@ static const unsigned char ssl3_pad_2[48] = {
+     0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c
+ };
+ 
++/*
++ * Clear the contents of an SSL3_RECORD but retain any memory allocated
++ */
+ void SSL3_RECORD_clear(SSL3_RECORD *r)
+ {
+-    memset(r-&gt;seq_num, 0, sizeof(r-&gt;seq_num));
++    unsigned char *comp = r-&gt;comp;
++
++    memset(r, 0, sizeof(*r));
++    r-&gt;comp = comp;
+ }
+ 
+ void SSL3_RECORD_release(SSL3_RECORD *r)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001132.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001134.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1133">[ date ]</a>
+              <a href="thread.html#1133">[ thread ]</a>
+              <a href="subject.html#1133">[ subject ]</a>
+              <a href="author.html#1133">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

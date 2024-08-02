@@ -1,0 +1,319 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469977483.216401.22085.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009382.html">
+   <LINK REL="Next"  HREF="009386.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469977483.216401.22085.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Sun Jul 31 15:04:43 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009382.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009386.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9385">[ date ]</a>
+              <a href="thread.html#9385">[ thread ]</a>
+              <a href="subject.html#9385">[ subject ]</a>
+              <a href="author.html#9385">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  abdb460d8abe68fedcf00b52d2ba4bf4b7c1725c (commit)
+       via  382bb0b294582c9d7f39ebfb96cd8849071687e0 (commit)
+       via  83151b73a4736bca1797f8edc2b0ad4cf7ac9146 (commit)
+      from  e1f02308aeb124168d8a6655e5c822c3b0126260 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit abdb460d8abe68fedcf00b52d2ba4bf4b7c1725c
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jul 25 15:04:33 2016 +0200
+
+    evp/bio_enc.c: perform enc_read operation without using overlapping buffers.
+    
+    Reviewed-by: Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+commit 382bb0b294582c9d7f39ebfb96cd8849071687e0
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jul 25 15:03:43 2016 +0200
+
+    test/smcont.txt: trigger assertion in bio_enc.c.
+    
+    Reviewed-by: Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+commit 83151b73a4736bca1797f8edc2b0ad4cf7ac9146
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon Jul 25 15:02:26 2016 +0200
+
+    evp/evp_enc.c: make assert error message more readable
+    and add EVPerr(PARTIALLY_OVERLAPPED)
+    
+    Reviewed-by: Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/bio_enc.c  | 36 +++++++++++++++++++++++++++---------
+ crypto/evp/evp_enc.c  | 28 +++++++++++++++++++---------
+ crypto/evp/evp_err.c  |  3 +++
+ include/openssl/evp.h |  3 +++
+ test/smcont.txt       |  2 +-
+ 5 files changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/crypto/evp/bio_enc.c b/crypto/evp/bio_enc.c
+index 5bc5d65..47d0384 100644
+--- a/crypto/evp/bio_enc.c
++++ b/crypto/evp/bio_enc.c
+@@ -40,7 +40,7 @@ typedef struct enc_struct {
+      * buf is larger than ENC_BLOCK_SIZE because EVP_DecryptUpdate can return
+      * up to a block more data than is presented to it
+      */
+-    char buf[ENC_BLOCK_SIZE + BUF_OFFSET + 2];
++    unsigned char buf[ENC_BLOCK_SIZE + BUF_OFFSET + 2];
+ } BIO_ENC_CTX;
+ 
+ static const BIO_METHOD methods_enc = {
+@@ -136,32 +136,50 @@ static int enc_read(BIO *b, char *out, int outl)
+      */
+ 
+     while (outl &gt; 0) {
++        int buf_len;
++
+         if (ctx-&gt;cont &lt;= 0)
+             break;
+ 
++        buf_len = outl + EVP_MAX_BLOCK_LENGTH - 1;
++        buf_len -= buf_len % EVP_MAX_BLOCK_LENGTH;
++        if (buf_len &gt; ENC_BLOCK_SIZE) {
++            buf_len = ENC_BLOCK_SIZE;
++        }
++
+         /*
+          * read in at IV offset, read the EVP_Cipher documentation about why
+          */
+-        i = BIO_read(next, &amp;(ctx-&gt;buf[BUF_OFFSET]), ENC_BLOCK_SIZE);
++        i = BIO_read(next, &amp;(ctx-&gt;buf[BUF_OFFSET]), buf_len);
+ 
+         if (i &lt;= 0) {
+             /* Should be continue next time we are called? */
+             if (!BIO_should_retry(next)) {
+                 ctx-&gt;cont = i;
+                 i = EVP_CipherFinal_ex(ctx-&gt;cipher,
+-                                       (unsigned char *)ctx-&gt;buf,
+-                                       &amp;(ctx-&gt;buf_len));
++                                       ctx-&gt;buf, &amp;(ctx-&gt;buf_len));
+                 ctx-&gt;ok = i;
+                 ctx-&gt;buf_off = 0;
+             } else {
+                 ret = (ret == 0) ? i : ret;
+                 break;
+             }
++        } else if (outl &gt;= EVP_MAX_BLOCK_LENGTH) {
++            if (!EVP_CipherUpdate(ctx-&gt;cipher,
++                                  (unsigned char *)out, &amp;buf_len,
++                                  &amp;(ctx-&gt;buf[BUF_OFFSET]), i)) {
++                BIO_clear_retry_flags(b);
++                return 0;
++            }
++            ret += buf_len;
++            outl -= buf_len;
++            out += buf_len;
++
++            continue;
+         } else {
+             if (!EVP_CipherUpdate(ctx-&gt;cipher,
+-                                  (unsigned char *)ctx-&gt;buf, &amp;ctx-&gt;buf_len,
+-                                  (unsigned char *)&amp;(ctx-&gt;buf[BUF_OFFSET]),
+-                                  i)) {
++                                  ctx-&gt;buf, &amp;ctx-&gt;buf_len,
++                                  &amp;(ctx-&gt;buf[BUF_OFFSET]), i)) {
+                 BIO_clear_retry_flags(b);
+                 ctx-&gt;ok = 0;
+                 return 0;
+@@ -228,8 +246,8 @@ static int enc_write(BIO *b, const char *in, int inl)
+     while (inl &gt; 0) {
+         n = (inl &gt; ENC_BLOCK_SIZE) ? ENC_BLOCK_SIZE : inl;
+         if (!EVP_CipherUpdate(ctx-&gt;cipher,
+-                              (unsigned char *)ctx-&gt;buf, &amp;ctx-&gt;buf_len,
+-                              (unsigned char *)in, n)) {
++                              ctx-&gt;buf, &amp;ctx-&gt;buf_len,
++                              (const unsigned char *)in, n)) {
+             BIO_clear_retry_flags(b);
+             ctx-&gt;ok = 0;
+             return 0;
+diff --git a/crypto/evp/evp_enc.c b/crypto/evp/evp_enc.c
+index e43a5d2..bedc964 100644
+--- a/crypto/evp/evp_enc.c
++++ b/crypto/evp/evp_enc.c
+@@ -285,10 +285,10 @@ static int is_partially_overlapping(const void *ptr1, const void *ptr2,
+      * operations are used instead of boolean to minimize number
+      * of conditional branches.]
+      */
+-    int condition = (len &gt; 0) &amp; (diff != 0) &amp; ((diff &lt; (PTRDIFF_T)len) |
+-                                               (diff &gt; (0 - (PTRDIFF_T)len)));
+-    assert(!condition);
+-    return condition;
++    int overlapped = (len &gt; 0) &amp; (diff != 0) &amp; ((diff &lt; (PTRDIFF_T)len) |
++                                                (diff &gt; (0 - (PTRDIFF_T)len)));
++    assert(!overlapped);
++    return overlapped;
+ }
+ 
+ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+@@ -297,8 +297,10 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+     int i, j, bl;
+ 
+     if (ctx-&gt;cipher-&gt;flags &amp; EVP_CIPH_FLAG_CUSTOM_CIPHER) {
+-        if (is_partially_overlapping(out, in, inl))
++        if (is_partially_overlapping(out, in, inl)) {
++            EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+             return 0;
++        }
+ 
+         i = ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl);
+         if (i &lt; 0)
+@@ -312,8 +314,10 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+         *outl = 0;
+         return inl == 0;
+     }
+-    if (is_partially_overlapping(out, in, inl))
++    if (is_partially_overlapping(out, in, inl)) {
++        EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+         return 0;
++    }
+ 
+     if (ctx-&gt;buf_len == 0 &amp;&amp; (inl &amp; (ctx-&gt;block_mask)) == 0) {
+         if (ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl)) {
+@@ -338,8 +342,10 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+             memcpy(&amp;(ctx-&gt;buf[i]), in, j);
+             inl -= j;
+             in += j;
+-            if (is_partially_overlapping(out, in, bl))
++            if (is_partially_overlapping(out, in, bl)) {
++	        EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+                 return 0;
++            }
+             if (!ctx-&gt;cipher-&gt;do_cipher(ctx, out, ctx-&gt;buf, bl))
+                 return 0;
+             out += bl;
+@@ -417,8 +423,10 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+     unsigned int b;
+ 
+     if (ctx-&gt;cipher-&gt;flags &amp; EVP_CIPH_FLAG_CUSTOM_CIPHER) {
+-        if (is_partially_overlapping(out, in, inl))
++        if (is_partially_overlapping(out, in, inl)) {
++            EVPerr(EVP_F_EVP_DECRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+             return 0;
++        }
+ 
+         fix_len = ctx-&gt;cipher-&gt;do_cipher(ctx, out, in, inl);
+         if (fix_len &lt; 0) {
+@@ -443,8 +451,10 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
+     if (ctx-&gt;final_used) {
+         /* see comment about PTRDIFF_T comparison above */
+         if (((PTRDIFF_T)out == (PTRDIFF_T)in)
+-            || is_partially_overlapping(out, in, b))
++            || is_partially_overlapping(out, in, b)) {
++            EVPerr(EVP_F_EVP_DECRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+             return 0;
++        }
+         memcpy(out, ctx-&gt;final, b);
+         out += b;
+         fix_len = 1;
+diff --git a/crypto/evp/evp_err.c b/crypto/evp/evp_err.c
+index bde5e31..a0d2250 100644
+--- a/crypto/evp/evp_err.c
++++ b/crypto/evp/evp_err.c
+@@ -33,8 +33,10 @@ static ERR_STRING_DATA EVP_str_functs[] = {
+     {ERR_FUNC(EVP_F_EVP_CIPHER_CTX_SET_KEY_LENGTH),
+      &quot;EVP_CIPHER_CTX_set_key_length&quot;},
+     {ERR_FUNC(EVP_F_EVP_DECRYPTFINAL_EX), &quot;EVP_DecryptFinal_ex&quot;},
++    {ERR_FUNC(EVP_F_EVP_DECRYPTUPDATE), &quot;EVP_DecryptUpdate&quot;},
+     {ERR_FUNC(EVP_F_EVP_DIGESTINIT_EX), &quot;EVP_DigestInit_ex&quot;},
+     {ERR_FUNC(EVP_F_EVP_ENCRYPTFINAL_EX), &quot;EVP_EncryptFinal_ex&quot;},
++    {ERR_FUNC(EVP_F_EVP_ENCRYPTUPDATE), &quot;EVP_EncryptUpdate&quot;},
+     {ERR_FUNC(EVP_F_EVP_MD_CTX_COPY_EX), &quot;EVP_MD_CTX_copy_ex&quot;},
+     {ERR_FUNC(EVP_F_EVP_MD_SIZE), &quot;EVP_MD_size&quot;},
+     {ERR_FUNC(EVP_F_EVP_OPENINIT), &quot;EVP_OpenInit&quot;},
+@@ -133,6 +135,7 @@ static ERR_STRING_DATA EVP_str_reasons[] = {
+     {ERR_REASON(EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE),
+      &quot;operation not supported for this keytype&quot;},
+     {ERR_REASON(EVP_R_OPERATON_NOT_INITIALIZED), &quot;operaton not initialized&quot;},
++    {ERR_REASON(EVP_R_PARTIALLY_OVERLAPPING), &quot;partially overlapping buffers&quot;},
+     {ERR_REASON(EVP_R_PRIVATE_KEY_DECODE_ERROR), &quot;private key decode error&quot;},
+     {ERR_REASON(EVP_R_PRIVATE_KEY_ENCODE_ERROR), &quot;private key encode error&quot;},
+     {ERR_REASON(EVP_R_PUBLIC_KEY_NOT_RSA), &quot;public key not rsa&quot;},
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index 10e048a..3671bd0 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -1459,8 +1459,10 @@ int ERR_load_EVP_strings(void);
+ # define EVP_F_EVP_CIPHER_CTX_CTRL                        124
+ # define EVP_F_EVP_CIPHER_CTX_SET_KEY_LENGTH              122
+ # define EVP_F_EVP_DECRYPTFINAL_EX                        101
++# define EVP_F_EVP_DECRYPTUPDATE                          166
+ # define EVP_F_EVP_DIGESTINIT_EX                          128
+ # define EVP_F_EVP_ENCRYPTFINAL_EX                        127
++# define EVP_F_EVP_ENCRYPTUPDATE                          167
+ # define EVP_F_EVP_MD_CTX_COPY_EX                         110
+ # define EVP_F_EVP_MD_SIZE                                162
+ # define EVP_F_EVP_OPENINIT                               102
+@@ -1551,6 +1553,7 @@ int ERR_load_EVP_strings(void);
+ # define EVP_R_NO_OPERATION_SET                           149
+ # define EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE   150
+ # define EVP_R_OPERATON_NOT_INITIALIZED                   151
++# define EVP_R_PARTIALLY_OVERLAPPING                      162
+ # define EVP_R_PRIVATE_KEY_DECODE_ERROR                   145
+ # define EVP_R_PRIVATE_KEY_ENCODE_ERROR                   146
+ # define EVP_R_PUBLIC_KEY_NOT_RSA                         106
+diff --git a/test/smcont.txt b/test/smcont.txt
+index e837c0b..9b09746 100644
+--- a/test/smcont.txt
++++ b/test/smcont.txt
+@@ -1 +1 @@
+-Some test content for OpenSSL CMS
+\ No newline at end of file
++Somewhat longer test content for OpenSSL CMS utility to handle, and a bit longer...
+\ No newline at end of file
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009382.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009386.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9385">[ date ]</a>
+              <a href="thread.html#9385">[ thread ]</a>
+              <a href="subject.html#9385">[ subject ]</a>
+              <a href="author.html#9385">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,297 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1618309787.325505.3572.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033847.html">
+   <LINK REL="Next"  HREF="033853.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1618309787.325505.3572.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Tue Apr 13 10:29:47 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033847.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033853.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33848">[ date ]</a>
+              <a href="thread.html#33848">[ thread ]</a>
+              <a href="subject.html#33848">[ subject ]</a>
+              <a href="author.html#33848">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  feba11cf2ea1dee9cc6e30bf5953404c9c2c88c6 (commit)
+      from  3ab736acb89c277bd174f958591c65c66d611c72 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit feba11cf2ea1dee9cc6e30bf5953404c9c2c88c6
+Author: Todd Short &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tshort at akamai.com</A>&gt;
+Date:   Mon Mar 22 12:56:36 2021 -0400
+
+    Handle set_alpn_protos inputs better.
+    
+    It's possible to set an invalid protocol list that will be sent in a
+    ClientHello. This validates the inputs to make sure this does not
+    happen.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14815">https://github.com/openssl/openssl/pull/14815</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c          | 49 +++++++++++++++++++++++++++++-----
+ test/clienthellotest.c | 12 ++++++---
+ test/sslapitest.c      | 72 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 124 insertions(+), 9 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index c4394cf9e2..3d0f309fd2 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -2985,6 +2985,19 @@ void SSL_CTX_set_npn_select_cb(SSL_CTX *ctx,
+ }
+ #endif
+ 
++static int alpn_value_ok(const unsigned char *protos, unsigned int protos_len)
++{
++    unsigned int idx;
++
++    if (protos_len &lt; 2 || protos == NULL)
++        return 0;
++
++    for (idx = 0; idx &lt; protos_len; idx += protos[idx] + 1) {
++        if (protos[idx] == 0)
++            return 0;
++    }
++    return idx == protos_len;
++}
+ /*
+  * SSL_CTX_set_alpn_protos sets the ALPN protocol list on |ctx| to |protos|.
+  * |protos| must be in wire-format (i.e. a series of non-empty, 8-bit
+@@ -2993,13 +3006,25 @@ void SSL_CTX_set_npn_select_cb(SSL_CTX *ctx,
+ int SSL_CTX_set_alpn_protos(SSL_CTX *ctx, const unsigned char *protos,
+                             unsigned int protos_len)
+ {
+-    OPENSSL_free(ctx-&gt;ext.alpn);
+-    ctx-&gt;ext.alpn = OPENSSL_memdup(protos, protos_len);
+-    if (ctx-&gt;ext.alpn == NULL) {
++    unsigned char *alpn;
++
++    if (protos_len == 0 || protos == NULL) {
++        OPENSSL_free(ctx-&gt;ext.alpn);
++        ctx-&gt;ext.alpn = NULL;
+         ctx-&gt;ext.alpn_len = 0;
++        return 0;
++    }
++    /* Not valid per RFC */
++    if (!alpn_value_ok(protos, protos_len))
++        return 1;
++
++    alpn = OPENSSL_memdup(protos, protos_len);
++    if (alpn == NULL) {
+         ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE);
+         return 1;
+     }
++    OPENSSL_free(ctx-&gt;ext.alpn);
++    ctx-&gt;ext.alpn = alpn;
+     ctx-&gt;ext.alpn_len = protos_len;
+ 
+     return 0;
+@@ -3013,13 +3038,25 @@ int SSL_CTX_set_alpn_protos(SSL_CTX *ctx, const unsigned char *protos,
+ int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos,
+                         unsigned int protos_len)
+ {
+-    OPENSSL_free(ssl-&gt;ext.alpn);
+-    ssl-&gt;ext.alpn = OPENSSL_memdup(protos, protos_len);
+-    if (ssl-&gt;ext.alpn == NULL) {
++    unsigned char *alpn;
++
++    if (protos_len == 0 || protos == NULL) {
++        OPENSSL_free(ssl-&gt;ext.alpn);
++        ssl-&gt;ext.alpn = NULL;
+         ssl-&gt;ext.alpn_len = 0;
++        return 0;
++    }
++    /* Not valid per RFC */
++    if (!alpn_value_ok(protos, protos_len))
++        return 1;
++
++    alpn = OPENSSL_memdup(protos, protos_len);
++    if (alpn == NULL) {
+         ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE);
+         return 1;
+     }
++    OPENSSL_free(ssl-&gt;ext.alpn);
++    ssl-&gt;ext.alpn = alpn;
+     ssl-&gt;ext.alpn_len = protos_len;
+ 
+     return 0;
+diff --git a/test/clienthellotest.c b/test/clienthellotest.c
+index 2b92395bac..2f6d336dbc 100644
+--- a/test/clienthellotest.c
++++ b/test/clienthellotest.c
+@@ -45,10 +45,16 @@
+ 
+ static const char *sessionfile = NULL;
+ /* Dummy ALPN protocols used to pad out the size of the ClientHello */
++/* ASCII 'O' = 79 = 0x4F = EBCDIC '|'*/
++#ifdef CHARSET_EBCDIC
+ static const char alpn_prots[] =
+-    &quot;0123456789012345678901234567890123456789012345678901234567890123456789&quot;
+-    &quot;0123456789012345678901234567890123456789012345678901234567890123456789&quot;
+-    &quot;01234567890123456789&quot;;
++    &quot;|1234567890123456789012345678901234567890123456789012345678901234567890123456789&quot;
++    &quot;|1234567890123456789012345678901234567890123456789012345678901234567890123456789&quot;;
++#else
++static const char alpn_prots[] =
++    &quot;O1234567890123456789012345678901234567890123456789012345678901234567890123456789&quot;
++    &quot;O1234567890123456789012345678901234567890123456789012345678901234567890123456789&quot;;
++#endif
+ 
+ static int test_client_hello(int currtest)
+ {
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index 624c7967da..4625d34046 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -8616,6 +8616,77 @@ end:
+     return testresult;
+ }
+ #endif
++/*
++ * Test that setting an ALPN does not violate RFC
++ */
++static int test_set_alpn(void)
++{
++    SSL_CTX *ctx = NULL;
++    SSL *ssl = NULL;
++    int testresult = 0;
++
++    unsigned char bad0[] = { 0x00, 'b', 'a', 'd' };
++    unsigned char good[] = { 0x04, 'g', 'o', 'o', 'd' };
++    unsigned char bad1[] = { 0x01, 'b', 'a', 'd' };
++    unsigned char bad2[] = { 0x03, 'b', 'a', 'd', 0x00};
++    unsigned char bad3[] = { 0x03, 'b', 'a', 'd', 0x01, 'b', 'a', 'd'};
++    unsigned char bad4[] = { 0x03, 'b', 'a', 'd', 0x06, 'b', 'a', 'd'};
++
++    /* Create an initial SSL_CTX with no certificate configured */
++    ctx = SSL_CTX_new_ex(libctx, NULL, TLS_server_method());
++    if (!TEST_ptr(ctx))
++        goto end;
++
++    /* the set_alpn functions return 0 (false) on success, non-zero (true) on failure */
++    if (!TEST_false(SSL_CTX_set_alpn_protos(ctx, NULL, 2)))
++        goto end;
++    if (!TEST_false(SSL_CTX_set_alpn_protos(ctx, good, 0)))
++        goto end;
++    if (!TEST_false(SSL_CTX_set_alpn_protos(ctx, good, sizeof(good))))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, good, 1)))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, bad0, sizeof(bad0))))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, bad1, sizeof(bad1))))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, bad2, sizeof(bad2))))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, bad3, sizeof(bad3))))
++        goto end;
++    if (!TEST_true(SSL_CTX_set_alpn_protos(ctx, bad4, sizeof(bad4))))
++        goto end;
++
++    ssl = SSL_new(ctx);
++    if (!TEST_ptr(ssl))
++        goto end;
++
++    if (!TEST_false(SSL_set_alpn_protos(ssl, NULL, 2)))
++        goto end;
++    if (!TEST_false(SSL_set_alpn_protos(ssl, good, 0)))
++        goto end;
++    if (!TEST_false(SSL_set_alpn_protos(ssl, good, sizeof(good))))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, good, 1)))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, bad0, sizeof(bad0))))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, bad1, sizeof(bad1))))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, bad2, sizeof(bad2))))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, bad3, sizeof(bad3))))
++        goto end;
++    if (!TEST_true(SSL_set_alpn_protos(ssl, bad4, sizeof(bad4))))
++        goto end;
++
++    testresult = 1;
++
++end:
++    SSL_free(ssl);
++    SSL_CTX_free(ctx);
++    return testresult;
++}
+ 
+ static int test_inherit_verify_param(void)
+ {
+@@ -8908,6 +8979,7 @@ int setup_tests(void)
+     ADD_TEST(test_sni_tls13);
+ #endif
+     ADD_TEST(test_inherit_verify_param);
++    ADD_TEST(test_set_alpn);
+     return 1;
+ 
+  err:
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033847.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033853.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33848">[ date ]</a>
+              <a href="thread.html#33848">[ thread ]</a>
+              <a href="subject.html#33848">[ subject ]</a>
+              <a href="author.html#33848">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

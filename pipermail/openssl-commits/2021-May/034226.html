@@ -1,0 +1,610 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620905434.866569.4087.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034225.html">
+   <LINK REL="Next"  HREF="034228.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620905434.866569.4087.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Thu May 13 11:30:34 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034225.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034228.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34226">[ date ]</a>
+              <a href="thread.html#34226">[ thread ]</a>
+              <a href="subject.html#34226">[ subject ]</a>
+              <a href="author.html#34226">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7bc027d73bc51cfa0ae23fbfd91134be9464d694 (commit)
+       via  b4c4a2c68817ea0b2df8012673fa4e0712681704 (commit)
+      from  e9fe0f7e9df7e0909ca52a024b889e48616a29d9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7bc027d73bc51cfa0ae23fbfd91134be9464d694
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Tue Apr 27 18:12:15 2021 +0200
+
+    Fallback to legacy pem decoding if OSSL_DECODER fails
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15045">https://github.com/openssl/openssl/pull/15045</A>)
+
+commit b4c4a2c68817ea0b2df8012673fa4e0712681704
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Tue Apr 27 16:01:13 2021 +0200
+
+    Implement pem_read_key directly through OSSL_DECODER
+    
+    Using OSSL_STORE is too heavy and breaks things.
+    
+    There were also needed various fixes mainly for missing proper
+    handling of the SM2 keys in the OSSL_DECODER.
+    
+    Fixes #14788
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15045">https://github.com/openssl/openssl/pull/15045</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_asn1.c                           |   7 +
+ crypto/ec/ec_key.c                            |   3 +
+ crypto/pem/pem_pkey.c                         | 232 +++++++++++++++++++-------
+ crypto/x509/x_pubkey.c                        |   4 +-
+ providers/fips-sources.checksums              |   6 +-
+ providers/fips.checksum                       |   2 +-
+ providers/implementations/keymgmt/ec_kmgmt.c  |   8 +-
+ providers/implementations/keymgmt/rsa_kmgmt.c |   4 +-
+ test/evp_extra_test2.c                        |   9 +-
+ test/sslapitest.c                             |  30 ++--
+ 10 files changed, 221 insertions(+), 84 deletions(-)
+
+diff --git a/crypto/ec/ec_asn1.c b/crypto/ec/ec_asn1.c
+index ed30d1b3a9..0e37b21ac3 100644
+--- a/crypto/ec/ec_asn1.c
++++ b/crypto/ec/ec_asn1.c
+@@ -965,6 +965,9 @@ EC_KEY *d2i_ECPrivateKey(EC_KEY **a, const unsigned char **in, long len)
+         goto err;
+     }
+ 
++    if (EC_GROUP_get_curve_name(ret-&gt;group) == NID_sm2)
++        EC_KEY_set_flags(ret, EC_FLAG_SM2_RANGE);
++
+     EC_POINT_clear_free(ret-&gt;pub_key);
+     ret-&gt;pub_key = EC_POINT_new(ret-&gt;group);
+     if (ret-&gt;pub_key == NULL) {
+@@ -1109,6 +1112,10 @@ EC_KEY *d2i_ECParameters(EC_KEY **a, const unsigned char **in, long len)
+             ret-&gt;dirty_cnt++;
+         return NULL;
+     }
++
++    if (EC_GROUP_get_curve_name(ret-&gt;group) == NID_sm2)
++        EC_KEY_set_flags(ret, EC_FLAG_SM2_RANGE);
++
+     ret-&gt;dirty_cnt++;
+ 
+     if (a)
+diff --git a/crypto/ec/ec_key.c b/crypto/ec/ec_key.c
+index f06715fa6b..ea2bad3e26 100644
+--- a/crypto/ec/ec_key.c
++++ b/crypto/ec/ec_key.c
+@@ -678,6 +678,9 @@ int EC_KEY_set_group(EC_KEY *key, const EC_GROUP *group)
+         return 0;
+     EC_GROUP_free(key-&gt;group);
+     key-&gt;group = EC_GROUP_dup(group);
++    if (key-&gt;group != NULL &amp;&amp; EC_GROUP_get_curve_name(key-&gt;group) == NID_sm2)
++        EC_KEY_set_flags(key, EC_FLAG_SM2_RANGE);
++
+     key-&gt;dirty_cnt++;
+     return (key-&gt;group == NULL) ? 0 : 1;
+ }
+diff --git a/crypto/pem/pem_pkey.c b/crypto/pem/pem_pkey.c
+index 3faca8d0ec..3f0a9e4fef 100644
+--- a/crypto/pem/pem_pkey.c
++++ b/crypto/pem/pem_pkey.c
+@@ -7,7 +7,7 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-/* We need to use some STORE deprecated APIs */
++/* We need to use some deprecated APIs */
+ #define OPENSSL_SUPPRESS_DEPRECATED
+ 
+ #include &lt;stdio.h&gt;
+@@ -20,82 +20,198 @@
+ #include &lt;openssl/pem.h&gt;
+ #include &lt;openssl/engine.h&gt;
+ #include &lt;openssl/dh.h&gt;
+-#include &lt;openssl/store.h&gt;
++#include &lt;openssl/decoder.h&gt;
+ #include &lt;openssl/ui.h&gt;
+-#include &quot;crypto/store.h&quot;
+ #include &quot;crypto/asn1.h&quot;
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;pem_local.h&quot;
+ 
+ int ossl_pem_check_suffix(const char *pem_str, const char *suffix);
+ 
+-static EVP_PKEY *pem_read_bio_key(BIO *bp, EVP_PKEY **x,
+-                                  pem_password_cb *cb, void *u,
+-                                  OSSL_LIB_CTX *libctx, const char *propq,
+-                                  int expected_store_info_type,
+-                                  int try_secure)
++static EVP_PKEY *pem_read_bio_key_decoder(BIO *bp, EVP_PKEY **x,
++                                          pem_password_cb *cb, void *u,
++                                          OSSL_LIB_CTX *libctx,
++                                          const char *propq,
++                                          int selection)
+ {
+-    EVP_PKEY *ret = NULL;
+-    OSSL_STORE_CTX *ctx = NULL;
+-    OSSL_STORE_INFO *info = NULL;
+-    const UI_METHOD *ui_method = NULL;
+-    UI_METHOD *allocated_ui_method = NULL;
+-
+-    if (expected_store_info_type != OSSL_STORE_INFO_PKEY
+-        &amp;&amp; expected_store_info_type != OSSL_STORE_INFO_PUBKEY
+-        &amp;&amp; expected_store_info_type != OSSL_STORE_INFO_PARAMS) {
+-        ERR_raise(ERR_LIB_PEM, ERR_R_PASSED_INVALID_ARGUMENT);
++    EVP_PKEY *pkey = NULL;
++    OSSL_DECODER_CTX *dctx = NULL;
++
++    dctx = OSSL_DECODER_CTX_new_for_pkey(&amp;pkey, &quot;PEM&quot;, NULL, NULL,
++                                         selection, libctx, propq);
++
++    if (dctx == NULL)
+         return NULL;
+-    }
+ 
+     if (cb == NULL)
+         cb = PEM_def_callback;
+-    ui_method = allocated_ui_method = UI_UTIL_wrap_read_pem_callback(cb, 0);
+-    if (ui_method == NULL)
+-        return NULL;
+ 
+-    if ((ctx = OSSL_STORE_attach(bp, &quot;file&quot;, libctx, propq, ui_method, u,
+-                                 NULL, NULL, NULL)) == NULL)
++    if (!OSSL_DECODER_CTX_set_pem_password_cb(dctx, cb, u))
+         goto err;
+-#ifndef OPENSSL_NO_SECURE_HEAP
+-# ifndef OPENSSL_NO_DEPRECATED_3_0
+-    if (try_secure) {
+-        int on = 1;
+-        if (!OSSL_STORE_ctrl(ctx, OSSL_STORE_C_USE_SECMEM, &amp;on))
++
++    while (!OSSL_DECODER_from_bio(dctx, bp) || pkey == NULL)
++        if (BIO_eof(bp) != 0)
+             goto err;
+-    }
+-# endif
+-#endif
+ 
+-    if (!OSSL_STORE_expect(ctx, expected_store_info_type))
++    if (!evp_keymgmt_util_has(pkey, selection)) {
++        EVP_PKEY_free(pkey);
++        pkey = NULL;
++        ERR_raise(ERR_LIB_PEM, PEM_R_UNSUPPORTED_KEY_COMPONENTS);
+         goto err;
++    }
+ 
+-    while (!OSSL_STORE_eof(ctx)
+-           &amp;&amp; (info = OSSL_STORE_load(ctx)) != NULL) {
+-        if (OSSL_STORE_INFO_get_type(info) == expected_store_info_type) {
+-            switch (expected_store_info_type) {
+-            case OSSL_STORE_INFO_PKEY:
+-                ret = OSSL_STORE_INFO_get1_PKEY(info);
+-                break;
+-            case OSSL_STORE_INFO_PUBKEY:
+-                ret = OSSL_STORE_INFO_get1_PUBKEY(info);
+-                break;
+-            case OSSL_STORE_INFO_PARAMS:
+-                ret = OSSL_STORE_INFO_get1_PARAMS(info);
+-                break;
+-            }
+-        }
+-        OSSL_STORE_INFO_free(info);
+-        info = NULL;
++    if (x != NULL) {
++        EVP_PKEY_free(*x);
++        *x = pkey;
+     }
+ 
+-    if (ret != NULL &amp;&amp; x != NULL)
+-        *x = ret;
++ err:
++    OSSL_DECODER_CTX_free(dctx);
++    return pkey;
++}
++
++static EVP_PKEY *pem_read_bio_key_legacy(BIO *bp, EVP_PKEY **x,
++                                         pem_password_cb *cb, void *u,
++                                         OSSL_LIB_CTX *libctx,
++                                         const char *propq,
++                                         int selection)
++{
++    char *nm = NULL;
++    const unsigned char *p = NULL;
++    unsigned char *data = NULL;
++    long len;
++    int slen;
++    EVP_PKEY *ret = NULL;
+ 
++    ERR_set_mark();  /* not interested in PEM read errors */
++    if (selection &amp; OSSL_KEYMGMT_SELECT_PRIVATE_KEY) {
++        if (!PEM_bytes_read_bio_secmem(&amp;data, &amp;len, &amp;nm,
++                                       PEM_STRING_EVP_PKEY,
++                                       bp, cb, u)) {
++            ERR_pop_to_mark();
++            return NULL;
++         }
++    } else {
++        const char *pem_string = PEM_STRING_PARAMETERS;
++
++        if (selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY)
++            pem_string = PEM_STRING_PUBLIC;
++        if (!PEM_bytes_read_bio(&amp;data, &amp;len, &amp;nm,
++                                pem_string,
++                                bp, cb, u)) {
++            ERR_pop_to_mark();
++            return NULL;
++        }
++    }
++    ERR_clear_last_mark();
++    p = data;
++
++    if (strcmp(nm, PEM_STRING_PKCS8INF) == 0) {
++        PKCS8_PRIV_KEY_INFO *p8inf;
++
++        if ((p8inf = d2i_PKCS8_PRIV_KEY_INFO(NULL, &amp;p, len)) == NULL)
++            goto p8err;
++        ret = evp_pkcs82pkey_legacy(p8inf, libctx, propq);
++        if (x != NULL) {
++            EVP_PKEY_free(*x);
++            *x = ret;
++        }
++        PKCS8_PRIV_KEY_INFO_free(p8inf);
++    } else if (strcmp(nm, PEM_STRING_PKCS8) == 0) {
++        PKCS8_PRIV_KEY_INFO *p8inf;
++        X509_SIG *p8;
++        int klen;
++        char psbuf[PEM_BUFSIZE];
++
++        if ((p8 = d2i_X509_SIG(NULL, &amp;p, len)) == NULL)
++            goto p8err;
++        if (cb != NULL)
++            klen = cb(psbuf, PEM_BUFSIZE, 0, u);
++        else
++            klen = PEM_def_callback(psbuf, PEM_BUFSIZE, 0, u);
++        if (klen &lt; 0) {
++            ERR_raise(ERR_LIB_PEM, PEM_R_BAD_PASSWORD_READ);
++            X509_SIG_free(p8);
++            goto err;
++        }
++        p8inf = PKCS8_decrypt(p8, psbuf, klen);
++        X509_SIG_free(p8);
++        OPENSSL_cleanse(psbuf, klen);
++        if (p8inf == NULL)
++            goto p8err;
++        ret = evp_pkcs82pkey_legacy(p8inf, libctx, propq);
++        if (x != NULL) {
++            EVP_PKEY_free(*x);
++            *x = ret;
++        }
++        PKCS8_PRIV_KEY_INFO_free(p8inf);
++    } else if ((slen = ossl_pem_check_suffix(nm, &quot;PRIVATE KEY&quot;)) &gt; 0) {
++        const EVP_PKEY_ASN1_METHOD *ameth;
++        ameth = EVP_PKEY_asn1_find_str(NULL, nm, slen);
++        if (ameth == NULL || ameth-&gt;old_priv_decode == NULL)
++            goto p8err;
++        ret = d2i_PrivateKey(ameth-&gt;pkey_id, x, &amp;p, len);
++    } else if (selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY) {
++        ret = d2i_PUBKEY(x, &amp;p, len);
++    } else if ((slen = ossl_pem_check_suffix(nm, &quot;PARAMETERS&quot;)) &gt; 0) {
++        ret = EVP_PKEY_new();
++        if (ret == NULL)
++            goto err;
++        if (!EVP_PKEY_set_type_str(ret, nm, slen)
++            || !ret-&gt;ameth-&gt;param_decode
++            || !ret-&gt;ameth-&gt;param_decode(ret, &amp;p, len)) {
++            EVP_PKEY_free(ret);
++            ret = NULL;
++            goto err;
++        }
++        if (x) {
++            EVP_PKEY_free(*x);
++            *x = ret;
++        }
++    }
++
++ p8err:
++    if (ret == NULL)
++        ERR_raise(ERR_LIB_PEM, ERR_R_ASN1_LIB);
+  err:
+-    OSSL_STORE_close(ctx);
+-    UI_destroy_method(allocated_ui_method);
+-    OSSL_STORE_INFO_free(info);
++    OPENSSL_secure_free(nm);
++    OPENSSL_secure_clear_free(data, len);
++    return ret;
++}
++
++static EVP_PKEY *pem_read_bio_key(BIO *bp, EVP_PKEY **x,
++                                  pem_password_cb *cb, void *u,
++                                  OSSL_LIB_CTX *libctx,
++                                  const char *propq,
++                                  int selection)
++{
++    EVP_PKEY *ret;
++    BIO *new_bio = NULL;
++    int pos;
++
++    if ((pos = BIO_tell(bp)) &lt; 0) {
++        new_bio = BIO_new(BIO_f_readbuffer());
++        if (new_bio == NULL)
++            return NULL;
++        bp = BIO_push(new_bio, bp);
++        pos = BIO_tell(bp);
++    }
++
++    ERR_set_mark();
++    ret = pem_read_bio_key_decoder(bp, x, cb, u, libctx, propq, selection);
++    if (ret == NULL
++        &amp;&amp; (BIO_seek(bp, pos) &lt; 0
++            || (ret = pem_read_bio_key_legacy(bp, x, cb, u,
++                                              libctx, propq,
++                                              selection)) == NULL))
++        ERR_clear_last_mark();
++    else
++        ERR_pop_to_mark();
++
++    if (new_bio != NULL) {
++        BIO_pop(new_bio);
++        BIO_free(new_bio);
++    }
+     return ret;
+ }
+ 
+@@ -104,7 +220,7 @@ EVP_PKEY *PEM_read_bio_PUBKEY_ex(BIO *bp, EVP_PKEY **x,
+                                  OSSL_LIB_CTX *libctx, const char *propq)
+ {
+     return pem_read_bio_key(bp, x, cb, u, libctx, propq,
+-                            OSSL_STORE_INFO_PUBKEY, 0);
++                            EVP_PKEY_PUBLIC_KEY);
+ }
+ 
+ EVP_PKEY *PEM_read_bio_PUBKEY(BIO *bp, EVP_PKEY **x, pem_password_cb *cb,
+@@ -142,7 +258,7 @@ EVP_PKEY *PEM_read_bio_PrivateKey_ex(BIO *bp, EVP_PKEY **x,
+                                      OSSL_LIB_CTX *libctx, const char *propq)
+ {
+     return pem_read_bio_key(bp, x, cb, u, libctx, propq,
+-                            OSSL_STORE_INFO_PKEY, 1);
++                            EVP_PKEY_KEYPAIR);
+ }
+ 
+ EVP_PKEY *PEM_read_bio_PrivateKey(BIO *bp, EVP_PKEY **x, pem_password_cb *cb,
+@@ -207,7 +323,7 @@ EVP_PKEY *PEM_read_bio_Parameters_ex(BIO *bp, EVP_PKEY **x,
+                                      OSSL_LIB_CTX *libctx, const char *propq)
+ {
+     return pem_read_bio_key(bp, x, NULL, NULL, libctx, propq,
+-                            OSSL_STORE_INFO_PARAMS, 0);
++                            EVP_PKEY_KEY_PARAMETERS);
+ }
+ 
+ EVP_PKEY *PEM_read_bio_Parameters(BIO *bp, EVP_PKEY **x)
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index 9b846a8bc2..966a1a534b 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -678,12 +678,14 @@ EC_KEY *d2i_EC_PUBKEY(EC_KEY **a, const unsigned char **pp, long length)
+     EVP_PKEY *pkey;
+     EC_KEY *key = NULL;
+     const unsigned char *q;
++    int type;
+ 
+     q = *pp;
+     pkey = d2i_PUBKEY_legacy(NULL, &amp;q, length);
+     if (pkey == NULL)
+         return NULL;
+-    if (EVP_PKEY_id(pkey) == EVP_PKEY_EC)
++    type = EVP_PKEY_id(pkey);
++    if (type == EVP_PKEY_EC || type == EVP_PKEY_SM2)
+         key = EVP_PKEY_get1_EC_KEY(pkey);
+     EVP_PKEY_free(pkey);
+     if (key == NULL)
+diff --git a/providers/fips-sources.checksums b/providers/fips-sources.checksums
+index 57c66af718..872759e0c7 100644
+--- a/providers/fips-sources.checksums
++++ b/providers/fips-sources.checksums
+@@ -147,7 +147,7 @@ d4969259e4fa5b71d8abbf5e736e658bd1daad6e46d272a9b88e190e2de96b61  crypto/ec/curv
+ 86e2becf9b3870979e2abefa1bd318e1a31820d275e2b50e03b17fc287abb20a  crypto/ec/ec_check.c
+ 845a5e6ad6921aed63a18084d6b64a1907e4cb093639153ba32138e0b29ff0e5  crypto/ec/ec_curve.c
+ 8cfd0dcfb5acbf6105691a2d5e2826dba1ff3906707bc9dd6ff9bffcc306468f  crypto/ec/ec_cvt.c
+-2103bb62699b1a0ca4e3f75bd1697d856a9afd7f0051d49e433cf69d62d53e2a  crypto/ec/ec_key.c
++5485a66d4251bc2f044e4d91f6a6b5068957c3b685237bf96a4b45e9c737420c  crypto/ec/ec_key.c
+ 7b34605e017eb81037344538f917c32d3ab85c744a819617e012bab73c27dd68  crypto/ec/ec_kmeth.c
+ 90f070e5a7ea950e6fe88ed81c72161c58a4896efb4608076061e1fe12908908  crypto/ec/ec_lib.c
+ 58aa89c186c9bb6a5075a1d961723fe1fc97c6e290756ae682fe494c4f2435a0  crypto/ec/ec_mult.c
+@@ -323,7 +323,7 @@ d447cd774869da68a2cc0bbb19c547ee6ed4858c7aee1f3d5bba7796f97823a9  providers/comm
+ eec462d685dd3b4764b076a3c18ecd9dd254350a0b78ddc2f8a60587829e1ce3  providers/common/provider_util.c
+ ce6731be4da709c753bd2c04e88d51d567c955c651e7575bb1410968e6c7620e  providers/common/securitycheck.c
+ 50a0e01e877ae818cf874f4515a130db0e869d4e9e8ce882bff1255695aba789  providers/common/securitycheck_fips.c
+-5c31ba4eedb31e2509288be50280e0df58faa86fe4b5e99a1167a53fd6f3bd0f  providers/fips/fipsprov.c
++ff2d14b053ecad3a2bc42e2b4a54fe2bbb62fd6068d090dde4d68ae0e14a1a1d  providers/fips/fipsprov.c
+ c69e60c29711d55cd5672dab9ff051f3c093d54e63a0ec575baa899e6bbf9c2b  providers/fips/self_test.c
+ fb56f801613642f6b497803890b528a643024e3cdb5bd5dd619a2981afb2f3b0  providers/fips/self_test_kats.c
+ 08b287621158afb67e61e52fc34efbb9f9fe22ee6709c7ed6c937d5feb2b7fd8  providers/implementations/asymciphers/rsa_enc.c
+@@ -375,7 +375,7 @@ a5b4ddffa137a52f6a0a0c0c28c618d9bff00af2ec49e51885fc7af116e04869  providers/impl
+ 1a6b7e37229e81eae3981ab2e0b7669eb24aaa6487738c4b44a970da212560b6  providers/implementations/keymgmt/ecx_kmgmt.c
+ 053a2be39a87f50b877ebdbbf799cf5faf8b2de33b04311d819d212ee1ea329b  providers/implementations/keymgmt/kdf_legacy_kmgmt.c
+ 21b259d6a9eb5e319106012179e04963fb9659ed85af37f5c9c8752ec2385dae  providers/implementations/keymgmt/mac_legacy_kmgmt.c
+-c48eb00f0de1c28baaa3cf7c0e85d4d2a20592783aa545f8934da487c05a3e87  providers/implementations/keymgmt/rsa_kmgmt.c
++adb3672738af90c3f5829c77abe95af2862b13a7cb1679aac4edc9c704cbdef7  providers/implementations/keymgmt/rsa_kmgmt.c
+ 25d20ceb61cadb495ec890ae2c49c5c1c840b39ac77f20058ee87249cab341ef  providers/implementations/macs/cmac_prov.c
+ f51b074d55028d3e24656da348d21ca79f6680fdb30383d936251f1b3467caab  providers/implementations/macs/gmac_prov.c
+ 35505704fda658c0911f95974913c1f2dd75c8f91c5d2ec597c70c52624bdfdf  providers/implementations/macs/hmac_prov.c
+diff --git a/providers/fips.checksum b/providers/fips.checksum
+index 83fe30d81c..3054d8e19f 100644
+--- a/providers/fips.checksum
++++ b/providers/fips.checksum
+@@ -1 +1 @@
+-3ea8c9568047f0cf5ca79b8de0b7d4daa76044baa6bfe25a22a7bbfe13186f7c  providers/fips-sources.checksums
++b3dca5cc989c42b9e46c0e0b1738ff17b51ce825f0b87ae13b8f609a0840978f  providers/fips-sources.checksums
+diff --git a/providers/implementations/keymgmt/ec_kmgmt.c b/providers/implementations/keymgmt/ec_kmgmt.c
+index f563d920c4..2673619ef4 100644
+--- a/providers/implementations/keymgmt/ec_kmgmt.c
++++ b/providers/implementations/keymgmt/ec_kmgmt.c
+@@ -1288,14 +1288,8 @@ static void *sm2_gen(void *genctx, OSSL_CALLBACK *osslcb, void *cbarg)
+     ret = ec_gen_assign_group(ec, gctx-&gt;gen_group);
+ 
+     /* Whether you want it or not, you get a keypair, not just one half */
+-    if ((gctx-&gt;selection &amp; OSSL_KEYMGMT_SELECT_KEYPAIR) != 0) {
+-        /*
+-         * For SM2, we need a new flag to indicate the 'generate' function
+-         * to use a new range
+-         */
+-        EC_KEY_set_flags(ec, EC_FLAG_SM2_RANGE);
++    if ((gctx-&gt;selection &amp; OSSL_KEYMGMT_SELECT_KEYPAIR) != 0)
+         ret = ret &amp;&amp; EC_KEY_generate_key(ec);
+-    }
+ 
+     if (ret)
+         return ec;
+diff --git a/providers/implementations/keymgmt/rsa_kmgmt.c b/providers/implementations/keymgmt/rsa_kmgmt.c
+index a075c54487..34871629ba 100644
+--- a/providers/implementations/keymgmt/rsa_kmgmt.c
++++ b/providers/implementations/keymgmt/rsa_kmgmt.c
+@@ -122,9 +122,7 @@ static int rsa_has(const void *keydata, int selection)
+     if ((selection &amp; RSA_POSSIBLE_SELECTIONS) == 0)
+         return 1; /* the selection is not missing */
+ 
+-    if ((selection &amp; OSSL_KEYMGMT_SELECT_OTHER_PARAMETERS) != 0)
+-        /* This will change with OAEP */
+-        ok = ok &amp;&amp; (RSA_test_flags(rsa, RSA_FLAG_TYPE_RSASSAPSS) != 0);
++    /* OSSL_KEYMGMT_SELECT_OTHER_PARAMETERS are always available even if empty */
+     if ((selection &amp; OSSL_KEYMGMT_SELECT_KEYPAIR) != 0)
+         ok = ok &amp;&amp; (RSA_get0_e(rsa) != NULL);
+     if ((selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0)
+diff --git a/test/evp_extra_test2.c b/test/evp_extra_test2.c
+index d9d26711ba..cad1934c5b 100644
+--- a/test/evp_extra_test2.c
++++ b/test/evp_extra_test2.c
+@@ -371,10 +371,17 @@ static int test_d2i_PrivateKey_ex(void) {
+     provider = OSSL_PROVIDER_load(NULL, &quot;default&quot;);
+     key_bio = BIO_new_mem_buf((&amp;keydata[0])-&gt;kder, (&amp;keydata)[0]-&gt;size);
+ 
+-    ok = TEST_ptr(pkey = PEM_read_bio_PrivateKey(key_bio, NULL, NULL, NULL));
++    if (!TEST_ptr_null(pkey = PEM_read_bio_PrivateKey(key_bio, NULL, NULL, NULL)))
++        goto err;
++
++    ERR_clear_error();
++    if (!TEST_int_ge(BIO_seek(key_bio, 0), 0))
++        goto err;
++    ok = TEST_ptr(pkey = d2i_PrivateKey_bio(key_bio, NULL));
+     TEST_int_eq(ERR_peek_error(), 0);
+     test_openssl_errors();
+ 
++ err:
+     EVP_PKEY_free(pkey);
+     BIO_free(key_bio);
+     OSSL_PROVIDER_unload(provider);
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index d4c8bf4d38..ad83491573 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -8102,12 +8102,21 @@ static int test_sigalgs_available(int idx)
+     if (!TEST_ptr(cctx) || !TEST_ptr(sctx))
+         goto end;
+ 
+-    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+-                                       TLS_client_method(),
+-                                       TLS1_VERSION,
+-                                       0,
+-                                       &amp;sctx, &amp;cctx, cert, privkey)))
+-        goto end;
++    if (idx != 5) {
++        if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
++                                           TLS_client_method(),
++                                           TLS1_VERSION,
++                                           0,
++                                           &amp;sctx, &amp;cctx, cert, privkey)))
++            goto end;
++    } else {
++        if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
++                                           TLS_client_method(),
++                                           TLS1_VERSION,
++                                           0,
++                                           &amp;sctx, &amp;cctx, cert2, privkey2)))
++            goto end;
++    }
+ 
+     /* Ensure we only use TLSv1.2 ciphersuites based on SHA256 */
+     if (idx &lt; 4) {
+@@ -8135,16 +8144,17 @@ static int test_sigalgs_available(int idx)
+             goto end;
+     }
+ 
+-    if (!TEST_int_eq(SSL_CTX_use_certificate_file(sctx, cert2,
+-                                                  SSL_FILETYPE_PEM), 1)
++    if (idx != 5
++        &amp;&amp; (!TEST_int_eq(SSL_CTX_use_certificate_file(sctx, cert2,
++                                                      SSL_FILETYPE_PEM), 1)
+             || !TEST_int_eq(SSL_CTX_use_PrivateKey_file(sctx,
+                                                         privkey2,
+                                                         SSL_FILETYPE_PEM), 1)
+-            || !TEST_int_eq(SSL_CTX_check_private_key(sctx), 1))
++            || !TEST_int_eq(SSL_CTX_check_private_key(sctx), 1)))
+         goto end;
+ 
+     if (!TEST_true(create_ssl_objects(sctx, cctx, &amp;serverssl, &amp;clientssl,
+-                                             NULL, NULL)))
++                                      NULL, NULL)))
+         goto end;
+ 
+     if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE)))
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034225.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034228.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34226">[ date ]</a>
+              <a href="thread.html#34226">[ thread ]</a>
+              <a href="subject.html#34226">[ subject ]</a>
+              <a href="author.html#34226">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,150 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1504248614.686106.25402.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016216.html">
+   <LINK REL="Next"  HREF="016223.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1504248614.686106.25402.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Fri Sep  1 06:50:14 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016216.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="016223.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16217">[ date ]</a>
+              <a href="thread.html#16217">[ thread ]</a>
+              <a href="subject.html#16217">[ subject ]</a>
+              <a href="author.html#16217">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6e5a853bda24e8aece325ecf5aa68b8ea832e414 (commit)
+      from  89bc9cf682e833d44fe135c901fe75f600d871ef (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6e5a853bda24e8aece325ecf5aa68b8ea832e414
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Thu Aug 31 01:09:48 2017 +0200
+
+    crypto/cryptlib.c: mask more capability bits upon FXSR bit flip.
+    
+    OPENSSL_ia32cap.pod discusses possibility to disable operations on
+    XMM register bank. This formally means that this flag has to be checked
+    in combination with other flags. But it customarily isn't. But instead
+    of chasing all the cases we can flip more bits together with FXSR one.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4303">https://github.com/openssl/openssl/pull/4303</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/cryptlib.c     | 25 ++++++++++++++++++++-----
+ crypto/modes/gcm128.c |  3 +--
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/crypto/cryptlib.c b/crypto/cryptlib.c
+index 6e45b0d..eb24b27 100644
+--- a/crypto/cryptlib.c
++++ b/crypto/cryptlib.c
+@@ -42,12 +42,24 @@ void OPENSSL_cpuid_setup(void)
+         if (!sscanf(env + off, &quot;%lli&quot;, (long long *)&amp;vec))
+             vec = strtoul(env + off, NULL, 0);
+ #  endif
+-        if (off)
+-            vec = OPENSSL_ia32_cpuid(OPENSSL_ia32cap_P) &amp; ~vec;
+-        else if (env[0] == ':')
++        if (off) {
++            IA32CAP mask = vec;
++            vec = OPENSSL_ia32_cpuid(OPENSSL_ia32cap_P) &amp; ~mask;
++            if (mask &amp; (1&lt;&lt;24)) {
++                /*
++                 * User disables FXSR bit, mask even other capabilities
++                 * that operate exclusively on XMM, so we don't have to
++                 * double-check all the time. We mask PCLMULQDQ, AMD XOP,
++                 * AES-NI and AVX. Formally speaking we don't have to
++                 * do it in x86_64 case, but we can safely assume that
++                 * x86_64 users won't actually flip this flag.
++                 */
++                vec &amp;= ~((IA32CAP)(1&lt;&lt;1|1&lt;&lt;11|1&lt;&lt;25|1&lt;&lt;28) &lt;&lt; 32);
++            }
++        } else if (env[0] == ':') {
+             vec = OPENSSL_ia32_cpuid(OPENSSL_ia32cap_P);
++        }
+ 
+-        OPENSSL_ia32cap_P[2] = 0;
+         if ((env = strchr(env, ':'))) {
+             unsigned int vecx;
+             env++;
+@@ -57,9 +69,12 @@ void OPENSSL_cpuid_setup(void)
+                 OPENSSL_ia32cap_P[2] &amp;= ~vecx;
+             else
+                 OPENSSL_ia32cap_P[2] = vecx;
++        } else {
++            OPENSSL_ia32cap_P[2] = 0;
+         }
+-    } else
++    } else {
+         vec = OPENSSL_ia32_cpuid(OPENSSL_ia32cap_P);
++    }
+ 
+     /*
+      * |(1&lt;&lt;10) sets a reserved bit to signal that variable
+diff --git a/crypto/modes/gcm128.c b/crypto/modes/gcm128.c
+index 7dead28..c3a9259 100644
+--- a/crypto/modes/gcm128.c
++++ b/crypto/modes/gcm128.c
+@@ -747,8 +747,7 @@ void CRYPTO_gcm128_init(GCM128_CONTEXT *ctx, void *key, block128_f block)
+ # endif
+ # if    defined(GHASH_ASM_X86_OR_64)
+ #  if   !defined(GHASH_ASM_X86) || defined(OPENSSL_IA32_SSE2)
+-    if (OPENSSL_ia32cap_P[0] &amp; (1 &lt;&lt; 24) &amp;&amp; /* check FXSR bit */
+-        OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; 1)) { /* check PCLMULQDQ bit */
++    if (OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; 1)) { /* check PCLMULQDQ bit */
+         if (((OPENSSL_ia32cap_P[1] &gt;&gt; 22) &amp; 0x41) == 0x41) { /* AVX+MOVBE */
+             gcm_init_avx(ctx-&gt;Htable, ctx-&gt;H.u);
+             ctx-&gt;gmult = gcm_gmult_avx;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016216.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="016223.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16217">[ date ]</a>
+              <a href="thread.html#16217">[ thread ]</a>
+              <a href="subject.html#16217">[ subject ]</a>
+              <a href="author.html#16217">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

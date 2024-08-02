@@ -1,0 +1,883 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1615630606.578388.6572.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033425.html">
+   <LINK REL="Next"  HREF="033428.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1615630606.578388.6572.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Sat Mar 13 10:16:46 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033425.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033428.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33427">[ date ]</a>
+              <a href="thread.html#33427">[ thread ]</a>
+              <a href="subject.html#33427">[ subject ]</a>
+              <a href="author.html#33427">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  f62846b703d163265176fe960ec7d087b4c3fa96 (commit)
+       via  c89fd035d54f8c80cd0bbd26b9a90fcff385cbb5 (commit)
+      from  234261f3a1a4fc88d51fde2007852c0a45e7ce8a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit f62846b703d163265176fe960ec7d087b4c3fa96
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Wed Mar 10 17:27:13 2021 +0100
+
+    apps/ts.c: Allow -untrusted arg to refer to multiple sources
+    
+    This requires moving generally useful functions from apps/cmp.c to apps/lib/apps.c
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14504">https://github.com/openssl/openssl/pull/14504</A>)
+
+commit c89fd035d54f8c80cd0bbd26b9a90fcff385cbb5
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Wed Mar 10 17:21:37 2021 +0100
+
+    TS ESS: Let TS_RESP_verify_signature() make use of untrusted certs also from token response
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14504">https://github.com/openssl/openssl/pull/14504</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/cmp.c                 | 174 +++------------------------------------------
+ apps/include/apps.h        |   9 +++
+ apps/lib/apps.c            | 158 ++++++++++++++++++++++++++++++++++++++++
+ apps/ts.c                  |  31 ++++----
+ crypto/ts/ts_rsp_verify.c  |  10 ++-
+ doc/man1/openssl-ts.pod.in |  15 ++--
+ test/recipes/80-test_tsa.t |  56 +++++++--------
+ 7 files changed, 242 insertions(+), 211 deletions(-)
+
+diff --git a/apps/cmp.c b/apps/cmp.c
+index 519e0bc2a5..2112df0186 100644
+--- a/apps/cmp.c
++++ b/apps/cmp.c
+@@ -618,25 +618,6 @@ static int set_verbosity(int level)
+     return 1;
+ }
+ 
+-static char *next_item(char *opt) /* in list separated by comma and/or space */
+-{
+-    /* advance to separator (comma or whitespace), if any */
+-    while (*opt != ',' &amp;&amp; !isspace(*opt) &amp;&amp; *opt != '\0') {
+-        if (*opt == '\\' &amp;&amp; opt[1] != '\0')
+-            /* skip and unescape '\' escaped char */
+-            memmove(opt, opt + 1, strlen(opt));
+-        opt++;
+-    }
+-    if (*opt != '\0') {
+-        /* terminate current item */
+-        *opt++ = '\0';
+-        /* skip over any whitespace after separator */
+-        while (isspace(*opt))
+-            opt++;
+-    }
+-    return *opt == '\0' ? NULL : opt; /* NULL indicates end of input */
+-}
+-
+ static EVP_PKEY *load_key_pwd(const char *uri, int format,
+                               const char *pass, ENGINE *eng, const char *desc)
+ {
+@@ -689,63 +670,6 @@ static X509_REQ *load_csr_autofmt(const char *infile, const char *desc)
+     return csr;
+ }
+ 
+-static void warn_cert_msg(const char *uri, X509 *cert, const char *msg)
+-{
+-    char *subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+-
+-    CMP_warn3(&quot;certificate from '%s' with subject '%s' %s&quot;, uri, subj, msg);
+-    OPENSSL_free(subj);
+-}
+-
+-static void warn_cert(const char *uri, X509 *cert, int warn_EE)
+-{
+-    uint32_t ex_flags = X509_get_extension_flags(cert);
+-    int res = X509_cmp_timeframe(vpm, X509_get0_notBefore(cert),
+-                                 X509_get0_notAfter(cert));
+-
+-    if (res != 0)
+-        warn_cert_msg(uri, cert, res &gt; 0 ? &quot;has expired&quot; : &quot;not yet valid&quot;);
+-    if (warn_EE &amp;&amp; (ex_flags &amp; EXFLAG_V1) == 0 &amp;&amp; (ex_flags &amp; EXFLAG_CA) == 0)
+-        warn_cert_msg(uri, cert, &quot;is not a CA cert&quot;);
+-}
+-
+-static void warn_certs(const char *uri, STACK_OF(X509) *certs, int warn_EE)
+-{
+-    int i;
+-
+-    for (i = 0; i &lt; sk_X509_num(certs); i++)
+-        warn_cert(uri, sk_X509_value(certs, i), warn_EE);
+-}
+-
+-/* TODO potentially move this and related functions to apps/lib/apps.c */
+-static int load_cert_certs(const char *uri,
+-                           X509 **pcert, STACK_OF(X509) **pcerts,
+-                           int exclude_http, const char *pass, const char *desc)
+-{
+-    int ret = 0;
+-    char *pass_string;
+-
+-    if (exclude_http &amp;&amp; (strncasecmp(uri, &quot;<A HREF="http://">http://</A>&quot;, 7) == 0
+-                         || strncasecmp(uri, &quot;<A HREF="https://">https://</A>&quot;, 8) == 0)) {
+-        BIO_printf(bio_err, &quot;error: HTTP retrieval not allowed for %s\n&quot;, desc);
+-        return ret;
+-    }
+-    pass_string = get_passwd(pass, desc);
+-    ret = load_key_certs_crls(uri, 0, pass_string, desc, NULL, NULL, NULL,
+-                              pcert, pcerts, NULL, NULL);
+-    clear_free(pass_string);
+-
+-    if (ret) {
+-        if (pcert != NULL)
+-            warn_cert(uri, *pcert, 0);
+-        warn_certs(uri, *pcerts, 1);
+-    } else {
+-        sk_X509_pop_free(*pcerts, X509_free);
+-        *pcerts = NULL;
+-    }
+-    return ret;
+-}
+-
+ /* set expected host name/IP addr and clears the email addr in the given ts */
+ static int truststore_set_host_etc(X509_STORE *ts, char *host)
+ {
+@@ -763,24 +687,6 @@ static int truststore_set_host_etc(X509_STORE *ts, char *host)
+         || X509_VERIFY_PARAM_set1_host(ts_vpm, host, 0);
+ }
+ 
+-static X509_STORE *sk_X509_to_store(X509_STORE *store /* may be NULL */,
+-                                    const STACK_OF(X509) *certs /* may NULL */)
+-{
+-    int i;
+-
+-    if (store == NULL)
+-        store = X509_STORE_new();
+-    if (store == NULL)
+-        return NULL;
+-    for (i = 0; i &lt; sk_X509_num(certs); i++) {
+-        if (!X509_STORE_add_cert(store, sk_X509_value(certs, i))) {
+-            X509_STORE_free(store);
+-            return NULL;
+-        }
+-    }
+-    return store;
+-}
+-
+ /* write OSSL_CMP_MSG DER-encoded to the specified file name item */
+ static int write_PKIMESSAGE(const OSSL_CMP_MSG *msg, char **filenames)
+ {
+@@ -952,37 +858,9 @@ static int set_gennames(OSSL_CMP_CTX *ctx, char *names, const char *desc)
+     return 1;
+ }
+ 
+-/* TODO potentially move to apps/lib/apps.c */
+-/*
+- * create cert store structure with certificates read from given file(s)
+- * returns pointer to created X509_STORE on success, NULL on error
+- */
+-static X509_STORE *load_certstore(char *input, const char *desc)
+-{
+-    X509_STORE *store = NULL;
+-    STACK_OF(X509) *certs = NULL;
+-
+-    while (input != NULL) {
+-        char *next = next_item(input);
+-        int ok;
+-
+-        if (!load_cert_certs(input, NULL, &amp;certs, 1, opt_otherpass, desc)) {
+-            X509_STORE_free(store);
+-            return NULL;
+-        }
+-        ok = (store = sk_X509_to_store(store, certs)) != NULL;
+-        sk_X509_pop_free(certs, X509_free);
+-        certs = NULL;
+-        if (!ok)
+-            return NULL;
+-        input = next;
+-    }
+-    return store;
+-}
+-
+ static X509_STORE *load_trusted(char *input, int for_new_cert, const char *desc)
+ {
+-    X509_STORE *ts = load_certstore(input, desc);
++    X509_STORE *ts = load_certstore(input, opt_otherpass, desc, vpm);
+ 
+     if (ts == NULL)
+         return NULL;
+@@ -998,40 +876,6 @@ static X509_STORE *load_trusted(char *input, int for_new_cert, const char *desc)
+     return NULL;
+ }
+ 
+-/* TODO potentially move to apps/lib/apps.c */
+-static STACK_OF(X509) *load_certs_multifile(char *files,
+-                                            const char *pass, const char *desc)
+-{
+-    STACK_OF(X509) *certs = NULL;
+-    STACK_OF(X509) *result = sk_X509_new_null();
+-
+-    if (files == NULL)
+-        goto err;
+-    if (result == NULL)
+-        goto oom;
+-
+-    while (files != NULL) {
+-        char *next = next_item(files);
+-
+-        if (!load_cert_certs(files, NULL, &amp;certs, 0, pass, desc))
+-            goto err;
+-        if (!X509_add_certs(result, certs,
+-                            X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP))
+-            goto oom;
+-        sk_X509_pop_free(certs, X509_free);
+-        certs = NULL;
+-        files = next;
+-    }
+-    return result;
+-
+- oom:
+-    BIO_printf(bio_err, &quot;out of memory\n&quot;);
+- err:
+-    sk_X509_pop_free(certs, X509_free);
+-    sk_X509_pop_free(result, X509_free);
+-    return NULL;
+-}
+-
+ typedef int (*add_X509_stack_fn_t)(void *ctx, const STACK_OF(X509) *certs);
+ 
+ static int setup_certs(char *files, const char *desc, void *ctx,
+@@ -1042,7 +886,7 @@ static int setup_certs(char *files, const char *desc, void *ctx,
+ 
+     if (files == NULL)
+         return 1;
+-    if ((certs = load_certs_multifile(files, opt_otherpass, desc)) == NULL)
++    if ((certs = load_certs_multifile(files, opt_otherpass, desc, vpm)) == NULL)
+         return 0;
+     ok = (*set1_fn)(ctx, certs);
+     sk_X509_pop_free(certs, X509_free);
+@@ -1350,8 +1194,9 @@ static SSL_CTX *setup_ssl_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+     SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
+ 
+     if (opt_tls_trusted != NULL) {
+-        if ((trust_store = load_certstore(opt_tls_trusted,
+-                                          &quot;trusted TLS certificates&quot;)) == NULL)
++        trust_store = load_certstore(opt_tls_trusted, opt_otherpass,
++                                     &quot;trusted TLS certificates&quot;, vpm);
++        if (trust_store == NULL)
+             goto err;
+         SSL_CTX_set_cert_store(ssl_ctx, trust_store);
+         /* for improved diagnostics on SSL_CTX_build_cert_chain() errors: */
+@@ -1364,7 +1209,8 @@ static SSL_CTX *setup_ssl_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+         int ok;
+ 
+         if (!load_cert_certs(opt_tls_cert, &amp;cert, &amp;certs, 0, opt_tls_keypass,
+-                             &quot;TLS client certificate (optionally with chain)&quot;))
++                             &quot;TLS client certificate (optionally with chain)&quot;,
++                             vpm))
+             /* need opt_tls_keypass if opt_tls_cert is encrypted PKCS#12 file */
+             goto err;
+ 
+@@ -1418,7 +1264,8 @@ static SSL_CTX *setup_ssl_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+         if (opt_tls_extra != NULL) {
+             STACK_OF(X509) *tls_extra = load_certs_multifile(opt_tls_extra,
+                                                              opt_otherpass,
+-                                                             &quot;extra certificates for TLS&quot;);
++                                                             &quot;extra certificates for TLS&quot;,
++                                                             vpm);
+             int res = 1;
+ 
+             if (tls_extra == NULL)
+@@ -1541,7 +1388,8 @@ static int setup_protection_ctx(OSSL_CMP_CTX *ctx, ENGINE *engine)
+         int ok;
+ 
+         if (!load_cert_certs(opt_cert, &amp;cert, &amp;certs, 0, opt_keypass,
+-                             &quot;CMP client certificate (optionally with chain)&quot;))
++                             &quot;CMP client certificate (optionally with chain)&quot;,
++                             vpm))
+             /* opt_keypass is needed if opt_cert is an encrypted PKCS#12 file */
+             return 0;
+         ok = OSSL_CMP_CTX_set1_cert(ctx, cert);
+diff --git a/apps/include/apps.h b/apps/include/apps.h
+index 8c365c44bd..416e1d2568 100644
+--- a/apps/include/apps.h
++++ b/apps/include/apps.h
+@@ -120,6 +120,15 @@ EVP_PKEY *load_pubkey(const char *uri, int format, int maybe_stdin,
+                       const char *pass, ENGINE *e, const char *desc);
+ EVP_PKEY *load_keyparams(const char *uri, int maybe_stdin, const char *keytype,
+                          const char *desc);
++char *next_item(char *opt); /* in list separated by comma and/or space */
++int load_cert_certs(const char *uri,
++                    X509 **pcert, STACK_OF(X509) **pcerts,
++                    int exclude_http, const char *pass, const char *desc,
++                    X509_VERIFY_PARAM *vpm);
++STACK_OF(X509) *load_certs_multifile(char *files, const char *pass,
++                                     const char *desc, X509_VERIFY_PARAM *vpm);
++X509_STORE *load_certstore(char *input, const char *pass, const char *desc,
++                           X509_VERIFY_PARAM *vpm);
+ int load_certs(const char *uri, STACK_OF(X509) **certs,
+                const char *pass, const char *desc);
+ int load_crls(const char *uri, STACK_OF(X509_CRL) **crls,
+diff --git a/apps/lib/apps.c b/apps/lib/apps.c
+index 2938e91620..f114f0b10c 100644
+--- a/apps/lib/apps.c
++++ b/apps/lib/apps.c
+@@ -638,6 +638,164 @@ void* app_malloc(int sz, const char *what)
+     return vp;
+ }
+ 
++char *next_item(char *opt) /* in list separated by comma and/or space */
++{
++    /* advance to separator (comma or whitespace), if any */
++    while (*opt != ',' &amp;&amp; !isspace(*opt) &amp;&amp; *opt != '\0') {
++        if (*opt == '\\' &amp;&amp; opt[1] != '\0')
++            /* skip and unescape '\' escaped char */
++            memmove(opt, opt + 1, strlen(opt));
++        opt++;
++    }
++    if (*opt != '\0') {
++        /* terminate current item */
++        *opt++ = '\0';
++        /* skip over any whitespace after separator */
++        while (isspace(*opt))
++            opt++;
++    }
++    return *opt == '\0' ? NULL : opt; /* NULL indicates end of input */
++}
++
++static void warn_cert_msg(const char *uri, X509 *cert, const char *msg)
++{
++    char *subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
++
++    BIO_printf(bio_err, &quot;Warning: certificate from '%s' with subject '%s' %s&quot;,
++               uri, subj, msg);
++    OPENSSL_free(subj);
++}
++
++static void warn_cert(const char *uri, X509 *cert, int warn_EE,
++                      X509_VERIFY_PARAM *vpm)
++{
++    uint32_t ex_flags = X509_get_extension_flags(cert);
++    int res = X509_cmp_timeframe(vpm, X509_get0_notBefore(cert),
++                                 X509_get0_notAfter(cert));
++
++    if (res != 0)
++        warn_cert_msg(uri, cert, res &gt; 0 ? &quot;has expired&quot; : &quot;not yet valid&quot;);
++    if (warn_EE &amp;&amp; (ex_flags &amp; EXFLAG_V1) == 0 &amp;&amp; (ex_flags &amp; EXFLAG_CA) == 0)
++        warn_cert_msg(uri, cert, &quot;is not a CA cert&quot;);
++}
++
++static void warn_certs(const char *uri, STACK_OF(X509) *certs, int warn_EE,
++                       X509_VERIFY_PARAM *vpm)
++{
++    int i;
++
++    for (i = 0; i &lt; sk_X509_num(certs); i++)
++        warn_cert(uri, sk_X509_value(certs, i), warn_EE, vpm);
++}
++
++int load_cert_certs(const char *uri,
++                    X509 **pcert, STACK_OF(X509) **pcerts,
++                    int exclude_http, const char *pass, const char *desc,
++                    X509_VERIFY_PARAM *vpm)
++{
++    int ret = 0;
++    char *pass_string;
++
++    if (exclude_http &amp;&amp; (strncasecmp(uri, &quot;<A HREF="http://">http://</A>&quot;, 7) == 0
++                         || strncasecmp(uri, &quot;<A HREF="https://">https://</A>&quot;, 8) == 0)) {
++        BIO_printf(bio_err, &quot;error: HTTP retrieval not allowed for %s\n&quot;, desc);
++        return ret;
++    }
++    pass_string = get_passwd(pass, desc);
++    ret = load_key_certs_crls(uri, 0, pass_string, desc, NULL, NULL, NULL,
++                              pcert, pcerts, NULL, NULL);
++    clear_free(pass_string);
++
++    if (ret) {
++        if (pcert != NULL)
++            warn_cert(uri, *pcert, 0, vpm);
++        warn_certs(uri, *pcerts, 1, vpm);
++    } else {
++        sk_X509_pop_free(*pcerts, X509_free);
++        *pcerts = NULL;
++    }
++    return ret;
++}
++
++STACK_OF(X509) *load_certs_multifile(char *files, const char *pass,
++                                     const char *desc, X509_VERIFY_PARAM *vpm)
++{
++    STACK_OF(X509) *certs = NULL;
++    STACK_OF(X509) *result = sk_X509_new_null();
++
++    if (files == NULL)
++        goto err;
++    if (result == NULL)
++        goto oom;
++
++    while (files != NULL) {
++        char *next = next_item(files);
++
++        if (!load_cert_certs(files, NULL, &amp;certs, 0, pass, desc, vpm))
++            goto err;
++        if (!X509_add_certs(result, certs,
++                            X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP))
++            goto oom;
++        sk_X509_pop_free(certs, X509_free);
++        certs = NULL;
++        files = next;
++    }
++    return result;
++
++ oom:
++    BIO_printf(bio_err, &quot;out of memory\n&quot;);
++ err:
++    sk_X509_pop_free(certs, X509_free);
++    sk_X509_pop_free(result, X509_free);
++    return NULL;
++}
++
++static X509_STORE *sk_X509_to_store(X509_STORE *store /* may be NULL */,
++                                    const STACK_OF(X509) *certs /* may NULL */)
++{
++    int i;
++
++    if (store == NULL)
++        store = X509_STORE_new();
++    if (store == NULL)
++        return NULL;
++    for (i = 0; i &lt; sk_X509_num(certs); i++) {
++        if (!X509_STORE_add_cert(store, sk_X509_value(certs, i))) {
++            X509_STORE_free(store);
++            return NULL;
++        }
++    }
++    return store;
++}
++
++/*
++ * Create cert store structure with certificates read from given file(s).
++ * Returns pointer to created X509_STORE on success, NULL on error.
++ */
++X509_STORE *load_certstore(char *input, const char *pass, const char *desc,
++                           X509_VERIFY_PARAM *vpm)
++{
++    X509_STORE *store = NULL;
++    STACK_OF(X509) *certs = NULL;
++
++    while (input != NULL) {
++        char *next = next_item(input);
++        int ok;
++
++        if (!load_cert_certs(input, NULL, &amp;certs, 1, pass, desc, vpm)) {
++            X509_STORE_free(store);
++            return NULL;
++        }
++        ok = (store = sk_X509_to_store(store, certs)) != NULL;
++        sk_X509_pop_free(certs, X509_free);
++        certs = NULL;
++        if (!ok)
++            return NULL;
++        input = next;
++    }
++    return store;
++}
++
+ /*
+  * Initialize or extend, if *certs != NULL, a certificate stack.
+  * The caller is responsible for freeing *certs if its value is left not NULL.
+diff --git a/apps/ts.c b/apps/ts.c
+index 62afe7560d..cc69a7de72 100644
+--- a/apps/ts.c
++++ b/apps/ts.c
+@@ -65,12 +65,12 @@ static int verify_command(const char *data, const char *digest, const char *quer
+                           const char *in, int token_in,
+                           const char *CApath, const char *CAfile,
+                           const char *CAstore,
+-                          const char *untrusted, X509_VERIFY_PARAM *vpm);
++                          char *untrusted, X509_VERIFY_PARAM *vpm);
+ static TS_VERIFY_CTX *create_verify_ctx(const char *data, const char *digest,
+                                         const char *queryfile,
+                                         const char *CApath, const char *CAfile,
+                                         const char *CAstore,
+-                                        const char *untrusted,
++                                        char *untrusted,
+                                         X509_VERIFY_PARAM *vpm);
+ static X509_STORE *create_cert_store(const char *CApath, const char *CAfile,
+                                      const char *CAstore, X509_VERIFY_PARAM *vpm);
+@@ -100,7 +100,7 @@ const OPTIONS ts_options[] = {
+     {&quot;CAfile&quot;, OPT_CAFILE, '&lt;', &quot;File with trusted CA certs&quot;},
+     {&quot;CApath&quot;, OPT_CAPATH, '/', &quot;Path to trusted CA files&quot;},
+     {&quot;CAstore&quot;, OPT_CASTORE, ':', &quot;URI to trusted CA store&quot;},
+-    {&quot;untrusted&quot;, OPT_UNTRUSTED, '&lt;', &quot;File with untrusted certs&quot;},
++    {&quot;untrusted&quot;, OPT_UNTRUSTED, '&lt;', &quot;Extra untrusted certs&quot;},
+     {&quot;token_in&quot;, OPT_TOKEN_IN, '-', &quot;Input is a PKCS#7 file&quot;},
+     {&quot;token_out&quot;, OPT_TOKEN_OUT, '-', &quot;Output is a PKCS#7 file&quot;},
+     {&quot;passin&quot;, OPT_PASSIN, 's', &quot;Input file pass phrase source&quot;},
+@@ -149,16 +149,17 @@ static char* opt_helplist[] = {
+     &quot;    [-text]&quot;,
+ #endif
+     &quot;&quot;,
+-    &quot; openssl ts -verify -CApath dir -CAfile file.pem -CAstore uri&quot;,
+-    &quot;   -untrusted file.pem [-data file] [-digest hexstring]&quot;,
+-    &quot;    [-queryfile file] -in file [-token_in] ...&quot;,
++    &quot; openssl ts -verify -CApath dir -CAfile root-cert.pem -CAstore uri&quot;,
++    &quot;   -untrusted extra-certs.pem [-data file] [-digest hexstring]&quot;,
++    &quot;    [-queryfile request.tsq] -in response.tsr [-token_in] ...&quot;,
+     NULL,
+ };
+ 
+ int ts_main(int argc, char **argv)
+ {
+     CONF *conf = NULL;
+-    const char *CAfile = NULL, *untrusted = NULL, *prog;
++    const char *CAfile = NULL, *prog;
++    char *untrusted = NULL;
+     const char *configfile = default_config_file, *engine = NULL;
+     const char *section = NULL, *digestname = NULL;
+     char **helpp;
+@@ -842,7 +843,7 @@ static int save_ts_serial(const char *serialfile, ASN1_INTEGER *serial)
+ static int verify_command(const char *data, const char *digest, const char *queryfile,
+                           const char *in, int token_in,
+                           const char *CApath, const char *CAfile,
+-                          const char *CAstore, const char *untrusted,
++                          const char *CAstore, char *untrusted,
+                           X509_VERIFY_PARAM *vpm)
+ {
+     BIO *in_bio = NULL;
+@@ -890,10 +891,11 @@ static TS_VERIFY_CTX *create_verify_ctx(const char *data, const char *digest,
+                                         const char *queryfile,
+                                         const char *CApath, const char *CAfile,
+                                         const char *CAstore,
+-                                        const char *untrusted,
++                                        char *untrusted,
+                                         X509_VERIFY_PARAM *vpm)
+ {
+     TS_VERIFY_CTX *ctx = NULL;
++    STACK_OF(X509) *certs;
+     BIO *input = NULL;
+     TS_REQ *request = NULL;
+     int ret = 0;
+@@ -943,10 +945,13 @@ static TS_VERIFY_CTX *create_verify_ctx(const char *data, const char *digest,
+             == NULL)
+         goto err;
+ 
+-    /* Loading untrusted certificates. */
+-    if (untrusted
+-        &amp;&amp; TS_VERIFY_CTX_set_certs(ctx, TS_CONF_load_certs(untrusted)) == NULL)
+-        goto err;
++    /* Loading any extra untrusted certificates. */
++    if (untrusted != NULL) {
++        certs = load_certs_multifile(untrusted, NULL, &quot;extra untrusted certs&quot;,
++                                     vpm);
++        if (certs == NULL || TS_VERIFY_CTX_set_certs(ctx, certs) == NULL)
++            goto err;
++    }
+     ret = 1;
+ 
+  err:
+diff --git a/crypto/ts/ts_rsp_verify.c b/crypto/ts/ts_rsp_verify.c
+index 3aea4f4dfb..b45ca28b5d 100644
+--- a/crypto/ts/ts_rsp_verify.c
++++ b/crypto/ts/ts_rsp_verify.c
+@@ -89,6 +89,7 @@ int TS_RESP_verify_signature(PKCS7 *token, STACK_OF(X509) *certs,
+ {
+     STACK_OF(PKCS7_SIGNER_INFO) *sinfos = NULL;
+     PKCS7_SIGNER_INFO *si;
++    STACK_OF(X509) *untrusted = NULL;
+     STACK_OF(X509) *signers = NULL;
+     X509 *signer;
+     STACK_OF(X509) *chain = NULL;
+@@ -125,7 +126,13 @@ int TS_RESP_verify_signature(PKCS7 *token, STACK_OF(X509) *certs,
+         goto err;
+     signer = sk_X509_value(signers, 0);
+ 
+-    if (!ts_verify_cert(store, certs, signer, &amp;chain))
++    untrusted = sk_X509_new_reserve(NULL, sk_X509_num(certs)
++                                    + sk_X509_num(token-&gt;d.sign-&gt;cert));
++    if (untrusted == NULL
++            || !X509_add_certs(untrusted, certs, 0)
++            || !X509_add_certs(untrusted, token-&gt;d.sign-&gt;cert, 0))
++        goto err;
++    if (!ts_verify_cert(store, untrusted, signer, &amp;chain))
+         goto err;
+     if (!ts_check_signing_certs(si, chain))
+         goto err;
+@@ -149,6 +156,7 @@ int TS_RESP_verify_signature(PKCS7 *token, STACK_OF(X509) *certs,
+ 
+  err:
+     BIO_free_all(p7bio);
++    sk_X509_free(untrusted);
+     sk_X509_pop_free(chain, X509_free);
+     sk_X509_free(signers);
+ 
+diff --git a/doc/man1/openssl-ts.pod.in b/doc/man1/openssl-ts.pod.in
+index d91d06f0fd..402a7a879a 100644
+--- a/doc/man1/openssl-ts.pod.in
++++ b/doc/man1/openssl-ts.pod.in
+@@ -50,7 +50,7 @@ B&lt;-verify&gt;
+ [B&lt;-queryfile&gt; I&lt;request.tsq&gt;]
+ [B&lt;-in&gt; I&lt;response.tsr&gt;]
+ [B&lt;-token_in&gt;]
+-[B&lt;-untrusted&gt; I&lt;file&gt;]
++[B&lt;-untrusted&gt; I&lt;files&gt;|I&lt;uris&gt;]
+ [B&lt;-CAfile&gt; I&lt;file&gt;]
+ [B&lt;-CApath&gt; I&lt;dir&gt;]
+ [B&lt;-CAstore&gt; I&lt;uri&gt;]
+@@ -326,14 +326,17 @@ This flag can be used together with the B&lt;-in&gt; option and indicates
+ that the input is a DER encoded timestamp token (ContentInfo) instead
+ of a timestamp response (TimeStampResp). (Optional)
+ 
+-=item B&lt;-untrusted&gt; I&lt;cert_file.pem&gt;
++=item B&lt;-untrusted&gt; I&lt;files&gt;|I&lt;uris&gt;
+ 
+-Set of additional untrusted certificates in PEM format which may be
+-needed when building the certificate chain for the TSA's signing
+-certificate. This file must contain the TSA signing certificate and
+-all intermediate CA certificates unless the response includes them.
++A set of additional untrusted certificates which may be
++needed when building the certificate chain for the TSA's signing certificate.
++These do not need to contain the TSA signing certificate and intermediate CA
++certificates as far as the response already includes them.
+ (Optional)
+ 
++Multiple sources may be given, separated by commas and/or whitespace.
++Each file may contain multiple certificates.
++
+ =item B&lt;-CAfile&gt; I&lt;file&gt;, B&lt;-CApath&gt; I&lt;dir&gt;, B&lt;-CAstore&gt; I&lt;uri&gt;
+ 
+ See L&lt;openssl-verification-options(1)/Trusted Certificate Options&gt; for details.
+diff --git a/test/recipes/80-test_tsa.t b/test/recipes/80-test_tsa.t
+index 1d80b24bac..3cb8399c87 100644
+--- a/test/recipes/80-test_tsa.t
++++ b/test/recipes/80-test_tsa.t
+@@ -1,5 +1,5 @@
+ #! /usr/bin/env perl
+-# Copyright 2015-2020 The OpenSSL Project Authors. All Rights Reserved.
++# Copyright 2015-2021 The OpenSSL Project Authors. All Rights Reserved.
+ #
+ # Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+ # this file except in compliance with the License.  You can obtain a copy
+@@ -13,7 +13,7 @@ use warnings;
+ use POSIX;
+ use File::Spec::Functions qw/splitdir curdir catfile/;
+ use File::Compare;
+-use OpenSSL::Test qw/:DEFAULT cmdstr srctop_file/;
++use OpenSSL::Test qw/:DEFAULT cmdstr srctop_file data_file/;
+ use OpenSSL::Test::Utils;
+ 
+ setup(&quot;test_tsa&quot;);
+@@ -26,7 +26,9 @@ plan skip_all =&gt; &quot;TS is not supported by this OpenSSL build&quot;
+ my $openssl_conf;
+ my $testtsa;
+ my $CAtsa;
+-my @RUN;
++my @QUERY = (&quot;openssl&quot;, &quot;ts&quot;, &quot;-query&quot;);
++my @REPLY;
++my @VERIFY = (&quot;openssl&quot;, &quot;ts&quot;, &quot;-verify&quot;);
+ 
+ sub create_tsa_cert {
+     my $INDEX = shift;
+@@ -51,7 +53,7 @@ sub create_time_stamp_response {
+     my $outputfile = shift;
+     my $datafile = shift;
+ 
+-    ok(run(app([@RUN, &quot;-reply&quot;, &quot;-section&quot;, &quot;$datafile&quot;,
++    ok(run(app([@REPLY, &quot;-section&quot;, &quot;$datafile&quot;,
+                 &quot;-queryfile&quot;, &quot;$queryfile&quot;, &quot;-out&quot;, &quot;$outputfile&quot;])));
+ }
+ 
+@@ -60,10 +62,10 @@ sub verify_time_stamp_response {
+     my $inputfile = shift;
+     my $datafile = shift;
+ 
+-    ok(run(app([@RUN, &quot;-verify&quot;, &quot;-queryfile&quot;, &quot;$queryfile&quot;,
++    ok(run(app([@VERIFY, &quot;-queryfile&quot;, &quot;$queryfile&quot;,
+                 &quot;-in&quot;, &quot;$inputfile&quot;, &quot;-CAfile&quot;, &quot;tsaca.pem&quot;,
+                 &quot;-untrusted&quot;, &quot;tsa_cert1.pem&quot;])));
+-    ok(run(app([@RUN, &quot;-verify&quot;, &quot;-data&quot;, &quot;$datafile&quot;,
++    ok(run(app([@VERIFY, &quot;-data&quot;, &quot;$datafile&quot;,
+                 &quot;-in&quot;, &quot;$inputfile&quot;, &quot;-CAfile&quot;, &quot;tsaca.pem&quot;,
+                 &quot;-untrusted&quot;, &quot;tsa_cert1.pem&quot;])));
+ }
+@@ -72,7 +74,7 @@ sub verify_time_stamp_response_fail {
+     my $queryfile = shift;
+     my $inputfile = shift;
+ 
+-    ok(!run(app([@RUN, &quot;-verify&quot;, &quot;-queryfile&quot;, &quot;$queryfile&quot;,
++    ok(!run(app([@VERIFY, &quot;-queryfile&quot;, &quot;$queryfile&quot;,
+                  &quot;-in&quot;, &quot;$inputfile&quot;, &quot;-CAfile&quot;, &quot;tsaca.pem&quot;,
+                  &quot;-untrusted&quot;, &quot;tsa_cert1.pem&quot;])));
+ }
+@@ -87,7 +89,7 @@ indir &quot;tsa&quot; =&gt; sub
+     $openssl_conf = srctop_file(&quot;test&quot;, &quot;CAtsa.cnf&quot;);
+     $testtsa = srctop_file(&quot;test&quot;, &quot;recipes&quot;, &quot;80-test_tsa.t&quot;);
+     $CAtsa = srctop_file(&quot;test&quot;, &quot;CAtsa.cnf&quot;);
+-    @RUN = (&quot;openssl&quot;, &quot;ts&quot;, &quot;-config&quot;, $openssl_conf);
++    @REPLY = (&quot;openssl&quot;, &quot;ts&quot;, &quot;-config&quot;, $openssl_conf, &quot;-reply&quot;);
+ 
+     # ../apps/CA.pl needs these
+     $ENV{OPENSSL_CONFIG} = &quot;-config $openssl_conf&quot;;
+@@ -112,19 +114,19 @@ indir &quot;tsa&quot; =&gt; sub
+      };
+ 
+      skip &quot;failed&quot;, 16
+-         unless ok(run(app([@RUN, &quot;-query&quot;, &quot;-data&quot;, $testtsa,
++         unless ok(run(app([@QUERY, &quot;-data&quot;, $testtsa,
+                             &quot;-tspolicy&quot;, &quot;tsa_policy1&quot;, &quot;-cert&quot;,
+                             &quot;-out&quot;, &quot;req1.tsq&quot;])),
+                    'creating req1.req time stamp request for file testtsa');
+ 
+-     ok(run(app([@RUN, &quot;-query&quot;, &quot;-in&quot;, &quot;req1.tsq&quot;, &quot;-text&quot;])),
++     ok(run(app([@QUERY, &quot;-in&quot;, &quot;req1.tsq&quot;, &quot;-text&quot;])),
+         'printing req1.req');
+ 
+      subtest 'generating valid response for req1.req' =&gt; sub {
+          create_time_stamp_response(&quot;req1.tsq&quot;, &quot;resp1.tsr&quot;, &quot;tsa_config1&quot;)
+      };
+ 
+-     ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;resp1.tsr&quot;, &quot;-text&quot;])),
++     ok(run(app([@REPLY, &quot;-in&quot;, &quot;resp1.tsr&quot;, &quot;-text&quot;])),
+         'printing response');
+ 
+      subtest 'verifying valid response' =&gt; sub {
+@@ -133,25 +135,23 @@ indir &quot;tsa&quot; =&gt; sub
+ 
+      skip &quot;failed&quot;, 11
+          unless subtest 'verifying valid token' =&gt; sub {
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;resp1.tsr&quot;,
++             ok(run(app([@REPLY, &quot;-in&quot;, &quot;resp1.tsr&quot;,
+                          &quot;-out&quot;, &quot;resp1.tsr.token&quot;, &quot;-token_out&quot;])));
+-             ok(run(app([@RUN, &quot;-verify&quot;, &quot;-queryfile&quot;, &quot;req1.tsq&quot;,
++             ok(run(app([@VERIFY, &quot;-queryfile&quot;, &quot;req1.tsq&quot;,
+                          &quot;-in&quot;, &quot;resp1.tsr.token&quot;, &quot;-token_in&quot;,
+-                         &quot;-CAfile&quot;, &quot;tsaca.pem&quot;,
+-                         &quot;-untrusted&quot;, &quot;tsa_cert1.pem&quot;])));
+-             ok(run(app([@RUN, &quot;-verify&quot;, &quot;-data&quot;, $testtsa,
++                         &quot;-CAfile&quot;, &quot;tsaca.pem&quot;])));
++             ok(run(app([@VERIFY, &quot;-data&quot;, $testtsa,
+                          &quot;-in&quot;, &quot;resp1.tsr.token&quot;, &quot;-token_in&quot;,
+-                         &quot;-CAfile&quot;, &quot;tsaca.pem&quot;,
+-                         &quot;-untrusted&quot;, &quot;tsa_cert1.pem&quot;])));
++                         &quot;-CAfile&quot;, &quot;tsaca.pem&quot;])));
+      };
+ 
+      skip &quot;failed&quot;, 10
+-         unless ok(run(app([@RUN, &quot;-query&quot;, &quot;-data&quot;, $testtsa,
++         unless ok(run(app([@QUERY, &quot;-data&quot;, $testtsa,
+                             &quot;-tspolicy&quot;, &quot;tsa_policy2&quot;, &quot;-no_nonce&quot;,
+                             &quot;-out&quot;, &quot;req2.tsq&quot;])),
+                    'creating req2.req time stamp request for file testtsa');
+ 
+-     ok(run(app([@RUN, &quot;-query&quot;, &quot;-in&quot;, &quot;req2.tsq&quot;, &quot;-text&quot;])),
++     ok(run(app([@QUERY, &quot;-in&quot;, &quot;req2.tsq&quot;, &quot;-text&quot;])),
+         'printing req2.req');
+ 
+      skip &quot;failed&quot;, 8
+@@ -164,20 +164,20 @@ indir &quot;tsa&quot; =&gt; sub
+              my $RESPONSE2=&quot;resp2.tsr.copy.tsr&quot;;
+              my $TOKEN_DER=&quot;resp2.tsr.token.der&quot;;
+ 
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;resp2.tsr&quot;,
++             ok(run(app([@REPLY, &quot;-in&quot;, &quot;resp2.tsr&quot;,
+                          &quot;-out&quot;, &quot;$TOKEN_DER&quot;, &quot;-token_out&quot;])));
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;$TOKEN_DER&quot;,
++             ok(run(app([@REPLY, &quot;-in&quot;, &quot;$TOKEN_DER&quot;,
+                          &quot;-token_in&quot;, &quot;-out&quot;, &quot;$RESPONSE2&quot;])));
+              is(compare($RESPONSE2, &quot;resp2.tsr&quot;), 0);
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;resp2.tsr&quot;,
++             ok(run(app([@REPLY, &quot;-in&quot;, &quot;resp2.tsr&quot;,
+                          &quot;-text&quot;, &quot;-token_out&quot;])));
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;$TOKEN_DER&quot;,
++             ok(run(app([@REPLY, &quot;-in&quot;, &quot;$TOKEN_DER&quot;,
+                          &quot;-token_in&quot;, &quot;-text&quot;, &quot;-token_out&quot;])));
+-             ok(run(app([@RUN, &quot;-reply&quot;, &quot;-queryfile&quot;, &quot;req2.tsq&quot;,
++             ok(run(app([@REPLY, &quot;-queryfile&quot;, &quot;req2.tsq&quot;,
+                          &quot;-text&quot;, &quot;-token_out&quot;])));
+      };
+ 
+-     ok(run(app([@RUN, &quot;-reply&quot;, &quot;-in&quot;, &quot;resp2.tsr&quot;, &quot;-text&quot;])),
++     ok(run(app([@REPLY, &quot;-in&quot;, &quot;resp2.tsr&quot;, &quot;-text&quot;])),
+         'printing response');
+ 
+      subtest 'verifying valid response' =&gt; sub {
+@@ -193,11 +193,11 @@ indir &quot;tsa&quot; =&gt; sub
+      };
+ 
+      skip &quot;failure&quot;, 2
+-         unless ok(run(app([@RUN, &quot;-query&quot;, &quot;-data&quot;, $CAtsa,
++         unless ok(run(app([@QUERY, &quot;-data&quot;, $CAtsa,
+                             &quot;-no_nonce&quot;, &quot;-out&quot;, &quot;req3.tsq&quot;])),
+                    &quot;creating req3.req time stamp request for file CAtsa.cnf&quot;);
+ 
+-     ok(run(app([@RUN, &quot;-query&quot;, &quot;-in&quot;, &quot;req3.tsq&quot;, &quot;-text&quot;])),
++     ok(run(app([@QUERY, &quot;-in&quot;, &quot;req3.tsq&quot;, &quot;-text&quot;])),
+         'printing req3.req');
+ 
+      subtest 'verifying response against wrong request, it should fail' =&gt; sub {
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033425.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033428.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33427">[ date ]</a>
+              <a href="thread.html#33427">[ thread ]</a>
+              <a href="subject.html#33427">[ subject ]</a>
+              <a href="author.html#33427">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

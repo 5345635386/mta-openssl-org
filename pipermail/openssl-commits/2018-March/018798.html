@@ -1,0 +1,2020 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522246618.087750.1062.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018797.html">
+   <LINK REL="Next"  HREF="018801.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522246618.087750.1062.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Mar 28 14:16:58 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018797.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018801.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18798">[ date ]</a>
+              <a href="thread.html#18798">[ thread ]</a>
+              <a href="subject.html#18798">[ subject ]</a>
+              <a href="author.html#18798">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  dcf8b01f44c4dc5f76ea72093261b61d8a34601b (commit)
+      from  7814cdf3ebc0bae649cc46f279ac4e4369d309de (commit)
+
+
+- Log -----------------------------------------------------------------
+commit dcf8b01f44c4dc5f76ea72093261b61d8a34601b
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Mar 12 17:15:25 2018 +0000
+
+    Tolerate a Certificate using a non-supported group on server side
+    
+    If a server has been configured to use an ECDSA certificate, we should
+    allow it regardless of whether the server's own supported groups list
+    includes the certificate's group.
+    
+    Fixes #2033
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5601">https://github.com/openssl/openssl/pull/5601</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_locl.h                        |   2 +-
+ ssl/statem/statem_clnt.c              |   3 +-
+ ssl/t1_lib.c                          |  24 +-
+ test/ssl-tests/20-cert-select.conf    | 859 ++++++++++++++++++----------------
+ test/ssl-tests/20-cert-select.conf.in |  44 ++
+ 5 files changed, 524 insertions(+), 408 deletions(-)
+
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index eae5788..1c3ee35 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -2453,7 +2453,7 @@ SSL_COMP *ssl3_comp_find(STACK_OF(SSL_COMP) *sk, int n);
+ #  ifndef OPENSSL_NO_EC
+ 
+ __owur const TLS_GROUP_INFO *tls1_group_id_lookup(uint16_t curve_id);
+-__owur int tls1_check_group_id(SSL *s, uint16_t group_id);
++__owur int tls1_check_group_id(SSL *s, uint16_t group_id, int check_own_curves);
+ __owur uint16_t tls1_shared_group(SSL *s, int nmatch);
+ __owur int tls1_set_groups(uint16_t **pext, size_t *pextlen,
+                            int *curves, size_t ncurves);
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index e940fc8..29db4bc 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -2192,7 +2192,8 @@ static int tls_process_ske_ecdhe(SSL *s, PACKET *pkt, EVP_PKEY **pkey)
+      * Check curve is named curve type and one of our preferences, if not
+      * server has sent an invalid curve.
+      */
+-    if (curve_type != NAMED_CURVE_TYPE || !tls1_check_group_id(s, curve_id)) {
++    if (curve_type != NAMED_CURVE_TYPE
++            || !tls1_check_group_id(s, curve_id, 1)) {
+         SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_F_TLS_PROCESS_SKE_ECDHE,
+                  SSL_R_WRONG_CURVE);
+         return 0;
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 174d7de..cf5f783 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -467,7 +467,7 @@ static int tls1_check_pkey_comp(SSL *s, EVP_PKEY *pkey)
+ }
+ 
+ /* Check a group id matches preferences */
+-int tls1_check_group_id(SSL *s, uint16_t group_id)
++int tls1_check_group_id(SSL *s, uint16_t group_id, int check_own_groups)
+     {
+     const uint16_t *groups;
+     size_t groups_len;
+@@ -491,10 +491,12 @@ int tls1_check_group_id(SSL *s, uint16_t group_id)
+         }
+     }
+ 
+-    /* Check group is one of our preferences */
+-    tls1_get_supported_groups(s, &amp;groups, &amp;groups_len);
+-    if (!tls1_in_list(group_id, groups, groups_len))
+-        return 0;
++    if (check_own_groups) {
++        /* Check group is one of our preferences */
++        tls1_get_supported_groups(s, &amp;groups, &amp;groups_len);
++        if (!tls1_in_list(group_id, groups, groups_len))
++            return 0;
++    }
+ 
+     if (!tls_curve_allowed(s, group_id, SSL_SECOP_CURVE_CHECK))
+         return 0;
+@@ -554,7 +556,11 @@ static int tls1_check_cert_param(SSL *s, X509 *x, int check_ee_md)
+     if (!tls1_check_pkey_comp(s, pkey))
+         return 0;
+     group_id = tls1_get_group_id(pkey);
+-    if (!tls1_check_group_id(s, group_id))
++    /*
++     * For a server we allow the certificate to not be in our list of supported
++     * groups.
++     */
++    if (!tls1_check_group_id(s, group_id, !s-&gt;server))
+         return 0;
+     /*
+      * Special case for suite B. We *MUST* sign using SHA256+P-256 or
+@@ -601,9 +607,9 @@ int tls1_check_ec_tmp_key(SSL *s, unsigned long cid)
+      * curves permitted.
+      */
+     if (cid == TLS1_CK_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+-        return tls1_check_group_id(s, TLSEXT_curve_P_256);
++        return tls1_check_group_id(s, TLSEXT_curve_P_256, 1);
+     if (cid == TLS1_CK_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+-        return tls1_check_group_id(s, TLSEXT_curve_P_384);
++        return tls1_check_group_id(s, TLSEXT_curve_P_384, 1);
+ 
+     return 0;
+ }
+@@ -979,7 +985,7 @@ int tls12_check_peer_sigalg(SSL *s, uint16_t sig, EVP_PKEY *pkey)
+         }
+         if (!SSL_IS_TLS13(s)) {
+             /* Check curve matches extensions */
+-            if (!tls1_check_group_id(s, tls1_get_group_id(pkey))) {
++            if (!tls1_check_group_id(s, tls1_get_group_id(pkey), 1)) {
+                 SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER,
+                          SSL_F_TLS12_CHECK_PEER_SIGALG, SSL_R_WRONG_CURVE);
+                 return 0;
+diff --git a/test/ssl-tests/20-cert-select.conf b/test/ssl-tests/20-cert-select.conf
+index 1f415bf..26da1c0 100644
+--- a/test/ssl-tests/20-cert-select.conf
++++ b/test/ssl-tests/20-cert-select.conf
+@@ -1,52 +1,54 @@
+ # Generated with generate_ssl_tests.pl
+ 
+-num_tests = 45
++num_tests = 47
+ 
+ test-0 = 0-ECDSA CipherString Selection
+-test-1 = 1-Ed25519 CipherString and Signature Algorithm Selection
+-test-2 = 2-Ed448 CipherString and Signature Algorithm Selection
+-test-3 = 3-RSA CipherString Selection
+-test-4 = 4-RSA-PSS Certificate CipherString Selection
+-test-5 = 5-P-256 CipherString and Signature Algorithm Selection
+-test-6 = 6-Ed25519 CipherString and Curves Selection
+-test-7 = 7-Ed448 CipherString and Curves Selection
+-test-8 = 8-ECDSA CipherString Selection, no ECDSA certificate
+-test-9 = 9-ECDSA Signature Algorithm Selection
+-test-10 = 10-ECDSA Signature Algorithm Selection SHA384
+-test-11 = 11-ECDSA Signature Algorithm Selection SHA1
+-test-12 = 12-ECDSA Signature Algorithm Selection compressed point
+-test-13 = 13-ECDSA Signature Algorithm Selection, no ECDSA certificate
+-test-14 = 14-RSA Signature Algorithm Selection
+-test-15 = 15-RSA-PSS Signature Algorithm Selection
+-test-16 = 16-RSA-PSS Certificate Legacy Signature Algorithm Selection
+-test-17 = 17-RSA-PSS Certificate Unified Signature Algorithm Selection
+-test-18 = 18-Only RSA-PSS Certificate
+-test-19 = 19-RSA-PSS Certificate, no PSS signature algorithms
+-test-20 = 20-Suite B P-256 Hash Algorithm Selection
+-test-21 = 21-Suite B P-384 Hash Algorithm Selection
+-test-22 = 22-TLS 1.2 Ed25519 Client Auth
+-test-23 = 23-TLS 1.2 Ed448 Client Auth
+-test-24 = 24-Only RSA-PSS Certificate, TLS v1.1
+-test-25 = 25-TLS 1.3 ECDSA Signature Algorithm Selection
+-test-26 = 26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point
+-test-27 = 27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1
+-test-28 = 28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS
+-test-29 = 29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS
+-test-30 = 30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate
+-test-31 = 31-TLS 1.3 RSA Signature Algorithm Selection, no PSS
+-test-32 = 32-TLS 1.3 RSA-PSS Signature Algorithm Selection
+-test-33 = 33-TLS 1.3 Ed25519 Signature Algorithm Selection
+-test-34 = 34-TLS 1.3 Ed448 Signature Algorithm Selection
+-test-35 = 35-TLS 1.3 Ed25519 CipherString and Groups Selection
+-test-36 = 36-TLS 1.3 Ed448 CipherString and Groups Selection
+-test-37 = 37-TLS 1.3 RSA Client Auth Signature Algorithm Selection
+-test-38 = 38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names
+-test-39 = 39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection
+-test-40 = 40-TLS 1.3 Ed25519 Client Auth
+-test-41 = 41-TLS 1.3 Ed448 Client Auth
+-test-42 = 42-TLS 1.2 DSA Certificate Test
+-test-43 = 43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms
+-test-44 = 44-TLS 1.3 DSA Certificate Test
++test-1 = 1-ECDSA CipherString Selection
++test-2 = 2-ECDSA CipherString Selection
++test-3 = 3-Ed25519 CipherString and Signature Algorithm Selection
++test-4 = 4-Ed448 CipherString and Signature Algorithm Selection
++test-5 = 5-RSA CipherString Selection
++test-6 = 6-RSA-PSS Certificate CipherString Selection
++test-7 = 7-P-256 CipherString and Signature Algorithm Selection
++test-8 = 8-Ed25519 CipherString and Curves Selection
++test-9 = 9-Ed448 CipherString and Curves Selection
++test-10 = 10-ECDSA CipherString Selection, no ECDSA certificate
++test-11 = 11-ECDSA Signature Algorithm Selection
++test-12 = 12-ECDSA Signature Algorithm Selection SHA384
++test-13 = 13-ECDSA Signature Algorithm Selection SHA1
++test-14 = 14-ECDSA Signature Algorithm Selection compressed point
++test-15 = 15-ECDSA Signature Algorithm Selection, no ECDSA certificate
++test-16 = 16-RSA Signature Algorithm Selection
++test-17 = 17-RSA-PSS Signature Algorithm Selection
++test-18 = 18-RSA-PSS Certificate Legacy Signature Algorithm Selection
++test-19 = 19-RSA-PSS Certificate Unified Signature Algorithm Selection
++test-20 = 20-Only RSA-PSS Certificate
++test-21 = 21-RSA-PSS Certificate, no PSS signature algorithms
++test-22 = 22-Suite B P-256 Hash Algorithm Selection
++test-23 = 23-Suite B P-384 Hash Algorithm Selection
++test-24 = 24-TLS 1.2 Ed25519 Client Auth
++test-25 = 25-TLS 1.2 Ed448 Client Auth
++test-26 = 26-Only RSA-PSS Certificate, TLS v1.1
++test-27 = 27-TLS 1.3 ECDSA Signature Algorithm Selection
++test-28 = 28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point
++test-29 = 29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1
++test-30 = 30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS
++test-31 = 31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS
++test-32 = 32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate
++test-33 = 33-TLS 1.3 RSA Signature Algorithm Selection, no PSS
++test-34 = 34-TLS 1.3 RSA-PSS Signature Algorithm Selection
++test-35 = 35-TLS 1.3 Ed25519 Signature Algorithm Selection
++test-36 = 36-TLS 1.3 Ed448 Signature Algorithm Selection
++test-37 = 37-TLS 1.3 Ed25519 CipherString and Groups Selection
++test-38 = 38-TLS 1.3 Ed448 CipherString and Groups Selection
++test-39 = 39-TLS 1.3 RSA Client Auth Signature Algorithm Selection
++test-40 = 40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names
++test-41 = 41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection
++test-42 = 42-TLS 1.3 Ed25519 Client Auth
++test-43 = 43-TLS 1.3 Ed448 Client Auth
++test-44 = 44-TLS 1.2 DSA Certificate Test
++test-45 = 45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms
++test-46 = 46-TLS 1.3 DSA Certificate Test
+ # ===========================================================
+ 
+ [0-ECDSA CipherString Selection]
+@@ -84,14 +86,77 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[1-Ed25519 CipherString and Signature Algorithm Selection]
+-ssl_conf = 1-Ed25519 CipherString and Signature Algorithm Selection-ssl
++[1-ECDSA CipherString Selection]
++ssl_conf = 1-ECDSA CipherString Selection-ssl
+ 
+-[1-Ed25519 CipherString and Signature Algorithm Selection-ssl]
+-server = 1-Ed25519 CipherString and Signature Algorithm Selection-server
+-client = 1-Ed25519 CipherString and Signature Algorithm Selection-client
++[1-ECDSA CipherString Selection-ssl]
++server = 1-ECDSA CipherString Selection-server
++client = 1-ECDSA CipherString Selection-client
+ 
+-[1-Ed25519 CipherString and Signature Algorithm Selection-server]
++[1-ECDSA CipherString Selection-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
++ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ecdsa-key.pem
++Groups = P-384
++MaxProtocol = TLSv1.2
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[1-ECDSA CipherString Selection-client]
++CipherString = aECDSA
++Groups = P-256:P-384
++MaxProtocol = TLSv1.2
++RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-1]
++ExpectedResult = Success
++ExpectedServerCANames = empty
++ExpectedServerCertType = P-256
++ExpectedServerSignType = EC
++
++
++# ===========================================================
++
++[2-ECDSA CipherString Selection]
++ssl_conf = 2-ECDSA CipherString Selection-ssl
++
++[2-ECDSA CipherString Selection-ssl]
++server = 2-ECDSA CipherString Selection-server
++client = 2-ECDSA CipherString Selection-client
++
++[2-ECDSA CipherString Selection-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
++ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ecdsa-key.pem
++Groups = P-256:P-384
++MaxProtocol = TLSv1.2
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[2-ECDSA CipherString Selection-client]
++CipherString = aECDSA
++Groups = P-384
++MaxProtocol = TLSv1.2
++RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-2]
++ExpectedResult = ServerFail
++
++
++# ===========================================================
++
++[3-Ed25519 CipherString and Signature Algorithm Selection]
++ssl_conf = 3-Ed25519 CipherString and Signature Algorithm Selection-ssl
++
++[3-Ed25519 CipherString and Signature Algorithm Selection-ssl]
++server = 3-Ed25519 CipherString and Signature Algorithm Selection-server
++client = 3-Ed25519 CipherString and Signature Algorithm Selection-client
++
++[3-Ed25519 CipherString and Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -103,7 +168,7 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[1-Ed25519 CipherString and Signature Algorithm Selection-client]
++[3-Ed25519 CipherString and Signature Algorithm Selection-client]
+ CipherString = aECDSA
+ MaxProtocol = TLSv1.2
+ RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+@@ -111,7 +176,7 @@ SignatureAlgorithms = ed25519:ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-1]
++[test-3]
+ ExpectedResult = Success
+ ExpectedServerCANames = empty
+ ExpectedServerCertType = Ed25519
+@@ -120,14 +185,14 @@ ExpectedServerSignType = Ed25519
+ 
+ # ===========================================================
+ 
+-[2-Ed448 CipherString and Signature Algorithm Selection]
+-ssl_conf = 2-Ed448 CipherString and Signature Algorithm Selection-ssl
++[4-Ed448 CipherString and Signature Algorithm Selection]
++ssl_conf = 4-Ed448 CipherString and Signature Algorithm Selection-ssl
+ 
+-[2-Ed448 CipherString and Signature Algorithm Selection-ssl]
+-server = 2-Ed448 CipherString and Signature Algorithm Selection-server
+-client = 2-Ed448 CipherString and Signature Algorithm Selection-client
++[4-Ed448 CipherString and Signature Algorithm Selection-ssl]
++server = 4-Ed448 CipherString and Signature Algorithm Selection-server
++client = 4-Ed448 CipherString and Signature Algorithm Selection-client
+ 
+-[2-Ed448 CipherString and Signature Algorithm Selection-server]
++[4-Ed448 CipherString and Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -139,7 +204,7 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[2-Ed448 CipherString and Signature Algorithm Selection-client]
++[4-Ed448 CipherString and Signature Algorithm Selection-client]
+ CipherString = aECDSA
+ MaxProtocol = TLSv1.2
+ RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+@@ -147,7 +212,7 @@ SignatureAlgorithms = ed448:ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-2]
++[test-4]
+ ExpectedResult = Success
+ ExpectedServerCANames = empty
+ ExpectedServerCertType = Ed448
+@@ -156,14 +221,14 @@ ExpectedServerSignType = Ed448
+ 
+ # ===========================================================
+ 
+-[3-RSA CipherString Selection]
+-ssl_conf = 3-RSA CipherString Selection-ssl
++[5-RSA CipherString Selection]
++ssl_conf = 5-RSA CipherString Selection-ssl
+ 
+-[3-RSA CipherString Selection-ssl]
+-server = 3-RSA CipherString Selection-server
+-client = 3-RSA CipherString Selection-client
++[5-RSA CipherString Selection-ssl]
++server = 5-RSA CipherString Selection-server
++client = 5-RSA CipherString Selection-client
+ 
+-[3-RSA CipherString Selection-server]
++[5-RSA CipherString Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -175,13 +240,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[3-RSA CipherString Selection-client]
++[5-RSA CipherString Selection-client]
+ CipherString = aRSA
+ MaxProtocol = TLSv1.2
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-3]
++[test-5]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignType = RSA-PSS
+@@ -189,14 +254,14 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[4-RSA-PSS Certificate CipherString Selection]
+-ssl_conf = 4-RSA-PSS Certificate CipherString Selection-ssl
++[6-RSA-PSS Certificate CipherString Selection]
++ssl_conf = 6-RSA-PSS Certificate CipherString Selection-ssl
+ 
+-[4-RSA-PSS Certificate CipherString Selection-ssl]
+-server = 4-RSA-PSS Certificate CipherString Selection-server
+-client = 4-RSA-PSS Certificate CipherString Selection-client
++[6-RSA-PSS Certificate CipherString Selection-ssl]
++server = 6-RSA-PSS Certificate CipherString Selection-server
++client = 6-RSA-PSS Certificate CipherString Selection-client
+ 
+-[4-RSA-PSS Certificate CipherString Selection-server]
++[6-RSA-PSS Certificate CipherString Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -210,13 +275,13 @@ PSS.Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ PSS.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[4-RSA-PSS Certificate CipherString Selection-client]
++[6-RSA-PSS Certificate CipherString Selection-client]
+ CipherString = aRSA
+ MaxProtocol = TLSv1.2
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-4]
++[test-6]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA-PSS
+ ExpectedServerSignType = RSA-PSS
+@@ -224,14 +289,14 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[5-P-256 CipherString and Signature Algorithm Selection]
+-ssl_conf = 5-P-256 CipherString and Signature Algorithm Selection-ssl
++[7-P-256 CipherString and Signature Algorithm Selection]
++ssl_conf = 7-P-256 CipherString and Signature Algorithm Selection-ssl
+ 
+-[5-P-256 CipherString and Signature Algorithm Selection-ssl]
+-server = 5-P-256 CipherString and Signature Algorithm Selection-server
+-client = 5-P-256 CipherString and Signature Algorithm Selection-client
++[7-P-256 CipherString and Signature Algorithm Selection-ssl]
++server = 7-P-256 CipherString and Signature Algorithm Selection-server
++client = 7-P-256 CipherString and Signature Algorithm Selection-client
+ 
+-[5-P-256 CipherString and Signature Algorithm Selection-server]
++[7-P-256 CipherString and Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -243,14 +308,14 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[5-P-256 CipherString and Signature Algorithm Selection-client]
++[7-P-256 CipherString and Signature Algorithm Selection-client]
+ CipherString = aECDSA
+ MaxProtocol = TLSv1.2
+ SignatureAlgorithms = ECDSA+SHA256:ed25519
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-5]
++[test-7]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA256
+@@ -259,14 +324,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[6-Ed25519 CipherString and Curves Selection]
+-ssl_conf = 6-Ed25519 CipherString and Curves Selection-ssl
++[8-Ed25519 CipherString and Curves Selection]
++ssl_conf = 8-Ed25519 CipherString and Curves Selection-ssl
+ 
+-[6-Ed25519 CipherString and Curves Selection-ssl]
+-server = 6-Ed25519 CipherString and Curves Selection-server
+-client = 6-Ed25519 CipherString and Curves Selection-client
++[8-Ed25519 CipherString and Curves Selection-ssl]
++server = 8-Ed25519 CipherString and Curves Selection-server
++client = 8-Ed25519 CipherString and Curves Selection-client
+ 
+-[6-Ed25519 CipherString and Curves Selection-server]
++[8-Ed25519 CipherString and Curves Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -278,7 +343,7 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[6-Ed25519 CipherString and Curves Selection-client]
++[8-Ed25519 CipherString and Curves Selection-client]
+ CipherString = aECDSA
+ Curves = X25519
+ MaxProtocol = TLSv1.2
+@@ -286,7 +351,7 @@ SignatureAlgorithms = ECDSA+SHA256:ed25519
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-6]
++[test-8]
+ ExpectedResult = Success
+ ExpectedServerCertType = Ed25519
+ ExpectedServerSignType = Ed25519
+@@ -294,14 +359,14 @@ ExpectedServerSignType = Ed25519
+ 
+ # ===========================================================
+ 
+-[7-Ed448 CipherString and Curves Selection]
+-ssl_conf = 7-Ed448 CipherString and Curves Selection-ssl
++[9-Ed448 CipherString and Curves Selection]
++ssl_conf = 9-Ed448 CipherString and Curves Selection-ssl
+ 
+-[7-Ed448 CipherString and Curves Selection-ssl]
+-server = 7-Ed448 CipherString and Curves Selection-server
+-client = 7-Ed448 CipherString and Curves Selection-client
++[9-Ed448 CipherString and Curves Selection-ssl]
++server = 9-Ed448 CipherString and Curves Selection-server
++client = 9-Ed448 CipherString and Curves Selection-client
+ 
+-[7-Ed448 CipherString and Curves Selection-server]
++[9-Ed448 CipherString and Curves Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -313,7 +378,7 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[7-Ed448 CipherString and Curves Selection-client]
++[9-Ed448 CipherString and Curves Selection-client]
+ CipherString = aECDSA
+ Curves = X448
+ MaxProtocol = TLSv1.2
+@@ -321,7 +386,7 @@ SignatureAlgorithms = ECDSA+SHA256:ed448
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-7]
++[test-9]
+ ExpectedResult = Success
+ ExpectedServerCertType = Ed448
+ ExpectedServerSignType = Ed448
+@@ -329,39 +394,39 @@ ExpectedServerSignType = Ed448
+ 
+ # ===========================================================
+ 
+-[8-ECDSA CipherString Selection, no ECDSA certificate]
+-ssl_conf = 8-ECDSA CipherString Selection, no ECDSA certificate-ssl
++[10-ECDSA CipherString Selection, no ECDSA certificate]
++ssl_conf = 10-ECDSA CipherString Selection, no ECDSA certificate-ssl
+ 
+-[8-ECDSA CipherString Selection, no ECDSA certificate-ssl]
+-server = 8-ECDSA CipherString Selection, no ECDSA certificate-server
+-client = 8-ECDSA CipherString Selection, no ECDSA certificate-client
++[10-ECDSA CipherString Selection, no ECDSA certificate-ssl]
++server = 10-ECDSA CipherString Selection, no ECDSA certificate-server
++client = 10-ECDSA CipherString Selection, no ECDSA certificate-client
+ 
+-[8-ECDSA CipherString Selection, no ECDSA certificate-server]
++[10-ECDSA CipherString Selection, no ECDSA certificate-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[8-ECDSA CipherString Selection, no ECDSA certificate-client]
++[10-ECDSA CipherString Selection, no ECDSA certificate-client]
+ CipherString = aECDSA
+ MaxProtocol = TLSv1.2
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-8]
++[test-10]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[9-ECDSA Signature Algorithm Selection]
+-ssl_conf = 9-ECDSA Signature Algorithm Selection-ssl
++[11-ECDSA Signature Algorithm Selection]
++ssl_conf = 11-ECDSA Signature Algorithm Selection-ssl
+ 
+-[9-ECDSA Signature Algorithm Selection-ssl]
+-server = 9-ECDSA Signature Algorithm Selection-server
+-client = 9-ECDSA Signature Algorithm Selection-client
++[11-ECDSA Signature Algorithm Selection-ssl]
++server = 11-ECDSA Signature Algorithm Selection-server
++client = 11-ECDSA Signature Algorithm Selection-client
+ 
+-[9-ECDSA Signature Algorithm Selection-server]
++[11-ECDSA Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -373,13 +438,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[9-ECDSA Signature Algorithm Selection-client]
++[11-ECDSA Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-9]
++[test-11]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA256
+@@ -388,14 +453,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[10-ECDSA Signature Algorithm Selection SHA384]
+-ssl_conf = 10-ECDSA Signature Algorithm Selection SHA384-ssl
++[12-ECDSA Signature Algorithm Selection SHA384]
++ssl_conf = 12-ECDSA Signature Algorithm Selection SHA384-ssl
+ 
+-[10-ECDSA Signature Algorithm Selection SHA384-ssl]
+-server = 10-ECDSA Signature Algorithm Selection SHA384-server
+-client = 10-ECDSA Signature Algorithm Selection SHA384-client
++[12-ECDSA Signature Algorithm Selection SHA384-ssl]
++server = 12-ECDSA Signature Algorithm Selection SHA384-server
++client = 12-ECDSA Signature Algorithm Selection SHA384-client
+ 
+-[10-ECDSA Signature Algorithm Selection SHA384-server]
++[12-ECDSA Signature Algorithm Selection SHA384-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -407,13 +472,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[10-ECDSA Signature Algorithm Selection SHA384-client]
++[12-ECDSA Signature Algorithm Selection SHA384-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA384
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-10]
++[test-12]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA384
+@@ -422,14 +487,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[11-ECDSA Signature Algorithm Selection SHA1]
+-ssl_conf = 11-ECDSA Signature Algorithm Selection SHA1-ssl
++[13-ECDSA Signature Algorithm Selection SHA1]
++ssl_conf = 13-ECDSA Signature Algorithm Selection SHA1-ssl
+ 
+-[11-ECDSA Signature Algorithm Selection SHA1-ssl]
+-server = 11-ECDSA Signature Algorithm Selection SHA1-server
+-client = 11-ECDSA Signature Algorithm Selection SHA1-client
++[13-ECDSA Signature Algorithm Selection SHA1-ssl]
++server = 13-ECDSA Signature Algorithm Selection SHA1-server
++client = 13-ECDSA Signature Algorithm Selection SHA1-client
+ 
+-[11-ECDSA Signature Algorithm Selection SHA1-server]
++[13-ECDSA Signature Algorithm Selection SHA1-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -441,13 +506,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[11-ECDSA Signature Algorithm Selection SHA1-client]
++[13-ECDSA Signature Algorithm Selection SHA1-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA1
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-11]
++[test-13]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA1
+@@ -456,14 +521,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[12-ECDSA Signature Algorithm Selection compressed point]
+-ssl_conf = 12-ECDSA Signature Algorithm Selection compressed point-ssl
++[14-ECDSA Signature Algorithm Selection compressed point]
++ssl_conf = 14-ECDSA Signature Algorithm Selection compressed point-ssl
+ 
+-[12-ECDSA Signature Algorithm Selection compressed point-ssl]
+-server = 12-ECDSA Signature Algorithm Selection compressed point-server
+-client = 12-ECDSA Signature Algorithm Selection compressed point-client
++[14-ECDSA Signature Algorithm Selection compressed point-ssl]
++server = 14-ECDSA Signature Algorithm Selection compressed point-server
++client = 14-ECDSA Signature Algorithm Selection compressed point-client
+ 
+-[12-ECDSA Signature Algorithm Selection compressed point-server]
++[14-ECDSA Signature Algorithm Selection compressed point-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-cecdsa-cert.pem
+@@ -471,13 +536,13 @@ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-cecdsa-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[12-ECDSA Signature Algorithm Selection compressed point-client]
++[14-ECDSA Signature Algorithm Selection compressed point-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-12]
++[test-14]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA256
+@@ -486,39 +551,39 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[13-ECDSA Signature Algorithm Selection, no ECDSA certificate]
+-ssl_conf = 13-ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl
++[15-ECDSA Signature Algorithm Selection, no ECDSA certificate]
++ssl_conf = 15-ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl
+ 
+-[13-ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl]
+-server = 13-ECDSA Signature Algorithm Selection, no ECDSA certificate-server
+-client = 13-ECDSA Signature Algorithm Selection, no ECDSA certificate-client
++[15-ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl]
++server = 15-ECDSA Signature Algorithm Selection, no ECDSA certificate-server
++client = 15-ECDSA Signature Algorithm Selection, no ECDSA certificate-client
+ 
+-[13-ECDSA Signature Algorithm Selection, no ECDSA certificate-server]
++[15-ECDSA Signature Algorithm Selection, no ECDSA certificate-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[13-ECDSA Signature Algorithm Selection, no ECDSA certificate-client]
++[15-ECDSA Signature Algorithm Selection, no ECDSA certificate-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-13]
++[test-15]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[14-RSA Signature Algorithm Selection]
+-ssl_conf = 14-RSA Signature Algorithm Selection-ssl
++[16-RSA Signature Algorithm Selection]
++ssl_conf = 16-RSA Signature Algorithm Selection-ssl
+ 
+-[14-RSA Signature Algorithm Selection-ssl]
+-server = 14-RSA Signature Algorithm Selection-server
+-client = 14-RSA Signature Algorithm Selection-client
++[16-RSA Signature Algorithm Selection-ssl]
++server = 16-RSA Signature Algorithm Selection-server
++client = 16-RSA Signature Algorithm Selection-client
+ 
+-[14-RSA Signature Algorithm Selection-server]
++[16-RSA Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -530,13 +595,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[14-RSA Signature Algorithm Selection-client]
++[16-RSA Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-14]
++[test-16]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignHash = SHA256
+@@ -545,14 +610,14 @@ ExpectedServerSignType = RSA
+ 
+ # ===========================================================
+ 
+-[15-RSA-PSS Signature Algorithm Selection]
+-ssl_conf = 15-RSA-PSS Signature Algorithm Selection-ssl
++[17-RSA-PSS Signature Algorithm Selection]
++ssl_conf = 17-RSA-PSS Signature Algorithm Selection-ssl
+ 
+-[15-RSA-PSS Signature Algorithm Selection-ssl]
+-server = 15-RSA-PSS Signature Algorithm Selection-server
+-client = 15-RSA-PSS Signature Algorithm Selection-client
++[17-RSA-PSS Signature Algorithm Selection-ssl]
++server = 17-RSA-PSS Signature Algorithm Selection-server
++client = 17-RSA-PSS Signature Algorithm Selection-client
+ 
+-[15-RSA-PSS Signature Algorithm Selection-server]
++[17-RSA-PSS Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -564,13 +629,13 @@ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-ed448-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[15-RSA-PSS Signature Algorithm Selection-client]
++[17-RSA-PSS Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA-PSS+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-15]
++[test-17]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignHash = SHA256
+@@ -579,14 +644,14 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[16-RSA-PSS Certificate Legacy Signature Algorithm Selection]
+-ssl_conf = 16-RSA-PSS Certificate Legacy Signature Algorithm Selection-ssl
++[18-RSA-PSS Certificate Legacy Signature Algorithm Selection]
++ssl_conf = 18-RSA-PSS Certificate Legacy Signature Algorithm Selection-ssl
+ 
+-[16-RSA-PSS Certificate Legacy Signature Algorithm Selection-ssl]
+-server = 16-RSA-PSS Certificate Legacy Signature Algorithm Selection-server
+-client = 16-RSA-PSS Certificate Legacy Signature Algorithm Selection-client
++[18-RSA-PSS Certificate Legacy Signature Algorithm Selection-ssl]
++server = 18-RSA-PSS Certificate Legacy Signature Algorithm Selection-server
++client = 18-RSA-PSS Certificate Legacy Signature Algorithm Selection-client
+ 
+-[16-RSA-PSS Certificate Legacy Signature Algorithm Selection-server]
++[18-RSA-PSS Certificate Legacy Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -600,13 +665,13 @@ PSS.Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ PSS.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[16-RSA-PSS Certificate Legacy Signature Algorithm Selection-client]
++[18-RSA-PSS Certificate Legacy Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA-PSS+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-16]
++[test-18]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignHash = SHA256
+@@ -615,14 +680,14 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[17-RSA-PSS Certificate Unified Signature Algorithm Selection]
+-ssl_conf = 17-RSA-PSS Certificate Unified Signature Algorithm Selection-ssl
++[19-RSA-PSS Certificate Unified Signature Algorithm Selection]
++ssl_conf = 19-RSA-PSS Certificate Unified Signature Algorithm Selection-ssl
+ 
+-[17-RSA-PSS Certificate Unified Signature Algorithm Selection-ssl]
+-server = 17-RSA-PSS Certificate Unified Signature Algorithm Selection-server
+-client = 17-RSA-PSS Certificate Unified Signature Algorithm Selection-client
++[19-RSA-PSS Certificate Unified Signature Algorithm Selection-ssl]
++server = 19-RSA-PSS Certificate Unified Signature Algorithm Selection-server
++client = 19-RSA-PSS Certificate Unified Signature Algorithm Selection-client
+ 
+-[17-RSA-PSS Certificate Unified Signature Algorithm Selection-server]
++[19-RSA-PSS Certificate Unified Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -636,13 +701,13 @@ PSS.Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ PSS.PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[17-RSA-PSS Certificate Unified Signature Algorithm Selection-client]
++[19-RSA-PSS Certificate Unified Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = rsa_pss_pss_sha256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-17]
++[test-19]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA-PSS
+ ExpectedServerSignHash = SHA256
+@@ -651,24 +716,24 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[18-Only RSA-PSS Certificate]
+-ssl_conf = 18-Only RSA-PSS Certificate-ssl
++[20-Only RSA-PSS Certificate]
++ssl_conf = 20-Only RSA-PSS Certificate-ssl
+ 
+-[18-Only RSA-PSS Certificate-ssl]
+-server = 18-Only RSA-PSS Certificate-server
+-client = 18-Only RSA-PSS Certificate-client
++[20-Only RSA-PSS Certificate-ssl]
++server = 20-Only RSA-PSS Certificate-server
++client = 20-Only RSA-PSS Certificate-client
+ 
+-[18-Only RSA-PSS Certificate-server]
++[20-Only RSA-PSS Certificate-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ 
+-[18-Only RSA-PSS Certificate-client]
++[20-Only RSA-PSS Certificate-client]
+ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-18]
++[test-20]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA-PSS
+ ExpectedServerSignHash = SHA256
+@@ -677,38 +742,38 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[19-RSA-PSS Certificate, no PSS signature algorithms]
+-ssl_conf = 19-RSA-PSS Certificate, no PSS signature algorithms-ssl
++[21-RSA-PSS Certificate, no PSS signature algorithms]
++ssl_conf = 21-RSA-PSS Certificate, no PSS signature algorithms-ssl
+ 
+-[19-RSA-PSS Certificate, no PSS signature algorithms-ssl]
+-server = 19-RSA-PSS Certificate, no PSS signature algorithms-server
+-client = 19-RSA-PSS Certificate, no PSS signature algorithms-client
++[21-RSA-PSS Certificate, no PSS signature algorithms-ssl]
++server = 21-RSA-PSS Certificate, no PSS signature algorithms-server
++client = 21-RSA-PSS Certificate, no PSS signature algorithms-client
+ 
+-[19-RSA-PSS Certificate, no PSS signature algorithms-server]
++[21-RSA-PSS Certificate, no PSS signature algorithms-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ 
+-[19-RSA-PSS Certificate, no PSS signature algorithms-client]
++[21-RSA-PSS Certificate, no PSS signature algorithms-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-19]
++[test-21]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[20-Suite B P-256 Hash Algorithm Selection]
+-ssl_conf = 20-Suite B P-256 Hash Algorithm Selection-ssl
++[22-Suite B P-256 Hash Algorithm Selection]
++ssl_conf = 22-Suite B P-256 Hash Algorithm Selection-ssl
+ 
+-[20-Suite B P-256 Hash Algorithm Selection-ssl]
+-server = 20-Suite B P-256 Hash Algorithm Selection-server
+-client = 20-Suite B P-256 Hash Algorithm Selection-client
++[22-Suite B P-256 Hash Algorithm Selection-ssl]
++server = 22-Suite B P-256 Hash Algorithm Selection-server
++client = 22-Suite B P-256 Hash Algorithm Selection-client
+ 
+-[20-Suite B P-256 Hash Algorithm Selection-server]
++[22-Suite B P-256 Hash Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = SUITEB128
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/p256-server-cert.pem
+@@ -716,13 +781,13 @@ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/p256-server-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[20-Suite B P-256 Hash Algorithm Selection-client]
++[22-Suite B P-256 Hash Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA384:ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/p384-root.pem
+ VerifyMode = Peer
+ 
+-[test-20]
++[test-22]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignHash = SHA256
+@@ -731,14 +796,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[21-Suite B P-384 Hash Algorithm Selection]
+-ssl_conf = 21-Suite B P-384 Hash Algorithm Selection-ssl
++[23-Suite B P-384 Hash Algorithm Selection]
++ssl_conf = 23-Suite B P-384 Hash Algorithm Selection-ssl
+ 
+-[21-Suite B P-384 Hash Algorithm Selection-ssl]
+-server = 21-Suite B P-384 Hash Algorithm Selection-server
+-client = 21-Suite B P-384 Hash Algorithm Selection-client
++[23-Suite B P-384 Hash Algorithm Selection-ssl]
++server = 23-Suite B P-384 Hash Algorithm Selection-server
++client = 23-Suite B P-384 Hash Algorithm Selection-client
+ 
+-[21-Suite B P-384 Hash Algorithm Selection-server]
++[23-Suite B P-384 Hash Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = SUITEB128
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/p384-server-cert.pem
+@@ -746,13 +811,13 @@ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/p384-server-key.pem
+ MaxProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[21-Suite B P-384 Hash Algorithm Selection-client]
++[23-Suite B P-384 Hash Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256:ECDSA+SHA384
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/p384-root.pem
+ VerifyMode = Peer
+ 
+-[test-21]
++[test-23]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-384
+ ExpectedServerSignHash = SHA384
+@@ -761,21 +826,21 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[22-TLS 1.2 Ed25519 Client Auth]
+-ssl_conf = 22-TLS 1.2 Ed25519 Client Auth-ssl
++[24-TLS 1.2 Ed25519 Client Auth]
++ssl_conf = 24-TLS 1.2 Ed25519 Client Auth-ssl
+ 
+-[22-TLS 1.2 Ed25519 Client Auth-ssl]
+-server = 22-TLS 1.2 Ed25519 Client Auth-server
+-client = 22-TLS 1.2 Ed25519 Client Auth-client
++[24-TLS 1.2 Ed25519 Client Auth-ssl]
++server = 24-TLS 1.2 Ed25519 Client Auth-server
++client = 24-TLS 1.2 Ed25519 Client Auth-client
+ 
+-[22-TLS 1.2 Ed25519 Client Auth-server]
++[24-TLS 1.2 Ed25519 Client Auth-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[22-TLS 1.2 Ed25519 Client Auth-client]
++[24-TLS 1.2 Ed25519 Client Auth-client]
+ CipherString = DEFAULT
+ Ed25519.Certificate = ${ENV::TEST_CERTS_DIR}/client-ed25519-cert.pem
+ Ed25519.PrivateKey = ${ENV::TEST_CERTS_DIR}/client-ed25519-key.pem
+@@ -784,7 +849,7 @@ MinProtocol = TLSv1.2
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-22]
++[test-24]
+ ExpectedClientCertType = Ed25519
+ ExpectedClientSignType = Ed25519
+ ExpectedResult = Success
+@@ -792,21 +857,21 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[23-TLS 1.2 Ed448 Client Auth]
+-ssl_conf = 23-TLS 1.2 Ed448 Client Auth-ssl
++[25-TLS 1.2 Ed448 Client Auth]
++ssl_conf = 25-TLS 1.2 Ed448 Client Auth-ssl
+ 
+-[23-TLS 1.2 Ed448 Client Auth-ssl]
+-server = 23-TLS 1.2 Ed448 Client Auth-server
+-client = 23-TLS 1.2 Ed448 Client Auth-client
++[25-TLS 1.2 Ed448 Client Auth-ssl]
++server = 25-TLS 1.2 Ed448 Client Auth-server
++client = 25-TLS 1.2 Ed448 Client Auth-client
+ 
+-[23-TLS 1.2 Ed448 Client Auth-server]
++[25-TLS 1.2 Ed448 Client Auth-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[23-TLS 1.2 Ed448 Client Auth-client]
++[25-TLS 1.2 Ed448 Client Auth-client]
+ CipherString = DEFAULT
+ Ed448.Certificate = ${ENV::TEST_CERTS_DIR}/client-ed448-cert.pem
+ Ed448.PrivateKey = ${ENV::TEST_CERTS_DIR}/client-ed448-key.pem
+@@ -815,7 +880,7 @@ MinProtocol = TLSv1.2
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-23]
++[test-25]
+ ExpectedClientCertType = Ed448
+ ExpectedClientSignType = Ed448
+ ExpectedResult = Success
+@@ -823,38 +888,38 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[24-Only RSA-PSS Certificate, TLS v1.1]
+-ssl_conf = 24-Only RSA-PSS Certificate, TLS v1.1-ssl
++[26-Only RSA-PSS Certificate, TLS v1.1]
++ssl_conf = 26-Only RSA-PSS Certificate, TLS v1.1-ssl
+ 
+-[24-Only RSA-PSS Certificate, TLS v1.1-ssl]
+-server = 24-Only RSA-PSS Certificate, TLS v1.1-server
+-client = 24-Only RSA-PSS Certificate, TLS v1.1-client
++[26-Only RSA-PSS Certificate, TLS v1.1-ssl]
++server = 26-Only RSA-PSS Certificate, TLS v1.1-server
++client = 26-Only RSA-PSS Certificate, TLS v1.1-client
+ 
+-[24-Only RSA-PSS Certificate, TLS v1.1-server]
++[26-Only RSA-PSS Certificate, TLS v1.1-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/server-pss-cert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/server-pss-key.pem
+ 
+-[24-Only RSA-PSS Certificate, TLS v1.1-client]
++[26-Only RSA-PSS Certificate, TLS v1.1-client]
+ CipherString = DEFAULT
+ MaxProtocol = TLSv1.1
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-24]
++[test-26]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[25-TLS 1.3 ECDSA Signature Algorithm Selection]
+-ssl_conf = 25-TLS 1.3 ECDSA Signature Algorithm Selection-ssl
++[27-TLS 1.3 ECDSA Signature Algorithm Selection]
++ssl_conf = 27-TLS 1.3 ECDSA Signature Algorithm Selection-ssl
+ 
+-[25-TLS 1.3 ECDSA Signature Algorithm Selection-ssl]
+-server = 25-TLS 1.3 ECDSA Signature Algorithm Selection-server
+-client = 25-TLS 1.3 ECDSA Signature Algorithm Selection-client
++[27-TLS 1.3 ECDSA Signature Algorithm Selection-ssl]
++server = 27-TLS 1.3 ECDSA Signature Algorithm Selection-server
++client = 27-TLS 1.3 ECDSA Signature Algorithm Selection-client
+ 
+-[25-TLS 1.3 ECDSA Signature Algorithm Selection-server]
++[27-TLS 1.3 ECDSA Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -867,13 +932,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[25-TLS 1.3 ECDSA Signature Algorithm Selection-client]
++[27-TLS 1.3 ECDSA Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-25]
++[test-27]
+ ExpectedResult = Success
+ ExpectedServerCANames = empty
+ ExpectedServerCertType = P-256
+@@ -883,14 +948,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point]
+-ssl_conf = 26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-ssl
++[28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point]
++ssl_conf = 28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-ssl
+ 
+-[26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-ssl]
+-server = 26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-server
+-client = 26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-client
++[28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-ssl]
++server = 28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-server
++client = 28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-client
+ 
+-[26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-server]
++[28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-cecdsa-cert.pem
+@@ -899,26 +964,26 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[26-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-client]
++[28-TLS 1.3 ECDSA Signature Algorithm Selection compressed point-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-26]
++[test-28]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1]
+-ssl_conf = 27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-ssl
++[29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1]
++ssl_conf = 29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-ssl
+ 
+-[27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-ssl]
+-server = 27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-server
+-client = 27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-client
++[29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-ssl]
++server = 29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-server
++client = 29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-client
+ 
+-[27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-server]
++[29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -931,26 +996,26 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[27-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-client]
++[29-TLS 1.3 ECDSA Signature Algorithm Selection SHA1-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA1
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-27]
++[test-29]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS]
+-ssl_conf = 28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-ssl
++[30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS]
++ssl_conf = 30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-ssl
+ 
+-[28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-ssl]
+-server = 28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-server
+-client = 28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-client
++[30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-ssl]
++server = 30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-server
++client = 30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-client
+ 
+-[28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-server]
++[30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -963,14 +1028,14 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[28-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-client]
++[30-TLS 1.3 ECDSA Signature Algorithm Selection with PSS-client]
+ CipherString = DEFAULT
+ RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ SignatureAlgorithms = ECDSA+SHA256:RSA-PSS+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-28]
++[test-30]
+ ExpectedResult = Success
+ ExpectedServerCANames = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ ExpectedServerCertType = P-256
+@@ -980,14 +1045,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS]
+-ssl_conf = 29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-ssl
++[31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS]
++ssl_conf = 31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-ssl
+ 
+-[29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-ssl]
+-server = 29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-server
+-client = 29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-client
++[31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-ssl]
++server = 31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-server
++client = 31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-client
+ 
+-[29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-server]
++[31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1000,13 +1065,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[29-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-client]
++[31-TLS 1.3 RSA Signature Algorithm Selection SHA384 with PSS-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA384:RSA-PSS+SHA384
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-29]
++[test-31]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignHash = SHA384
+@@ -1015,40 +1080,40 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate]
+-ssl_conf = 30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl
++[32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate]
++ssl_conf = 32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl
+ 
+-[30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl]
+-server = 30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-server
+-client = 30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-client
++[32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-ssl]
++server = 32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-server
++client = 32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-client
+ 
+-[30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-server]
++[32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[30-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-client]
++[32-TLS 1.3 ECDSA Signature Algorithm Selection, no ECDSA certificate-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-30]
++[test-32]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[31-TLS 1.3 RSA Signature Algorithm Selection, no PSS]
+-ssl_conf = 31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-ssl
++[33-TLS 1.3 RSA Signature Algorithm Selection, no PSS]
++ssl_conf = 33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-ssl
+ 
+-[31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-ssl]
+-server = 31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-server
+-client = 31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-client
++[33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-ssl]
++server = 33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-server
++client = 33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-client
+ 
+-[31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-server]
++[33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1061,26 +1126,26 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[31-TLS 1.3 RSA Signature Algorithm Selection, no PSS-client]
++[33-TLS 1.3 RSA Signature Algorithm Selection, no PSS-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-31]
++[test-33]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[32-TLS 1.3 RSA-PSS Signature Algorithm Selection]
+-ssl_conf = 32-TLS 1.3 RSA-PSS Signature Algorithm Selection-ssl
++[34-TLS 1.3 RSA-PSS Signature Algorithm Selection]
++ssl_conf = 34-TLS 1.3 RSA-PSS Signature Algorithm Selection-ssl
+ 
+-[32-TLS 1.3 RSA-PSS Signature Algorithm Selection-ssl]
+-server = 32-TLS 1.3 RSA-PSS Signature Algorithm Selection-server
+-client = 32-TLS 1.3 RSA-PSS Signature Algorithm Selection-client
++[34-TLS 1.3 RSA-PSS Signature Algorithm Selection-ssl]
++server = 34-TLS 1.3 RSA-PSS Signature Algorithm Selection-server
++client = 34-TLS 1.3 RSA-PSS Signature Algorithm Selection-client
+ 
+-[32-TLS 1.3 RSA-PSS Signature Algorithm Selection-server]
++[34-TLS 1.3 RSA-PSS Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1093,13 +1158,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[32-TLS 1.3 RSA-PSS Signature Algorithm Selection-client]
++[34-TLS 1.3 RSA-PSS Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = RSA-PSS+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-32]
++[test-34]
+ ExpectedResult = Success
+ ExpectedServerCertType = RSA
+ ExpectedServerSignHash = SHA256
+@@ -1108,14 +1173,14 @@ ExpectedServerSignType = RSA-PSS
+ 
+ # ===========================================================
+ 
+-[33-TLS 1.3 Ed25519 Signature Algorithm Selection]
+-ssl_conf = 33-TLS 1.3 Ed25519 Signature Algorithm Selection-ssl
++[35-TLS 1.3 Ed25519 Signature Algorithm Selection]
++ssl_conf = 35-TLS 1.3 Ed25519 Signature Algorithm Selection-ssl
+ 
+-[33-TLS 1.3 Ed25519 Signature Algorithm Selection-ssl]
+-server = 33-TLS 1.3 Ed25519 Signature Algorithm Selection-server
+-client = 33-TLS 1.3 Ed25519 Signature Algorithm Selection-client
++[35-TLS 1.3 Ed25519 Signature Algorithm Selection-ssl]
++server = 35-TLS 1.3 Ed25519 Signature Algorithm Selection-server
++client = 35-TLS 1.3 Ed25519 Signature Algorithm Selection-client
+ 
+-[33-TLS 1.3 Ed25519 Signature Algorithm Selection-server]
++[35-TLS 1.3 Ed25519 Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1128,13 +1193,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[33-TLS 1.3 Ed25519 Signature Algorithm Selection-client]
++[35-TLS 1.3 Ed25519 Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ed25519
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-33]
++[test-35]
+ ExpectedResult = Success
+ ExpectedServerCertType = Ed25519
+ ExpectedServerSignType = Ed25519
+@@ -1142,14 +1207,14 @@ ExpectedServerSignType = Ed25519
+ 
+ # ===========================================================
+ 
+-[34-TLS 1.3 Ed448 Signature Algorithm Selection]
+-ssl_conf = 34-TLS 1.3 Ed448 Signature Algorithm Selection-ssl
++[36-TLS 1.3 Ed448 Signature Algorithm Selection]
++ssl_conf = 36-TLS 1.3 Ed448 Signature Algorithm Selection-ssl
+ 
+-[34-TLS 1.3 Ed448 Signature Algorithm Selection-ssl]
+-server = 34-TLS 1.3 Ed448 Signature Algorithm Selection-server
+-client = 34-TLS 1.3 Ed448 Signature Algorithm Selection-client
++[36-TLS 1.3 Ed448 Signature Algorithm Selection-ssl]
++server = 36-TLS 1.3 Ed448 Signature Algorithm Selection-server
++client = 36-TLS 1.3 Ed448 Signature Algorithm Selection-client
+ 
+-[34-TLS 1.3 Ed448 Signature Algorithm Selection-server]
++[36-TLS 1.3 Ed448 Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1162,13 +1227,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[34-TLS 1.3 Ed448 Signature Algorithm Selection-client]
++[36-TLS 1.3 Ed448 Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ SignatureAlgorithms = ed448
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-34]
++[test-36]
+ ExpectedResult = Success
+ ExpectedServerCertType = Ed448
+ ExpectedServerSignType = Ed448
+@@ -1176,14 +1241,14 @@ ExpectedServerSignType = Ed448
+ 
+ # ===========================================================
+ 
+-[35-TLS 1.3 Ed25519 CipherString and Groups Selection]
+-ssl_conf = 35-TLS 1.3 Ed25519 CipherString and Groups Selection-ssl
++[37-TLS 1.3 Ed25519 CipherString and Groups Selection]
++ssl_conf = 37-TLS 1.3 Ed25519 CipherString and Groups Selection-ssl
+ 
+-[35-TLS 1.3 Ed25519 CipherString and Groups Selection-ssl]
+-server = 35-TLS 1.3 Ed25519 CipherString and Groups Selection-server
+-client = 35-TLS 1.3 Ed25519 CipherString and Groups Selection-client
++[37-TLS 1.3 Ed25519 CipherString and Groups Selection-ssl]
++server = 37-TLS 1.3 Ed25519 CipherString and Groups Selection-server
++client = 37-TLS 1.3 Ed25519 CipherString and Groups Selection-client
+ 
+-[35-TLS 1.3 Ed25519 CipherString and Groups Selection-server]
++[37-TLS 1.3 Ed25519 CipherString and Groups Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1196,14 +1261,14 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[35-TLS 1.3 Ed25519 CipherString and Groups Selection-client]
++[37-TLS 1.3 Ed25519 CipherString and Groups Selection-client]
+ CipherString = DEFAULT
+ Groups = X25519
+ SignatureAlgorithms = ECDSA+SHA256:ed25519
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-35]
++[test-37]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignType = EC
+@@ -1211,14 +1276,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[36-TLS 1.3 Ed448 CipherString and Groups Selection]
+-ssl_conf = 36-TLS 1.3 Ed448 CipherString and Groups Selection-ssl
++[38-TLS 1.3 Ed448 CipherString and Groups Selection]
++ssl_conf = 38-TLS 1.3 Ed448 CipherString and Groups Selection-ssl
+ 
+-[36-TLS 1.3 Ed448 CipherString and Groups Selection-ssl]
+-server = 36-TLS 1.3 Ed448 CipherString and Groups Selection-server
+-client = 36-TLS 1.3 Ed448 CipherString and Groups Selection-client
++[38-TLS 1.3 Ed448 CipherString and Groups Selection-ssl]
++server = 38-TLS 1.3 Ed448 CipherString and Groups Selection-server
++client = 38-TLS 1.3 Ed448 CipherString and Groups Selection-client
+ 
+-[36-TLS 1.3 Ed448 CipherString and Groups Selection-server]
++[38-TLS 1.3 Ed448 CipherString and Groups Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-ecdsa-cert.pem
+@@ -1231,14 +1296,14 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[36-TLS 1.3 Ed448 CipherString and Groups Selection-client]
++[38-TLS 1.3 Ed448 CipherString and Groups Selection-client]
+ CipherString = DEFAULT
+ Groups = X448
+ SignatureAlgorithms = ECDSA+SHA256:ed448
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-36]
++[test-38]
+ ExpectedResult = Success
+ ExpectedServerCertType = P-256
+ ExpectedServerSignType = EC
+@@ -1246,14 +1311,14 @@ ExpectedServerSignType = EC
+ 
+ # ===========================================================
+ 
+-[37-TLS 1.3 RSA Client Auth Signature Algorithm Selection]
+-ssl_conf = 37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-ssl
++[39-TLS 1.3 RSA Client Auth Signature Algorithm Selection]
++ssl_conf = 39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-ssl
+ 
+-[37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-ssl]
+-server = 37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-server
+-client = 37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-client
++[39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-ssl]
++server = 39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-server
++client = 39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-client
+ 
+-[37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-server]
++[39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ClientSignatureAlgorithms = PSS+SHA256
+@@ -1261,7 +1326,7 @@ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[37-TLS 1.3 RSA Client Auth Signature Algorithm Selection-client]
++[39-TLS 1.3 RSA Client Auth Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-client-chain.pem
+ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-key.pem
+@@ -1272,7 +1337,7 @@ RSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-key.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-37]
++[test-39]
+ ExpectedClientCANames = empty
+ ExpectedClientCertType = RSA
+ ExpectedClientSignHash = SHA256
+@@ -1282,14 +1347,14 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names]
+-ssl_conf = 38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-ssl
++[40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names]
++ssl_conf = 40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-ssl
+ 
+-[38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-ssl]
+-server = 38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-server
+-client = 38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-client
++[40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-ssl]
++server = 40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-server
++client = 40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-client
+ 
+-[38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-server]
++[40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ClientSignatureAlgorithms = PSS+SHA256
+@@ -1298,7 +1363,7 @@ RequestCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[38-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-client]
++[40-TLS 1.3 RSA Client Auth Signature Algorithm Selection non-empty CA Names-client]
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-client-chain.pem
+ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-key.pem
+@@ -1309,7 +1374,7 @@ RSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-key.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-38]
++[test-40]
+ ExpectedClientCANames = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ ExpectedClientCertType = RSA
+ ExpectedClientSignHash = SHA256
+@@ -1319,14 +1384,14 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection]
+-ssl_conf = 39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-ssl
++[41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection]
++ssl_conf = 41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-ssl
+ 
+-[39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-ssl]
+-server = 39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-server
+-client = 39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-client
++[41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-ssl]
++server = 41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-server
++client = 41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-client
+ 
+-[39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-server]
++[41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ClientSignatureAlgorithms = ECDSA+SHA256
+@@ -1334,7 +1399,7 @@ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[39-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-client]
++[41-TLS 1.3 ECDSA Client Auth Signature Algorithm Selection-client]
+ CipherString = DEFAULT
+ ECDSA.Certificate = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-client-chain.pem
+ ECDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-ecdsa-key.pem
+@@ -1345,7 +1410,7 @@ RSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/ee-key.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-39]
++[test-41]
+ ExpectedClientCertType = P-256
+ ExpectedClientSignHash = SHA256
+ ExpectedClientSignType = EC
+@@ -1354,21 +1419,21 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[40-TLS 1.3 Ed25519 Client Auth]
+-ssl_conf = 40-TLS 1.3 Ed25519 Client Auth-ssl
++[42-TLS 1.3 Ed25519 Client Auth]
++ssl_conf = 42-TLS 1.3 Ed25519 Client Auth-ssl
+ 
+-[40-TLS 1.3 Ed25519 Client Auth-ssl]
+-server = 40-TLS 1.3 Ed25519 Client Auth-server
+-client = 40-TLS 1.3 Ed25519 Client Auth-client
++[42-TLS 1.3 Ed25519 Client Auth-ssl]
++server = 42-TLS 1.3 Ed25519 Client Auth-server
++client = 42-TLS 1.3 Ed25519 Client Auth-client
+ 
+-[40-TLS 1.3 Ed25519 Client Auth-server]
++[42-TLS 1.3 Ed25519 Client Auth-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[40-TLS 1.3 Ed25519 Client Auth-client]
++[42-TLS 1.3 Ed25519 Client Auth-client]
+ CipherString = DEFAULT
+ EdDSA.Certificate = ${ENV::TEST_CERTS_DIR}/client-ed25519-cert.pem
+ EdDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/client-ed25519-key.pem
+@@ -1377,7 +1442,7 @@ MinProtocol = TLSv1.3
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-40]
++[test-42]
+ ExpectedClientCertType = Ed25519
+ ExpectedClientSignType = Ed25519
+ ExpectedResult = Success
+@@ -1385,21 +1450,21 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[41-TLS 1.3 Ed448 Client Auth]
+-ssl_conf = 41-TLS 1.3 Ed448 Client Auth-ssl
++[43-TLS 1.3 Ed448 Client Auth]
++ssl_conf = 43-TLS 1.3 Ed448 Client Auth-ssl
+ 
+-[41-TLS 1.3 Ed448 Client Auth-ssl]
+-server = 41-TLS 1.3 Ed448 Client Auth-server
+-client = 41-TLS 1.3 Ed448 Client Auth-client
++[43-TLS 1.3 Ed448 Client Auth-ssl]
++server = 43-TLS 1.3 Ed448 Client Auth-server
++client = 43-TLS 1.3 Ed448 Client Auth-client
+ 
+-[41-TLS 1.3 Ed448 Client Auth-server]
++[43-TLS 1.3 Ed448 Client Auth-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Require
+ 
+-[41-TLS 1.3 Ed448 Client Auth-client]
++[43-TLS 1.3 Ed448 Client Auth-client]
+ CipherString = DEFAULT
+ EdDSA.Certificate = ${ENV::TEST_CERTS_DIR}/client-ed448-cert.pem
+ EdDSA.PrivateKey = ${ENV::TEST_CERTS_DIR}/client-ed448-key.pem
+@@ -1408,7 +1473,7 @@ MinProtocol = TLSv1.3
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-41]
++[test-43]
+ ExpectedClientCertType = Ed448
+ ExpectedClientSignType = Ed448
+ ExpectedResult = Success
+@@ -1416,14 +1481,14 @@ ExpectedResult = Success
+ 
+ # ===========================================================
+ 
+-[42-TLS 1.2 DSA Certificate Test]
+-ssl_conf = 42-TLS 1.2 DSA Certificate Test-ssl
++[44-TLS 1.2 DSA Certificate Test]
++ssl_conf = 44-TLS 1.2 DSA Certificate Test-ssl
+ 
+-[42-TLS 1.2 DSA Certificate Test-ssl]
+-server = 42-TLS 1.2 DSA Certificate Test-server
+-client = 42-TLS 1.2 DSA Certificate Test-client
++[44-TLS 1.2 DSA Certificate Test-ssl]
++server = 44-TLS 1.2 DSA Certificate Test-server
++client = 44-TLS 1.2 DSA Certificate Test-client
+ 
+-[42-TLS 1.2 DSA Certificate Test-server]
++[44-TLS 1.2 DSA Certificate Test-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = ALL
+ DHParameters = ${ENV::TEST_CERTS_DIR}/dhp2048.pem
+@@ -1433,26 +1498,26 @@ MaxProtocol = TLSv1.2
+ MinProtocol = TLSv1.2
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[42-TLS 1.2 DSA Certificate Test-client]
++[44-TLS 1.2 DSA Certificate Test-client]
+ CipherString = ALL
+ SignatureAlgorithms = DSA+SHA256:DSA+SHA1
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-42]
++[test-44]
+ ExpectedResult = Success
+ 
+ 
+ # ===========================================================
+ 
+-[43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms]
+-ssl_conf = 43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-ssl
++[45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms]
++ssl_conf = 45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-ssl
+ 
+-[43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-ssl]
+-server = 43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-server
+-client = 43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-client
++[45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-ssl]
++server = 45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-server
++client = 45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-client
+ 
+-[43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-server]
++[45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ ClientSignatureAlgorithms = ECDSA+SHA1:DSA+SHA256:RSA+SHA256
+@@ -1460,25 +1525,25 @@ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/root-cert.pem
+ VerifyMode = Request
+ 
+-[43-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-client]
++[45-TLS 1.3 Client Auth No TLS 1.3 Signature Algorithms-client]
+ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-43]
++[test-45]
+ ExpectedResult = ServerFail
+ 
+ 
+ # ===========================================================
+ 
+-[44-TLS 1.3 DSA Certificate Test]
+-ssl_conf = 44-TLS 1.3 DSA Certificate Test-ssl
++[46-TLS 1.3 DSA Certificate Test]
++ssl_conf = 46-TLS 1.3 DSA Certificate Test-ssl
+ 
+-[44-TLS 1.3 DSA Certificate Test-ssl]
+-server = 44-TLS 1.3 DSA Certificate Test-server
+-client = 44-TLS 1.3 DSA Certificate Test-client
++[46-TLS 1.3 DSA Certificate Test-ssl]
++server = 46-TLS 1.3 DSA Certificate Test-server
++client = 46-TLS 1.3 DSA Certificate Test-client
+ 
+-[44-TLS 1.3 DSA Certificate Test-server]
++[46-TLS 1.3 DSA Certificate Test-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = ALL
+ DSA.Certificate = ${ENV::TEST_CERTS_DIR}/server-dsa-cert.pem
+@@ -1487,13 +1552,13 @@ MaxProtocol = TLSv1.3
+ MinProtocol = TLSv1.3
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[44-TLS 1.3 DSA Certificate Test-client]
++[46-TLS 1.3 DSA Certificate Test-client]
+ CipherString = ALL
+ SignatureAlgorithms = DSA+SHA1:DSA+SHA256:ECDSA+SHA256
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
+-[test-44]
++[test-46]
+ ExpectedResult = ServerFail
+ 
+ 
+diff --git a/test/ssl-tests/20-cert-select.conf.in b/test/ssl-tests/20-cert-select.conf.in
+index c6589c7..62dfc52 100644
+--- a/test/ssl-tests/20-cert-select.conf.in
++++ b/test/ssl-tests/20-cert-select.conf.in
+@@ -54,6 +54,50 @@ our @tests = (
+         },
+     },
+     {
++        name =&gt; &quot;ECDSA CipherString Selection&quot;,
++        server =&gt; {
++            &quot;ECDSA.Certificate&quot; =&gt; test_pem(&quot;server-ecdsa-cert.pem&quot;),
++            &quot;ECDSA.PrivateKey&quot; =&gt; test_pem(&quot;server-ecdsa-key.pem&quot;),
++            &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++            #Deliberately set supported_groups to one not in the cert. This
++            #should be tolerated
++            &quot;Groups&quot; =&gt; &quot;P-384&quot;
++        },
++        client =&gt; {
++            &quot;CipherString&quot; =&gt; &quot;aECDSA&quot;,
++            &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++            &quot;Groups&quot; =&gt; &quot;P-256:P-384&quot;,
++            &quot;RequestCAFile&quot; =&gt; test_pem(&quot;root-cert.pem&quot;),
++        },
++        test   =&gt; {
++            &quot;ExpectedServerCertType&quot; =&gt;, &quot;P-256&quot;,
++            &quot;ExpectedServerSignType&quot; =&gt;, &quot;EC&quot;,
++            # Note: certificate_authorities not sent for TLS &lt; 1.3
++            &quot;ExpectedServerCANames&quot; =&gt;, &quot;empty&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;
++        },
++    },
++    {
++        name =&gt; &quot;ECDSA CipherString Selection&quot;,
++        server =&gt; {
++            &quot;ECDSA.Certificate&quot; =&gt; test_pem(&quot;server-ecdsa-cert.pem&quot;),
++            &quot;ECDSA.PrivateKey&quot; =&gt; test_pem(&quot;server-ecdsa-key.pem&quot;),
++            &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++            &quot;Groups&quot; =&gt; &quot;P-256:P-384&quot;
++        },
++        client =&gt; {
++            &quot;CipherString&quot; =&gt; &quot;aECDSA&quot;,
++            &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++            #Deliberately set groups to not include the certificate group. This
++            #should fail
++            &quot;Groups&quot; =&gt; &quot;P-384&quot;,
++            &quot;RequestCAFile&quot; =&gt; test_pem(&quot;root-cert.pem&quot;),
++        },
++        test   =&gt; {
++            &quot;ExpectedResult&quot; =&gt; &quot;ServerFail&quot;
++        },
++    },
++    {
+         name =&gt; &quot;Ed25519 CipherString and Signature Algorithm Selection&quot;,
+         server =&gt; $server,
+         client =&gt; {
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018797.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018801.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18798">[ date ]</a>
+              <a href="thread.html#18798">[ thread ]</a>
+              <a href="subject.html#18798">[ subject ]</a>
+              <a href="author.html#18798">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

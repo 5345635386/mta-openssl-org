@@ -1,0 +1,922 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599576363.763941.17142.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030520.html">
+   <LINK REL="Next"  HREF="030528.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1599576363.763941.17142.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Sep  8 14:46:03 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030520.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030528.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30521">[ date ]</a>
+              <a href="thread.html#30521">[ thread ]</a>
+              <a href="subject.html#30521">[ subject ]</a>
+              <a href="author.html#30521">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  1251cddf8d413af3747e81e39141f34318f92cd6 (commit)
+       via  4ce1025a8ac37d255f569147116dd776f9267cce (commit)
+      from  924663c36d47066d5307937da77fed7e872730c7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 1251cddf8d413af3747e81e39141f34318f92cd6
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Mon Sep 7 08:47:00 2020 +0200
+
+    TEST: modify test/endecode_test.c to not use legacy keys
+    
+    Now that PEM_write_bio_PrivateKey_traditional() can handle
+    provider-native EVP_PKEYs, we don't need to use explicitly legacy
+    ones.
+    
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12738">https://github.com/openssl/openssl/pull/12738</A>)
+
+commit 4ce1025a8ac37d255f569147116dd776f9267cce
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Aug 27 10:07:09 2020 +0200
+
+    PEM: Make PEM_write_bio_PrivateKey_traditional() handle provider-native keys
+    
+    PEM_write_bio_PrivateKey_traditional() didn't handle provider-native
+    keys very well.  Originally, it would simply use the corresponding
+    encoder, which is likely to output modern PEM (not &quot;traditional&quot;).
+    
+    PEM_write_bio_PrivateKey_traditional() is now changed to try and get a
+    legacy copy of the input EVP_PKEY, and use that copy for traditional
+    output, if it has such support.
+    
+    Internally, evp_pkey_copy_downgraded() is added, to be used when
+    evp_pkey_downgrade() is too intrusive for what it's needed for.
+    
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12738">https://github.com/openssl/openssl/pull/12738</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/p_lib.c                                | 222 +++++++++++++---------
+ crypto/pem/pem_pkey.c                             |  20 +-
+ doc/internal/man3/evp_pkey_export_to_provider.pod |  10 +-
+ include/crypto/evp.h                              |   2 +
+ test/endecode_test.c                              | 221 ++++++++-------------
+ 5 files changed, 242 insertions(+), 233 deletions(-)
+
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index fec4e2d43b..0f5378c4fe 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -1369,6 +1369,19 @@ size_t EVP_PKEY_get1_tls_encodedpoint(EVP_PKEY *pkey, unsigned char **ppt)
+ 
+ /*- All methods below can also be used in FIPS_MODULE */
+ 
++static int evp_pkey_reset_unlocked(EVP_PKEY *pk)
++{
++    if (pk == NULL)
++        return 0;
++
++    memset(pk, 0, sizeof(*pk));
++    pk-&gt;type = EVP_PKEY_NONE;
++    pk-&gt;save_type = EVP_PKEY_NONE;
++    pk-&gt;references = 1;
++    pk-&gt;save_parameters = 1;
++    return 1;
++}
++
+ EVP_PKEY *EVP_PKEY_new(void)
+ {
+     EVP_PKEY *ret = OPENSSL_zalloc(sizeof(*ret));
+@@ -1377,10 +1390,10 @@ EVP_PKEY *EVP_PKEY_new(void)
+         EVPerr(EVP_F_EVP_PKEY_NEW, ERR_R_MALLOC_FAILURE);
+         return NULL;
+     }
+-    ret-&gt;type = EVP_PKEY_NONE;
+-    ret-&gt;save_type = EVP_PKEY_NONE;
+-    ret-&gt;references = 1;
+-    ret-&gt;save_parameters = 1;
++
++    if (!evp_pkey_reset_unlocked(ret))
++        goto err;
++
+     ret-&gt;lock = CRYPTO_THREAD_lock_new();
+     if (ret-&gt;lock == NULL) {
+         EVPerr(EVP_F_EVP_PKEY_NEW, ERR_R_MALLOC_FAILURE);
+@@ -1802,109 +1815,142 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+ }
+ 
+ #ifndef FIPS_MODULE
+-int evp_pkey_downgrade(EVP_PKEY *pk)
++int evp_pkey_copy_downgraded(EVP_PKEY **dest, const EVP_PKEY *src)
+ {
+-    EVP_KEYMGMT *keymgmt = pk-&gt;keymgmt;
+-    void *keydata = pk-&gt;keydata;
+-    int type = pk-&gt;type;
+-    const char *keytype = NULL;
++    if (!ossl_assert(dest != NULL))
++        return 0;
+ 
+-    /* If this isn't a provider side key, we're done */
+-    if (keymgmt == NULL)
+-        return 1;
++    if (evp_pkey_is_assigned(src) &amp;&amp; evp_pkey_is_provided(src)) {
++        EVP_KEYMGMT *keymgmt = src-&gt;keymgmt;
++        void *keydata = src-&gt;keydata;
++        int type = src-&gt;type;
++        const char *keytype = NULL;
+ 
+-    keytype = evp_first_name(EVP_KEYMGMT_provider(keymgmt), keymgmt-&gt;name_id);
++        keytype = evp_first_name(EVP_KEYMGMT_provider(keymgmt),
++                                 keymgmt-&gt;name_id);
+ 
+-    /*
+-     * If the type is EVP_PKEY_NONE, then we have a problem somewhere else
+-     * in our code.  If it's not one of the well known EVP_PKEY_xxx values,
+-     * it should at least be EVP_PKEY_KEYMGMT at this point.
+-     * TODO(3.0) remove this check when we're confident that the rest of the
+-     * code treats this correctly.
+-     */
+-    if (!ossl_assert(type != EVP_PKEY_NONE)) {
+-        ERR_raise_data(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR,
+-                       &quot;keymgmt key type = %s but legacy type = EVP_PKEY_NONE&quot;,
+-                       keytype);
+-        return 0;
+-    }
++        /*
++         * If the type is EVP_PKEY_NONE, then we have a problem somewhere
++         * else in our code.  If it's not one of the well known EVP_PKEY_xxx
++         * values, it should at least be EVP_PKEY_KEYMGMT at this point.
++         * TODO(3.0) remove this check when we're confident that the rest
++         * of the code treats this correctly.
++         */
++        if (!ossl_assert(type != EVP_PKEY_NONE)) {
++            ERR_raise_data(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR,
++                           &quot;keymgmt key type = %s but legacy type = EVP_PKEY_NONE&quot;,
++                           keytype);
++            return 0;
++        }
+ 
+-    /* Prefer the legacy key type name for error reporting */
+-    if (type != EVP_PKEY_KEYMGMT)
+-        keytype = OBJ_nid2sn(type);
++        /* Prefer the legacy key type name for error reporting */
++        if (type != EVP_PKEY_KEYMGMT)
++            keytype = OBJ_nid2sn(type);
+ 
+-    /*
+-     * To be able to downgrade, we steal the provider side &quot;origin&quot; keymgmt
+-     * and keydata.  We've already grabbed the pointers, so all we need to
+-     * do is clear those pointers in |pk| and then call evp_pkey_free_it().
+-     * That way, we can restore |pk| if we need to.
+-     */
+-    pk-&gt;keymgmt = NULL;
+-    pk-&gt;keydata = NULL;
+-    evp_pkey_free_it(pk);
+-    if (EVP_PKEY_set_type(pk, type)) {
+-        /* If the key is typed but empty, we're done */
+-        if (keydata == NULL) {
+-            /* We're dropping the EVP_KEYMGMT */
+-            EVP_KEYMGMT_free(keymgmt);
+-            return 1;
+-        }
++        /* Make sure we have a clean slate to copy into */
++        if (*dest == NULL)
++            *dest = EVP_PKEY_new();
++        else
++            evp_pkey_free_it(*dest);
+ 
+-        if (pk-&gt;ameth-&gt;import_from == NULL) {
+-            ERR_raise_data(ERR_LIB_EVP, EVP_R_NO_IMPORT_FUNCTION,
+-                           &quot;key type = %s&quot;, keytype);
+-        } else {
+-            /*
+-             * We perform the export in the same libctx as the keymgmt that we
+-             * are using.
+-             */
+-            OPENSSL_CTX *libctx = ossl_provider_library_context(keymgmt-&gt;prov);
+-            EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(libctx, pk, NULL);
+-            if (pctx == NULL)
+-                ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
++        if (EVP_PKEY_set_type(*dest, type)) {
++            /* If the key is typed but empty, we're done */
++            if (keydata == NULL)
++                return 1;
+ 
+-            if (pctx != NULL
+-                    &amp;&amp; evp_keymgmt_export(keymgmt, keydata,
+-                                          OSSL_KEYMGMT_SELECT_ALL,
+-                                          pk-&gt;ameth-&gt;import_from, pctx)) {
++            if ((*dest)-&gt;ameth-&gt;import_from == NULL) {
++                ERR_raise_data(ERR_LIB_EVP, EVP_R_NO_IMPORT_FUNCTION,
++                               &quot;key type = %s&quot;, keytype);
++            } else {
+                 /*
+-                 * Save the provider side data in the operation cache, so they'll
+-                 * find it again.  evp_pkey_free_it() cleared the cache, so it's
+-                 * safe to assume slot zero is free.
+-                 * Note that evp_keymgmt_util_cache_keydata() increments keymgmt's
+-                 * reference count.
++                 * We perform the export in the same libctx as the keymgmt
++                 * that we are using.
+                  */
+-                evp_keymgmt_util_cache_keydata(pk, 0, keymgmt, keydata);
+-                EVP_PKEY_CTX_free(pctx);
++                OPENSSL_CTX *libctx =
++                    ossl_provider_library_context(keymgmt-&gt;prov);
++                EVP_PKEY_CTX *pctx =
++                    EVP_PKEY_CTX_new_from_pkey(libctx, *dest, NULL);
+ 
+-                /* Synchronize the dirty count */
+-                pk-&gt;dirty_cnt_copy = pk-&gt;ameth-&gt;dirty_cnt(pk);
++                if (pctx == NULL)
++                    ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+ 
+-                /* evp_keymgmt_export() increased the refcount... */
+-                EVP_KEYMGMT_free(keymgmt);
+-                return 1;
++                if (pctx != NULL
++                    &amp;&amp; evp_keymgmt_export(keymgmt, keydata,
++                                          OSSL_KEYMGMT_SELECT_ALL,
++                                          (*dest)-&gt;ameth-&gt;import_from,
++                                          pctx)) {
++                    /* Synchronize the dirty count */
++                    (*dest)-&gt;dirty_cnt_copy = (*dest)-&gt;ameth-&gt;dirty_cnt(*dest);
++
++                    EVP_PKEY_CTX_free(pctx);
++                    return 1;
++                }
++                EVP_PKEY_CTX_free(pctx);
+             }
+-            EVP_PKEY_CTX_free(pctx);
+-        }
+ 
+-        ERR_raise_data(ERR_LIB_EVP, EVP_R_KEYMGMT_EXPORT_FAILURE,
+-                       &quot;key type = %s&quot;, keytype);
++            ERR_raise_data(ERR_LIB_EVP, EVP_R_KEYMGMT_EXPORT_FAILURE,
++                           &quot;key type = %s&quot;, keytype);
++        }
+     }
+ 
++    return 0;
++}
++
++int evp_pkey_downgrade(EVP_PKEY *pk)
++{
++    EVP_PKEY tmp_copy;           /* Stack allocated! */
++
++    /* If this isn't an assigned provider side key, we're done */
++    if (!evp_pkey_is_assigned(pk) || !evp_pkey_is_provided(pk))
++        return 1;
++
+     /*
+-     * Something went wrong.  This could for example happen if the keymgmt
+-     * turns out to be an HSM implementation that refuses to let go of some
+-     * of the key data, typically the private bits.  In this case, we restore
+-     * the provider side internal &quot;origin&quot; and leave it at that.
++     * To be able to downgrade, we steal the contents of |pk|, then reset
++     * it, and finally try to make it a downgraded copy.  If any of that
++     * fails, we restore the copied contents into |pk|.
+      */
+-    if (!ossl_assert(evp_keymgmt_util_assign_pkey(pk, keymgmt, keydata))) {
+-        /* This should not be impossible */
+-        ERR_raise(ERR_LIB_EVP, ERR_R_INTERNAL_ERROR);
+-        return 0;
++    tmp_copy = *pk;
++
++    if (evp_pkey_reset_unlocked(pk)
++        &amp;&amp; evp_pkey_copy_downgraded(&amp;pk, &amp;tmp_copy)) {
++        /* Restore the common attributes, then empty |tmp_copy| */
++        pk-&gt;references = tmp_copy.references;
++        pk-&gt;lock = tmp_copy.lock;
++        pk-&gt;attributes = tmp_copy.attributes;
++        pk-&gt;save_parameters = tmp_copy.save_parameters;
++        pk-&gt;ex_data = tmp_copy.ex_data;
++
++        /* Ensure that stuff we've copied won't be freed */
++        tmp_copy.lock = NULL;
++        tmp_copy.attributes = NULL;
++        memset(&amp;tmp_copy.ex_data, 0, sizeof(tmp_copy.ex_data));
++
++        /*
++         * Save the provider side data in the operation cache, so they'll
++         * find it again.  |pk| is new, so it's safe to assume slot zero
++         * is free.
++         * Note that evp_keymgmt_util_cache_keydata() increments keymgmt's
++         * reference count, so we need to decrement it, or there will be a
++         * leak.
++         */
++        evp_keymgmt_util_cache_keydata(pk, 0, tmp_copy.keymgmt,
++                                       tmp_copy.keydata);
++        EVP_KEYMGMT_free(tmp_copy.keymgmt);
++
++        /*
++         * Clear keymgmt and keydata from |tmp_copy|, or they'll get
++         * inadvertently freed.
++         */
++        tmp_copy.keymgmt = NULL;
++        tmp_copy.keydata = NULL;
++
++        evp_pkey_free_it(&amp;tmp_copy);
++
++        return 1;
+     }
+-    /* evp_keymgmt_util_assign_pkey() increased the refcount... */
+-    EVP_KEYMGMT_free(keymgmt);
+-    return 0;     /* No downgrade, but at least the key is restored */
++
++    *pk = tmp_copy;
++    return 0;
+ }
+ #endif  /* FIPS_MODULE */
+ 
+diff --git a/crypto/pem/pem_pkey.c b/crypto/pem/pem_pkey.c
+index 8b9bfe101e..462010d2ac 100644
+--- a/crypto/pem/pem_pkey.c
++++ b/crypto/pem/pem_pkey.c
+@@ -165,20 +165,36 @@ PEM_write_cb_fnsig(PrivateKey, EVP_PKEY, BIO, write_bio)
+     return PEM_write_bio_PrivateKey_traditional(out, x, enc, kstr, klen, cb, u);
+ }
+ 
++/*
++ * Note: there is no way to tell a provided pkey encoder to use &quot;traditional&quot;
++ * encoding.  Therefore, if the pkey is provided, we try to take a copy 
++ * TODO: when #legacy keys are gone, this function will not be possible any
++ * more and should be removed.
++ */
+ int PEM_write_bio_PrivateKey_traditional(BIO *bp, const EVP_PKEY *x,
+                                          const EVP_CIPHER *enc,
+                                          const unsigned char *kstr, int klen,
+                                          pem_password_cb *cb, void *u)
+ {
+     char pem_str[80];
++    EVP_PKEY *copy = NULL;
++    int ret;
++
++    if (evp_pkey_is_assigned(x)
++        &amp;&amp; evp_pkey_is_provided(x)
++        &amp;&amp; evp_pkey_copy_downgraded(&amp;copy, x))
++        x = copy;
+ 
+     if (x-&gt;ameth == NULL || x-&gt;ameth-&gt;old_priv_encode == NULL) {
+         ERR_raise(ERR_LIB_PEM, PEM_R_UNSUPPORTED_PUBLIC_KEY_TYPE);
+         return 0;
+     }
+     BIO_snprintf(pem_str, 80, &quot;%s PRIVATE KEY&quot;, x-&gt;ameth-&gt;pem_str);
+-    return PEM_ASN1_write_bio((i2d_of_void *)i2d_PrivateKey,
+-                              pem_str, bp, x, enc, kstr, klen, cb, u);
++    ret = PEM_ASN1_write_bio((i2d_of_void *)i2d_PrivateKey,
++                             pem_str, bp, x, enc, kstr, klen, cb, u);
++
++    EVP_PKEY_free(copy);
++    return ret;
+ }
+ 
+ EVP_PKEY *PEM_read_bio_Parameters_ex(BIO *bp, EVP_PKEY **x,
+diff --git a/doc/internal/man3/evp_pkey_export_to_provider.pod b/doc/internal/man3/evp_pkey_export_to_provider.pod
+index 1c80365ca6..b34cf86619 100644
+--- a/doc/internal/man3/evp_pkey_export_to_provider.pod
++++ b/doc/internal/man3/evp_pkey_export_to_provider.pod
+@@ -2,7 +2,7 @@
+ 
+ =head1 NAME
+ 
+-evp_pkey_export_to_provider, evp_pkey_downgrade
++evp_pkey_export_to_provider, evp_pkey_copy_downgraded, evp_pkey_downgrade
+ - internal EVP_PKEY support functions for providers
+ 
+ =head1 SYNOPSIS
+@@ -13,6 +13,7 @@ evp_pkey_export_to_provider, evp_pkey_downgrade
+  void *evp_pkey_export_to_provider(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+                                    EVP_KEYMGMT **keymgmt,
+                                    const char *propquery);
++ int evp_pkey_copy_downgraded(EVP_PKEY **dest, const EVP_PKEY *src);
+  int evp_pkey_downgrade(EVP_PKEY *pk);
+ 
+ =head1 DESCRIPTION
+@@ -29,6 +30,13 @@ default context), the name of the legacy type of I&lt;pk&gt;, and the I&lt;propquery&gt;
+ If I&lt;keymgmt&gt; isn't NULL but I&lt;*keymgmt&gt; is, and the &quot;origin&quot; was successfully
+ exported, then I&lt;*keymgmt&gt; is assigned the implicitly fetched B&lt;EVP_KEYMGMT&gt;.
+ 
++evp_pkey_copy_downgraded() makes a copy of I&lt;src&gt; in legacy form into I&lt;*dest&gt;,
++if there's a corresponding legacy implementation.  This should be used if the
++use of a downgraded key is temporary.
++For example, L&lt;PEM_write_bio_PrivateKey_traditional(3)&gt; uses this to try its
++best to get &quot;traditional&quot; PEM output even if the input B&lt;EVP_PKEY&gt; has a
++provider-native internal key.
++
+ evp_pkey_downgrade() converts an B&lt;EVP_PKEY&gt; with a provider side &quot;origin&quot; key
+ to one with a legacy &quot;origin&quot;, if there's a corresponding legacy implementation.
+ This clears the operation cache, except for the provider side &quot;origin&quot; key.
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index c488834511..9d9b0a7298 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -591,6 +591,7 @@ struct evp_pkey_st {
+ # endif
+ 
+     /* == Common attributes == */
++    /* If these are modified, so must evp_pkey_downgrade() */
+     CRYPTO_REF_COUNT references;
+     CRYPTO_RWLOCK *lock;
+     STACK_OF(X509_ATTRIBUTE) *attributes; /* [ 0 ] */
+@@ -672,6 +673,7 @@ void *evp_pkey_export_to_provider(EVP_PKEY *pk, OPENSSL_CTX *libctx,
+                                   EVP_KEYMGMT **keymgmt,
+                                   const char *propquery);
+ #ifndef FIPS_MODULE
++int evp_pkey_copy_downgraded(EVP_PKEY **dest, const EVP_PKEY *src);
+ int evp_pkey_downgrade(EVP_PKEY *pk);
+ void evp_pkey_free_legacy(EVP_PKEY *x);
+ #endif
+diff --git a/test/endecode_test.c b/test/endecode_test.c
+index 5b1e06946f..580b7e8f35 100644
+--- a/test/endecode_test.c
++++ b/test/endecode_test.c
+@@ -38,14 +38,6 @@ static OSSL_PARAM *ec_explicit_tri_params_explicit = NULL;
+ # endif
+ #endif
+ 
+-/*
+- * TODO(3.0) Modify PEM_write_bio_PrivateKey_traditional() to handle
+- * provider side EVP_PKEYs (which don't necessarily have an ameth)
+- *
+- * In the mean time, we use separate &quot;downgraded&quot; EVP_PKEYs to test
+- * encoding/decoding with &quot;traditional&quot; keys.
+- */
+-
+ static EVP_PKEY *make_template(const char *type, OSSL_PARAM *genparams)
+ {
+     EVP_PKEY *pkey = NULL;
+@@ -66,7 +58,7 @@ static EVP_PKEY *make_template(const char *type, OSSL_PARAM *genparams)
+ }
+ 
+ static EVP_PKEY *make_key(const char *type, EVP_PKEY *template,
+-                          OSSL_PARAM *genparams, int make_legacy)
++                          OSSL_PARAM *genparams)
+ {
+     EVP_PKEY *pkey = NULL;
+     EVP_PKEY_CTX *ctx =
+@@ -84,11 +76,6 @@ static EVP_PKEY *make_key(const char *type, EVP_PKEY *template,
+                || EVP_PKEY_CTX_set_params(ctx, genparams) &gt; 0)
+            &amp;&amp; EVP_PKEY_keygen(ctx, &amp;pkey) &gt; 0);
+     EVP_PKEY_CTX_free(ctx);
+-    if (make_legacy &amp;&amp; EVP_PKEY_get0(pkey) == NULL) {
+-        EVP_PKEY_free(pkey);
+-        pkey = NULL;
+-    }
+-
+     return pkey;
+ }
+ 
+@@ -102,23 +89,21 @@ static EVP_PKEY *make_key(const char *type, EVP_PKEY *template,
+  */
+ 
+ typedef int (encoder)(void **encoded, long *encoded_len,
+-                         void *object, const char *pass, const char *pcipher,
+-                         const char *encoder_propq);
++                      void *object, const char *pass, const char *pcipher,
++                      const char *encoder_propq);
+ typedef int (decoder)(void **object,
+-                           void *encoded, long encoded_len,
+-                           const char *pass);
++                      void *encoded, long encoded_len,
++                      const char *pass);
+ typedef int (tester)(const void *data1, size_t data1_len,
+                      const void *data2, size_t data2_len);
+ typedef int (checker)(const char *type, const void *data, size_t data_len);
+ typedef void (dumper)(const char *label, const void *data, size_t data_len);
+ 
+ static int test_encode_decode(const char *type, EVP_PKEY *pkey,
+-                                      const char *pass, const char *pcipher,
+-                                      encoder *encode_cb,
+-                                      decoder *decode_cb,
+-                                      tester *test_cb,
+-                                      checker *check_cb, dumper *dump_cb,
+-                                      const char *encoder_propq, int make_legacy)
++                              const char *pass, const char *pcipher,
++                              encoder *encode_cb, decoder *decode_cb,
++                              tester *test_cb, checker *check_cb,
++                              dumper *dump_cb, const char *encoder_propq)
+ {
+     void *encoded = NULL;
+     long encoded_len = 0;
+@@ -135,14 +120,6 @@ static int test_encode_decode(const char *type, EVP_PKEY *pkey,
+         || !TEST_int_eq(EVP_PKEY_eq(pkey, pkey2), 1))
+         goto end;
+ 
+-    /*
+-     * TODO(3.0) Remove this when PEM_write_bio_PrivateKey_traditional()
+-     * handles provider side keys.
+-     */
+-    if (make_legacy
+-        &amp;&amp; !TEST_ptr(EVP_PKEY_get0(pkey2)))
+-        goto end;
+-
+     /*
+      * Double check the encoding, but only for unprotected keys,
+      * as protected keys have a random component, which makes the output
+@@ -173,9 +150,9 @@ static int test_encode_decode(const char *type, EVP_PKEY *pkey,
+ /* Encoding and desencoding methods */
+ 
+ static int encode_EVP_PKEY_prov(void **encoded, long *encoded_len,
+-                                   void *object,
+-                                   const char *pass, const char *pcipher,
+-                                   const char *encoder_propq)
++                                void *object,
++                                const char *pass, const char *pcipher,
++                                const char *encoder_propq)
+ {
+     EVP_PKEY *pkey = object;
+     OSSL_ENCODER_CTX *ectx = NULL;
+@@ -208,8 +185,8 @@ static int encode_EVP_PKEY_prov(void **encoded, long *encoded_len,
+ }
+ 
+ static int decode_EVP_PKEY_prov(void **object,
+-                                     void *encoded, long encoded_len,
+-                                     const char *pass)
++                                void *encoded, long encoded_len,
++                                const char *pass)
+ {
+     EVP_PKEY *pkey = NULL;
+     OSSL_DECODER_CTX *dctx = NULL;
+@@ -234,10 +211,10 @@ static int decode_EVP_PKEY_prov(void **object,
+ }
+ 
+ static int encode_EVP_PKEY_legacy_PEM(void **encoded,
+-                                         long *encoded_len,
+-                                         void *object,
+-                                         const char *pass, const char *pcipher,
+-                                         ossl_unused const char *encoder_propq)
++                                      long *encoded_len,
++                                      void *object,
++                                      const char *pass, const char *pcipher,
++                                      ossl_unused const char *encoder_propq)
+ {
+     EVP_PKEY *pkey = object;
+     EVP_CIPHER *cipher = NULL;
+@@ -273,12 +250,11 @@ static int encode_EVP_PKEY_legacy_PEM(void **encoded,
+ }
+ 
+ #ifndef OPENSSL_NO_DSA
+-static int encode_EVP_PKEY_MSBLOB(void **encoded,
+-                                     long *encoded_len,
+-                                     void *object,
+-                                     ossl_unused const char *pass,
+-                                     ossl_unused const char *pcipher,
+-                                     ossl_unused const char *encoder_propq)
++static int encode_EVP_PKEY_MSBLOB(void **encoded, long *encoded_len,
++                                  void *object,
++                                  ossl_unused const char *pass,
++                                  ossl_unused const char *pcipher,
++                                  ossl_unused const char *encoder_propq)
+ {
+     EVP_PKEY *pkey = object;
+     BIO *mem_ser = NULL;
+@@ -301,12 +277,11 @@ static int encode_EVP_PKEY_MSBLOB(void **encoded,
+     return ok;
+ }
+ 
+-static int encode_public_EVP_PKEY_MSBLOB(void **encoded,
+-                                            long *encoded_len,
+-                                            void *object,
+-                                            ossl_unused const char *pass,
+-                                            ossl_unused const char *pcipher,
+-                                            ossl_unused const char *encoder_propq)
++static int encode_public_EVP_PKEY_MSBLOB(void **encoded, long *encoded_len,
++                                         void *object,
++                                         ossl_unused const char *pass,
++                                         ossl_unused const char *pcipher,
++                                         ossl_unused const char *encoder_propq)
+ {
+     EVP_PKEY *pkey = object;
+     BIO *mem_ser = NULL;
+@@ -338,10 +313,10 @@ static int pass_pw(char *buf, int size, int rwflag, void *userdata)
+ }
+ 
+ static int encode_EVP_PKEY_PVK(void **encoded, long *encoded_len,
+-                                  void *object,
+-                                  const char *pass,
+-                                  ossl_unused const char *pcipher,
+-                                  ossl_unused const char *encoder_propq)
++                               void *object,
++                               const char *pass,
++                               ossl_unused const char *pcipher,
++                               ossl_unused const char *encoder_propq)
+ {
+     EVP_PKEY *pkey = object;
+     BIO *mem_ser = NULL;
+@@ -413,12 +388,9 @@ static int check_unprotected_PKCS8_DER(const char *type,
+ static int test_unprotected_via_DER(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_unprotected_PKCS8_DER, dump_der,
+-                                      OSSL_ENCODER_PrivateKey_TO_DER_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_mem, check_unprotected_PKCS8_DER, dump_der,
++                              OSSL_ENCODER_PrivateKey_TO_DER_PQ);
+ }
+ 
+ static int check_unprotected_PKCS8_PEM(const char *type,
+@@ -432,12 +404,9 @@ static int check_unprotected_PKCS8_PEM(const char *type,
+ static int test_unprotected_via_PEM(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_text,
+-                                      check_unprotected_PKCS8_PEM, dump_pem,
+-                                      OSSL_ENCODER_PrivateKey_TO_PEM_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_text, check_unprotected_PKCS8_PEM, dump_pem,
++                              OSSL_ENCODER_PrivateKey_TO_PEM_PQ);
+ }
+ 
+ static int check_unprotected_legacy_PEM(const char *type,
+@@ -454,11 +423,9 @@ static int check_unprotected_legacy_PEM(const char *type,
+ static int test_unprotected_via_legacy_PEM(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_legacy_PEM,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_text,
+-                                      check_unprotected_legacy_PEM, dump_pem,
+-                                      NULL, 1);
++                              encode_EVP_PKEY_legacy_PEM, decode_EVP_PKEY_prov,
++                              test_text, check_unprotected_legacy_PEM, dump_pem,
++                              NULL);
+ }
+ 
+ #ifndef OPENSSL_NO_DSA
+@@ -475,11 +442,9 @@ static int check_MSBLOB(const char *type, const void *data, size_t data_len)
+ static int test_unprotected_via_MSBLOB(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_MSBLOB,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_MSBLOB, dump_der,
+-                                      NULL, 0);
++                              encode_EVP_PKEY_MSBLOB, decode_EVP_PKEY_prov,
++                              test_mem, check_MSBLOB, dump_der,
++                              NULL);
+ }
+ 
+ # ifndef OPENSSL_NO_RC4
+@@ -495,11 +460,9 @@ static int check_PVK(const char *type, const void *data, size_t data_len)
+ static int test_unprotected_via_PVK(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_PVK,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_PVK, dump_der,
+-                                      NULL, 0);
++                              encode_EVP_PKEY_PVK, decode_EVP_PKEY_prov,
++                              test_mem, check_PVK, dump_der,
++                              NULL);
+ }
+ # endif
+ #endif
+@@ -521,12 +484,9 @@ static int check_protected_PKCS8_DER(const char *type,
+ static int test_protected_via_DER(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, pass, pass_cipher,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_protected_PKCS8_DER, dump_der,
+-                                      OSSL_ENCODER_PrivateKey_TO_DER_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_mem, check_protected_PKCS8_DER, dump_der,
++                              OSSL_ENCODER_PrivateKey_TO_DER_PQ);
+ }
+ 
+ static int check_protected_PKCS8_PEM(const char *type,
+@@ -540,12 +500,9 @@ static int check_protected_PKCS8_PEM(const char *type,
+ static int test_protected_via_PEM(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, pass, pass_cipher,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_text,
+-                                      check_protected_PKCS8_PEM, dump_pem,
+-                                      OSSL_ENCODER_PrivateKey_TO_PEM_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_text, check_protected_PKCS8_PEM, dump_pem,
++                              OSSL_ENCODER_PrivateKey_TO_PEM_PQ);
+ }
+ 
+ static int check_protected_legacy_PEM(const char *type,
+@@ -563,22 +520,18 @@ static int check_protected_legacy_PEM(const char *type,
+ static int test_protected_via_legacy_PEM(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, pass, pass_cipher,
+-                                      encode_EVP_PKEY_legacy_PEM,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_text,
+-                                      check_protected_legacy_PEM, dump_pem,
+-                                      NULL, 1);
++                              encode_EVP_PKEY_legacy_PEM, decode_EVP_PKEY_prov,
++                              test_text, check_protected_legacy_PEM, dump_pem,
++                              NULL);
+ }
+ 
+ #if !defined(OPENSSL_NO_DSA) &amp;&amp; !defined(OPENSSL_NO_RC4)
+ static int test_protected_via_PVK(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, pass, NULL,
+-                                      encode_EVP_PKEY_PVK,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_PVK, dump_der,
+-                                      NULL, 0);
++                              encode_EVP_PKEY_PVK, decode_EVP_PKEY_prov,
++                              test_mem, check_PVK, dump_der,
++                              NULL);
+ }
+ #endif
+ 
+@@ -595,12 +548,9 @@ static int check_public_DER(const char *type, const void *data, size_t data_len)
+ static int test_public_via_DER(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_public_DER, dump_der,
+-                                      OSSL_ENCODER_PUBKEY_TO_DER_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_mem, check_public_DER, dump_der,
++                              OSSL_ENCODER_PUBKEY_TO_DER_PQ);
+ }
+ 
+ static int check_public_PEM(const char *type, const void *data, size_t data_len)
+@@ -614,12 +564,9 @@ static int check_public_PEM(const char *type, const void *data, size_t data_len)
+ static int test_public_via_PEM(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_EVP_PKEY_prov,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_text,
+-                                      check_public_PEM, dump_pem,
+-                                      OSSL_ENCODER_PUBKEY_TO_PEM_PQ,
+-                                      0);
++                              encode_EVP_PKEY_prov, decode_EVP_PKEY_prov,
++                              test_text, check_public_PEM, dump_pem,
++                              OSSL_ENCODER_PUBKEY_TO_PEM_PQ);
+ }
+ 
+ #ifndef OPENSSL_NO_DSA
+@@ -637,43 +584,33 @@ static int check_public_MSBLOB(const char *type,
+ static int test_public_via_MSBLOB(const char *type, EVP_PKEY *key)
+ {
+     return test_encode_decode(type, key, NULL, NULL,
+-                                      encode_public_EVP_PKEY_MSBLOB,
+-                                      decode_EVP_PKEY_prov,
+-                                      test_mem,
+-                                      check_public_MSBLOB, dump_der,
+-                                      NULL, 0);
++                              encode_public_EVP_PKEY_MSBLOB,
++                              decode_EVP_PKEY_prov,
++                              test_mem, check_public_MSBLOB, dump_der,
++                              NULL);
+ }
+ #endif
+ 
+ #define KEYS(KEYTYPE)                           \
+-    static EVP_PKEY *key_##KEYTYPE = NULL;      \
+-    static EVP_PKEY *legacy_key_##KEYTYPE = NULL
++    static EVP_PKEY *key_##KEYTYPE = NULL
+ #define MAKE_KEYS(KEYTYPE, KEYTYPEstr, params)                          \
+     ok = ok                                                             \
+-        &amp;&amp; TEST_ptr(key_##KEYTYPE =                                     \
+-                    make_key(KEYTYPEstr, NULL, params, 0))              \
+-        &amp;&amp; TEST_ptr(legacy_key_##KEYTYPE =                              \
+-                    make_key(KEYTYPEstr, NULL, params, 1))
++        &amp;&amp; TEST_ptr(key_##KEYTYPE = make_key(KEYTYPEstr, NULL, params))
+ #define FREE_KEYS(KEYTYPE)                                              \
+     EVP_PKEY_free(key_##KEYTYPE);                                       \
+-    EVP_PKEY_free(legacy_key_##KEYTYPE)
+ 
+ #define DOMAIN_KEYS(KEYTYPE)                    \
+     static EVP_PKEY *template_##KEYTYPE = NULL; \
+-    static EVP_PKEY *key_##KEYTYPE = NULL;      \
+-    static EVP_PKEY *legacy_key_##KEYTYPE = NULL
++    static EVP_PKEY *key_##KEYTYPE = NULL
+ #define MAKE_DOMAIN_KEYS(KEYTYPE, KEYTYPEstr, params)                   \
+     ok = ok                                                             \
+         &amp;&amp; TEST_ptr(template_##KEYTYPE =                                \
+                     make_template(KEYTYPEstr, params))                  \
+         &amp;&amp; TEST_ptr(key_##KEYTYPE =                                     \
+-                    make_key(KEYTYPEstr, template_##KEYTYPE, NULL, 0))  \
+-        &amp;&amp; TEST_ptr(legacy_key_##KEYTYPE =                              \
+-                    make_key(KEYTYPEstr, template_##KEYTYPE, NULL, 1))
++                    make_key(KEYTYPEstr, template_##KEYTYPE, NULL))
+ #define FREE_DOMAIN_KEYS(KEYTYPE)                                       \
+     EVP_PKEY_free(template_##KEYTYPE);                                  \
+-    EVP_PKEY_free(key_##KEYTYPE);                                       \
+-    EVP_PKEY_free(legacy_key_##KEYTYPE)
++    EVP_PKEY_free(key_##KEYTYPE)
+ 
+ #define IMPLEMENT_TEST_SUITE(KEYTYPE, KEYTYPEstr)                       \
+     static int test_unprotected_##KEYTYPE##_via_DER(void)               \
+@@ -712,17 +649,17 @@ static int test_public_via_MSBLOB(const char *type, EVP_PKEY *key)
+ #define IMPLEMENT_TEST_SUITE_LEGACY(KEYTYPE, KEYTYPEstr)                \
+     static int test_unprotected_##KEYTYPE##_via_legacy_PEM(void)        \
+     {                                                                   \
+-        return test_unprotected_via_legacy_PEM(KEYTYPEstr,              \
+-                                               legacy_key_##KEYTYPE);   \
++        return                                                          \
++            test_unprotected_via_legacy_PEM(KEYTYPEstr, key_##KEYTYPE); \
+     }                                                                   \
+     static int test_protected_##KEYTYPE##_via_legacy_PEM(void)          \
+     {                                                                   \
+-        return test_protected_via_legacy_PEM(KEYTYPEstr,                \
+-                                             legacy_key_##KEYTYPE);     \
++        return                                                          \
++            test_protected_via_legacy_PEM(KEYTYPEstr, key_##KEYTYPE);   \
+     }
+ 
+ #define ADD_TEST_SUITE_LEGACY(KEYTYPE)                                 \
+-    ADD_TEST(test_unprotected_##KEYTYPE##_via_legacy_PEM);      \
++    ADD_TEST(test_unprotected_##KEYTYPE##_via_legacy_PEM);             \
+     ADD_TEST(test_protected_##KEYTYPE##_via_legacy_PEM)
+ 
+ #ifndef OPENSSL_NO_DSA
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030520.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030528.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30521">[ date ]</a>
+              <a href="thread.html#30521">[ thread ]</a>
+              <a href="subject.html#30521">[ subject ]</a>
+              <a href="author.html#30521">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

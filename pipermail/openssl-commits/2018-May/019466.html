@@ -1,0 +1,192 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1527714503.973112.8930.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019465.html">
+   <LINK REL="Next"  HREF="019467.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1527714503.973112.8930.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Wed May 30 21:08:23 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019465.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019467.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19466">[ date ]</a>
+              <a href="thread.html#19466">[ thread ]</a>
+              <a href="subject.html#19466">[ subject ]</a>
+              <a href="author.html#19466">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  848113a30b431c2fe21ae8de2a366b9b6146fb92 (commit)
+      from  c869c3ada944bc42a6c00e0433c9d523c4426cde (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 848113a30b431c2fe21ae8de2a366b9b6146fb92
+Author: User &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">milosprv at gmail.com</A>&gt;
+Date:   Wed May 16 13:59:36 2018 -0400
+
+    bn/bn_exp.c: mitigation of the One-and-Done side-channel attack.
+    
+    The One&amp;Done attack, which is described in a paper to appear in the
+    USENIX Security'18 conference, uses EM emanations to recover the values
+    of the bits that are obtained using BN_is_bit_set while constructing
+    the value of the window in BN_mod_exp_consttime. The EM signal changes
+    slightly depending on the value of the bit, and since the lookup of a
+    bit is surrounded by highly regular execution (constant-time Montgomery
+    multiplications) the attack is able to isolate the (very brief) part of
+    the signal that changes depending on the bit. Although the change is
+    slight, the attack recovers it successfully &gt;90% of the time on several
+    phones and IoT devices (all with ARM processors with clock rates around
+    1GHz), so after only one RSA decryption more than 90% of the bits in
+    d_p and d_q are recovered correctly, which enables rapid recovery of
+    the full RSA key using an algorithm (also described in the paper) that
+    modifies the branch-and-prune approach for a situation in which the
+    exponents' bits are recovered with errors, i.e. where we do not know
+    a priori which bits are correctly recovered.
+    
+    The mitigation for the attack is relatively simple - all the bits of
+    the window are obtained at once, along with other bits so that an
+    entire integer's worth of bits are obtained together using masking and
+    shifts, without unnecessarily considering each bit in isolation. This
+    improves performance somewhat (one call to bn_get_bits is faster than
+    several calls to BN_is_bit_set), so the attacker now gets one signal
+    snippet per window (rather than one per bit) in which the signal is
+    affected by all bits in the integer (rather than just the one bit).
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/6276">https://github.com/openssl/openssl/pull/6276</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/bn_exp.c | 39 +++++++++++++++++++++++++++------------
+ 1 file changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/crypto/bn/bn_exp.c b/crypto/bn/bn_exp.c
+index 258e901..2dbf5b4 100644
+--- a/crypto/bn/bn_exp.c
++++ b/crypto/bn/bn_exp.c
+@@ -473,7 +473,6 @@ int BN_mod_exp_mont(BIGNUM *rr, const BIGNUM *a, const BIGNUM *p,
+     return ret;
+ }
+ 
+-#if defined(SPARC_T4_MONT)
+ static BN_ULONG bn_get_bits(const BIGNUM *a, int bitpos)
+ {
+     BN_ULONG ret = 0;
+@@ -492,7 +491,6 @@ static BN_ULONG bn_get_bits(const BIGNUM *a, int bitpos)
+ 
+     return ret &amp; BN_MASK2;
+ }
+-#endif
+ 
+ /*
+  * BN_mod_exp_mont_consttime() stores the precomputed powers in a specific
+@@ -599,7 +597,7 @@ int BN_mod_exp_mont_consttime(BIGNUM *rr, const BIGNUM *a, const BIGNUM *p,
+                               const BIGNUM *m, BN_CTX *ctx,
+                               BN_MONT_CTX *in_mont)
+ {
+-    int i, bits, ret = 0, window, wvalue;
++    int i, bits, ret = 0, window, wvalue, wmask, window0;
+     int top;
+     BN_MONT_CTX *mont = NULL;
+ 
+@@ -1040,27 +1038,44 @@ int BN_mod_exp_mont_consttime(BIGNUM *rr, const BIGNUM *a, const BIGNUM *p,
+             }
+         }
+ 
+-        bits--;
+-        for (wvalue = 0, i = bits % window; i &gt;= 0; i--, bits--)
+-            wvalue = (wvalue &lt;&lt; 1) + BN_is_bit_set(p, bits);
++        /* 
++         * The exponent may not have a whole number of fixed-size windows.
++         * To simplify the main loop, the initial window has between 1 and
++         * full-window-size bits such that what remains is always a whole
++         * number of windows
++         */ 
++        window0 = (bits - 1) % window + 1;
++        wmask = (1 &lt;&lt; window0) - 1;
++        bits -= window0;
++        wvalue = bn_get_bits(p, bits) &amp; wmask;
+         if (!MOD_EXP_CTIME_COPY_FROM_PREBUF(&amp;tmp, top, powerbuf, wvalue,
+                                             window))
+             goto err;
+ 
++        wmask = (1 &lt;&lt; window) - 1;
+         /*
+          * Scan the exponent one window at a time starting from the most
+          * significant bits.
+          */
+-        while (bits &gt;= 0) {
+-            wvalue = 0;         /* The 'value' of the window */
++        while (bits &gt; 0) {
+ 
+-            /* Scan the window, squaring the result as we go */
+-            for (i = 0; i &lt; window; i++, bits--) {
++            /* Square the result window-size times */
++            for (i = 0; i &lt; window; i++)
+                 if (!BN_mod_mul_montgomery(&amp;tmp, &amp;tmp, &amp;tmp, mont, ctx))
+                     goto err;
+-                wvalue = (wvalue &lt;&lt; 1) + BN_is_bit_set(p, bits);
+-            }
+ 
++            /* 
++             * Get a window's worth of bits from the exponent
++             * This avoids calling BN_is_bit_set for each bit, which
++             * is not only slower but also makes each bit vulnerable to
++             * EM (and likely other) side-channel attacks like One&amp;Done
++             * (for details see &quot;One&amp;Done: A Single-Decryption EM-Based
++             *  Attack on OpenSSL&#8217;s Constant-Time Blinded RSA&quot; by M. Alam,
++             *  H. Khan, M. Dey, N. Sinha, R. Callan, A. Zajic, and
++             *  M. Prvulovic, in USENIX Security'18)
++             */
++            bits -= window;
++            wvalue = bn_get_bits(p, bits) &amp; wmask;
+             /*
+              * Fetch the appropriate pre-computed value from the pre-buf
+              */
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019465.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019467.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19466">[ date ]</a>
+              <a href="thread.html#19466">[ thread ]</a>
+              <a href="subject.html#19466">[ subject ]</a>
+              <a href="author.html#19466">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

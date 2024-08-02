@@ -1,0 +1,339 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522865701.619666.12206.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018895.html">
+   <LINK REL="Next"  HREF="018898.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1522865701.619666.12206.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Apr  4 18:15:01 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018895.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018898.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18897">[ date ]</a>
+              <a href="thread.html#18897">[ thread ]</a>
+              <a href="subject.html#18897">[ subject ]</a>
+              <a href="author.html#18897">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8e2bec9b8aaba602af6fda2523a15238aa49aade (commit)
+      from  dbcfd9025f86e997f6246d51e4700a0560ce3977 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8e2bec9b8aaba602af6fda2523a15238aa49aade
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Apr 4 18:31:50 2018 +0200
+
+    Remove ambiguity in rand_pool_add[_end] return value
+    
+    When these two functions returned zero, it could mean:
+    
+    1. that an error occured.  In their case, the error is an overflow of
+       the pool, i.e. the correct response from the caller would be to
+       stop trying to fill the pool.
+    2. that there isn't enought entropy acquired yet, i.e. the correct
+       response from the caller would be to try and add more entropy to
+       the pool.
+    
+    Because of this ambiguity, the returned zero turns out to be useless.
+    This change makes the returned value more consistent.  1 means the
+    addition of new entropy was successful, 0 means it wasn't.  To know if
+    the pool has been filled enough, the caller will have to call some
+    other function, such as rand_pool_entropy_available().
+    
+    Fixes #5846
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5876">https://github.com/openssl/openssl/pull/5876</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/rand_lib.c  | 42 ++++++++++++++++++------------------------
+ crypto/rand/rand_unix.c |  9 ++++++---
+ crypto/rand/rand_vms.c  |  5 +++--
+ crypto/rand/rand_win.c  |  9 ++++++---
+ 4 files changed, 33 insertions(+), 32 deletions(-)
+
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 143dfb0..3589e75 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -130,26 +130,20 @@ size_t rand_acquire_entropy_from_cpu(RAND_POOL *pool)
+         buffer = rand_pool_add_begin(pool, bytes_needed);
+ 
+         if (buffer != NULL) {
+-
+-            /* If RDSEED is available, use that. */
++            /* Whichever comes first, use RDSEED, RDRAND or nothing */
+             if ((OPENSSL_ia32cap_P[2] &amp; (1 &lt;&lt; 18)) != 0) {
+                 if (OPENSSL_ia32_rdseed_bytes(buffer, bytes_needed)
+-                    == bytes_needed)
+-                    return rand_pool_add_end(pool,
+-                                             bytes_needed,
+-                                             8 * bytes_needed);
+-            }
+-
+-            /* Second choice is RDRAND. */
+-            if ((OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; (62 - 32))) != 0) {
++                    == bytes_needed) {
++                    rand_pool_add_end(pool, bytes_needed, 8 * bytes_needed);
++                }
++            } else if ((OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; (62 - 32))) != 0) {
+                 if (OPENSSL_ia32_rdrand_bytes(buffer, bytes_needed)
+-                    == bytes_needed)
+-                    return rand_pool_add_end(pool,
+-                                             bytes_needed,
+-                                             8 * bytes_needed);
++                    == bytes_needed) {
++                    rand_pool_add_end(pool, bytes_needed, 8 * bytes_needed);
++                }
++            } else {
++                rand_pool_add_end(pool, 0, 0);
+             }
+-
+-            return rand_pool_add_end(pool, 0, 0);
+         }
+     }
+ 
+@@ -222,7 +216,8 @@ size_t rand_drbg_get_entropy(RAND_DRBG *drbg,
+                 bytes = bytes_needed;
+             rand_drbg_unlock(drbg-&gt;parent);
+ 
+-            entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++            rand_pool_add_end(pool, bytes, 8 * bytes);
++            entropy_available = rand_pool_entropy_available(pool);
+         }
+ 
+     } else {
+@@ -631,11 +626,10 @@ size_t rand_pool_bytes_remaining(RAND_POOL *pool)
+  * random input which contains at least |entropy| bits of
+  * randomness.
+  *
+- * Return available amount of entropy after this operation.
+- * (see rand_pool_entropy_available(pool))
++ * Returns 1 if the added amount is adequate, otherwise 0
+  */
+-size_t rand_pool_add(RAND_POOL *pool,
+-                     const unsigned char *buffer, size_t len, size_t entropy)
++int rand_pool_add(RAND_POOL *pool,
++                  const unsigned char *buffer, size_t len, size_t entropy)
+ {
+     if (len &gt; pool-&gt;max_len - pool-&gt;len) {
+         RANDerr(RAND_F_RAND_POOL_ADD, RAND_R_ENTROPY_INPUT_TOO_LONG);
+@@ -648,7 +642,7 @@ size_t rand_pool_add(RAND_POOL *pool,
+         pool-&gt;entropy += entropy;
+     }
+ 
+-    return rand_pool_entropy_available(pool);
++    return 1;
+ }
+ 
+ /*
+@@ -685,7 +679,7 @@ unsigned char *rand_pool_add_begin(RAND_POOL *pool, size_t len)
+  * to the buffer which contain at least |entropy| bits of randomness.
+  * It is allowed to add less bytes than originally reserved.
+  */
+-size_t rand_pool_add_end(RAND_POOL *pool, size_t len, size_t entropy)
++int rand_pool_add_end(RAND_POOL *pool, size_t len, size_t entropy)
+ {
+     if (len &gt; pool-&gt;max_len - pool-&gt;len) {
+         RANDerr(RAND_F_RAND_POOL_ADD_END, RAND_R_RANDOM_POOL_OVERFLOW);
+@@ -697,7 +691,7 @@ size_t rand_pool_add_end(RAND_POOL *pool, size_t len, size_t entropy)
+         pool-&gt;entropy += entropy;
+     }
+ 
+-    return rand_pool_entropy_available(pool);
++    return 1;
+ }
+ 
+ int RAND_set_rand_method(const RAND_METHOD *meth)
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index b86f94a..0f9407f 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -174,7 +174,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+         if (getrandom(buffer, bytes_needed, 0) == (int)bytes_needed)
+             bytes = bytes_needed;
+ 
+-        entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++        rand_pool_add_end(pool, bytes, 8 * bytes);
++        entropy_available = rand_pool_entropy_available(pool);
+     }
+     if (entropy_available &gt; 0)
+         return entropy_available;
+@@ -203,7 +204,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+                 if (fread(buffer, 1, bytes_needed, fp) == bytes_needed)
+                     bytes = bytes_needed;
+ 
+-                entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++                rand_pool_add_end(pool, bytes, 8 * bytes);
++                entropy_available = rand_pool_entropy_available(pool);
+             }
+             fclose(fp);
+             if (entropy_available &gt; 0)
+@@ -241,7 +243,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+                 if (num == (int)bytes_needed)
+                     bytes = bytes_needed;
+ 
+-                entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++                rand_pool_add_end(pool, bytes, 8 * bytes);
++                entropy_available = rand_pool_entropy_available(pool);
+             }
+             if (entropy_available &gt; 0)
+                 return entropy_available;
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index 7edec9e..1507c6f 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -148,8 +148,9 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+     if (total_length &gt; bytes_remaining)
+         total_length = bytes_remaining;
+ 
+-    return rand_pool_add(pool, (PTR_T)data_buffer, total_length,
+-                         total_length * ENTROPY_BITS_PER_BYTE);
++    rand_pool_add(pool, (PTR_T)data_buffer, total_length,
++                  total_length * ENTROPY_BITS_PER_BYTE);
++    return rand_pool_entropy_available(pool);
+ }
+ 
+ #endif
+diff --git a/crypto/rand/rand_win.c b/crypto/rand/rand_win.c
+index 7f34188..ad5e3d1 100644
+--- a/crypto/rand/rand_win.c
++++ b/crypto/rand/rand_win.c
+@@ -70,7 +70,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+             BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS)
+             bytes = bytes_needed;
+ 
+-        entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++        rand_pool_add_end(pool, bytes, 8 * bytes);
++        entropy_available = rand_pool_entropy_available(pool);
+     }
+     if (entropy_available &gt; 0)
+         return entropy_available;
+@@ -88,7 +89,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+             CryptReleaseContext(hProvider, 0);
+         }
+ 
+-        entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++        rand_pool_add_end(pool, bytes, 8 * bytes);
++        entropy_available = rand_pool_entropy_available(pool);
+     }
+     if (entropy_available &gt; 0)
+         return entropy_available;
+@@ -106,7 +108,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ 
+             CryptReleaseContext(hProvider, 0);
+         }
+-        entropy_available = rand_pool_add_end(pool, bytes, 8 * bytes);
++        rand_pool_add_end(pool, bytes, 8 * bytes);
++        entropy_available = rand_pool_entropy_available(pool);
+     }
+     if (entropy_available &gt; 0)
+         return entropy_available;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018895.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018898.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18897">[ date ]</a>
+              <a href="thread.html#18897">[ thread ]</a>
+              <a href="subject.html#18897">[ subject ]</a>
+              <a href="author.html#18897">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

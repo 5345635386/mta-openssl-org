@@ -1,0 +1,462 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1614158288.894878.12787.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033232.html">
+   <LINK REL="Next"  HREF="033240.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1614158288.894878.12787.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Feb 24 09:18:08 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033232.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033240.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33239">[ date ]</a>
+              <a href="thread.html#33239">[ thread ]</a>
+              <a href="subject.html#33239">[ subject ]</a>
+              <a href="author.html#33239">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  10315851d0230646947213ac148747bc64c56798 (commit)
+      from  ce0b307ea01bc5e3e178cd4dba45f9bb9d4ba5df (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 10315851d0230646947213ac148747bc64c56798
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Jan 28 09:00:58 2021 +0100
+
+    X509: Refactor X509_PUBKEY processing to include provider side keys
+    
+    When a SubjectPublicKeyInfo (SPKI) is decoded into an X509_PUBKEY
+    structure, the corresponding EVP_PKEY is automatically added as well.
+    This used to only support our built-in keytypes, and only in legacy
+    form.
+    
+    This is now refactored by making The ASN1 implementation of the
+    X509_PUBKEY an EXTERN_ASN1, resulting in a more manual implementation
+    of the basic support routines.  Specifically, the d2i routine will do
+    what was done in the callback before, and try to interpret the input
+    as an EVP_PKEY, first in legacy form, and then using OSSL_DECODER.
+    
+    Fixes #13893
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14281">https://github.com/openssl/openssl/pull/14281</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_pubkey.c                             | 231 +++++++++++++++++----
+ include/crypto/x509.h                              |   3 +
+ .../implementations/encode_decode/decode_der2key.c |   3 +-
+ 3 files changed, 196 insertions(+), 41 deletions(-)
+
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index 5d500f0690..8392540c73 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -22,17 +22,23 @@
+ #include &quot;crypto/x509.h&quot;
+ #include &lt;openssl/rsa.h&gt;
+ #include &lt;openssl/dsa.h&gt;
++#include &lt;openssl/decoder.h&gt;
+ #include &lt;openssl/encoder.h&gt;
+ #include &quot;internal/provider.h&quot;
++#include &quot;internal/sizes.h&quot;
+ 
+ struct X509_pubkey_st {
+     X509_ALGOR *algor;
+     ASN1_BIT_STRING *public_key;
++
+     EVP_PKEY *pkey;
+ 
+     /* extra data for the callback, used by d2i_PUBKEY_ex */
+     OSSL_LIB_CTX *libctx;
+     char *propq;
++
++    /* Flag to force legacy keys */
++    unsigned int flag_force_legacy : 1;
+ };
+ 
+ static int x509_pubkey_decode(EVP_PKEY **pk, const X509_PUBKEY *key);
+@@ -53,46 +59,172 @@ static int x509_pubkey_set0_libctx(X509_PUBKEY *x, OSSL_LIB_CTX *libctx,
+     return 1;
+ }
+ 
+-/* Minor tweak to operation: free up EVP_PKEY */
+-static int pubkey_cb(int operation, ASN1_VALUE **pval, const ASN1_ITEM *it,
+-                     void *exarg)
++ASN1_SEQUENCE(X509_PUBKEY_INTERNAL) = {
++        ASN1_SIMPLE(X509_PUBKEY, algor, X509_ALGOR),
++        ASN1_SIMPLE(X509_PUBKEY, public_key, ASN1_BIT_STRING)
++} static_ASN1_SEQUENCE_END_name(X509_PUBKEY, X509_PUBKEY_INTERNAL)
++
++static void x509_pubkey_ex_free(ASN1_VALUE **pval, const ASN1_ITEM *it)
+ {
+     X509_PUBKEY *pubkey = (X509_PUBKEY *)*pval;
+ 
+-    if (operation == ASN1_OP_FREE_POST) {
+-        OPENSSL_free(pubkey-&gt;propq);
+-        EVP_PKEY_free(pubkey-&gt;pkey);
+-    } else if (operation == ASN1_OP_D2I_POST) {
+-        /* Attempt to decode public key and cache in pubkey structure. */
+-        EVP_PKEY_free(pubkey-&gt;pkey);
+-        pubkey-&gt;pkey = NULL;
+-        /*
+-         * Opportunistically decode the key but remove any non fatal errors
+-         * from the queue. Subsequent explicit attempts to decode/use the key
+-         * will return an appropriate error.
+-         */
+-        ERR_set_mark();
+-        if (x509_pubkey_decode(&amp;pubkey-&gt;pkey, pubkey) == -1) {
++    X509_ALGOR_free(pubkey-&gt;algor);
++    ASN1_BIT_STRING_free(pubkey-&gt;public_key);
++    EVP_PKEY_free(pubkey-&gt;pkey);
++    OPENSSL_free(pubkey);
++    *pval = NULL;
++}
++
++static int x509_pubkey_ex_populate(ASN1_VALUE **pval, const ASN1_ITEM *it)
++{
++    X509_PUBKEY *pubkey = (X509_PUBKEY *)*pval;
++
++    return (pubkey-&gt;algor != NULL
++            || (pubkey-&gt;algor = X509_ALGOR_new()) != NULL)
++        &amp;&amp; (pubkey-&gt;public_key != NULL
++            || (pubkey-&gt;public_key = ASN1_BIT_STRING_new()) != NULL);
++}
++
++static int x509_pubkey_ex_new(ASN1_VALUE **pval, const ASN1_ITEM *it)
++{
++    X509_PUBKEY *ret;
++
++    if ((ret = OPENSSL_zalloc(sizeof(*ret))) == NULL
++        || !x509_pubkey_ex_populate((ASN1_VALUE **)&amp;ret, NULL)) {
++        x509_pubkey_ex_free((ASN1_VALUE **)&amp;ret, NULL);
++        ERR_raise(ERR_LIB_ASN1, ERR_R_MALLOC_FAILURE);
++    } else {
++        *pval = (ASN1_VALUE *)ret;
++    }
++
++    return ret != NULL;
++}
++
++static int x509_pubkey_ex_d2i(ASN1_VALUE **pval,
++                              const unsigned char **in, long len,
++                              const ASN1_ITEM *it, int tag, int aclass,
++                              char opt, ASN1_TLC *ctx)
++{
++    const unsigned char *in_saved = *in;
++    X509_PUBKEY *pubkey;
++    int ret;
++    OSSL_DECODER_CTX *dctx = NULL;
++
++    if (*pval == NULL &amp;&amp; !x509_pubkey_ex_new(pval, it))
++        return 0;
++    if (!x509_pubkey_ex_populate(pval, NULL)) {
++        ERR_raise(ERR_LIB_ASN1, ERR_R_MALLOC_FAILURE);
++        return 0;
++    }
++
++    /* This ensures that |*in| advances properly no matter what */
++    if ((ret = ASN1_item_ex_d2i(pval, in, len,
++                                ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL),
++                                tag, aclass, opt, ctx)) &lt;= 0)
++        return ret;
++
++    pubkey = (X509_PUBKEY *)*pval;
++    EVP_PKEY_free(pubkey-&gt;pkey);
++    pubkey-&gt;pkey = NULL;
++
++    /*
++     * Opportunistically decode the key but remove any non fatal errors
++     * from the queue. Subsequent explicit attempts to decode/use the key
++     * will return an appropriate error.
++     */
++    ERR_set_mark();
++
++    /*
++     * Try to decode with legacy method first.  This ensures that engines
++     * aren't overriden by providers.
++     */
++    if ((ret = x509_pubkey_decode(&amp;pubkey-&gt;pkey, pubkey)) == -1) {
++        /* -1 indicates a fatal error, like malloc failure */
++        ERR_clear_last_mark();
++        goto end;
++    }
++
++    /* Try to decode it into an EVP_PKEY with OSSL_DECODER */
++    if (ret &lt;= 0 &amp;&amp; !pubkey-&gt;flag_force_legacy) {
++        const unsigned char *p = in_saved;
++        char txtoidname[OSSL_MAX_NAME_SIZE];
++
++        if (OBJ_obj2txt(txtoidname, sizeof(txtoidname),
++                        pubkey-&gt;algor-&gt;algorithm, 0) &lt;= 0) {
+             ERR_clear_last_mark();
+-            return 0;
++            goto end;
+         }
+-        ERR_pop_to_mark();
+-    } else if (operation == ASN1_OP_DUP_POST) {
+-        X509_PUBKEY *old = exarg;
+-
+-        if (!x509_pubkey_set0_libctx(pubkey, old-&gt;libctx, old-&gt;propq))
+-            return 0;
++        if ((dctx =
++             OSSL_DECODER_CTX_new_for_pkey(&amp;pubkey-&gt;pkey,
++                                           &quot;DER&quot;, &quot;SubjectPublicKeyInfo&quot;,
++                                           txtoidname, EVP_PKEY_PUBLIC_KEY,
++                                           pubkey-&gt;libctx,
++                                           pubkey-&gt;propq)) != NULL)
++            /*
++             * As said higher up, we're being opportunistic.  In other words,
++             * we don't care about what the return value signals.
++             */
++            OSSL_DECODER_from_data(dctx, &amp;p, NULL);
+     }
+-    return 1;
++
++    ERR_pop_to_mark();
++    ret = 1;
++ end:
++    OSSL_DECODER_CTX_free(dctx);
++    return ret;
+ }
+ 
+-ASN1_SEQUENCE_cb(X509_PUBKEY, pubkey_cb) = {
+-        ASN1_SIMPLE(X509_PUBKEY, algor, X509_ALGOR),
+-        ASN1_SIMPLE(X509_PUBKEY, public_key, ASN1_BIT_STRING)
+-} ASN1_SEQUENCE_END_cb(X509_PUBKEY, X509_PUBKEY)
++static int x509_pubkey_ex_i2d(const ASN1_VALUE **pval, unsigned char **out,
++                              const ASN1_ITEM *it, int tag, int aclass)
++{
++    return ASN1_item_ex_i2d(pval, out, ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL),
++                            tag, aclass);
++}
++
++static int x509_pubkey_ex_print(BIO *out, const ASN1_VALUE **pval, int indent,
++                                const char *fname, const ASN1_PCTX *pctx)
++{
++    return ASN1_item_print(out, *pval, indent,
++                           ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL), pctx);
++}
++
++static const ASN1_EXTERN_FUNCS x509_pubkey_ff = {
++    NULL,
++    x509_pubkey_ex_new,
++    x509_pubkey_ex_free,
++    0,                          /* Default clear behaviour is OK */
++    x509_pubkey_ex_d2i,
++    x509_pubkey_ex_i2d,
++    x509_pubkey_ex_print
++};
+ 
++IMPLEMENT_EXTERN_ASN1(X509_PUBKEY, V_ASN1_SEQUENCE, x509_pubkey_ff)
+ IMPLEMENT_ASN1_FUNCTIONS(X509_PUBKEY)
+-IMPLEMENT_ASN1_DUP_FUNCTION(X509_PUBKEY)
++
++/*
++ * X509_PUBKEY_dup() must be implemented manually, because there is no
++ * support for it in ASN1_EXTERN_FUNCS.
++ */
++X509_PUBKEY *X509_PUBKEY_dup(const X509_PUBKEY *a)
++{
++    X509_PUBKEY *pubkey = NULL;
++
++    if (!x509_pubkey_ex_new(NULL, ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL))
++        || !x509_pubkey_set0_libctx(pubkey, a-&gt;libctx, a-&gt;propq)
++        || (pubkey-&gt;algor = X509_ALGOR_dup(a-&gt;algor)) == NULL
++        || (pubkey-&gt;public_key = ASN1_BIT_STRING_new()) == NULL
++        || !ASN1_BIT_STRING_set(pubkey-&gt;public_key,
++                                a-&gt;public_key-&gt;data, a-&gt;public_key-&gt;length)
++        || (a-&gt;pkey != NULL &amp;&amp; !EVP_PKEY_up_ref(a-&gt;pkey))) {
++        x509_pubkey_ex_free((ASN1_VALUE **)&amp;pubkey,
++                            ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL));
++        ERR_raise(ERR_LIB_X509, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++
++    pubkey-&gt;pkey = a-&gt;pkey;
++    return pubkey;
++}
+ 
+ /* TODO should better be called X509_PUBKEY_set1 */
+ int X509_PUBKEY_set(X509_PUBKEY **x, EVP_PKEY *pkey)
+@@ -175,9 +307,9 @@ int X509_PUBKEY_set(X509_PUBKEY **x, EVP_PKEY *pkey)
+  * Attempt to decode a public key.
+  * Returns 1 on success, 0 for a decode failure and -1 for a fatal
+  * error e.g. malloc failure.
++ *
++ * This function is #legacy.
+  */
+-
+-
+ static int x509_pubkey_decode(EVP_PKEY **ppkey, const X509_PUBKEY *key)
+ {
+     EVP_PKEY *pkey = EVP_PKEY_new();
+@@ -256,9 +388,14 @@ EVP_PKEY *X509_PUBKEY_get(const X509_PUBKEY *key)
+  * Now three pseudo ASN1 routines that take an EVP_PKEY structure and encode
+  * or decode as X509_PUBKEY
+  */
+-
+-EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
+-                        OSSL_LIB_CTX *libctx, const char *propq)
++static EVP_PKEY *d2i_PUBKEY_int(EVP_PKEY **a,
++                                const unsigned char **pp, long length,
++                                OSSL_LIB_CTX *libctx, const char *propq,
++                                unsigned int force_legacy,
++                                X509_PUBKEY *
++                                (*d2i_x509_pubkey)(X509_PUBKEY **a,
++                                                   const unsigned char **in,
++                                                   long len))
+ {
+     X509_PUBKEY *xpk, *xpk2 = NULL, **pxpk = NULL;
+     EVP_PKEY *pktmp = NULL;
+@@ -271,7 +408,7 @@ EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
+      * feature.  It's not generally recommended, but is safe enough for
+      * newly created structures.
+      */
+-    if (libctx != NULL || propq != NULL) {
++    if (libctx != NULL || propq != NULL || force_legacy) {
+         xpk2 = OPENSSL_zalloc(sizeof(*xpk2));
+         if (xpk2 == NULL) {
+             ERR_raise(ERR_LIB_X509, ERR_R_MALLOC_FAILURE);
+@@ -279,9 +416,10 @@ EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
+         }
+         if (!x509_pubkey_set0_libctx(xpk2, libctx, propq))
+             goto end;
++        xpk2-&gt;flag_force_legacy = !!force_legacy;
+         pxpk = &amp;xpk2;
+     }
+-    xpk = d2i_X509_PUBKEY(pxpk, &amp;q, length);
++    xpk = d2i_x509_pubkey(pxpk, &amp;q, length);
+     if (xpk == NULL)
+         goto end;
+     pktmp = X509_PUBKEY_get(xpk);
+@@ -299,6 +437,19 @@ EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
+     return pktmp;
+ }
+ 
++/* For the algorithm specific d2i functions further down */
++EVP_PKEY *d2i_PUBKEY_legacy(EVP_PKEY **a,
++                            const unsigned char **pp, long length)
++{
++    return d2i_PUBKEY_int(a, pp, length, NULL, NULL, 1, d2i_X509_PUBKEY);
++}
++
++EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
++                        OSSL_LIB_CTX *libctx, const char *propq)
++{
++    return d2i_PUBKEY_int(a, pp, length, libctx, propq, 0, d2i_X509_PUBKEY);
++}
++
+ EVP_PKEY *d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length)
+ {
+     return d2i_PUBKEY_ex(a, pp, length, NULL, NULL);
+@@ -365,7 +516,7 @@ RSA *d2i_RSA_PUBKEY(RSA **a, const unsigned char **pp, long length)
+     const unsigned char *q;
+ 
+     q = *pp;
+-    pkey = d2i_PUBKEY(NULL, &amp;q, length);
++    pkey = d2i_PUBKEY_legacy(NULL, &amp;q, length);
+     if (pkey == NULL)
+         return NULL;
+     key = EVP_PKEY_get1_RSA(pkey);
+@@ -406,7 +557,7 @@ DSA *d2i_DSA_PUBKEY(DSA **a, const unsigned char **pp, long length)
+     const unsigned char *q;
+ 
+     q = *pp;
+-    pkey = d2i_PUBKEY(NULL, &amp;q, length);
++    pkey = d2i_PUBKEY_legacy(NULL, &amp;q, length);
+     if (pkey == NULL)
+         return NULL;
+     key = EVP_PKEY_get1_DSA(pkey);
+@@ -448,7 +599,7 @@ EC_KEY *d2i_EC_PUBKEY(EC_KEY **a, const unsigned char **pp, long length)
+     const unsigned char *q;
+ 
+     q = *pp;
+-    pkey = d2i_PUBKEY(NULL, &amp;q, length);
++    pkey = d2i_PUBKEY_legacy(NULL, &amp;q, length);
+     if (pkey == NULL)
+         return NULL;
+     key = EVP_PKEY_get1_EC_KEY(pkey);
+diff --git a/include/crypto/x509.h b/include/crypto/x509.h
+index 809f6e328e..67fd88dbc4 100644
+--- a/include/crypto/x509.h
++++ b/include/crypto/x509.h
+@@ -327,4 +327,7 @@ int X509_PUBKEY_get0_libctx(OSSL_LIB_CTX **plibctx, const char **ppropq,
+ /* Calculate default key identifier according to RFC 5280 section 4.2.1.2 (1) */
+ ASN1_OCTET_STRING *x509_pubkey_hash(X509_PUBKEY *pubkey);
+ 
++/* A variant of d2i_PUBKEY() that is guaranteed to only return legacy keys */
++EVP_PKEY *d2i_PUBKEY_legacy(EVP_PKEY **a,
++                            const unsigned char **in, long length);
+ #endif
+diff --git a/providers/implementations/encode_decode/decode_der2key.c b/providers/implementations/encode_decode/decode_der2key.c
+index 466a73f908..5073e660cd 100644
+--- a/providers/implementations/encode_decode/decode_der2key.c
++++ b/providers/implementations/encode_decode/decode_der2key.c
+@@ -31,6 +31,7 @@
+ #include &quot;crypto/evp.h&quot;
+ #include &quot;crypto/ecx.h&quot;
+ #include &quot;crypto/rsa.h&quot;
++#include &quot;crypto/x509.h&quot;
+ #include &quot;prov/bio.h&quot;
+ #include &quot;prov/implementations.h&quot;
+ #include &quot;endecoder_local.h&quot;
+@@ -330,7 +331,7 @@ static int der2key_decode(void *vctx, OSSL_CORE_BIO *cin, int selection,
+             &amp;&amp; (selection &amp; OSSL_KEYMGMT_SELECT_PUBLIC_KEY) != 0) {
+             RESET_ERR_MARK();
+             derp = der;
+-            pkey = d2i_PUBKEY_ex(NULL, &amp;derp, der_len, libctx, NULL);
++            pkey = d2i_PUBKEY_legacy(NULL, &amp;derp, der_len);
+         }
+ 
+         if (pkey != NULL) {
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033232.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033240.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33239">[ date ]</a>
+              <a href="thread.html#33239">[ thread ]</a>
+              <a href="subject.html#33239">[ subject ]</a>
+              <a href="author.html#33239">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

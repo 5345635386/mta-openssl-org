@@ -1,0 +1,192 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1494534967.231294.14270.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014603.html">
+   <LINK REL="Next"  HREF="014606.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1494534967.231294.14270.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu May 11 20:36:07 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014603.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="014606.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14605">[ date ]</a>
+              <a href="thread.html#14605">[ thread ]</a>
+              <a href="subject.html#14605">[ subject ]</a>
+              <a href="author.html#14605">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7031ddac94d0ae616d1b0670263a9265ce672cd2 (commit)
+      from  b57f0c598bde43e147a886c9ffb0d6fdb3141d72 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7031ddac94d0ae616d1b0670263a9265ce672cd2
+Author: Todd Short &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tshort at akamai.com</A>&gt;
+Date:   Thu May 11 15:48:10 2017 -0400
+
+    Fix infinite loops in secure memory allocation.
+    
+    Issue 1:
+    
+    sh.bittable_size is a size_t but i is and int, which can result in
+    freelist == -1 if sh.bittable_size exceeds an int.
+    
+    This seems to result in an OPENSSL_assert due to invalid allocation
+    size, so maybe that is &quot;ok.&quot;
+    
+    Worse, if sh.bittable_size is exactly 1&lt;&lt;31, then this becomes an
+    infinite loop (because 1&lt;&lt;31 is a negative int, so it can be shifted
+    right forever and sticks at -1).
+    
+    Issue 2:
+    
+    CRYPTO_secure_malloc_init() sets secure_mem_initialized=1 even when
+    sh_init() returns 0.
+    
+    If sh_init() fails, we end up with secure_mem_initialized=1 but
+    sh.minsize=0. If you then call secure_malloc(), which then calls,
+    sh_malloc(), this then enters an infite loop since 0 &lt;&lt; anything will
+    never be larger than size.
+    
+    Issue 3:
+    
+    That same sh_malloc loop will loop forever for a size greater
+    than size_t/2 because i will proceed (assuming sh.minsize=16):
+    i=16, 32, 64, ..., size_t/8, size_t/4, size_t/2, 0, 0, 0, 0, ....
+    This sequence will never be larger than &quot;size&quot;.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3449">https://github.com/openssl/openssl/pull/3449</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem_sec.c  | 15 ++++++++++++---
+ test/secmemtest.c | 21 +++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 351dec4..774b696 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -73,8 +73,12 @@ int CRYPTO_secure_malloc_init(size_t size, int minsize)
+         sec_malloc_lock = CRYPTO_THREAD_lock_new();
+         if (sec_malloc_lock == NULL)
+             return 0;
+-        ret = sh_init(size, minsize);
+-        secure_mem_initialized = 1;
++        if ((ret = sh_init(size, minsize)) != 0) {
++            secure_mem_initialized = 1;
++        } else {
++            CRYPTO_THREAD_lock_free(sec_malloc_lock);
++            sec_malloc_lock = NULL;
++        }
+     }
+ 
+     return ret;
+@@ -90,6 +94,7 @@ int CRYPTO_secure_malloc_done()
+         sh_done();
+         secure_mem_initialized = 0;
+         CRYPTO_THREAD_lock_free(sec_malloc_lock);
++        sec_malloc_lock = NULL;
+         return 1;
+     }
+ #endif /* IMPLEMENTED */
+@@ -341,7 +346,8 @@ static void sh_remove_from_list(char *ptr)
+ 
+ static int sh_init(size_t size, int minsize)
+ {
+-    int i, ret;
++    int ret;
++    size_t i;
+     size_t pgsize;
+     size_t aligned;
+ 
+@@ -498,6 +504,9 @@ static void *sh_malloc(size_t size)
+     size_t i;
+     char *chunk;
+ 
++    if (size &gt; sh.arena_size)
++        return NULL;
++
+     list = sh.freelist_size - 1;
+     for (i = sh.minsize; i &lt; size; i &lt;&lt;= 1)
+         list--;
+diff --git a/test/secmemtest.c b/test/secmemtest.c
+index 3244d06..c92db50 100644
+--- a/test/secmemtest.c
++++ b/test/secmemtest.c
+@@ -61,6 +61,27 @@ static int test_sec_mem(void)
+         || !TEST_true(CRYPTO_secure_malloc_done())
+         || !TEST_false(CRYPTO_secure_malloc_initialized()))
+         goto end;
++
++    TEST_info(&quot;Possible infinite loop: allocate more than available&quot;);
++    if (!TEST_true(CRYPTO_secure_malloc_init(32768, 16)))
++        goto end;
++    TEST_ptr_null(OPENSSL_secure_malloc((size_t)-1));
++    TEST_true(CRYPTO_secure_malloc_done());
++
++    TEST_info(&quot;Possible infinite loop: small arena&quot;);
++    if (!TEST_false(CRYPTO_secure_malloc_init(16, 16)))
++        goto end;
++    TEST_false(CRYPTO_secure_malloc_initialized());
++    TEST_ptr_null(OPENSSL_secure_malloc((size_t)-1));
++    TEST_true(CRYPTO_secure_malloc_done());
++
++    if (sizeof(size_t) &gt; 4) {
++        TEST_info(&quot;Possible infinite loop: 1&lt;&lt;31 limit&quot;);
++        if (!TEST_true(CRYPTO_secure_malloc_init((size_t)1&lt;&lt;34, (size_t)1&lt;&lt;4) != 0))
++            goto end;
++        TEST_true(CRYPTO_secure_malloc_done());
++    }
++    
+     /* this can complete - it was not really secure */
+     testresult = 1;
+  end:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014603.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="014606.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14605">[ date ]</a>
+              <a href="thread.html#14605">[ thread ]</a>
+              <a href="subject.html#14605">[ subject ]</a>
+              <a href="author.html#14605">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

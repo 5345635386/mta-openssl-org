@@ -1,0 +1,356 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1567675279.981893.11932.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024855.html">
+   <LINK REL="Next"  HREF="024858.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1567675279.981893.11932.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Sep  5 09:21:19 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024855.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024858.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24856">[ date ]</a>
+              <a href="thread.html#24856">[ thread ]</a>
+              <a href="subject.html#24856">[ subject ]</a>
+              <a href="author.html#24856">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6b4152f1896e07ed94dc82663846ae9d38d4ca42 (commit)
+       via  b783beeadf6b80bc431e6f3230b5d5585c87ef87 (commit)
+      from  46c428d73633bc68377a3a425f22313584999365 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6b4152f1896e07ed94dc82663846ae9d38d4ca42
+Author: Billy Brumley &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bbrumley at gmail.com</A>&gt;
+Date:   Mon Sep 2 15:03:26 2019 +0300
+
+    [test] computing ECC cofactors: regression test
+    
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9827">https://github.com/openssl/openssl/pull/9827</A>)
+
+commit b783beeadf6b80bc431e6f3230b5d5585c87ef87
+Author: Billy Brumley &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bbrumley at gmail.com</A>&gt;
+Date:   Mon Sep 2 15:02:30 2019 +0300
+
+    [crypto/ec] for ECC parameters with NULL or zero cofactor, compute it
+    
+    The cofactor argument to EC_GROUP_set_generator is optional, and SCA mitigations for ECC currently use it. So the library currently falls back to very old SCA-vulnerable code if the cofactor is not present.
+    
+    This PR allows EC_GROUP_set_generator to compute the cofactor for all curves of cryptographic interest. Steering scalar multiplication to more SCA-robust code.
+    
+    This issue affects persisted private keys in explicit parameter form, where the (optional) cofactor field is zero or absent.
+    
+    It also affects curves not built-in to the library, but constructed programatically with explicit parameters, then calling EC_GROUP_set_generator with a nonsensical value (NULL, zero).
+    
+    The very old scalar multiplication code is known to be vulnerable to local uarch attacks, outside of the OpenSSL threat model. New results suggest the code path is also vulnerable to traditional wall clock timing attacks.
+    
+    CVE-2019-1547
+    
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9827">https://github.com/openssl/openssl/pull/9827</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_lib.c | 105 ++++++++++++++++++++++++++++++++++++++++++++++++-----
+ test/ectest.c      |  89 +++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 182 insertions(+), 12 deletions(-)
+
+diff --git a/crypto/ec/ec_lib.c b/crypto/ec/ec_lib.c
+index d30504de65..bc52e63443 100644
+--- a/crypto/ec/ec_lib.c
++++ b/crypto/ec/ec_lib.c
+@@ -274,6 +274,67 @@ int EC_METHOD_get_field_type(const EC_METHOD *meth)
+ 
+ static int ec_precompute_mont_data(EC_GROUP *);
+ 
++/*-
++ * Try computing cofactor from the generator order (n) and field cardinality (q).
++ * This works for all curves of cryptographic interest.
++ *
++ * Hasse thm: q + 1 - 2*sqrt(q) &lt;= n*h &lt;= q + 1 + 2*sqrt(q)
++ * h_min = (q + 1 - 2*sqrt(q))/n
++ * h_max = (q + 1 + 2*sqrt(q))/n
++ * h_max - h_min = 4*sqrt(q)/n
++ * So if n &gt; 4*sqrt(q) holds, there is only one possible value for h:
++ * h = \lfloor (h_min + h_max)/2 \rceil = \lfloor (q + 1)/n \rceil
++ *
++ * Otherwise, zero cofactor and return success.
++ */
++static int ec_guess_cofactor(EC_GROUP *group) {
++    int ret = 0;
++    BN_CTX *ctx = NULL;
++    BIGNUM *q = NULL;
++
++    /*-
++     * If the cofactor is too large, we cannot guess it.
++     * The RHS of below is a strict overestimate of lg(4 * sqrt(q))
++     */
++    if (BN_num_bits(group-&gt;order) &lt;= (BN_num_bits(group-&gt;field) + 1) / 2 + 3) {
++        /* default to 0 */
++        BN_zero(group-&gt;cofactor);
++        /* return success */
++        return 1;
++    }
++
++    if ((ctx = BN_CTX_new_ex(group-&gt;libctx)) == NULL)
++        return 0;
++
++    BN_CTX_start(ctx);
++    if ((q = BN_CTX_get(ctx)) == NULL)
++        goto err;
++
++    /* set q = 2**m for binary fields; q = p otherwise */
++    if (group-&gt;meth-&gt;field_type == NID_X9_62_characteristic_two_field) {
++        BN_zero(q);
++        if (!BN_set_bit(q, BN_num_bits(group-&gt;field) - 1))
++            goto err;
++    } else {
++        if (!BN_copy(q, group-&gt;field))
++            goto err;
++    }
++
++    /* compute h = \lfloor (q + 1)/n \rceil = \lfloor (q + 1 + n/2)/n \rfloor */
++    if (!BN_rshift1(group-&gt;cofactor, group-&gt;order) /* n/2 */
++        || !BN_add(group-&gt;cofactor, group-&gt;cofactor, q) /* q + n/2 */
++        /* q + 1 + n/2 */
++        || !BN_add(group-&gt;cofactor, group-&gt;cofactor, BN_value_one())
++        /* (q + 1 + n/2)/n */
++        || !BN_div(group-&gt;cofactor, NULL, group-&gt;cofactor, group-&gt;order, ctx))
++        goto err;
++    ret = 1;
++ err:
++    BN_CTX_end(ctx);
++    BN_CTX_free(ctx);
++    return ret;
++}
++
+ int EC_GROUP_set_generator(EC_GROUP *group, const EC_POINT *generator,
+                            const BIGNUM *order, const BIGNUM *cofactor)
+ {
+@@ -282,6 +343,34 @@ int EC_GROUP_set_generator(EC_GROUP *group, const EC_POINT *generator,
+         return 0;
+     }
+ 
++    /* require group-&gt;field &gt;= 1 */
++    if (group-&gt;field == NULL || BN_is_zero(group-&gt;field)
++        || BN_is_negative(group-&gt;field)) {
++        ECerr(EC_F_EC_GROUP_SET_GENERATOR, EC_R_INVALID_FIELD);
++        return 0;
++    }
++
++    /*-
++     * - require order &gt;= 1
++     * - enforce upper bound due to Hasse thm: order can be no more than one bit
++     *   longer than field cardinality
++     */
++    if (order == NULL || BN_is_zero(order) || BN_is_negative(order)
++        || BN_num_bits(order) &gt; BN_num_bits(group-&gt;field) + 1) {
++        ECerr(EC_F_EC_GROUP_SET_GENERATOR, EC_R_INVALID_GROUP_ORDER);
++        return 0;
++    }
++
++    /*-
++     * Unfortunately the cofactor is an optional field in many standards.
++     * Internally, the lib uses 0 cofactor as a marker for &quot;unknown cofactor&quot;.
++     * So accept cofactor == NULL or cofactor &gt;= 0.
++     */
++    if (cofactor != NULL &amp;&amp; BN_is_negative(cofactor)) {
++        ECerr(EC_F_EC_GROUP_SET_GENERATOR, EC_R_UNKNOWN_COFACTOR);
++        return 0;
++    }
++
+     if (group-&gt;generator == NULL) {
+         group-&gt;generator = EC_POINT_new(group);
+         if (group-&gt;generator == NULL)
+@@ -290,20 +379,18 @@ int EC_GROUP_set_generator(EC_GROUP *group, const EC_POINT *generator,
+     if (!EC_POINT_copy(group-&gt;generator, generator))
+         return 0;
+ 
+-    if (order != NULL) {
+-        if (!BN_copy(group-&gt;order, order))
+-            return 0;
+-    } else {
+-        BN_zero(group-&gt;order);
+-    }
++    if (!BN_copy(group-&gt;order, order))
++        return 0;
+ 
+-    /* The cofactor is an optional field, so it should be able to be NULL. */
+-    if (cofactor != NULL) {
++    /* Either take the provided positive cofactor, or try to compute it */
++    if (cofactor != NULL &amp;&amp; !BN_is_zero(cofactor)) {
+         if (!BN_copy(group-&gt;cofactor, cofactor))
+             return 0;
+-    } else {
++    } else if (!ec_guess_cofactor(group)) {
+         BN_zero(group-&gt;cofactor);
++        return 0;
+     }
++
+     /*
+      * Some groups have an order with
+      * factors of two, which makes the Montgomery setup fail.
+diff --git a/test/ectest.c b/test/ectest.c
+index cfe6d869eb..2cbbd4e340 100644
+--- a/test/ectest.c
++++ b/test/ectest.c
+@@ -1679,9 +1679,8 @@ static int check_named_curve_test(int id)
+                                              group_cofactor))
+         || !TEST_int_eq(EC_GROUP_check_named_curve(gtest, 0, NULL), 0)
+         /* The order is not an optional field, so this should fail */
+-        || !TEST_true(EC_GROUP_set_generator(gtest, group_gen, NULL,
+-                                             group_cofactor))
+-        || !TEST_int_le(EC_GROUP_check_named_curve(gtest, 0, NULL), 0)
++        || TEST_true(EC_GROUP_set_generator(gtest, group_gen, NULL,
++                                            group_cofactor))
+         || !TEST_true(EC_GROUP_set_generator(gtest, group_gen, group_order,
+                                              other_cofactor))
+         || !TEST_int_eq(EC_GROUP_check_named_curve(gtest, 0, NULL), 0)
+@@ -1856,6 +1855,89 @@ err:
+     return r;
+ }
+ 
++/*-
++ * For named curves, test that:
++ * - the lib correctly computes the cofactor if passed a NULL or zero cofactor
++ * - a nonsensical cofactor throws an error (negative test)
++ * - nonsensical orders throw errors (negative tests)
++ */
++static int cardinality_test(int n)
++{
++    int ret = 0;
++    int nid = curves[n].nid;
++    BN_CTX *ctx = NULL;
++    EC_GROUP *g1 = NULL, *g2 = NULL;
++    EC_POINT *g2_gen = NULL;
++    BIGNUM *g1_p = NULL, *g1_a = NULL, *g1_b = NULL, *g1_x = NULL, *g1_y = NULL,
++           *g1_order = NULL, *g1_cf = NULL, *g2_cf = NULL;
++
++   TEST_info(&quot;Curve %s cardinality test&quot;, OBJ_nid2sn(nid));
++
++    if (!TEST_ptr(ctx = BN_CTX_new())
++        || !TEST_ptr(g1 = EC_GROUP_new_by_curve_name(nid))
++        || !TEST_ptr(g2 = EC_GROUP_new(EC_GROUP_method_of(g1)))) {
++        EC_GROUP_free(g1);
++        EC_GROUP_free(g2);
++        BN_CTX_free(ctx);
++        return 0;
++    }
++
++    BN_CTX_start(ctx);
++    g1_p = BN_CTX_get(ctx);
++    g1_a = BN_CTX_get(ctx);
++    g1_b = BN_CTX_get(ctx);
++    g1_x = BN_CTX_get(ctx);
++    g1_y = BN_CTX_get(ctx);
++    g1_order = BN_CTX_get(ctx);
++    g1_cf = BN_CTX_get(ctx);
++
++    if (!TEST_ptr(g2_cf = BN_CTX_get(ctx))
++        /* pull out the explicit curve parameters */
++        || !TEST_true(EC_GROUP_get_curve(g1, g1_p, g1_a, g1_b, ctx))
++        || !TEST_true(EC_POINT_get_affine_coordinates(g1,
++                      EC_GROUP_get0_generator(g1), g1_x, g1_y, ctx))
++        || !TEST_true(BN_copy(g1_order, EC_GROUP_get0_order(g1)))
++        || !TEST_true(EC_GROUP_get_cofactor(g1, g1_cf, ctx))
++        /* construct g2 manually with g1 parameters */
++        || !TEST_true(EC_GROUP_set_curve(g2, g1_p, g1_a, g1_b, ctx))
++        || !TEST_ptr(g2_gen = EC_POINT_new(g2))
++        || !TEST_true(EC_POINT_set_affine_coordinates(g2, g2_gen, g1_x, g1_y, ctx))
++        /* pass NULL cofactor: lib should compute it */
++        || !TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, NULL))
++        || !TEST_true(EC_GROUP_get_cofactor(g2, g2_cf, ctx))
++        || !TEST_BN_eq(g1_cf, g2_cf)
++        /* pass zero cofactor: lib should compute it */
++        || !TEST_true(BN_set_word(g2_cf, 0))
++        || !TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, g2_cf))
++        || !TEST_true(EC_GROUP_get_cofactor(g2, g2_cf, ctx))
++        || !TEST_BN_eq(g1_cf, g2_cf)
++        /* negative test for invalid cofactor */
++        || !TEST_true(BN_set_word(g2_cf, 0))
++        || !TEST_true(BN_sub(g2_cf, g2_cf, BN_value_one()))
++        || TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, g2_cf))
++        /* negative test for NULL order */
++        || TEST_true(EC_GROUP_set_generator(g2, g2_gen, NULL, NULL))
++        /* negative test for zero order */
++        || !TEST_true(BN_set_word(g1_order, 0))
++        || TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, NULL))
++        /* negative test for negative order */
++        || !TEST_true(BN_set_word(g2_cf, 0))
++        || !TEST_true(BN_sub(g2_cf, g2_cf, BN_value_one()))
++        || TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, NULL))
++        /* negative test for too large order */
++        || !TEST_true(BN_lshift(g1_order, g1_p, 2))
++        || TEST_true(EC_GROUP_set_generator(g2, g2_gen, g1_order, NULL)))
++        goto err;
++    ret = 1;
++ err:
++    EC_POINT_free(g2_gen);
++    EC_GROUP_free(g1);
++    EC_GROUP_free(g2);
++    BN_CTX_end(ctx);
++    BN_CTX_free(ctx);
++    return ret;
++}
++
+ static int check_ec_key_field_public_range_test(int id)
+ {
+     int ret = 0, type = 0;
+@@ -1921,6 +2003,7 @@ int setup_tests(void)
+         return 0;
+ 
+     ADD_TEST(parameter_test);
++    ADD_ALL_TESTS(cardinality_test, crv_len);
+     ADD_TEST(prime_field_tests);
+ # ifndef OPENSSL_NO_EC2M
+     ADD_TEST(char2_field_tests);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024855.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024858.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24856">[ date ]</a>
+              <a href="thread.html#24856">[ thread ]</a>
+              <a href="subject.html#24856">[ subject ]</a>
+              <a href="author.html#24856">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

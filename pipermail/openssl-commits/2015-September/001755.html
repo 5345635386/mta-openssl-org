@@ -1,0 +1,250 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441489457.786736.27225.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001754.html">
+   <LINK REL="Next"  HREF="001756.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1441489457.786736.27225.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Sat Sep  5 21:44:17 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001754.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001756.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1755">[ date ]</a>
+              <a href="thread.html#1755">[ thread ]</a>
+              <a href="subject.html#1755">[ subject ]</a>
+              <a href="author.html#1755">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8e704858f21983383be2b77e986f475b51719a1e (commit)
+      from  ecdaa1aefd30a3624624a28139a1e78e17993725 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8e704858f21983383be2b77e986f475b51719a1e
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Fri Sep 4 08:13:19 2015 -0400
+
+    RT3955: Reduce some stack usage
+    
+    Use malloc/free instead of big onstack buffers.
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/bn_prime.c     | 14 ++++++++-----
+ crypto/pkcs7/pk7_smime.c | 54 ++++++++++++++++++++++++++++++------------------
+ 2 files changed, 43 insertions(+), 25 deletions(-)
+
+diff --git a/crypto/bn/bn_prime.c b/crypto/bn/bn_prime.c
+index c83820c..42d574b 100644
+--- a/crypto/bn/bn_prime.c
++++ b/crypto/bn/bn_prime.c
+@@ -131,7 +131,7 @@
+ static int witness(BIGNUM *w, const BIGNUM *a, const BIGNUM *a1,
+                    const BIGNUM *a1_odd, int k, BN_CTX *ctx,
+                    BN_MONT_CTX *mont);
+-static int probable_prime(BIGNUM *rnd, int bits);
++static int probable_prime(BIGNUM *rnd, int bits, prime_t *mods);
+ static int probable_prime_dh_safe(BIGNUM *rnd, int bits,
+                                   const BIGNUM *add, const BIGNUM *rem,
+                                   BN_CTX *ctx);
+@@ -211,9 +211,13 @@ int BN_generate_prime_ex(BIGNUM *ret, int bits, int safe,
+     BIGNUM *t;
+     int found = 0;
+     int i, j, c1 = 0;
+-    BN_CTX *ctx;
++    BN_CTX *ctx = NULL;
++    prime_t *mods = NULL;
+     int checks = BN_prime_checks_for_size(bits);
+ 
++    mods = OPENSSL_zalloc(sizeof(*mods) * NUMPRIMES);
++    if (mods == NULL)
++        goto err;
+     if (bits &lt; 2) {
+         /* There are no prime numbers this small. */
+         BNerr(BN_F_BN_GENERATE_PRIME_EX, BN_R_BITS_TOO_SMALL);
+@@ -234,7 +238,7 @@ int BN_generate_prime_ex(BIGNUM *ret, int bits, int safe,
+  loop:
+     /* make a random number and set the top and bottom bits */
+     if (add == NULL) {
+-        if (!probable_prime(ret, bits))
++        if (!probable_prime(ret, bits, mods))
+             goto err;
+     } else {
+         if (safe) {
+@@ -285,6 +289,7 @@ int BN_generate_prime_ex(BIGNUM *ret, int bits, int safe,
+     /* we have a prime :-) */
+     found = 1;
+  err:
++    OPENSSL_free(mods);
+     if (ctx != NULL)
+         BN_CTX_end(ctx);
+     BN_CTX_free(ctx);
+@@ -497,10 +502,9 @@ static int witness(BIGNUM *w, const BIGNUM *a, const BIGNUM *a1,
+     return 1;
+ }
+ 
+-static int probable_prime(BIGNUM *rnd, int bits)
++static int probable_prime(BIGNUM *rnd, int bits, prime_t *mods)
+ {
+     int i;
+-    prime_t mods[NUMPRIMES];
+     BN_ULONG delta;
+     BN_ULONG maxdelta = BN_MASK2 - primes[NUMPRIMES - 1];
+     char is_single_word = bits &lt;= BN_BITS2;
+diff --git a/crypto/pkcs7/pk7_smime.c b/crypto/pkcs7/pk7_smime.c
+index 91557af..6522a51 100644
+--- a/crypto/pkcs7/pk7_smime.c
++++ b/crypto/pkcs7/pk7_smime.c
+@@ -64,6 +64,9 @@
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/x509v3.h&gt;
+ 
++
++#define BUFFERSIZE 4096
++
+ static int pkcs7_copy_existing_digest(PKCS7 *p7, PKCS7_SIGNER_INFO *si);
+ 
+ PKCS7 *PKCS7_sign(X509 *signcert, EVP_PKEY *pkey, STACK_OF(X509) *certs,
+@@ -113,6 +116,7 @@ int PKCS7_final(PKCS7 *p7, BIO *data, int flags)
+ {
+     BIO *p7bio;
+     int ret = 0;
++
+     if ((p7bio = PKCS7_dataInit(p7, NULL)) == NULL) {
+         PKCS7err(PKCS7_F_PKCS7_FINAL, ERR_R_MALLOC_FAILURE);
+         return 0;
+@@ -253,7 +257,7 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+     STACK_OF(PKCS7_SIGNER_INFO) *sinfos;
+     PKCS7_SIGNER_INFO *si;
+     X509_STORE_CTX cert_ctx;
+-    char buf[4096];
++    char *buf = NULL;
+     int i, j = 0, k, ret = 0;
+     BIO *p7bio = NULL;
+     BIO *tmpin = NULL, *tmpout = NULL;
+@@ -355,8 +359,12 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+         tmpout = out;
+ 
+     /* We now have to 'read' from p7bio to calculate digests etc. */
++    if ((buf = OPENSSL_malloc(BUFFERSIZE)) == NULL) {
++        PKCS7err(PKCS7_F_PKCS7_VERIFY, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
+     for (;;) {
+-        i = BIO_read(p7bio, buf, sizeof(buf));
++        i = BIO_read(p7bio, buf, BUFFERSIZE);
+         if (i &lt;= 0)
+             break;
+         if (tmpout)
+@@ -387,6 +395,7 @@ int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store,
+     ret = 1;
+ 
+  err:
++    OPENSSL_free(buf);
+     if (tmpin == indata) {
+         if (indata)
+             BIO_pop(p7bio);
+@@ -505,7 +514,7 @@ int PKCS7_decrypt(PKCS7 *p7, EVP_PKEY *pkey, X509 *cert, BIO *data, int flags)
+ {
+     BIO *tmpmem;
+     int ret, i;
+-    char buf[4096];
++    char *buf = NULL;
+ 
+     if (!p7) {
+         PKCS7err(PKCS7_F_PKCS7_DECRYPT, PKCS7_R_INVALID_NULL_POINTER);
+@@ -549,24 +558,29 @@ int PKCS7_decrypt(PKCS7 *p7, EVP_PKEY *pkey, X509 *cert, BIO *data, int flags)
+         }
+         BIO_free_all(bread);
+         return ret;
+-    } else {
+-        for (;;) {
+-            i = BIO_read(tmpmem, buf, sizeof(buf));
+-            if (i &lt;= 0) {
+-                ret = 1;
+-                if (BIO_method_type(tmpmem) == BIO_TYPE_CIPHER) {
+-                    if (!BIO_get_cipher_status(tmpmem))
+-                        ret = 0;
+-                }
+-
+-                break;
+-            }
+-            if (BIO_write(data, buf, i) != i) {
+-                ret = 0;
+-                break;
++    }
++    if ((buf = OPENSSL_malloc(BUFFERSIZE)) == NULL) {
++        PKCS7err(PKCS7_F_PKCS7_DECRYPT, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++    for (;;) {
++        i = BIO_read(tmpmem, buf, BUFFERSIZE);
++        if (i &lt;= 0) {
++            ret = 1;
++            if (BIO_method_type(tmpmem) == BIO_TYPE_CIPHER) {
++                if (!BIO_get_cipher_status(tmpmem))
++                    ret = 0;
+             }
++
++            break;
++        }
++        if (BIO_write(data, buf, i) != i) {
++            ret = 0;
++            break;
+         }
+-        BIO_free_all(tmpmem);
+-        return ret;
+     }
++err:
++    OPENSSL_free(buf);
++    BIO_free_all(tmpmem);
++    return ret;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001754.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001756.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1755">[ date ]</a>
+              <a href="thread.html#1755">[ thread ]</a>
+              <a href="subject.html#1755">[ subject ]</a>
+              <a href="author.html#1755">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

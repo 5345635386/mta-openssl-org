@@ -1,0 +1,409 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457540006.405983.14549.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005280.html">
+   <LINK REL="Next"  HREF="005282.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1457540006.405983.14549.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Mar  9 16:13:26 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005280.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="005282.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5281">[ date ]</a>
+              <a href="thread.html#5281">[ thread ]</a>
+              <a href="subject.html#5281">[ subject ]</a>
+              <a href="author.html#5281">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  467bbe090bdb697d3edd5fba30917ec692d7e175 (commit)
+       via  c469a9a81e0126f690fde791f616ced113a6ca86 (commit)
+      from  9b13e27c28364b6c0f18bd6674c4c9d2a5e2dea0 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 467bbe090bdb697d3edd5fba30917ec692d7e175
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Mar 9 16:35:48 2016 +0100
+
+    CT test can't run without EC, so skip it on that algo as well
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+commit c469a9a81e0126f690fde791f616ced113a6ca86
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Mar 9 14:10:05 2016 +0100
+
+    Fix ct_test to not assume it's in the source directory
+    
+    ct_test assumed it's run in the source directory and failed when built
+    elsewhere.  It still defaults to that, but can be told another story
+    with the environment variables CT_DIR and CERTS_DIR.
+    
+    Test recipe updated to match.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/ct_test.c            | 139 +++++++++++++++++++++++++++++++---------------
+ test/recipes/80-test_ct.t |   4 +-
+ 2 files changed, 98 insertions(+), 45 deletions(-)
+
+diff --git a/test/ct_test.c b/test/ct_test.c
+index 90c3c08..f60be60 100644
+--- a/test/ct_test.c
++++ b/test/ct_test.c
+@@ -69,13 +69,17 @@
+ /* Used when declaring buffers to read text files into */
+ #define CT_TEST_MAX_FILE_SIZE 8096
+ 
++char *certs_dir = NULL;
++char *ct_dir = NULL;
++
+ typedef struct ct_test_fixture {
+     const char *test_case_name;
+     /* The CT log store to use during tests */
+     CTLOG_STORE* ctlog_store;
+     /* Set the following to test handling of SCTs in X509 certificates */
+-    const char *certificate_file_path;
+-    const char *issuer_file_path;
++    const char *certs_dir;
++    char *certificate_file;
++    char *issuer_file;
+     int expected_sct_count;
+     /* Set the following to test handling of SCTs in TLS format */
+     const uint8_t *tls_sct;
+@@ -86,7 +90,8 @@ typedef struct ct_test_fixture {
+      * This text will be compared to the actual text output during the test.
+      * A maximum of |CT_TEST_MAX_FILE_SIZE| bytes will be read of this file.
+      */
+-    const char *sct_text_file_path;
++    const char *sct_dir;
++    const char *sct_text_file;
+     /* Whether to test the validity of the SCT(s) */
+     int test_validity;
+ 
+@@ -128,28 +133,57 @@ static void tear_down(CT_TEST_FIXTURE fixture)
+     ERR_print_errors_fp(stderr);
+ }
+ 
+-static X509 *load_pem_cert(const char *file)
++static char *mk_file_path(const char *dir, const char *file)
++{
++    char *full_file = NULL;
++    size_t full_file_l = 0;
++    const char *sep = &quot;&quot;;
++#ifndef OPENSSL_SYS_VMS
++    sep = &quot;/&quot;;
++#endif
++
++    full_file_l = strlen(dir) + strlen(sep) + strlen(file) + 1;
++    full_file = OPENSSL_zalloc(full_file_l);
++    if (full_file != NULL) {
++        OPENSSL_strlcpy(full_file, dir, full_file_l);
++        OPENSSL_strlcat(full_file, sep, full_file_l);
++        OPENSSL_strlcat(full_file, file, full_file_l);
++    }
++
++    return full_file;
++}
++
++static X509 *load_pem_cert(const char *dir, const char *file)
+ {
+-    BIO *cert_io = BIO_new_file(file, &quot;r&quot;);
+     X509 *cert = NULL;
++    char *file_path = mk_file_path(dir, file);
+ 
+-    if (cert_io == NULL) goto end;
++    if (file_path != NULL) {
++        BIO *cert_io = BIO_new_file(file_path, &quot;r&quot;);
++        OPENSSL_free(file_path);
+ 
+-    cert = PEM_read_bio_X509(cert_io, NULL, NULL, NULL);
++        if (cert_io != NULL)
++            cert = PEM_read_bio_X509(cert_io, NULL, NULL, NULL);
+ 
+-end:
+-    BIO_free(cert_io);
++        BIO_free(cert_io);
++    }
+     return cert;
+ }
+ 
+-static int read_text_file(const char *path, char *buffer, int buffer_length)
++static int read_text_file(const char *dir, const char *file,
++                          char *buffer, int buffer_length)
+ {
+-    BIO *file = BIO_new_file(path, &quot;r&quot;);
+     int result = -1;
++    char *file_path = mk_file_path(dir, file);
++
++    if (file_path != NULL) {
++        BIO *file_io = BIO_new_file(file_path, &quot;r&quot;);
++        OPENSSL_free(file_path);
+ 
+-    if (file != NULL) {
+-        result = BIO_read(file, buffer, buffer_length);
+-        BIO_free(file);
++        if (file_io != NULL) {
++            result = BIO_read(file_io, buffer, buffer_length);
++            BIO_free(file_io);
++        }
+     }
+ 
+     return result;
+@@ -242,16 +276,15 @@ static int execute_cert_test(CT_TEST_FIXTURE fixture)
+     size_t tls_sct_len = 0;
+     CT_POLICY_EVAL_CTX *ct_policy_ctx = CT_POLICY_EVAL_CTX_new();
+ 
+-    if (fixture.sct_text_file_path != NULL) {
+-        sct_text_len = read_text_file(
+-            fixture.sct_text_file_path,
+-            expected_sct_text,
+-            CT_TEST_MAX_FILE_SIZE - 1);
++    if (fixture.sct_text_file != NULL) {
++        sct_text_len = read_text_file(fixture.sct_dir, fixture.sct_text_file,
++                                      expected_sct_text,
++                                      CT_TEST_MAX_FILE_SIZE - 1);
+ 
+         if (sct_text_len &lt; 0) {
+             test_failed = 1;
+             fprintf(stderr, &quot;Test data file not found: %s\n&quot;,
+-                fixture.sct_text_file_path);
++                fixture.sct_text_file);
+             goto end;
+         }
+ 
+@@ -260,27 +293,27 @@ static int execute_cert_test(CT_TEST_FIXTURE fixture)
+ 
+     CT_POLICY_EVAL_CTX_set0_log_store(ct_policy_ctx, fixture.ctlog_store);
+ 
+-    if (fixture.certificate_file_path != NULL) {
++    if (fixture.certificate_file != NULL) {
+         int sct_extension_index;
+         X509_EXTENSION *sct_extension = NULL;
+-        cert = load_pem_cert(fixture.certificate_file_path);
++        cert = load_pem_cert(fixture.certs_dir, fixture.certificate_file);
+ 
+         if (cert == NULL) {
+             test_failed = 1;
+             fprintf(stderr, &quot;Unable to load certificate: %s\n&quot;,
+-                fixture.certificate_file_path);
++                fixture.certificate_file);
+             goto end;
+         }
+ 
+         CT_POLICY_EVAL_CTX_set0_cert(ct_policy_ctx, cert);
+ 
+-        if (fixture.issuer_file_path != NULL) {
+-            issuer = load_pem_cert(fixture.issuer_file_path);
++        if (fixture.issuer_file != NULL) {
++            issuer = load_pem_cert(fixture.certs_dir, fixture.issuer_file);
+ 
+             if (issuer == NULL) {
+                 test_failed = 1;
+                 fprintf(stderr, &quot;Unable to load issuer certificate: %s\n&quot;,
+-                        fixture.issuer_file_path);
++                        fixture.issuer_file);
+                 goto end;
+             }
+ 
+@@ -294,11 +327,11 @@ static int execute_cert_test(CT_TEST_FIXTURE fixture)
+             if (sct_extension == NULL) {
+                 test_failed = 1;
+                 fprintf(stderr, &quot;SCT extension not found in: %s\n&quot;,
+-                    fixture.certificate_file_path);
++                    fixture.certificate_file);
+                 goto end;
+             }
+ 
+-            if (fixture.sct_text_file_path) {
++            if (fixture.sct_text_file) {
+                 test_failed = compare_extension_printout(sct_extension,
+                                                     expected_sct_text);
+                 if (test_failed != 0)
+@@ -357,7 +390,7 @@ static int execute_cert_test(CT_TEST_FIXTURE fixture)
+             test_failed = 1;
+             fprintf(stderr,
+                     &quot;Expected no SCTs, but found SCT extension in: %s\n&quot;,
+-                    fixture.certificate_file_path);
++                    fixture.certificate_file);
+             goto end;
+         }
+     }
+@@ -370,7 +403,7 @@ static int execute_cert_test(CT_TEST_FIXTURE fixture)
+             goto end;
+         }
+ 
+-        if (fixture.sct_text_file_path) {
++        if (fixture.sct_text_file) {
+             test_failed = compare_sct_printout(sct, expected_sct_text);
+             if (test_failed != 0)
+                 goto end;
+@@ -414,8 +447,9 @@ end:
+ static int test_no_scts_in_certificate()
+ {
+     SETUP_CT_TEST_FIXTURE();
+-    fixture.certificate_file_path = &quot;certs/leaf.pem&quot;;
+-    fixture.issuer_file_path = &quot;certs/subinterCA.pem&quot;;
++    fixture.certs_dir = certs_dir;
++    fixture.certificate_file = &quot;leaf.pem&quot;;
++    fixture.issuer_file = &quot;subinterCA.pem&quot;;
+     fixture.expected_sct_count = 0;
+     EXECUTE_CT_TEST();
+ }
+@@ -423,28 +457,33 @@ static int test_no_scts_in_certificate()
+ static int test_one_sct_in_certificate()
+ {
+     SETUP_CT_TEST_FIXTURE();
+-    fixture.certificate_file_path = &quot;certs/embeddedSCTs1.pem&quot;;
+-    fixture.issuer_file_path = &quot;certs/embeddedSCTs1_issuer.pem&quot;;
++    fixture.certs_dir = certs_dir;
++    fixture.certificate_file = &quot;embeddedSCTs1.pem&quot;;
++    fixture.issuer_file = &quot;embeddedSCTs1_issuer.pem&quot;;
+     fixture.expected_sct_count = 1;
+-    fixture.sct_text_file_path = &quot;certs/embeddedSCTs1.sct&quot;;
++    fixture.sct_dir = certs_dir;
++    fixture.sct_text_file = &quot;embeddedSCTs1.sct&quot;;
+     EXECUTE_CT_TEST();
+ }
+ 
+ static int test_multiple_scts_in_certificate()
+ {
+     SETUP_CT_TEST_FIXTURE();
+-    fixture.certificate_file_path = &quot;certs/embeddedSCTs3.pem&quot;;
+-    fixture.issuer_file_path = &quot;certs/embeddedSCTs3_issuer.pem&quot;;
++    fixture.certs_dir = certs_dir;
++    fixture.certificate_file = &quot;embeddedSCTs3.pem&quot;;
++    fixture.issuer_file = &quot;embeddedSCTs3_issuer.pem&quot;;
+     fixture.expected_sct_count = 3;
+-    fixture.sct_text_file_path = &quot;certs/embeddedSCTs3.sct&quot;;
++    fixture.sct_dir = certs_dir;
++    fixture.sct_text_file = &quot;embeddedSCTs3.sct&quot;;
+     EXECUTE_CT_TEST();
+ }
+ 
+ static int test_verify_one_sct()
+ {
+     SETUP_CT_TEST_FIXTURE();
+-    fixture.certificate_file_path = &quot;certs/embeddedSCTs1.pem&quot;;
+-    fixture.issuer_file_path = &quot;certs/embeddedSCTs1_issuer.pem&quot;;
++    fixture.certs_dir = certs_dir;
++    fixture.certificate_file = &quot;embeddedSCTs1.pem&quot;;
++    fixture.issuer_file = &quot;embeddedSCTs1_issuer.pem&quot;;
+     fixture.expected_sct_count = 1;
+     fixture.test_validity = 1;
+     EXECUTE_CT_TEST();
+@@ -453,8 +492,9 @@ static int test_verify_one_sct()
+ static int test_verify_multiple_scts()
+ {
+     SETUP_CT_TEST_FIXTURE();
+-    fixture.certificate_file_path = &quot;certs/embeddedSCTs3.pem&quot;;
+-    fixture.issuer_file_path = &quot;certs/embeddedSCTs3_issuer.pem&quot;;
++    fixture.certs_dir = certs_dir;
++    fixture.certificate_file = &quot;embeddedSCTs3.pem&quot;;
++    fixture.issuer_file = &quot;embeddedSCTs3_issuer.pem&quot;;
+     fixture.expected_sct_count = 3;
+     fixture.test_validity = 1;
+     EXECUTE_CT_TEST();
+@@ -479,7 +519,8 @@ static int test_decode_tls_sct()
+         &quot;\x6A\x68\x06\x53\x98\x7D\xCF\x41\x02\x7D\xFE\xFF\xA1\x05\x51\x9D\x89&quot;
+         &quot;\xED\xBF\x08&quot;; /* signature */
+     fixture.tls_sct_len = 118;
+-    fixture.sct_text_file_path = &quot;ct/tls1.sct&quot;;
++    fixture.sct_dir = ct_dir;
++    fixture.sct_text_file = &quot;tls1.sct&quot;;
+     EXECUTE_CT_TEST();
+ }
+ 
+@@ -502,13 +543,20 @@ static int test_encode_tls_sct()
+         &quot;\xE8\xAB\x6A\x68\x06\x53\x98\x7D\xCF\x41\x02\x7D\xFE\xFF\xA1\x05\x51&quot;
+         &quot;\x9D\x89\xED\xBF\x08&quot;, 71);
+     fixture.sct = sct;
+-    fixture.sct_text_file_path = &quot;ct/tls1.sct&quot;;
++    fixture.sct_dir = ct_dir;
++    fixture.sct_text_file = &quot;tls1.sct&quot;;
+     EXECUTE_CT_TEST();
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+     int result = 0;
++    char *tmp_env = NULL;
++
++    tmp_env = getenv(&quot;CT_DIR&quot;);
++    ct_dir = OPENSSL_strdup(tmp_env != NULL ? tmp_env : &quot;ct&quot;);
++    tmp_env = getenv(&quot;CERTS_DIR&quot;);
++    certs_dir = OPENSSL_strdup(tmp_env != NULL ? tmp_env : &quot;certs&quot;);
+ 
+     ADD_TEST(test_no_scts_in_certificate);
+     ADD_TEST(test_one_sct_in_certificate);
+@@ -521,6 +569,9 @@ int main(int argc, char *argv[])
+     result = run_tests(argv[0]);
+     ERR_print_errors_fp(stderr);
+ 
++    OPENSSL_free(ct_dir);
++    OPENSSL_free(certs_dir);
++
+     return result;
+ }
+ 
+diff --git a/test/recipes/80-test_ct.t b/test/recipes/80-test_ct.t
+index 54c3e22..6f1d8fc 100644
+--- a/test/recipes/80-test_ct.t
++++ b/test/recipes/80-test_ct.t
+@@ -5,5 +5,7 @@ use OpenSSL::Test::Simple;
+ 
+ setup(&quot;test_ct&quot;);
+ $ENV{CTLOG_FILE} = srctop_file(&quot;test&quot;, &quot;ct&quot;, &quot;log_list.conf&quot;);
+-simple_test(&quot;test_ct&quot;, &quot;ct_test&quot;, &quot;ct&quot;);
++$ENV{CT_DIR} = srctop_file(&quot;test&quot;, &quot;ct&quot;);
++$ENV{CERTS_DIR} = srctop_file(&quot;test&quot;, &quot;certs&quot;);
++simple_test(&quot;test_ct&quot;, &quot;ct_test&quot;, &quot;ct&quot;, &quot;ec&quot;);
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005280.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="005282.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5281">[ date ]</a>
+              <a href="thread.html#5281">[ thread ]</a>
+              <a href="subject.html#5281">[ subject ]</a>
+              <a href="author.html#5281">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

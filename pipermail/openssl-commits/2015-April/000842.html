@@ -1,0 +1,375 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1428504193.881619.9388.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000841.html">
+   <LINK REL="Next"  HREF="000848.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_1-stable%20update&In-Reply-To=%3C1428504193.881619.9388.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update">emilia at openssl.org
+       </A><BR>
+    <I>Wed Apr  8 14:43:13 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000841.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="000848.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#842">[ date ]</a>
+              <a href="thread.html#842">[ thread ]</a>
+              <a href="subject.html#842">[ subject ]</a>
+              <a href="author.html#842">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_1-stable has been updated
+       via  a20db08e77b62ee673e493e9bcbf0cacc5291f68 (commit)
+      from  9da34ad6cb09e8f57093da5003839894b09fb701 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a20db08e77b62ee673e493e9bcbf0cacc5291f68
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Wed Apr 1 17:08:45 2015 +0200
+
+    Harden SSLv2-supporting servers against Bleichenbacher's attack.
+    
+    There is no indication that the timing differences are exploitable in
+    OpenSSL, and indeed there is some indication (Usenix '14) that they
+    are too small to be exploitable. Nevertheless, be careful and apply
+    the same countermeasures as in s3_srvr.c
+    
+    Thanks to Nimrod Aviram, Sebastian Schinzel and Yuval Shavitt for
+    reporting this issue.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (cherry picked from commit ae50d8270026edf5b3c7f8aaa0c6677462b33d97)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s2_srvr.c | 104 ++++++++++++++++++++++++++++------------------------------
+ 1 file changed, 51 insertions(+), 53 deletions(-)
+
+diff --git a/ssl/s2_srvr.c b/ssl/s2_srvr.c
+index 19bb48c..4289272 100644
+--- a/ssl/s2_srvr.c
++++ b/ssl/s2_srvr.c
+@@ -111,6 +111,7 @@
+ 
+ #include &quot;ssl_locl.h&quot;
+ #ifndef OPENSSL_NO_SSL2
++#include &quot;../crypto/constant_time_locl.h&quot;
+ # include &lt;stdio.h&gt;
+ # include &lt;openssl/bio.h&gt;
+ # include &lt;openssl/rand.h&gt;
+@@ -372,12 +373,15 @@ int ssl2_accept(SSL *s)
+ static int get_client_master_key(SSL *s)
+ {
+     int is_export, i, n, keya;
+-    unsigned int ek;
++    unsigned int num_encrypted_key_bytes, key_length;
+     unsigned long len;
+     unsigned char *p;
+     const SSL_CIPHER *cp;
+     const EVP_CIPHER *c;
+     const EVP_MD *md;
++    unsigned char rand_premaster_secret[SSL_MAX_MASTER_KEY_LENGTH];
++    unsigned char decrypt_good;
++    size_t j;
+ 
+     p = (unsigned char *)s-&gt;init_buf-&gt;data;
+     if (s-&gt;state == SSL2_ST_GET_CLIENT_MASTER_KEY_A) {
+@@ -465,12 +469,6 @@ static int get_client_master_key(SSL *s)
+         return (0);
+     }
+ 
+-    if (s-&gt;session-&gt;cipher-&gt;algorithm2 &amp; SSL2_CF_8_BYTE_ENC) {
+-        is_export = 1;
+-        ek = 8;
+-    } else
+-        ek = 5;
+-
+     /*
+      * The format of the CLIENT-MASTER-KEY message is
+      * 1 byte message type
+@@ -484,12 +482,27 @@ static int get_client_master_key(SSL *s)
+      *
+      * If the cipher is an export cipher, then the encrypted key bytes
+      * are a fixed portion of the total key (5 or 8 bytes). The size of
+-     * this portion is in |ek|. If the cipher is not an export cipher,
+-     * then the entire key material is encrypted (i.e., clear key length
+-     * must be zero).
++     * this portion is in |num_encrypted_key_bytes|. If the cipher is not an
++     * export cipher, then the entire key material is encrypted (i.e., clear
++     * key length must be zero).
+      */
+-    if ((!is_export &amp;&amp; s-&gt;s2-&gt;tmp.clear != 0) ||
+-        (is_export &amp;&amp; s-&gt;s2-&gt;tmp.clear + ek != (unsigned int)EVP_CIPHER_key_length(c))) {
++    key_length = (unsigned int)EVP_CIPHER_key_length(c);
++    if (key_length &gt; SSL_MAX_MASTER_KEY_LENGTH) {
++        ssl2_return_error(s, SSL2_PE_UNDEFINED_ERROR);
++        SSLerr(SSL_F_GET_CLIENT_MASTER_KEY, ERR_R_INTERNAL_ERROR);
++        return -1;
++    }
++
++    if (s-&gt;session-&gt;cipher-&gt;algorithm2 &amp; SSL2_CF_8_BYTE_ENC) {
++        is_export = 1;
++        num_encrypted_key_bytes = 8;
++    } else if (is_export) {
++        num_encrypted_key_bytes = 5;
++    } else {
++        num_encrypted_key_bytes = key_length;
++    }
++
++    if (s-&gt;s2-&gt;tmp.clear + num_encrypted_key_bytes != key_length) {
+         ssl2_return_error(s, SSL2_PE_UNDEFINED_ERROR);
+         SSLerr(SSL_F_GET_CLIENT_MASTER_KEY,SSL_R_BAD_LENGTH);
+         return -1;
+@@ -499,64 +512,49 @@ static int get_client_master_key(SSL *s)
+      * Decryption can't be expanding, so if we don't have enough encrypted
+      * bytes to fit the key in the buffer, stop now.
+      */
+-    if ((is_export &amp;&amp; s-&gt;s2-&gt;tmp.enc &lt; ek) ||
+-        (!is_export &amp;&amp; s-&gt;s2-&gt;tmp.enc &lt; (unsigned int)EVP_CIPHER_key_length(c))) {
++    if (s-&gt;s2-&gt;tmp.enc &lt; num_encrypted_key_bytes) {
+         ssl2_return_error(s,SSL2_PE_UNDEFINED_ERROR);
+         SSLerr(SSL_F_GET_CLIENT_MASTER_KEY,SSL_R_LENGTH_TOO_SHORT);
+         return -1;
+     }
+ 
++    /*
++     * We must not leak whether a decryption failure occurs because of
++     * Bleichenbacher's attack on PKCS #1 v1.5 RSA padding (see RFC 2246,
++     * section 7.4.7.1). The code follows that advice of the TLS RFC and
++     * generates a random premaster secret for the case that the decrypt
++     * fails. See <A HREF="https://tools.ietf.org/html/rfc5246#section-7.4.7.1">https://tools.ietf.org/html/rfc5246#section-7.4.7.1</A>
++     */
++
++    /*
++     * should be RAND_bytes, but we cannot work around a failure.
++     */
++    if (RAND_pseudo_bytes(rand_premaster_secret,
++                          (int)num_encrypted_key_bytes) &lt;= 0)
++        return 0;
++
+     i = ssl_rsa_private_decrypt(s-&gt;cert, s-&gt;s2-&gt;tmp.enc,
+                                 &amp;(p[s-&gt;s2-&gt;tmp.clear]),
+                                 &amp;(p[s-&gt;s2-&gt;tmp.clear]),
+                                 (s-&gt;s2-&gt;ssl2_rollback) ? RSA_SSLV23_PADDING :
+                                 RSA_PKCS1_PADDING);
+-
+-    /* bad decrypt */
+-# if 1
++    ERR_clear_error();
+     /*
+      * If a bad decrypt, continue with protocol but with a random master
+      * secret (Bleichenbacher attack)
+      */
+-    if ((i &lt; 0) || ((!is_export &amp;&amp; i != EVP_CIPHER_key_length(c))
+-                    || (is_export &amp;&amp; i != (int)ek))) {
+-        ERR_clear_error();
+-        if (is_export)
+-            i = ek;
+-        else
+-            i = EVP_CIPHER_key_length(c);
+-        if (RAND_pseudo_bytes(&amp;p[s-&gt;s2-&gt;tmp.clear], i) &lt;= 0)
+-            return 0;
+-    }
+-# else
+-    if (i &lt; 0) {
+-        error = 1;
+-        SSLerr(SSL_F_GET_CLIENT_MASTER_KEY, SSL_R_BAD_RSA_DECRYPT);
+-    }
+-    /* incorrect number of key bytes for non export cipher */
+-    else if ((!is_export &amp;&amp; (i != EVP_CIPHER_key_length(c)))
+-             || (is_export &amp;&amp; ((i != ek) || (s-&gt;s2-&gt;tmp.clear + i !=
+-                                             EVP_CIPHER_key_length(c))))) {
+-        error = 1;
+-        SSLerr(SSL_F_GET_CLIENT_MASTER_KEY, SSL_R_WRONG_NUMBER_OF_KEY_BITS);
+-    }
+-    if (error) {
+-        ssl2_return_error(s, SSL2_PE_UNDEFINED_ERROR);
+-        return (-1);
++    decrypt_good = constant_time_eq_int_8(i, (int)num_encrypted_key_bytes);
++    for (j = 0; j &lt; num_encrypted_key_bytes; j++) {
++        p[s-&gt;s2-&gt;tmp.clear + j] =
++                constant_time_select_8(decrypt_good, p[s-&gt;s2-&gt;tmp.clear + j],
++                                       rand_premaster_secret[j]);
+     }
+-# endif
+ 
+-    if (is_export)
+-        i = EVP_CIPHER_key_length(c);
++    s-&gt;session-&gt;master_key_length = (int)key_length;
++    memcpy(s-&gt;session-&gt;master_key, p, key_length);
++    OPENSSL_cleanse(p, key_length);
+ 
+-    if (i &gt; SSL_MAX_MASTER_KEY_LENGTH) {
+-        ssl2_return_error(s, SSL2_PE_UNDEFINED_ERROR);
+-        SSLerr(SSL_F_GET_CLIENT_MASTER_KEY, ERR_R_INTERNAL_ERROR);
+-        return -1;
+-    }
+-    s-&gt;session-&gt;master_key_length = i;
+-    memcpy(s-&gt;session-&gt;master_key, p, (unsigned int)i);
+-    return (1);
++    return 1;
+ }
+ 
+ static int get_client_hello(SSL *s)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000841.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="000848.html">[openssl-commits] [openssl]  OpenSSL_1_0_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#842">[ date ]</a>
+              <a href="thread.html#842">[ thread ]</a>
+              <a href="subject.html#842">[ subject ]</a>
+              <a href="author.html#842">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

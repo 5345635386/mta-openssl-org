@@ -1,0 +1,1977 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452040334.318962.7592.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002596.html">
+   <LINK REL="Next"  HREF="002604.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1452040334.318962.7592.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Wed Jan  6 00:32:14 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002596.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002604.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2600">[ date ]</a>
+              <a href="thread.html#2600">[ thread ]</a>
+              <a href="subject.html#2600">[ subject ]</a>
+              <a href="author.html#2600">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  919ba009429b3617e975933f37a23be996a33b8d (commit)
+      from  e29c73c93b88a4b7f492c7c8c7343223e7548612 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 919ba009429b3617e975933f37a23be996a33b8d
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Tue Dec 29 13:28:28 2015 -0500
+
+    DANE support structures, constructructors and accessors
+    
+    Also tweak some of the code in demos/bio, to enable interactive
+    testing of BIO_s_accept's use of SSL_dup.  Changed the sconnect
+    client to authenticate the server, which now exercises the new
+    SSL_set1_host() function.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x509_vfy.c                     |   7 +
+ crypto/x509/x509_vpm.c                     |  18 +
+ demos/bio/client-arg.c                     |   3 +-
+ demos/bio/client-conf.c                    |   3 +-
+ demos/bio/saccept.c                        |  29 +-
+ demos/bio/sconnect.c                       |  33 +-
+ demos/bio/server.pem                       |  64 ++--
+ doc/crypto/X509_VERIFY_PARAM_set_flags.pod |   2 +-
+ doc/ssl/SSL_CTX_dane_enable.pod            | 278 ++++++++++++++++
+ doc/ssl/SSL_set1_host.pod                  | 115 +++++++
+ doc/ssl/ssl.pod                            |  19 ++
+ include/internal/dane.h                    | 147 ++++++++
+ include/openssl/safestack.h                |  23 ++
+ include/openssl/ssl.h                      |  40 +++
+ include/openssl/x509_vfy.h                 |   8 +
+ ssl/record/rec_layer_s3.c                  |   9 -
+ ssl/record/record.h                        |   1 -
+ ssl/ssl_cert.c                             |  15 +-
+ ssl/ssl_err.c                              |  22 ++
+ ssl/ssl_lib.c                              | 517 +++++++++++++++++++++++++++--
+ ssl/ssl_locl.h                             |   8 +
+ 21 files changed, 1284 insertions(+), 77 deletions(-)
+ create mode 100644 doc/ssl/SSL_CTX_dane_enable.pod
+ create mode 100644 doc/ssl/SSL_set1_host.pod
+ create mode 100644 include/internal/dane.h
+
+diff --git a/crypto/x509/x509_vfy.c b/crypto/x509/x509_vfy.c
+index 57fcf91..1c509a9 100644
+--- a/crypto/x509/x509_vfy.c
++++ b/crypto/x509/x509_vfy.c
+@@ -70,6 +70,7 @@
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/x509v3.h&gt;
+ #include &lt;openssl/objects.h&gt;
++#include &lt;internal/dane.h&gt;
+ #include &lt;internal/x509_int.h&gt;
+ #include &quot;x509_lcl.h&quot;
+ 
+@@ -2072,6 +2073,7 @@ int X509_STORE_CTX_init(X509_STORE_CTX *ctx, X509_STORE *store, X509 *x509,
+     ctx-&gt;current_reasons = 0;
+     ctx-&gt;tree = NULL;
+     ctx-&gt;parent = NULL;
++    ctx-&gt;dane = NULL;
+     /* Zero ex_data to make sure we're cleanup-safe */
+     memset(&amp;ctx-&gt;ex_data, 0, sizeof(ctx-&gt;ex_data));
+ 
+@@ -2263,6 +2265,11 @@ void X509_STORE_CTX_set0_param(X509_STORE_CTX *ctx, X509_VERIFY_PARAM *param)
+     ctx-&gt;param = param;
+ }
+ 
++void X509_STORE_CTX_set0_dane(X509_STORE_CTX *ctx, struct dane_st *dane)
++{
++    ctx-&gt;dane = dane;
++}
++
+ static int build_chain(X509_STORE_CTX *ctx)
+ {
+     int (*cb) (int, X509_STORE_CTX *) = ctx-&gt;verify_cb;
+diff --git a/crypto/x509/x509_vpm.c b/crypto/x509/x509_vpm.c
+index 2a15f82..827360d 100644
+--- a/crypto/x509/x509_vpm.c
++++ b/crypto/x509/x509_vpm.c
+@@ -444,6 +444,24 @@ char *X509_VERIFY_PARAM_get0_peername(X509_VERIFY_PARAM *param)
+     return param-&gt;peername;
+ }
+ 
++/*
++ * Move peername from one param structure to another, freeing any name present
++ * at the target.  If the source is a NULL parameter structure, free and zero
++ * the target peername.
++ */
++void X509_VERIFY_PARAM_move_peername(X509_VERIFY_PARAM *to,
++                                     X509_VERIFY_PARAM *from)
++{
++    char *peername = (from != NULL) ? from-&gt;peername : NULL;
++
++    if (to-&gt;peername != peername) {
++        OPENSSL_free(to-&gt;peername);
++        to-&gt;peername = peername;
++    }
++    if (from)
++        from-&gt;peername = NULL;
++}
++
+ int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                  const char *email, size_t emaillen)
+ {
+diff --git a/demos/bio/client-arg.c b/demos/bio/client-arg.c
+index 99ebff1..630b166 100644
+--- a/demos/bio/client-arg.c
++++ b/demos/bio/client-arg.c
+@@ -1,3 +1,4 @@
++#include &lt;string.h&gt;
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/ssl.h&gt;
+ 
+@@ -56,7 +57,7 @@ int main(int argc, char **argv)
+     if (!SSL_CONF_CTX_finish(cctx)) {
+         fprintf(stderr, &quot;Finish error\n&quot;);
+         ERR_print_errors_fp(stderr);
+-        goto err;
++        goto end;
+     }
+ 
+     /*
+diff --git a/demos/bio/client-conf.c b/demos/bio/client-conf.c
+index 2a78315..4e4d4bc 100644
+--- a/demos/bio/client-conf.c
++++ b/demos/bio/client-conf.c
+@@ -1,3 +1,4 @@
++#include &lt;string.h&gt;
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/ssl.h&gt;
+ #include &lt;openssl/conf.h&gt;
+@@ -64,7 +65,7 @@ int main(int argc, char **argv)
+     if (!SSL_CONF_CTX_finish(cctx)) {
+         fprintf(stderr, &quot;Finish error\n&quot;);
+         ERR_print_errors_fp(stderr);
+-        goto err;
++        goto end;
+     }
+ 
+     /*
+diff --git a/demos/bio/saccept.c b/demos/bio/saccept.c
+index 0d173aa..b6d0361 100644
+--- a/demos/bio/saccept.c
++++ b/demos/bio/saccept.c
+@@ -18,16 +18,30 @@
+ 
+ #define CERT_FILE       &quot;server.pem&quot;
+ 
+-BIO *in = NULL;
++static int done = 0;
+ 
+-void close_up()
++void interrupt()
+ {
+-    BIO_free(in);
++    done = 1;
++}
++
++void sigsetup(void)
++{
++    struct sigaction sa;
++
++    /*
++     * Catch at most once, and don't restart the accept system call.
++     */
++    sa.sa_flags = SA_RESETHAND;
++    sa.sa_handler = interrupt;
++    sigemptyset(&amp;sa.sa_mask);
++    sigaction(SIGINT, &amp;sa, NULL);
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+     char *port = NULL;
++    BIO *in = NULL;
+     BIO *ssl_bio, *tmp;
+     SSL_CTX *ctx;
+     char buf[512];
+@@ -38,15 +52,13 @@ int main(int argc, char *argv[])
+     else
+         port = argv[1];
+ 
+-    signal(SIGINT, close_up);
+-
+     SSL_load_error_strings();
+ 
+     /* Add ciphers and message digests */
+     OpenSSL_add_ssl_algorithms();
+ 
+     ctx = SSL_CTX_new(TLS_server_method());
+-    if (!SSL_CTX_use_certificate_file(ctx, CERT_FILE, SSL_FILETYPE_PEM))
++    if (!SSL_CTX_use_certificate_chain_file(ctx, CERT_FILE))
+         goto err;
+     if (!SSL_CTX_use_PrivateKey_file(ctx, CERT_FILE, SSL_FILETYPE_PEM))
+         goto err;
+@@ -66,6 +78,9 @@ int main(int argc, char *argv[])
+      */
+     BIO_set_accept_bios(in, ssl_bio);
+ 
++    /* Arrange to leave server loop on interrupt */
++    sigsetup();
++
+  again:
+     /*
+      * The first call will setup the accept socket, and the second will get a
+@@ -76,7 +91,7 @@ int main(int argc, char *argv[])
+     if (BIO_do_accept(in) &lt;= 0)
+         goto err;
+ 
+-    for (;;) {
++    while (!done) {
+         i = BIO_read(in, buf, 512);
+         if (i == 0) {
+             /*
+diff --git a/demos/bio/sconnect.c b/demos/bio/sconnect.c
+index 865d503..2b610cc 100644
+--- a/demos/bio/sconnect.c
++++ b/demos/bio/sconnect.c
+@@ -11,27 +11,38 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;unistd.h&gt;
++#include &lt;string.h&gt;
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/ssl.h&gt;
+ 
++#define HOSTPORT &quot;localhost:4433&quot;
++#define CAFILE &quot;root.pem&quot;
++
+ extern int errno;
+ 
+ int main(argc, argv)
+ int argc;
+ char *argv[];
+ {
+-    char *host;
+-    BIO *out;
++    const char *hostport = HOSTPORT;
++    const char *CAfile = CAFILE;
++    char *hostname;
++    char *cp;
++    BIO *out = NULL;
+     char buf[1024 * 10], *p;
+     SSL_CTX *ssl_ctx = NULL;
+     SSL *ssl;
+     BIO *ssl_bio;
+     int i, len, off, ret = 1;
+ 
+-    if (argc &lt;= 1)
+-        host = &quot;localhost:4433&quot;;
+-    else
+-        host = argv[1];
++    if (argc &gt; 1)
++        hostport = argv[1];
++    if (argc &gt; 2)
++        CAfile = argv[2];
++
++    hostname = OPENSSL_strdup(hostport);
++    if ((cp = strchr(hostname, ':')) != NULL)
++        *cp = 0;
+ 
+ #ifdef WATT32
+     dbug_init();
+@@ -45,17 +56,25 @@ char *argv[];
+     OpenSSL_add_ssl_algorithms();
+     ssl_ctx = SSL_CTX_new(TLS_client_method());
+ 
++    /* Enable trust chain verification */
++    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
++    SSL_CTX_load_verify_locations(ssl_ctx, CAfile, NULL);
++
+     /* Lets make a SSL structure */
+     ssl = SSL_new(ssl_ctx);
+     SSL_set_connect_state(ssl);
+ 
++    /* Enable peername verification */
++    if (SSL_set1_host(ssl, hostname) &lt;= 0)
++        goto err;
++
+     /* Use it inside an SSL BIO */
+     ssl_bio = BIO_new(BIO_f_ssl());
+     BIO_set_ssl(ssl_bio, ssl, BIO_CLOSE);
+ 
+     /* Lets use a connect BIO under the SSL BIO */
+     out = BIO_new(BIO_s_connect());
+-    BIO_set_conn_hostname(out, host);
++    BIO_set_conn_hostname(out, hostport);
+     BIO_set_nbio(out, 1);
+     out = BIO_push(ssl_bio, out);
+ 
+diff --git a/demos/bio/server.pem b/demos/bio/server.pem
+index ef0d22a..8a4a51f 100644
+--- a/demos/bio/server.pem
++++ b/demos/bio/server.pem
+@@ -1,26 +1,52 @@
+ subject= C = UK, O = OpenSSL Group, OU = FOR TESTING PURPOSES ONLY, CN = Test Server Cert
+ issuer= C = UK, O = OpenSSL Group, OU = FOR TESTING PURPOSES ONLY, CN = OpenSSL Test Intermediate CA
+ -----BEGIN CERTIFICATE-----
+-MIIDpTCCAo2gAwIBAgIJAK8ArbvjIOQlMA0GCSqGSIb3DQEBCwUAMHAxCzAJBgNV
++MIIDyTCCArGgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBwMQswCQYDVQQGEwJVSzEW
++MBQGA1UECgwNT3BlblNTTCBHcm91cDEiMCAGA1UECwwZRk9SIFRFU1RJTkcgUFVS
++UE9TRVMgT05MWTElMCMGA1UEAwwcT3BlblNTTCBUZXN0IEludGVybWVkaWF0ZSBD
++QTAgFw0xNjAxMDQwODU0NDZaGA8yMTE2MDEwNTA4NTQ0NlowZDELMAkGA1UEBhMC
++VUsxFjAUBgNVBAoMDU9wZW5TU0wgR3JvdXAxIjAgBgNVBAsMGUZPUiBURVNUSU5H
++IFBVUlBPU0VTIE9OTFkxGTAXBgNVBAMMEFRlc3QgU2VydmVyIENlcnQwggEiMA0G
++CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDzhPOSNtyyRspmeuUpxfNJKCLTuf7g
++3uQ4zu4iHOmRO5TQci+HhVlLZrHF9XqFXcIP0y4pWDbMSGuiorUmzmfiR7bfSdI/
+++qIQt8KXRH6HNG1t8ou0VSvWId5TS5Dq/er5ODUr9OaaDva7EquHIcMvvPQGuI+O
++EAcnleVCy9HVEIySrO4P3CNIicnGkwwiAud05yUAq/gPXBC1hTtmlPD7TVcGVSEi
++Jdvzqqlgv02qedGrkki6GY4S7GjZxrrf7Foc2EP+51LJzwLQx3/JfrCU41NEWAsu
++/Sl0tQabXESN+zJ1pDqoZ3uHMgpQjeGiE0olr+YcsSW/tJmiU9OiAr8RAgMBAAGj
++eDB2MB0GA1UdDgQWBBSCvM8AABPR9zklmifnr9LvIBturDAfBgNVHSMEGDAWgBQ2
++w2yI55X+sL3szj49hqshgYfa2jAJBgNVHRMEAjAAMBMGA1UdJQQMMAoGCCsGAQUF
++BwMBMBQGA1UdEQQNMAuCCWxvY2FsaG9zdDANBgkqhkiG9w0BAQsFAAOCAQEAC78R
++sAr4uvkYOu/pSwQ3MYOFqZ0BnPuP0/AZW2zF7TLNy8g36GyH9rKxz2ffQEHRmPQN
++Z11Ohg3z03jw/sVzkgt2U5Ipv923sSeCZcu0nuNex3v9/x72ldYikZNhQOsw+2kr
++hx3OvE9R7xl9eyjz7BknsbY7PC3kiUY8SDdc5Fr/XMkHm3ge65oWYOHBjC5tAr5K
++FGCEjM3syxS+Li5X6yfDGiVSjOU4gJuZDCYbl7cEQexU2deds8EmpJJrrI7s4JcQ
++rraHI8+Hu8X9VLpZE1jl/fKJw3D0i53PoN2WhukIOg1Zv+ajMKQ4ubVfISH2ebox
+++ybAZO8hxL6/I08/GQ==
++-----END CERTIFICATE-----
++subject= C = UK, O = OpenSSL Group, OU = FOR TESTING PURPOSES ONLY, CN = OpenSSL Test Intermediate CA
++issuer= C = UK, O = OpenSSL Group, OU = FOR TESTING PURPOSES ONLY, CN = OpenSSL Test Root CA
++-----BEGIN CERTIFICATE-----
++MIIDvjCCAqagAwIBAgIJAPzCy4CUW9/qMA0GCSqGSIb3DQEBCwUAMGgxCzAJBgNV
+ BAYTAlVLMRYwFAYDVQQKDA1PcGVuU1NMIEdyb3VwMSIwIAYDVQQLDBlGT1IgVEVT
+-VElORyBQVVJQT1NFUyBPTkxZMSUwIwYDVQQDDBxPcGVuU1NMIFRlc3QgSW50ZXJt
+-ZWRpYXRlIENBMB4XDTE1MDcxNDEzMjIwNVoXDTI1MDUyMjEzMjIwNVowZDELMAkG
+-A1UEBhMCVUsxFjAUBgNVBAoMDU9wZW5TU0wgR3JvdXAxIjAgBgNVBAsMGUZPUiBU
+-RVNUSU5HIFBVUlBPU0VTIE9OTFkxGTAXBgNVBAMMEFRlc3QgU2VydmVyIENlcnQw
+-ggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDzhPOSNtyyRspmeuUpxfNJ
+-KCLTuf7g3uQ4zu4iHOmRO5TQci+HhVlLZrHF9XqFXcIP0y4pWDbMSGuiorUmzmfi
+-R7bfSdI/+qIQt8KXRH6HNG1t8ou0VSvWId5TS5Dq/er5ODUr9OaaDva7EquHIcMv
+-vPQGuI+OEAcnleVCy9HVEIySrO4P3CNIicnGkwwiAud05yUAq/gPXBC1hTtmlPD7
+-TVcGVSEiJdvzqqlgv02qedGrkki6GY4S7GjZxrrf7Foc2EP+51LJzwLQx3/JfrCU
+-41NEWAsu/Sl0tQabXESN+zJ1pDqoZ3uHMgpQjeGiE0olr+YcsSW/tJmiU9OiAr8R
+-AgMBAAGjTjBMMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgXgMCwGCWCGSAGG
+-+EIBDQQfFh1PcGVuU1NMIEdlbmVyYXRlZCBDZXJ0aWZpY2F0ZTANBgkqhkiG9w0B
+-AQsFAAOCAQEAq8v8dvU3Xskb7q5LKbLXxTIF6owFs5uLk2k2msEAQzX7SrYFZwdE
+-5e33S71rpDbXiJjyD4Yj0Av5yeRlW0YVFlBZAwgPn29CDCD6+DeQ7AwtXvJhcq9e
+-llTLpB1EuXC5UCerQmq99wmfTrK0q4hgK7/5c7mcoD7V1iOEvxI2kmG6ukIupbKi
+-P1TNVVET1kPhRG1dFP9rge7j2ssY3/H+j3jlAJnwQQoYg+YCZ6g0atjOrqvywAy3
+-5E2d9LPF3TKw2mf4mAxjU6hPDOk0tiMS6g1xdHyeTftPXfN8Gli0T0LpNpy5a24B
+-dLPqZEpj0kXT8gTYEROX7tq9gYwpe6FVKw==
++VElORyBQVVJQT1NFUyBPTkxZMR0wGwYDVQQDDBRPcGVuU1NMIFRlc3QgUm9vdCBD
++QTAeFw0xNTA3MTQxMzIyMDVaFw0yNTA2MjExMzIyMDVaMHAxCzAJBgNVBAYTAlVL
++MRYwFAYDVQQKDA1PcGVuU1NMIEdyb3VwMSIwIAYDVQQLDBlGT1IgVEVTVElORyBQ
++VVJQT1NFUyBPTkxZMSUwIwYDVQQDDBxPcGVuU1NMIFRlc3QgSW50ZXJtZWRpYXRl
++IENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsErw75CmLYD6pkrG
++W/YhAl/K8L5wJYxDjqu2FghxjD8K308W3EHq4uBxEwR1OHXaM1+6ZZw7/r2I37VL
++IdurBEAIEUdbzx0so74FPawgz5EW2CTqoJnK8F71/vo5Kj1VPwW46CxwxUR3cfvJ
++GNXND2ip0TcyTSPLROXOyQakcVfIGJmdSa1wHKi+c2gMA4emADudZUOYLrg80gr2
++ldePm07ynbVsKKzCcStw8MdmoW9Qt3fLnPJn2TFUUBNWj+4kvL+88edWCVQXKNds
++ysD/CDrH4W/hjyPDStVsM6XpiNU0+L2ZY6fcj3OP8d0goOx45xotMn9m8hNkCGsr
++VXx9IwIDAQABo2MwYTAdBgNVHQ4EFgQUNsNsiOeV/rC97M4+PYarIYGH2towHwYD
++VR0jBBgwFoAUjBkP10IxdwUG4dOxn+s5+3hxOkUwDwYDVR0TAQH/BAUwAwEB/zAO
++BgNVHQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQELBQADggEBAANQT0pDWBQoT/RY76xz
++audadGz/dfYnwvSwT0RMFcXLcMVVRNqP0HeR8OP8qLaP7onRbNnEXNfos9pxXYlg
++j+/WjWTBLVcr3pX2Xtmcaqw3CGN9qbQI8B3JkYeijZmc5+3r5MzK/9R0w8Y/T9Xt
++CXEiQhtWHpPrFEfrExeVy2kjJNRctEfq3OTd1bjgX64zvTU7eR+MHFYKPoyMqwIR
++gjoVKinvovEwWoZe5kfMQwJNA3IgoJexX9BXbS8efAYF/ku3tS0laoZS/q6V/o5I
++RvG0OqnNgxhul+96PE5ujSaprsyvBswIUKt+e/BCxGaS6f2AJ8RmtoPOSfT4b9qN
++thI=
+ -----END CERTIFICATE-----
+ -----BEGIN RSA PRIVATE KEY-----
+ MIIEpAIBAAKCAQEA84TzkjbcskbKZnrlKcXzSSgi07n+4N7kOM7uIhzpkTuU0HIv
+diff --git a/doc/crypto/X509_VERIFY_PARAM_set_flags.pod b/doc/crypto/X509_VERIFY_PARAM_set_flags.pod
+index df5766c..a2219d2 100644
+--- a/doc/crypto/X509_VERIFY_PARAM_set_flags.pod
++++ b/doc/crypto/X509_VERIFY_PARAM_set_flags.pod
+@@ -127,7 +127,7 @@ IPv6.  The condensed &quot;::&quot; notation is supported for IPv6 addresses.
+ X509_VERIFY_PARAM_set_flags(), X509_VERIFY_PARAM_clear_flags(),
+ X509_VERIFY_PARAM_set_purpose(), X509_VERIFY_PARAM_set_trust(),
+ X509_VERIFY_PARAM_add0_policy() X509_VERIFY_PARAM_set1_policies(),
+-X509_VERIFY_PARAM_set1_host(), X509_VERIFY_PARAM_set_hostflags(),
++X509_VERIFY_PARAM_set1_host(), X509_VERIFY_PARAM_add1_host(),
+ X509_VERIFY_PARAM_set1_email(), X509_VERIFY_PARAM_set1_ip() and
+ X509_VERIFY_PARAM_set1_ip_asc() return 1 for success and 0 for
+ failure.
+diff --git a/doc/ssl/SSL_CTX_dane_enable.pod b/doc/ssl/SSL_CTX_dane_enable.pod
+new file mode 100644
+index 0000000..66eb1b3
+--- /dev/null
++++ b/doc/ssl/SSL_CTX_dane_enable.pod
+@@ -0,0 +1,278 @@
++=pod
++
++=head1 NAME
++
++SSL_CTX_dane_enable, SSL_CTX_dane_mtype_set, SSL_dane_enable,
++SSL_dane_tlsa_add, SSL_get0_dane_authority, SSL_get0_dane_tlsa -
++enable DANE TLS authentication of the remote TLS server in the local
++TLS client
++
++=head1 SYNOPSIS
++
++ #include &lt;openssl/ssl.h&gt;
++
++ int SSL_CTX_dane_enable(SSL_CTX *ctx);
++ int SSL_CTX_dane_mtype_set(SSL_CTX *ctx, const EVP_MD *md,
++                            uint8_t mtype, uint8_t ord);
++ int SSL_dane_enable(SSL *s, const char *basedomain);
++ int SSL_dane_tlsa_add(SSL *s, uint8_t usage, uint8_t selector,
++                       uint8_t mtype, unsigned char *data, size_t dlen);
++ int SSL_get0_dane_authority(SSL *s, X509 **mcert, EVP_PKEY **mspki);
++ int SSL_get0_dane_tlsa(SSL *s, uint8_t *usage, uint8_t *selector,
++                        uint8_t *mtype, unsigned const char **data,
++                        size_t *dlen);
++
++=head1 DESCRIPTION
++
++These functions implement support for DANE TLSA (RFC6698 and RFC7671)
++peer authentication.
++
++SSL_CTX_dane_enable() must be called first to initialize the
++shared state required for DANE support.  Individual connections
++associated with the context can then enable per-connection DANE
++support as appropriate.  DANE authentication is implemented in the
++L&lt;X509_verify_cert(3)&gt; function, and applications that override
++L&lt;X509_verify_cert(3)&gt; via L&lt;SSL_CTX_set_cert_verify_callback(3)&gt;
++are responsible to authenticate the peer chain in whatever manner
++they see fit.
++
++SSL_CTX_dane_mtype_set() may then be called zero or more times to
++to adjust the supported digest algorithms.  This must be done before
++any SSL handles are created for the context.
++
++The B&lt;mtype&gt; argument specifies a DANE TLSA matching type and the
++the B&lt;md&gt; argument specifies the associated digest algorithm handle.
++The B&lt;ord&gt; argument specifies a strength ordinal.  Algorithms with
++a larger strength ordinal are considered more secure.  Strength
++ordinals are used to implement RFC7671 digest algorithm agility.
++Specifying a B&lt;NULL&gt; digest algorithm for a matching type disables
++support for that matching type.  Matching type Full(0) cannot be
++modified or disabled.
++
++By default, matching type C&lt;SHA2-256(1)&gt; (see RFC7218 for definitions
++of the DANE TLSA parameter acronyms) is mapped to C&lt;EVP_sha256()&gt;
++with a strength ordinal of C&lt;1&gt; and matching type C&lt;SHA2-512(2)&gt;
++is mapped to C&lt;EVP_sha512()&gt; with a strength ordinal of C&lt;2&gt;.
++
++SSL_dane_enable() may be called before the SSL handshake is
++initiated with L&lt;SSL_connect(3)&gt; to enable DANE for that connection.
++(The connection must be associated with a DANE-enabled SSL context).
++The B&lt;basedomain&gt; argument specifies the RFC7671 TLSA base domain,
++which will be the primary peer reference identifier for certificate
++name checks.  Additional server names can be specified via
++L&lt;SSL_add1_host(3)&gt;.  The B&lt;basedomain&gt; is used as the default SNI
++hint if none has yet been specified via L&lt;SSL_set_tlsext_host_name(3)&gt;.
++
++SSL_dane_tlsa_add() may then be called one or more times, to
++load each of the TLSA records that apply to the remote TLS peer.
++(This too must be done prior to the beginning of the SSL handshake).
++The arguments specify the fields of the TLSA record.  The B&lt;data&gt;
++field is provided in binary (wire RDATA) form, not the hexadecimal ASCII
++presentation form, with an explicit length passed via B&lt;dlen&gt;.
++A return value of 0 indicates that &quot;unusable&quot; TLSA records
++(with invalid or unsupported parameters) were provided, a negative
++return value indicates an internal error in processing the records.
++If DANE authentication is enabled, but no TLSA records are added
++successfully, authentication will fail, and the handshake may not
++complete, depending on the B&lt;mode&gt; argument of L&lt;SSL_set_verify(3)&gt;
++and any verification callback.
++
++SSL_get0_dane_authority() can be used to get more detailed information
++about the matched DANE trust-anchor after successful connection
++completion.  The return value is negative if DANE verification
++failed (or was not enabled), 0 if an EE TLSA record directly matched
++the leaf certificate, or a positive number indicating the depth at
++which a TA record matched an issuer certificate.
++
++If the B&lt;mcert&gt; argument is not B&lt;NULL&gt; and a TLSA record matched
++a chain certificate, a pointer to the matching certificate is
++returned via B&lt;mcert&gt;.  The returned address is a short-term internal
++reference to the certificate and must not be freed by the application.
++Applications that want to retain access to the certificate can call
++L&lt;X509_up_ref(3)&gt; to obtain a long-term reference which must then
++be freed via L&lt;X509_free(3)&gt; once no longer needed.
++
++If no TLSA records directly matched any elements of the certificate
++chain, but a DANE-TA(2) SPKI(1) Full(0) record provided the public
++key that signed an element of the chain, then that key is returned
++via B&lt;mspki&gt; argument (if not NULL).  In this case the return value
++is the depth of the top-most element of the validated certificate
++chain.  As with B&lt;mcert&gt; this is a short-term internal reference,
++and L&lt;EVP_PKEY_up_ref(3)&gt; and L&lt;EVP_PKEY_free(3)&gt; can be used to
++acquire and release long-term references respectively.
++
++SSL_get0_dane_tlsa() can be used to retrieve the fields of the
++TLSA record that matched the peer certificate chain.  The return
++value indicates the match depth or failure to match just as with
++SSL_get0_dane_authority().  When the return value is non-negative,
++the storage pointed to by the B&lt;usage&gt;, B&lt;selector&gt;, B&lt;mtype&gt; and
++B&lt;data&gt; parameters is updated to the corresponding TLSA record
++fields.  The B&lt;data&gt; field is in binary wire form, and is therefore
++not NUL-terminated, its length is returned via the B&lt;dlen&gt; parameter.
++If any of these parameters is NULL, the corresponding field
++is not returned.  The B&lt;data&gt; parameter is set to a short-term
++internal-copy of the associated data field and must not be freed
++by the application.  Applications that need long-term access to
++this field need to copy the content.
++
++=head1 RETURN VALUES
++
++The functions SSL_CTX_dane_enable(), SSL_CTX_dane_mtype_set(),
++SSL_dane_enable() and SSL_dane_tlsa_add() return a positive value
++on success.  Negative return values indicate resource problems (out
++of memory, etc.) in the SSL library, while a return value of B&lt;0&gt;
++indicates incorrect usage or invalid input, such as an unsupported
++TLSA record certificate usage, selector or matching type.  Invalid
++input also includes malformed data, either a digest length that
++does not match the digest algorithm, or a C&lt;Full(0)&gt; (binary ASN.1
++DER form) certificate or a public key that fails to parse.
++
++The functions SSL_get0_dane_authority() and SSL_get0_dane_tlsa()
++return a negative value when DANE authentication failed or was not
++enabled, a non-negative value indicates the chain depth at which
++the TLSA record matched a chain certificate, or the depth of the
++top-most certificate, when the TLSA record is a full public key
++that is its signer.
++
++=head1 EXAMPLE
++
++Suppose &quot;smtp.example.com&quot; is the MX host of the domain &quot;example.com&quot;,
++and has DNSSEC-validated TLSA records.  The calls below will perform
++DANE authentication and arrange to match either the MX hostname or
++the destination domain name in the SMTP server certificate.  Wildcards
++are supported, but must match the entire label.  The actual name
++matched in the certificate (which might be a wildcard) is retrieved,
++and must be copied by the application if it is to be retained beyond
++the lifetime of the SSL connection.
++
++  SSL_CTX *ctx;
++  SSL *ssl;
++  int num_usable = 0;
++  const char *nexthop_domain = &quot;example.com&quot;;
++  const char *dane_tlsa_domain = &quot;smtp.example.com&quot;;
++  uint8_t usage, selector, mtype;
++
++  if ((ctx = SSL_CTX_new(TLS_client_method())) == NULL)
++    /* handle error */
++  if (SSL_CTX_dane_enable(ctx) &lt;= 0)
++    /* handle error */
++
++  if ((ssl = SSL_new(ctx)) == NULL)
++    /* handle error */
++
++  if (SSL_dane_enable(ssl, dane_tlsa_domain) &lt;= 0)
++    /* handle error */
++  if (!SSL_add1_host(ssl, nexthop_domain))
++    /* handle error */
++  SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
++
++  for (... each TLSA record ...) {
++    unsigned char *data;
++    size_t len;
++    int ret;
++
++    /* set usage, selector, mtype, data, len */
++
++    /* Opportunistic DANE TLS clients treat usages 0, 1 as unusable. */
++    switch (usage) {
++    case 0:     /* PKIX-TA(0) */
++    case 1:     /* PKIX-EE(1) */
++        continue;
++    }
++
++    ret = SSL_dane_tlsa_add(ssl, usage, selector, mtype, data, len);
++    /* free data as approriate */
++
++    if (ret &lt; 0)
++        /* handle SSL library internal error */
++    else if (ret == 0)
++        /* handle unusable TLSA record */
++    else
++      ++num_usable;
++  }
++
++  /*
++   * Opportunistic DANE clients use unauthenticated TLS when all TLSA records
++   * are unusable, so continue the handshake even if authentication fails.
++   */
++  if (num_usable == 0) {
++    int (*cb)(int ok, X509_STORE_CTX *sctx) = NULL;
++
++    /* Log all records unusable? */
++    /* Set cb to a non-NULL callback of your choice? */
++
++    SSL_set_verify(ssl, SSL_VERIFY_NONE, cb);
++  }
++
++  /* Perform SSL_connect() handshake and handle errors here */
++
++  if (SSL_get_verify_result(ssl) == X509_V_OK) {
++    const char *peername = SSL_get0_peername(ssl);
++    EVP_PKEY *mspki = NULL;
++
++    int depth = SSL_get0_dane_authority(s, NULL, &amp;mspki);
++    if (depth &gt;= 0) {
++        (void) SSL_get0_dane_tlsa(s, &amp;usage, &amp;selector, &amp;mtype, NULL, NULL);
++        printf(&quot;DANE TLSA %d %d %d %s at depth %d\n&quot;, usage, selector, mtype,
++               (mspki != NULL) ? &quot;TA public key verified certificate&quot; :
++               depth ? &quot;matched TA certificate&quot; : &quot;matched EE certificate&quot;,
++               depth);
++    }
++    if (peername != NULL) {
++      /* Name checks were in scope and matched the peername */
++      printf(bio, &quot;Verified peername: %s\n&quot;, peername);
++    }
++  } else {
++    /*
++     * Not authenticated, presumably all TLSA rrs unusable, but possibly a
++     * callback suppressed connection termination despite presence of TLSA
++     * usable RRs none of which matched.  Do whatever is appropriate for
++     * unauthenticated connections.
++     */
++  }
++
++=head1 NOTES
++
++It is expected that the majority of clients employing DANE TLS will
++be doing &quot;opportunistic DANE TLS&quot; in the sense of RFC7672 and
++RFC7435.  That is, they will use DANE authentication when
++DNSSEC-validated TLSA records are published for a given peer, and
++otherwise will use unauthenticated TLS or even cleartext.
++
++Such applications should generally treat any TLSA records published
++by the peer with usages PKIX-TA(0) and PKIX-EE(1) as &quot;unusable&quot;,
++and should not include them among the TLSA records used to authenticate
++peer connections.  In addition, some TLSA records with supported
++usages may be &quot;unusable&quot; as a result of invalid or unsupported
++parameters.
++
++When a peer has TLSA records, but none are &quot;usable&quot;,  an opportunistic
++application must avoid cleartext, but cannot authenticate the peer,
++and so should generally proceed with an unauthenticated connection.
++Opportunistic applications need to note the return value of each
++call to SSL_dane_tlsa_add(), and if all return 0 (due to invalid
++or unsupported parameters) disable peer authentication by calling
++L&lt;SSL_set_verify(3)&gt; with B&lt;mode&gt; equal to B&lt;SSL_VERIFY_NONE&gt;.
++
++=head1 SEE ALSO
++
++L&lt;SSL_new(3)&gt;,
++L&lt;SSL_add1_host(3)&gt;,
++L&lt;SSL_set_hostflags(3)&gt;,
++L&lt;SSL_set_tlsext_host_name(3)&gt;,
++L&lt;SSL_set_verify(3)&gt;,
++L&lt;SSL_CTX_set_cert_verify_callback(3)&gt;,
++L&lt;X509_verify_cert(3)&gt;,
++L&lt;SSL_connect(3)&gt;,
++L&lt;SSL_get0_peername(3)&gt;,
++L&lt;EVP_get_digestbyname(3)&gt;,
++L&lt;X509_up_ref(3)&gt;,
++L&lt;X509_free(3)&gt;,
++L&lt;EVP_PKEY_up_ref(3)&gt;,
++L&lt;EVP_PKEY_free(3)&gt;
++
++=head1 HISTORY
++
++These functions were first added to OpenSSL 1.1.0.
++
++=cut
+diff --git a/doc/ssl/SSL_set1_host.pod b/doc/ssl/SSL_set1_host.pod
+new file mode 100644
+index 0000000..b008a5f
+--- /dev/null
++++ b/doc/ssl/SSL_set1_host.pod
+@@ -0,0 +1,115 @@
++=pod
++
++=head1 NAME
++
++ SSL_set1_host, SSL_add1_host, SSL_set_hostflags, SSL_get0_peername -
++ SSL server verification parameters
++
++=head1 SYNOPSIS
++
++ #include &lt;openssl/ssl.h&gt;
++ #include &lt;openssl/x509_vfy.h&gt;
++
++ int SSL_set1_host(SSL *s, const char *hostname);
++ int SSL_add1_host(SSL *s, const char *hostname);
++ void SSL_set_hostflags(SSL *s, unsigned int flags);
++ const char *SSL_get0_peername(SSL *s);
++
++=head1 DESCRIPTION
++
++These functions configure server hostname checks in the SSL client.
++
++SSL_set1_host() sets the expected DNS hostname to B&lt;name&gt; clearing
++any previously specified host name or names.  If B&lt;name&gt; is NULL,
++or the empty string the list of hostnames is cleared, and name
++checks are not performed on the peer certificate.  When a non-empty
++B&lt;name&gt; is specified, certificate verification automatically checks
++the peer hostname via L&lt;X509_check_host(3)&gt; with B&lt;flags&gt; as specified
++via SSL_set_hostflags().  Clients that enable DANE TLSA authentication
++via L&lt;SSL_dane_enable(3)&gt; should leave it to that function to set
++the primary reference identifier of the peer, and should not call
++SSL_set1_host().
++
++SSL_add1_host() adds B&lt;name&gt; as an additional reference identifier
++that can match the peer's certificate.  Any previous names set via
++SSL_set1_host() or SSL_add1_host() are retained, no change is made
++if B&lt;name&gt; is NULL or empty.  When multiple names are configured,
++the peer is considered verified when any name matches.  This function
++is required for DANE TLA in the presence of service name indirection
++via CNAME, MX or SRV records as specified in RFC7671, RFC7672 or
++RFC7673.
++
++SSL_set_hostflags() sets the B&lt;flags&gt; that will be passed to
++L&lt;X509_check_host(3)&gt; when name checks are applicable, by default
++the B&lt;flags&gt; value is 0.  See L&lt;X509_check_host(3)&gt; for the list
++of available flags and their meaning.
++
++SSL_get0_peername() returns the DNS hostname or subject CommonName
++from the peer certificate that matched one of the reference
++identifiers.  When wildcard matching is not disabled, the name
++matched in the peer certificate may be a wildcard name.  When one
++of the reference identifiers configured via SSL_set1_host() or
++SSL_add1_host() starts with &quot;.&quot;, which indicates a parent domain prefix
++rather than a fixed name, the matched peer name may be a sub-domain
++of the reference identifier.  The returned string is allocated by
++the library and is no longer valid once the associated B&lt;ssl&gt; handle
++is cleared or freed, or a renegotiation takes place.  Applications
++must not free the return value.
++
++SSL clients are advised to use these functions in preference to
++explicitly calling L&lt;X509_check_host(3)&gt;.  Hostname checks are out
++of scope with the RFC7671 DANE-EE(3) certificate usage, and the
++internal check will be suppressed as appropriate when DANE is
++enabled.
++
++=head1 RETURN VALUES
++
++SSL_set1_host() and SSL_add1_host() return 1 for success and 0 for
++failure.
++
++SSL_get0_peername() returns NULL if peername verification is not
++applicable (as with RFC7671 DANE-EE(3)), or no trusted peername was
++matched.  Otherwise, it returns the matched peername.  To determine
++whether verification succeeded call L&lt;SSL_get_verify_result(3)&gt;.
++
++=head1 NOTES
++
++=head1 EXAMPLE
++
++Suppose &quot;smtp.example.com&quot; is the MX host of the domain &quot;example.com&quot;.
++The calls below will arrange to match either the MX hostname or the
++destination domain name in the SMTP server certificate.  Wildcards
++are supported, but must match the entire label.  The actual name
++matched in the certificate (which might be a wildcard) is retrieved,
++and must be copied by the application if it is to be retained beyond
++the lifetime of the SSL connection.
++
++  SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
++  if (!SSL_set1_host(ssl, &quot;smtp.example.com&quot;)) {
++    /* handle error */
++  }
++  if (!SSL_add1_host(ssl, &quot;example.com&quot;)) {
++    /* handle error */
++  }
++
++  /* XXX: Perform SSL_connect() handshake and handle errors here */
++
++  if (SSL_get_verify_result(ssl) == X509_V_OK) {
++      const char *peername = SSL_get0_peername(ssl);
++
++      if (peername != NULL) {
++          /* Name checks were in scope and matched the peername */
++      }
++  }
++
++=head1 SEE ALSO
++
++L&lt;X509_check_host(3)&gt;,
++L&lt;SSL_get_verify_result(3)&gt;.
++L&lt;SSL_dane_enable(3)&gt;.
++
++=head1 HISTORY
++
++These functions were first added to OpenSSL 1.1.0.
++
++=cut
+diff --git a/doc/ssl/ssl.pod b/doc/ssl/ssl.pod
+index adcec5f..bb3bc94 100644
+--- a/doc/ssl/ssl.pod
++++ b/doc/ssl/ssl.pod
+@@ -447,6 +447,25 @@ success or 0 on failure.
+ 
+ =item SSL *B&lt;SSL_dup&gt;(SSL *ssl);
+ 
++SSL_dup() allows applications to configure an SSL handle for use
++in multiple SSL connections, and then duplicate it prior to initiating
++each connection with the duplicated handle.
++Use of SSL_dup() avoids the need to repeat the configuration of the
++handles for each connection.
++This is used internally by L&lt;BIO_s_accept(3)&gt; to construct
++per-connection SSL handles after L&lt;accept(2)&gt;.
++
++For SSL_dup() to work, the connection MUST be in its initial state
++and MUST NOT have not yet have started the SSL handshake.
++For connections that are not in their initial state SSL_dup() just
++increments an internal reference count and returns the I&lt;same&gt;
++handle.
++It may be possible to use L&lt;SSL_clear(3)&gt; to recycle an SSL handle
++that is not in its initial state for re-use, but this is best
++avoided.
++Instead, save and restore the session, if desired, and construct a
++fresh handle for each connection.
++
+ =item STACK *B&lt;SSL_dup_CA_list&gt;(STACK *sk);
+ 
+ =item void B&lt;SSL_free&gt;(SSL *ssl);
+diff --git a/include/internal/dane.h b/include/internal/dane.h
+new file mode 100644
+index 0000000..cbe33f3
+--- /dev/null
++++ b/include/internal/dane.h
+@@ -0,0 +1,147 @@
++/* dane.h */
++/*
++ * Written by Viktor Dukhovni (<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>) for the OpenSSL project
++ * 2015.
++ */
++/* ====================================================================
++ * Copyright (c) 2015 The OpenSSL Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * 3. All advertising materials mentioning features or use of this
++ *    software must display the following acknowledgment:
++ *    &quot;This product includes software developed by the OpenSSL Project
++ *    for use in the OpenSSL Toolkit. (<A HREF="http://www.OpenSSL.org/">http://www.OpenSSL.org/</A>)&quot;
++ *
++ * 4. The names &quot;OpenSSL Toolkit&quot; and &quot;OpenSSL Project&quot; must not be used to
++ *    endorse or promote products derived from this software without
++ *    prior written permission. For written permission, please contact
++ *    <A HREF="../../../mailman/listinfo/openssl-commits.html">licensing at OpenSSL.org.</A>
++ *
++ * 5. Products derived from this software may not be called &quot;OpenSSL&quot;
++ *    nor may &quot;OpenSSL&quot; appear in their names without prior written
++ *    permission of the OpenSSL Project.
++ *
++ * 6. Redistributions of any form whatsoever must retain the following
++ *    acknowledgment:
++ *    &quot;This product includes software developed by the OpenSSL Project
++ *    for use in the OpenSSL Toolkit (<A HREF="http://www.OpenSSL.org/">http://www.OpenSSL.org/</A>)&quot;
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE OpenSSL PROJECT ``AS IS'' AND ANY
++ * EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE OpenSSL PROJECT OR
++ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
++ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
++ * OF THE POSSIBILITY OF SUCH DAMAGE.
++ * ====================================================================
++ *
++ * This product includes cryptographic software written by Eric Young
++ * (<A HREF="../../../mailman/listinfo/openssl-commits.html">eay at cryptsoft.com</A>).  This product includes software written by Tim
++ * Hudson (<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at cryptsoft.com</A>).
++ *
++ */
++#ifndef HEADER_INTERNAL_DANE_H
++#define HEADER_INTERNAL_DANE_H
++
++#include &lt;openssl/safestack.h&gt;
++
++/*-
++ * Certificate usages:
++ * <A HREF="https://tools.ietf.org/html/rfc6698#section-2.1.1">https://tools.ietf.org/html/rfc6698#section-2.1.1</A>
++ */
++#define DANETLS_USAGE_PKIX_TA   0
++#define DANETLS_USAGE_PKIX_EE   1
++#define DANETLS_USAGE_DANE_TA   2
++#define DANETLS_USAGE_DANE_EE   3
++#define DANETLS_USAGE_LAST      DANETLS_USAGE_DANE_EE
++
++/*-
++ * Selectors:
++ * <A HREF="https://tools.ietf.org/html/rfc6698#section-2.1.2">https://tools.ietf.org/html/rfc6698#section-2.1.2</A>
++ */
++#define DANETLS_SELECTOR_CERT   0
++#define DANETLS_SELECTOR_SPKI   1
++#define DANETLS_SELECTOR_LAST   DANETLS_SELECTOR_SPKI
++
++/*-
++ * Matching types:
++ * <A HREF="https://tools.ietf.org/html/rfc6698#section-2.1.3">https://tools.ietf.org/html/rfc6698#section-2.1.3</A>
++ */
++#define DANETLS_MATCHING_FULL   0
++#define DANETLS_MATCHING_2256   1
++#define DANETLS_MATCHING_2512   2
++#define DANETLS_MATCHING_LAST   DANETLS_MATCHING_2512
++
++typedef struct danetls_record_st {
++    uint8_t usage;
++    uint8_t selector;
++    uint8_t mtype;
++    unsigned char *data;
++    size_t dlen;
++    EVP_PKEY *spki;
++} danetls_record;
++
++/*
++ * Shared DANE context
++ */
++struct dane_ctx_st {
++    const EVP_MD  **mdevp;      /* mtype -&gt; digest */
++    uint8_t        *mdord;      /* mtype -&gt; preference */
++    uint8_t         mdmax;      /* highest supported mtype */
++};
++
++/*
++ * Per connection DANE state
++ */
++struct dane_st {
++    struct dane_ctx_st *dctx;
++    STACK_OF(danetls_record) *trecs;
++    STACK_OF(X509) *certs;      /* DANE-TA(2) Cert(0) Full(0) certs */
++    danetls_record *mtlsa;      /* Matching TLSA record */
++    X509           *mcert;      /* DANE matched cert */
++    uint32_t        umask;      /* Usages present */
++    int             mdpth;      /* Depth of matched cert */
++    int             pdpth;      /* Depth of PKIX trust */
++};
++
++#define DANETLS_ENABLED(dane)  ((dane) &amp;&amp; ((dane)-&gt;trecs != NULL))
++
++#define DANETLS_USAGE_BIT(u)   (((uint32_t)1) &lt;&lt; u)
++
++#define DANETLS_PKIX_TA_MASK (DANETLS_USAGE_BIT(DANETLS_USAGE_PKIX_TA))
++#define DANETLS_PKIX_EE_MASK (DANETLS_USAGE_BIT(DANETLS_USAGE_PKIX_EE))
++#define DANETLS_DANE_TA_MASK (DANETLS_USAGE_BIT(DANETLS_USAGE_DANE_TA))
++#define DANETLS_DANE_EE_MASK (DANETLS_USAGE_BIT(DANETLS_USAGE_DANE_EE))
++
++#define DANETLS_PKIX_MASK (DANETLS_PKIX_TA_MASK | DANETLS_PKIX_EE_MASK)
++#define DANETLS_DANE_MASK (DANETLS_DANE_TA_MASK | DANETLS_DANE_EE_MASK)
++#define DANETLS_TA_MASK (DANETLS_PKIX_TA_MASK | DANETLS_DANE_TA_MASK)
++#define DANETLS_EE_MASK (DANETLS_PKIX_EE_MASK | DANETLS_DANE_EE_MASK)
++
++#define DANETLS_HAS_PKIX(dane) ((dane) &amp;&amp; ((dane)-&gt;umask &amp; DANETLS_PKIX_MASK))
++#define DANETLS_HAS_DANE(dane) ((dane) &amp;&amp; ((dane)-&gt;umask &amp; DANETLS_DANE_MASK))
++#define DANETLS_HAS_TA(dane)   ((dane) &amp;&amp; ((dane)-&gt;umask &amp; DANETLS_TA_MASK))
++#define DANETLS_HAS_EE(dane)   ((dane) &amp;&amp; ((dane)-&gt;umask &amp; DANETLS_EE_MASK))
++
++#define DANETLS_HAS_PKIX_TA(dane) ((dane)&amp;&amp;((dane)-&gt;umask &amp; DANETLS_PKIX_TA_MASK))
++#define DANETLS_HAS_PKIX_EE(dane) ((dane)&amp;&amp;((dane)-&gt;umask &amp; DANETLS_PKIX_EE_MASK))
++#define DANETLS_HAS_DANE_TA(dane) ((dane)&amp;&amp;((dane)-&gt;umask &amp; DANETLS_DANE_TA_MASK))
++#define DANETLS_HAS_DANE_EE(dane) ((dane)&amp;&amp;((dane)-&gt;umask &amp; DANETLS_DANE_EE_MASK))
++
++#endif /* HEADER_INTERNAL_DANE_H */
+diff --git a/include/openssl/safestack.h b/include/openssl/safestack.h
+index cce3afd..94b8af4 100644
+--- a/include/openssl/safestack.h
++++ b/include/openssl/safestack.h
+@@ -2045,6 +2045,29 @@ DECLARE_SPECIAL_STACK_OF(OPENSSL_BLOCK, void)
+ # define sk_X509_VERIFY_PARAM_sort(st) SKM_sk_sort(X509_VERIFY_PARAM, (st))
+ # define sk_X509_VERIFY_PARAM_is_sorted(st) SKM_sk_is_sorted(X509_VERIFY_PARAM, (st))
+ 
++# define sk_danetls_record_new(cmp) SKM_sk_new(danetls_record, (cmp))
++# define sk_danetls_record_new_null() SKM_sk_new_null(danetls_record)
++# define sk_danetls_record_free(st) SKM_sk_free(danetls_record, (st))
++# define sk_danetls_record_num(st) SKM_sk_num(danetls_record, (st))
++# define sk_danetls_record_value(st, i) SKM_sk_value(danetls_record, (st), (i))
++# define sk_danetls_record_set(st, i, val) SKM_sk_set(danetls_record, (st), (i), (val))
++# define sk_danetls_record_zero(st) SKM_sk_zero(danetls_record, (st))
++# define sk_danetls_record_push(st, val) SKM_sk_push(danetls_record, (st), (val))
++# define sk_danetls_record_unshift(st, val) SKM_sk_unshift(danetls_record, (st), (val))
++# define sk_danetls_record_find(st, val) SKM_sk_find(danetls_record, (st), (val))
++# define sk_danetls_record_find_ex(st, val) SKM_sk_find_ex(danetls_record, (st), (val))
++# define sk_danetls_record_delete(st, i) SKM_sk_delete(danetls_record, (st), (i))
++# define sk_danetls_record_delete_ptr(st, ptr) SKM_sk_delete_ptr(danetls_record, (st), (ptr))
++# define sk_danetls_record_insert(st, val, i) SKM_sk_insert(danetls_record, (st), (val), (i))
++# define sk_danetls_record_set_cmp_func(st, cmp) SKM_sk_set_cmp_func(danetls_record, (st), (cmp))
++# define sk_danetls_record_dup(st) SKM_sk_dup(danetls_record, st)
++# define sk_danetls_record_pop_free(st, free_func) SKM_sk_pop_free(danetls_record, (st), (free_func))
++# define sk_danetls_record_deep_copy(st, copy_func, free_func) SKM_sk_deep_copy(danetls_record, (st), (copy_func), (free_func))
++# define sk_danetls_record_shift(st) SKM_sk_shift(danetls_record, (st))
++# define sk_danetls_record_pop(st) SKM_sk_pop(danetls_record, (st))
++# define sk_danetls_record_sort(st) SKM_sk_sort(danetls_record, (st))
++# define sk_danetls_record_is_sorted(st) SKM_sk_is_sorted(danetls_record, (st))
++
+ # define sk_nid_triple_new(cmp) SKM_sk_new(nid_triple, (cmp))
+ # define sk_nid_triple_new_null() SKM_sk_new_null(nid_triple)
+ # define sk_nid_triple_free(st) SKM_sk_free(nid_triple, (st))
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 0d22ab7..e634294 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -327,6 +327,8 @@ typedef struct ssl_conf_ctx_st SSL_CONF_CTX;
+ 
+ DECLARE_STACK_OF(SSL_CIPHER)
+ 
++DECLARE_STACK_OF(danetls_record)
++
+ /* SRTP protection profiles for use with the use_srtp extension (RFC 5764)*/
+ typedef struct srtp_protection_profile_st {
+     const char *name;
+@@ -1533,6 +1535,27 @@ __owur int SSL_set_purpose(SSL *s, int purpose);
+ __owur int SSL_CTX_set_trust(SSL_CTX *s, int trust);
+ __owur int SSL_set_trust(SSL *s, int trust);
+ 
++__owur int SSL_set1_host(SSL *s, const char *hostname);
++__owur int SSL_add1_host(SSL *s, const char *hostname);
++__owur const char *SSL_get0_peername(SSL *s);
++void SSL_set_hostflags(SSL *s, unsigned int flags);
++
++__owur int SSL_CTX_dane_enable(SSL_CTX *ctx);
++__owur int SSL_CTX_dane_mtype_set(SSL_CTX *ctx, const EVP_MD *md,
++                                  uint8_t mtype, uint8_t ord);
++__owur int SSL_dane_enable(SSL *s, const char *basedomain);
++__owur int SSL_dane_tlsa_add(SSL *s, uint8_t usage, uint8_t selector,
++                             uint8_t mtype, unsigned char *data, size_t dlen);
++__owur int SSL_get0_dane_authority(SSL *s, X509 **mcert, EVP_PKEY **mspki);
++__owur int SSL_get0_dane_tlsa(SSL *s, uint8_t *usage, uint8_t *selector,
++                              uint8_t *mtype, unsigned const char **data,
++                              size_t *dlen);
++/*
++ * Bridge opacity barrier between libcrypt and libssl, also needed to support
++ * offline testing in test/danetest.c
++ */
++struct dane_st *SSL_get0_dane(SSL *ssl);
++
+ __owur int SSL_CTX_set1_param(SSL_CTX *ctx, X509_VERIFY_PARAM *vpm);
+ __owur int SSL_set1_param(SSL *ssl, X509_VERIFY_PARAM *vpm);
+ 
+@@ -1919,6 +1942,9 @@ void ERR_load_SSL_strings(void);
+ /* Function codes. */
+ # define SSL_F_CHECK_SUITEB_CIPHER_LIST                   331
+ # define SSL_F_D2I_SSL_SESSION                            103
++# define SSL_F_DANE_CTX_ENABLE                            347
++# define SSL_F_DANE_MTYPE_SET                             393
++# define SSL_F_DANE_TLSA_ADD                              394
+ # define SSL_F_DO_DTLS1_WRITE                             245
+ # define SSL_F_DO_SSL3_WRITE                              104
+ # define SSL_F_DTLS1_ACCEPT                               246
+@@ -2059,6 +2085,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_F_SSL_CTX_USE_RSAPRIVATEKEY_FILE             179
+ # define SSL_F_SSL_CTX_USE_SERVERINFO                     336
+ # define SSL_F_SSL_CTX_USE_SERVERINFO_FILE                337
++# define SSL_F_SSL_DANE_ENABLE                            395
+ # define SSL_F_SSL_DO_CONFIG                              391
+ # define SSL_F_SSL_DO_HANDSHAKE                           180
+ # define SSL_F_SSL_GET_NEW_SESSION                        181
+@@ -2232,8 +2259,20 @@ void ERR_load_SSL_strings(void);
+ # define SSL_R_COMPRESSION_ID_NOT_WITHIN_PRIVATE_RANGE    307
+ # define SSL_R_COMPRESSION_LIBRARY_ERROR                  142
+ # define SSL_R_CONNECTION_TYPE_NOT_SET                    144
++# define SSL_R_CONTEXT_NOT_DANE_ENABLED                   167
+ # define SSL_R_COOKIE_GEN_CALLBACK_FAILURE                400
+ # define SSL_R_COOKIE_MISMATCH                            308
++# define SSL_R_DANE_ALREADY_ENABLED                       172
++# define SSL_R_DANE_CANNOT_OVERRIDE_MTYPE_FULL            173
++# define SSL_R_DANE_NOT_ENABLED                           175
++# define SSL_R_DANE_TLSA_BAD_CERTIFICATE                  180
++# define SSL_R_DANE_TLSA_BAD_CERTIFICATE_USAGE            184
++# define SSL_R_DANE_TLSA_BAD_DATA_LENGTH                  189
++# define SSL_R_DANE_TLSA_BAD_DIGEST_LENGTH                192
++# define SSL_R_DANE_TLSA_BAD_MATCHING_TYPE                200
++# define SSL_R_DANE_TLSA_BAD_PUBLIC_KEY                   201
++# define SSL_R_DANE_TLSA_BAD_SELECTOR                     202
++# define SSL_R_DANE_TLSA_NULL_DATA                        203
+ # define SSL_R_DATA_BETWEEN_CCS_AND_FINISHED              145
+ # define SSL_R_DATA_LENGTH_TOO_LONG                       146
+ # define SSL_R_DECRYPTION_FAILED                          147
+@@ -2253,6 +2292,7 @@ void ERR_load_SSL_strings(void);
+ # define SSL_R_EMPTY_SRTP_PROTECTION_PROFILE_LIST         354
+ # define SSL_R_ENCRYPTED_LENGTH_TOO_LONG                  150
+ # define SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST              151
++# define SSL_R_ERROR_SETTING_TLSA_BASE_DOMAIN             204
+ # define SSL_R_EXCESSIVE_MESSAGE_SIZE                     152
+ # define SSL_R_EXTRA_DATA_IN_MESSAGE                      153
+ # define SSL_R_FAILED_TO_INIT_ASYNC                       405
+diff --git a/include/openssl/x509_vfy.h b/include/openssl/x509_vfy.h
+index 5e65998..e37c2f7 100644
+--- a/include/openssl/x509_vfy.h
++++ b/include/openssl/x509_vfy.h
+@@ -263,6 +263,7 @@ struct x509_store_ctx_st {      /* X509_STORE_CTX */
+     /* For CRL path validation: parent context */
+     X509_STORE_CTX *parent;
+     CRYPTO_EX_DATA ex_data;
++    struct dane_st *dane;
+ } /* X509_STORE_CTX */ ;
+ 
+ void X509_STORE_CTX_set_depth(X509_STORE_CTX *ctx, int depth);
+@@ -528,6 +529,12 @@ X509_VERIFY_PARAM *X509_STORE_CTX_get0_param(X509_STORE_CTX *ctx);
+ void X509_STORE_CTX_set0_param(X509_STORE_CTX *ctx, X509_VERIFY_PARAM *param);
+ int X509_STORE_CTX_set_default(X509_STORE_CTX *ctx, const char *name);
+ 
++/*
++ * Bridge opacity barrier between libcrypt and libssl, also needed to support
++ * offline testing in test/danetest.c
++ */
++void X509_STORE_CTX_set0_dane(X509_STORE_CTX *ctx, struct dane_st *dane);
++
+ /* X509_VERIFY_PARAM functions */
+ 
+ X509_VERIFY_PARAM *X509_VERIFY_PARAM_new(void);
+@@ -558,6 +565,7 @@ int X509_VERIFY_PARAM_add1_host(X509_VERIFY_PARAM *param,
+ void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM *param,
+                                      unsigned int flags);
+ char *X509_VERIFY_PARAM_get0_peername(X509_VERIFY_PARAM *);
++void X509_VERIFY_PARAM_move_peername(X509_VERIFY_PARAM *, X509_VERIFY_PARAM *);
+ int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                  const char *email, size_t emaillen);
+ int X509_VERIFY_PARAM_set1_ip(X509_VERIFY_PARAM *param,
+diff --git a/ssl/record/rec_layer_s3.c b/ssl/record/rec_layer_s3.c
+index ae31f5d..5398912 100644
+--- a/ssl/record/rec_layer_s3.c
++++ b/ssl/record/rec_layer_s3.c
+@@ -208,15 +208,6 @@ int RECORD_LAYER_set_data(RECORD_LAYER *rl, const unsigned char *buf, int len)
+     return 1;
+ }
+ 
+-void RECORD_LAYER_dup(RECORD_LAYER *dst, RECORD_LAYER *src)
+-{
+-    /*
+-     * Currently only called from SSL_dup...which only seems to expect the
+-     * rstate to be duplicated and nothing else from the RECORD_LAYER???
+-     */
+-    dst-&gt;rstate = src-&gt;rstate;
+-}
+-
+ void RECORD_LAYER_reset_read_sequence(RECORD_LAYER *rl)
+ {
+     memset(rl-&gt;read_sequence, 0, sizeof(rl-&gt;read_sequence));
+diff --git a/ssl/record/record.h b/ssl/record/record.h
+index 9637071..af10166 100644
+--- a/ssl/record/record.h
++++ b/ssl/record/record.h
+@@ -321,7 +321,6 @@ void RECORD_LAYER_release(RECORD_LAYER *rl);
+ int RECORD_LAYER_read_pending(RECORD_LAYER *rl);
+ int RECORD_LAYER_write_pending(RECORD_LAYER *rl);
+ int RECORD_LAYER_set_data(RECORD_LAYER *rl, const unsigned char *buf, int len);
+-void RECORD_LAYER_dup(RECORD_LAYER *dst, RECORD_LAYER *src);
+ void RECORD_LAYER_reset_read_sequence(RECORD_LAYER *rl);
+ void RECORD_LAYER_reset_write_sequence(RECORD_LAYER *rl);
+ int RECORD_LAYER_setup_comp_buffer(RECORD_LAYER *rl);
+diff --git a/ssl/ssl_cert.c b/ssl/ssl_cert.c
+index 597de0a..7f01bcc 100644
+--- a/ssl/ssl_cert.c
++++ b/ssl/ssl_cert.c
+@@ -486,6 +486,7 @@ int ssl_verify_cert_chain(SSL *s, STACK_OF(X509) *sk)
+     int i;
+     X509_STORE *verify_store;
+     X509_STORE_CTX ctx;
++    X509_VERIFY_PARAM *param;
+ 
+     if (s-&gt;cert-&gt;verify_store)
+         verify_store = s-&gt;cert-&gt;verify_store;
+@@ -500,10 +501,16 @@ int ssl_verify_cert_chain(SSL *s, STACK_OF(X509) *sk)
+         SSLerr(SSL_F_SSL_VERIFY_CERT_CHAIN, ERR_R_X509_LIB);
+         return (0);
+     }
++    param = X509_STORE_CTX_get0_param(&amp;ctx);
++
+     /* Set suite B flags if needed */
+     X509_STORE_CTX_set_flags(&amp;ctx, tls1_suiteb(s));
+     X509_STORE_CTX_set_ex_data(&amp;ctx, SSL_get_ex_data_X509_STORE_CTX_idx(), s);
+ 
++    /* Verify via DANE if enabled */
++    if (DANETLS_ENABLED(&amp;s-&gt;dane))
++        X509_STORE_CTX_set0_dane(&amp;ctx, &amp;s-&gt;dane);
++
+     /*
+      * We need to inherit the verify parameters. These can be determined by
+      * the context: if its a server it will verify SSL client certificates or
+@@ -512,9 +519,9 @@ int ssl_verify_cert_chain(SSL *s, STACK_OF(X509) *sk)
+ 
+     X509_STORE_CTX_set_default(&amp;ctx, s-&gt;server ? &quot;ssl_client&quot; : &quot;ssl_server&quot;);
+     /*
+-     * Anything non-default in &quot;param&quot; should overwrite anything in the ctx.
++     * Anything non-default in &quot;s-&gt;param&quot; should overwrite anything in the ctx.
+      */
+-    X509_VERIFY_PARAM_set1(X509_STORE_CTX_get0_param(&amp;ctx), s-&gt;param);
++    X509_VERIFY_PARAM_set1(param, s-&gt;param);
+ 
+     if (s-&gt;verify_callback)
+         X509_STORE_CTX_set_verify_cb(&amp;ctx, s-&gt;verify_callback);
+@@ -534,6 +541,10 @@ int ssl_verify_cert_chain(SSL *s, STACK_OF(X509) *sk)
+     }
+ 
+     s-&gt;verify_result = ctx.error;
++
++    /* Move peername from the store context params to the SSL handle's */
++    X509_VERIFY_PARAM_move_peername(s-&gt;param, param);
++
+     X509_STORE_CTX_cleanup(&amp;ctx);
+ 
+     return (i);
+diff --git a/ssl/ssl_err.c b/ssl/ssl_err.c
+index d9dbf99..cfa4179 100644
+--- a/ssl/ssl_err.c
++++ b/ssl/ssl_err.c
+@@ -72,6 +72,9 @@
+ static ERR_STRING_DATA SSL_str_functs[] = {
+     {ERR_FUNC(SSL_F_CHECK_SUITEB_CIPHER_LIST), &quot;check_suiteb_cipher_list&quot;},
+     {ERR_FUNC(SSL_F_D2I_SSL_SESSION), &quot;d2i_SSL_SESSION&quot;},
++    {ERR_FUNC(SSL_F_DANE_CTX_ENABLE), &quot;dane_ctx_enable&quot;},
++    {ERR_FUNC(SSL_F_DANE_MTYPE_SET), &quot;dane_mtype_set&quot;},
++    {ERR_FUNC(SSL_F_DANE_TLSA_ADD), &quot;dane_tlsa_add&quot;},
+     {ERR_FUNC(SSL_F_DO_DTLS1_WRITE), &quot;do_dtls1_write&quot;},
+     {ERR_FUNC(SSL_F_DO_SSL3_WRITE), &quot;DO_SSL3_WRITE&quot;},
+     {ERR_FUNC(SSL_F_DTLS1_ACCEPT), &quot;dtls1_accept&quot;},
+@@ -262,6 +265,7 @@ static ERR_STRING_DATA SSL_str_functs[] = {
+     {ERR_FUNC(SSL_F_SSL_CTX_USE_SERVERINFO), &quot;SSL_CTX_use_serverinfo&quot;},
+     {ERR_FUNC(SSL_F_SSL_CTX_USE_SERVERINFO_FILE),
+      &quot;SSL_CTX_use_serverinfo_file&quot;},
++    {ERR_FUNC(SSL_F_SSL_DANE_ENABLE), &quot;SSL_dane_enable&quot;},
+     {ERR_FUNC(SSL_F_SSL_DO_CONFIG), &quot;ssl_do_config&quot;},
+     {ERR_FUNC(SSL_F_SSL_DO_HANDSHAKE), &quot;SSL_do_handshake&quot;},
+     {ERR_FUNC(SSL_F_SSL_GET_NEW_SESSION), &quot;ssl_get_new_session&quot;},
+@@ -491,9 +495,25 @@ static ERR_STRING_DATA SSL_str_reasons[] = {
+     {ERR_REASON(SSL_R_COMPRESSION_LIBRARY_ERROR),
+      &quot;compression library error&quot;},
+     {ERR_REASON(SSL_R_CONNECTION_TYPE_NOT_SET), &quot;connection type not set&quot;},
++    {ERR_REASON(SSL_R_CONTEXT_NOT_DANE_ENABLED), &quot;context not dane enabled&quot;},
+     {ERR_REASON(SSL_R_COOKIE_GEN_CALLBACK_FAILURE),
+      &quot;cookie gen callback failure&quot;},
+     {ERR_REASON(SSL_R_COOKIE_MISMATCH), &quot;cookie mismatch&quot;},
++    {ERR_REASON(SSL_R_DANE_ALREADY_ENABLED), &quot;dane already enabled&quot;},
++    {ERR_REASON(SSL_R_DANE_CANNOT_OVERRIDE_MTYPE_FULL),
++     &quot;dane cannot override mtype full&quot;},
++    {ERR_REASON(SSL_R_DANE_NOT_ENABLED), &quot;dane not enabled&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_CERTIFICATE), &quot;dane tlsa bad certificate&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_CERTIFICATE_USAGE),
++     &quot;dane tlsa bad certificate usage&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_DATA_LENGTH), &quot;dane tlsa bad data length&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_DIGEST_LENGTH),
++     &quot;dane tlsa bad digest length&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_MATCHING_TYPE),
++     &quot;dane tlsa bad matching type&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_PUBLIC_KEY), &quot;dane tlsa bad public key&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_BAD_SELECTOR), &quot;dane tlsa bad selector&quot;},
++    {ERR_REASON(SSL_R_DANE_TLSA_NULL_DATA), &quot;dane tlsa null data&quot;},
+     {ERR_REASON(SSL_R_DATA_BETWEEN_CCS_AND_FINISHED),
+      &quot;data between ccs and finished&quot;},
+     {ERR_REASON(SSL_R_DATA_LENGTH_TOO_LONG), &quot;data length too long&quot;},
+@@ -524,6 +544,8 @@ static ERR_STRING_DATA SSL_str_reasons[] = {
+      &quot;encrypted length too long&quot;},
+     {ERR_REASON(SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST),
+      &quot;error in received cipher list&quot;},
++    {ERR_REASON(SSL_R_ERROR_SETTING_TLSA_BASE_DOMAIN),
++     &quot;error setting tlsa base domain&quot;},
+     {ERR_REASON(SSL_R_EXCESSIVE_MESSAGE_SIZE), &quot;excessive message size&quot;},
+     {ERR_REASON(SSL_R_EXTRA_DATA_IN_MESSAGE), &quot;extra data in message&quot;},
+     {ERR_REASON(SSL_R_FAILED_TO_INIT_ASYNC), &quot;failed to init async&quot;},
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index 760014d..f0f1264 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -197,6 +197,333 @@ struct ssl_async_args {
+     } f;
+ };
+ 
++static const struct {
++    uint8_t mtype;
++    uint8_t ord;
++    int     nid;
++} dane_mds[] = {
++    { DANETLS_MATCHING_FULL, 0, NID_undef },
++    { DANETLS_MATCHING_2256, 1, NID_sha256 },
++    { DANETLS_MATCHING_2512, 2, NID_sha512 },
++};
++
++static int dane_ctx_enable(struct dane_ctx_st *dctx)
++{
++    const EVP_MD **mdevp;
++    uint8_t *mdord;
++    uint8_t mdmax = DANETLS_MATCHING_LAST;
++    int n = ((int) mdmax) + 1;          /* int to handle PrivMatch(255) */
++    size_t i;
++
++    mdevp = OPENSSL_zalloc(n * sizeof(*mdevp));
++    mdord = OPENSSL_zalloc(n * sizeof(*mdord));
++
++    if (mdord == NULL || mdevp == NULL) {
++        OPENSSL_free(mdevp);
++        SSLerr(SSL_F_DANE_CTX_ENABLE, ERR_R_MALLOC_FAILURE);
++        return 0;
++    }
++
++    /* Install default entries */
++    for (i = 0; i &lt; OSSL_NELEM(dane_mds); ++i) {
++        const EVP_MD *md;
++
++        if (dane_mds[i].nid == NID_undef ||
++            (md = EVP_get_digestbynid(dane_mds[i].nid)) == NULL)
++            continue;
++        mdevp[dane_mds[i].mtype] = md;
++        mdord[dane_mds[i].mtype] = dane_mds[i].ord;
++    }
++
++    dctx-&gt;mdevp = mdevp;
++    dctx-&gt;mdord = mdord;
++    dctx-&gt;mdmax = mdmax;
++
++    return 1;
++}
++
++static void dane_ctx_final(struct dane_ctx_st *dctx)
++{
++    OPENSSL_free(dctx-&gt;mdevp);
++    dctx-&gt;mdevp = NULL;
++
++    OPENSSL_free(dctx-&gt;mdord);
++    dctx-&gt;mdord = NULL;
++    dctx-&gt;mdmax = 0;
++}
++
++static void tlsa_free(danetls_record *t)
++{
++    if (t == NULL)
++        return;
++    OPENSSL_free(t-&gt;data);
++    EVP_PKEY_free(t-&gt;spki);
++    OPENSSL_free(t);
++}
++
++static void dane_final(struct dane_st *dane)
++{
++    sk_danetls_record_pop_free(dane-&gt;trecs, tlsa_free);
++    dane-&gt;trecs = NULL;
++
++    sk_X509_pop_free(dane-&gt;certs, X509_free);
++    dane-&gt;certs = NULL;
++
++    X509_free(dane-&gt;mcert);
++    dane-&gt;mcert = NULL;
++    dane-&gt;mtlsa = NULL;
++    dane-&gt;mdpth = -1;
++    dane-&gt;pdpth = -1;
++}
++
++/*
++ * dane_copy - Copy dane configuration, sans verification state.
++ */
++static int ssl_dane_dup(SSL *to, SSL *from)
++{
++    int num;
++    int i;
++
++    if (!DANETLS_ENABLED(&amp;from-&gt;dane))
++        return 1;
++
++    dane_final(&amp;to-&gt;dane);
++
++    num  = sk_danetls_record_num(from-&gt;dane.trecs);
++    for (i = 0; i &lt; num; ++i) {
++        danetls_record *t = sk_danetls_record_value(from-&gt;dane.trecs, i);
++        if (SSL_dane_tlsa_add(to, t-&gt;usage, t-&gt;selector, t-&gt;mtype,
++                              t-&gt;data, t-&gt;dlen) &lt;= 0)
++            return 0;
++    }
++    return 1;
++}
++
++static int dane_mtype_set(
++    struct dane_ctx_st *dctx,
++    const EVP_MD *md,
++    uint8_t mtype,
++    uint8_t ord)
++{
++    int i;
++
++    if (mtype == DANETLS_MATCHING_FULL &amp;&amp; md != NULL) {
++        SSLerr(SSL_F_DANE_MTYPE_SET,
++                SSL_R_DANE_CANNOT_OVERRIDE_MTYPE_FULL);
++        return 0;
++    }
++
++    if (mtype &gt; dctx-&gt;mdmax) {
++        const EVP_MD **mdevp;
++        uint8_t *mdord;
++        int n = ((int) mtype) + 1;
++
++        mdevp = OPENSSL_realloc(dctx-&gt;mdevp, n * sizeof(*mdevp));
++        if (mdevp == NULL) {
++            SSLerr(SSL_F_DANE_MTYPE_SET, ERR_R_MALLOC_FAILURE);
++            return -1;
++        }
++        dctx-&gt;mdevp = mdevp;
++
++        mdord = OPENSSL_realloc(dctx-&gt;mdord, n * sizeof(*mdord));
++        if (mdord == NULL) {
++            SSLerr(SSL_F_DANE_MTYPE_SET, ERR_R_MALLOC_FAILURE);
++            return -1;
++        }
++        dctx-&gt;mdord = mdord;
++
++        /* Zero-fill any gaps */
++        for (i = dctx-&gt;mdmax+1; i &lt; mtype; ++i) {
++            mdevp[i] = NULL;
++            mdord[i] = 0;
++        }
++
++        dctx-&gt;mdmax = mtype;
++    }
++
++    dctx-&gt;mdevp[mtype] = md;
++    /* Coerce ordinal of disabled matching types to 0 */
++    dctx-&gt;mdord[mtype] = (md == NULL) ? 0 : ord;
++
++    return 1;
++}
++
++static const EVP_MD *tlsa_md_get(struct dane_st *dane, uint8_t mtype)
++{
++    if (mtype &gt; dane-&gt;dctx-&gt;mdmax)
++        return NULL;
++    return dane-&gt;dctx-&gt;mdevp[mtype];
++}
++
++static int dane_tlsa_add(
++    struct dane_st *dane,
++    uint8_t usage,
++    uint8_t selector,
++    uint8_t mtype,
++    unsigned char *data,
++    size_t dlen)
++{
++    danetls_record *t;
++    const EVP_MD *md = NULL;
++    int ilen = (int)dlen;
++    int i;
++
++    if (dane-&gt;trecs == NULL) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_NOT_ENABLED);
++        return -1;
++    }
++
++    if (ilen &lt; 0 || dlen != (size_t)ilen) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_DATA_LENGTH);
++        return 0;
++    }
++
++    if (usage &gt; DANETLS_USAGE_LAST) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_CERTIFICATE_USAGE);
++        return 0;
++    }
++
++    if (selector &gt; DANETLS_SELECTOR_LAST) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_SELECTOR);
++        return 0;
++    }
++
++    if (mtype != DANETLS_MATCHING_FULL) {
++        md = tlsa_md_get(dane, mtype);
++        if (md == NULL) {
++            SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_MATCHING_TYPE);
++            return 0;
++        }
++    }
++
++    if (md != NULL &amp;&amp; dlen != (size_t)EVP_MD_size(md)) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_DIGEST_LENGTH);
++        return 0;
++    }
++    if (!data) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_NULL_DATA);
++        return 0;
++    }
++
++    if ((t = OPENSSL_zalloc(sizeof(*t))) == NULL) {
++        SSLerr(SSL_F_DANE_TLSA_ADD, ERR_R_MALLOC_FAILURE);
++        return -1;
++    }
++
++    t-&gt;usage = usage;
++    t-&gt;selector = selector;
++    t-&gt;mtype = mtype;
++    t-&gt;data = OPENSSL_malloc(ilen);
++    if (t-&gt;data == NULL) {
++        tlsa_free(t);
++        SSLerr(SSL_F_DANE_TLSA_ADD, ERR_R_MALLOC_FAILURE);
++        return -1;
++    }
++    memcpy(t-&gt;data, data, ilen);
++    t-&gt;dlen = ilen;
++
++    /* Validate and cache full certificate or public key */
++    if (mtype == DANETLS_MATCHING_FULL) {
++        const unsigned char *p = data;
++        X509 *cert = NULL;
++        EVP_PKEY *pkey = NULL;
++
++        switch (selector) {
++        case DANETLS_SELECTOR_CERT:
++            if (!d2i_X509(&amp;cert, &amp;p, dlen) || p &lt; data ||
++                dlen != (size_t)(p - data)) {
++                tlsa_free(t);
++                SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_CERTIFICATE);
++                return 0;
++            }
++            if (X509_get0_pubkey(cert) == NULL) {
++                tlsa_free(t);
++                SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_CERTIFICATE);
++                return 0;
++            }
++
++            if ((DANETLS_USAGE_BIT(usage) &amp; DANETLS_TA_MASK) == 0) {
++                X509_free(cert);
++                break;
++            }
++
++            /*
++             * For usage DANE-TA(2), we support authentication via &quot;2 0 0&quot; TLSA
++             * records that contain full certificates of trust-anchors that are
++             * not present in the wire chain.  For usage PKIX-TA(0), we augment
++             * the chain with untrusted Full(0) certificates from DNS, in case
++             * they are missing from the chain.
++             */
++            if ((dane-&gt;certs == NULL &amp;&amp;
++                 (dane-&gt;certs = sk_X509_new_null()) == NULL) ||
++                !sk_X509_push(dane-&gt;certs, cert)) {
++                SSLerr(SSL_F_DANE_TLSA_ADD, ERR_R_MALLOC_FAILURE);
++                X509_free(cert);
++                tlsa_free(t);
++                return -1;
++            }
++            break;
++
++        case DANETLS_SELECTOR_SPKI:
++            if (!d2i_PUBKEY(&amp;pkey, &amp;p, dlen) || p &lt; data ||
++                dlen != (size_t)(p - data)) {
++                tlsa_free(t);
++                SSLerr(SSL_F_DANE_TLSA_ADD, SSL_R_DANE_TLSA_BAD_PUBLIC_KEY);
++                return 0;
++            }
++
++            /*
++             * For usage DANE-TA(2), we support authentication via &quot;2 1 0&quot; TLSA
++             * records that contain full bare keys of trust-anchors that are
++             * not present in the wire chain.
++             */
++            if (usage == DANETLS_USAGE_DANE_TA)
++                t-&gt;spki = pkey;
++            else
++                EVP_PKEY_free(pkey);
++            break;
++        }
++    }
++
++    /*-
++     * Find the right insertion point for the new record.
++     *
++     * See crypto/x509/x509_vfy.c.  We sort DANE-EE(3) records first, so that
++     * they can be processed first, as they require no chain building, and no
++     * expiration or hostname checks.  Because DANE-EE(3) is numerically
++     * largest, this is accomplished via descending sort by &quot;usage&quot;.
++     *
++     * We also sort in descending order by matching ordinal to simplify
++     * the implementation of digest agility in the verification code.
++     *
++     * The choice of order for the selector is not significant, so we
++     * use the same descending order for consistency.
++     */
++    for (i = 0; i &lt; sk_danetls_record_num(dane-&gt;trecs); ++i) {
++        danetls_record *rec = sk_danetls_record_value(dane-&gt;trecs, i);
++        if (rec-&gt;usage &gt; usage)
++            continue;
++        if (rec-&gt;usage &lt; usage)
++            break;
++        if (rec-&gt;selector &gt; selector)
++            continue;
++        if (rec-&gt;selector &lt; selector)
++            break;
++        if (dane-&gt;dctx-&gt;mdord[rec-&gt;mtype] &gt; dane-&gt;dctx-&gt;mdord[mtype])
++            continue;
++        break;
++    }
++
++    if (!sk_danetls_record_insert(dane-&gt;trecs, t, i)) {
++        tlsa_free(t);
++        SSLerr(SSL_F_DANE_TLSA_ADD, ERR_R_MALLOC_FAILURE);
++        return -1;
++    }
++    dane-&gt;umask |= DANETLS_USAGE_BIT(usage);
++
++    return 1;
++}
++
+ static void clear_ciphers(SSL *s)
+ {
+     /* clear the current cipher */
+@@ -237,6 +564,16 @@ int SSL_clear(SSL *s)
+     clear_ciphers(s);
+     s-&gt;first_packet = 0;
+ 
++    /* Reset DANE verification result state */
++    s-&gt;dane.mdpth = -1;
++    s-&gt;dane.pdpth = -1;
++    X509_free(s-&gt;dane.mcert);
++    s-&gt;dane.mcert = NULL;
++    s-&gt;dane.mtlsa = NULL;
++
++    /* Clear the verification result peername */
++    X509_VERIFY_PARAM_move_peername(s-&gt;param, NULL);
++
+     /*
+      * Check to see if we were changed into a different method, if so, revert
+      * back if we are not doing session-id reuse.
+@@ -497,6 +834,121 @@ int SSL_set_trust(SSL *s, int trust)
+     return X509_VERIFY_PARAM_set_trust(s-&gt;param, trust);
+ }
+ 
++int SSL_set1_host(SSL *s, const char *hostname)
++{
++    return X509_VERIFY_PARAM_set1_host(s-&gt;param, hostname, 0);
++}
++
++int SSL_add1_host(SSL *s, const char *hostname)
++{
++    return X509_VERIFY_PARAM_add1_host(s-&gt;param, hostname, 0);
++}
++
++void SSL_set_hostflags(SSL *s, unsigned int flags)
++{
++    X509_VERIFY_PARAM_set_hostflags(s-&gt;param, flags);
++}
++
++const char *SSL_get0_peername(SSL *s)
++{
++    return X509_VERIFY_PARAM_get0_peername(s-&gt;param);
++}
++
++int SSL_CTX_dane_enable(SSL_CTX *ctx)
++{
++    return dane_ctx_enable(&amp;ctx-&gt;dane);
++}
++
++int SSL_dane_enable(SSL *s, const char *basedomain)
++{
++    struct dane_st *dane = &amp;s-&gt;dane;
++
++    if (s-&gt;ctx-&gt;dane.mdmax == 0) {
++        SSLerr(SSL_F_SSL_DANE_ENABLE, SSL_R_CONTEXT_NOT_DANE_ENABLED);
++        return 0;
++    }
++    if (dane-&gt;trecs != NULL) {
++        SSLerr(SSL_F_SSL_DANE_ENABLE, SSL_R_DANE_ALREADY_ENABLED);
++        return 0;
++    }
++
++    /* Primary RFC6125 reference identifier */
++    if (!X509_VERIFY_PARAM_set1_host(s-&gt;param, basedomain, 0)) {
++        SSLerr(SSL_F_SSL_DANE_ENABLE, SSL_R_ERROR_SETTING_TLSA_BASE_DOMAIN);
++        return -1;
++    }
++
++    /* Default SNI name */
++    if (s-&gt;tlsext_hostname == NULL) {
++	if (!SSL_set_tlsext_host_name(s, basedomain))
++	    return -1;
++    }
++
++    dane-&gt;mdpth = -1;
++    dane-&gt;pdpth = -1;
++    dane-&gt;dctx = &amp;s-&gt;ctx-&gt;dane;
++    dane-&gt;trecs = sk_danetls_record_new_null();
++
++    if (dane-&gt;trecs == NULL) {
++        SSLerr(SSL_F_SSL_DANE_ENABLE, ERR_R_MALLOC_FAILURE);
++        return -1;
++    }
++    return 1;
++}
++
++int SSL_get0_dane_authority(SSL *s, X509 **mcert, EVP_PKEY **mspki)
++{
++    struct dane_st *dane = &amp;s-&gt;dane;
++
++    if (!DANETLS_ENABLED(dane))
++        return -1;
++    if (dane-&gt;mtlsa) {
++        if (mcert)
++            *mcert = dane-&gt;mcert;
++        if (mspki)
++            *mspki = (dane-&gt;mcert == NULL) ? dane-&gt;mtlsa-&gt;spki : NULL;
++    }
++    return dane-&gt;mdpth;
++}
++
++int SSL_get0_dane_tlsa(SSL *s, uint8_t *usage, uint8_t *selector,
++                       uint8_t *mtype, unsigned const char **data, size_t *dlen)
++{
++    struct dane_st *dane = &amp;s-&gt;dane;
++
++    if (!DANETLS_ENABLED(dane))
++        return -1;
++    if (dane-&gt;mtlsa) {
++        if (usage)
++            *usage = dane-&gt;mtlsa-&gt;usage;
++        if (selector)
++            *selector = dane-&gt;mtlsa-&gt;selector;
++        if (mtype)
++            *mtype = dane-&gt;mtlsa-&gt;mtype;
++        if (data)
++            *data = dane-&gt;mtlsa-&gt;data;
++        if (dlen)
++            *dlen = dane-&gt;mtlsa-&gt;dlen;
++    }
++    return dane-&gt;mdpth;
++}
++
++struct dane_st *SSL_get0_dane(SSL *s)
++{
++    return &amp;s-&gt;dane;
++}
++
++int SSL_dane_tlsa_add(SSL *s, uint8_t usage, uint8_t selector,
++                      uint8_t mtype, unsigned char *data, size_t dlen)
++{
++    return dane_tlsa_add(&amp;s-&gt;dane, usage, selector, mtype, data, dlen);
++}
++
++int SSL_CTX_dane_mtype_set(SSL_CTX *ctx, const EVP_MD *md, uint8_t mtype, uint8_t ord)
++{
++    return dane_mtype_set(&amp;ctx-&gt;dane, md, mtype, ord);
++}
++
+ int SSL_CTX_set1_param(SSL_CTX *ctx, X509_VERIFY_PARAM *vpm)
+ {
+     return X509_VERIFY_PARAM_set1(ctx-&gt;param, vpm);
+@@ -543,6 +995,7 @@ void SSL_free(SSL *s)
+ #endif
+ 
+     X509_VERIFY_PARAM_free(s-&gt;param);
++    dane_final(&amp;s-&gt;dane);
+     CRYPTO_free_ex_data(CRYPTO_EX_INDEX_SSL, s, &amp;s-&gt;ex_data);
+ 
+     if (s-&gt;bbio != NULL) {
+@@ -877,9 +1330,10 @@ int SSL_copy_session_id(SSL *t, const SSL *f)
+      * what if we are setup for one protocol version but want to talk another
+      */
+     if (t-&gt;method != f-&gt;method) {
+-        t-&gt;method-&gt;ssl_free(t); /* cleanup current */
+-        t-&gt;method = f-&gt;method;  /* change method */
+-        t-&gt;method-&gt;ssl_new(t);  /* setup new */
++        t-&gt;method-&gt;ssl_free(t);
++        t-&gt;method = f-&gt;method;
++        if (t-&gt;method-&gt;ssl_new(t) == 0)
++            return 0;
+     }
+ 
+     CRYPTO_add(&amp;f-&gt;cert-&gt;references, 1, CRYPTO_LOCK_SSL_CERT);
+@@ -1922,6 +2376,7 @@ void SSL_CTX_free(SSL_CTX *a)
+ #endif
+ 
+     X509_VERIFY_PARAM_free(a-&gt;param);
++    dane_ctx_final(&amp;a-&gt;dane);
+ 
+     /*
+      * Free internal session cache. However: the remove_cb() may reference
+@@ -2346,24 +2801,23 @@ const SSL_METHOD *SSL_get_ssl_method(SSL *s)
+ 
+ int SSL_set_ssl_method(SSL *s, const SSL_METHOD *meth)
+ {
+-    int conn = -1;
+     int ret = 1;
+ 
+     if (s-&gt;method != meth) {
+-        if (s-&gt;handshake_func != NULL)
+-            conn = (s-&gt;handshake_func == s-&gt;method-&gt;ssl_connect);
++        const SSL_METHOD *sm = s-&gt;method;
++        int (*hf)(SSL *) = s-&gt;handshake_func;
+ 
+-        if (s-&gt;method-&gt;version == meth-&gt;version)
++        if (sm-&gt;version == meth-&gt;version)
+             s-&gt;method = meth;
+         else {
+-            s-&gt;method-&gt;ssl_free(s);
++            sm-&gt;ssl_free(s);
+             s-&gt;method = meth;
+             ret = s-&gt;method-&gt;ssl_new(s);
+         }
+ 
+-        if (conn == 1)
++        if (hf == sm-&gt;ssl_connect)
+             s-&gt;handshake_func = meth-&gt;ssl_connect;
+-        else if (conn == 0)
++        else if (hf == sm-&gt;ssl_accept)
+             s-&gt;handshake_func = meth-&gt;ssl_accept;
+     }
+     return (ret);
+@@ -2554,14 +3008,23 @@ SSL *SSL_dup(SSL *s)
+     SSL *ret;
+     int i;
+ 
++    /* If we're not quiescent, just up_ref! */
++    if (!SSL_in_init(s) || !SSL_in_before(s)) {
++        CRYPTO_add(&amp;s-&gt;references, 1, CRYPTO_LOCK_SSL);
++        return s;
++    }
++
++    /*
++     * Otherwise, copy configuration state, and session if set.
++     */
+     if ((ret = SSL_new(SSL_get_SSL_CTX(s))) == NULL)
+         return (NULL);
+ 
+-    ret-&gt;version = s-&gt;version;
+-    ret-&gt;method = s-&gt;method;
+-
+     if (s-&gt;session != NULL) {
+-        /* This copies session-id, SSL_METHOD, sid_ctx, and 'cert' */
++        /*
++         * Arranges to share the same session via up_ref.  This &quot;copies&quot;
++         * session-id, SSL_METHOD, sid_ctx, and 'cert'
++         */
+         if (!SSL_copy_session_id(ret, s))
+             goto err;
+     } else {
+@@ -2571,10 +3034,8 @@ SSL *SSL_dup(SSL *s)
+          * point to the same object, and thus we can't use
+          * SSL_copy_session_id.
+          */
+-
+-        ret-&gt;method-&gt;ssl_free(ret);
+-        ret-&gt;method = s-&gt;method;
+-        ret-&gt;method-&gt;ssl_new(ret);
++        if (!SSL_set_ssl_method(ret, s-&gt;method))
++            goto err;
+ 
+         if (s-&gt;cert != NULL) {
+             ssl_cert_free(ret-&gt;cert);
+@@ -2587,6 +3048,8 @@ SSL *SSL_dup(SSL *s)
+             goto err;
+     }
+ 
++    ssl_dane_dup(ret, s);
++    ret-&gt;version = s-&gt;version;
+     ret-&gt;options = s-&gt;options;
+     ret-&gt;mode = s-&gt;mode;
+     SSL_set_max_cert_list(ret, SSL_get_max_cert_list(s));
+@@ -2617,19 +3080,15 @@ SSL *SSL_dup(SSL *s)
+         } else
+             ret-&gt;wbio = ret-&gt;rbio;
+     }
+-    ret-&gt;rwstate = s-&gt;rwstate;
+-    ret-&gt;handshake_func = s-&gt;handshake_func;
++
+     ret-&gt;server = s-&gt;server;
+-    ret-&gt;renegotiate = s-&gt;renegotiate;
+-    ret-&gt;new_session = s-&gt;new_session;
+-    ret-&gt;quiet_shutdown = s-&gt;quiet_shutdown;
++    if (s-&gt;handshake_func) {
++        if (s-&gt;server)
++            SSL_set_accept_state(ret);
++        else
++            SSL_set_connect_state(ret);
++    }
+     ret-&gt;shutdown = s-&gt;shutdown;
+-    ret-&gt;statem = s-&gt;statem;      /* SSL_dup does not really work at any state,
+-                                   * though */
+-    RECORD_LAYER_dup(&amp;ret-&gt;rlayer, &amp;s-&gt;rlayer);
+-    ret-&gt;init_num = 0;          /* would have to copy ret-&gt;init_buf,
+-                                 * ret-&gt;init_msg, ret-&gt;init_num,
+-                                 * ret-&gt;init_off */
+     ret-&gt;hit = s-&gt;hit;
+ 
+     ret-&gt;default_passwd_callback = s-&gt;default_passwd_callback;
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 7e07297f..fee7fa6 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -169,6 +169,7 @@
+ #include &quot;record/record.h&quot;
+ #include &quot;statem/statem.h&quot;
+ #include &quot;packet_locl.h&quot;
++#include &quot;internal/dane.h&quot;
+ 
+ # ifdef OPENSSL_BUILD_SHLIBSSL
+ #  undef OPENSSL_EXTERN
+@@ -925,6 +926,9 @@ struct ssl_ctx_st {
+     unsigned char *alpn_client_proto_list;
+     unsigned alpn_client_proto_list_len;
+ 
++    /* Shared DANE context */
++    struct dane_ctx_st dane;
++
+     /* SRTP profiles we are willing to do from RFC 5764 */
+     STACK_OF(SRTP_PROTECTION_PROFILE) *srtp_profiles;
+     /*
+@@ -1007,6 +1011,10 @@ struct ssl_st {
+     void *msg_callback_arg;
+     int hit;                    /* reusing a previous session */
+     X509_VERIFY_PARAM *param;
++
++    /* Per connection DANE state */
++    struct dane_st dane;
++
+     /* crypto */
+     STACK_OF(SSL_CIPHER) *cipher_list;
+     STACK_OF(SSL_CIPHER) *cipher_list_by_id;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002596.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002604.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2600">[ date ]</a>
+              <a href="thread.html#2600">[ thread ]</a>
+              <a href="subject.html#2600">[ subject ]</a>
+              <a href="author.html#2600">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

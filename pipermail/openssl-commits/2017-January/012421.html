@@ -1,0 +1,187 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1485268451.951924.26286.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012419.html">
+   <LINK REL="Next"  HREF="012423.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1485268451.951924.26286.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Tue Jan 24 14:34:11 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012419.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="012423.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12421">[ date ]</a>
+              <a href="thread.html#12421">[ thread ]</a>
+              <a href="subject.html#12421">[ subject ]</a>
+              <a href="author.html#12421">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  07afdf3c3ac97af4f2b4eec22a97f7230f8227e0 (commit)
+      from  c83680a04aac7a15e6ac48ed732b8322c4c9d49a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 07afdf3c3ac97af4f2b4eec22a97f7230f8227e0
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jan 24 11:12:03 2017 +0000
+
+    Fix SSL_get0_raw_cipherlist()
+    
+    SSL_get0_raw_cipherlist() was a little too &quot;raw&quot; in the case of an SSLv2
+    compat ClientHello. In 1.0.2 and below, during version negotiation, if
+    we received an SSLv2 compat ClientHello but actually wanted to do SSLv3+
+    then we would construct a &quot;fake&quot; SSLv3+ ClientHello. This &quot;fake&quot; ClientHello
+    would have its ciphersuite list converted to the SSLv3+ format. It was
+    this &quot;fake&quot; raw list that got saved away to later be returned by a call to
+    SSL_get0_raw_cipherlist().
+    
+    In 1.1.0+ version negotiation works differently and we process an SSLv2
+    compat ClientHello directly without the need for an intermediary &quot;fake&quot;
+    ClientHello. This meant that the raw ciphersuite list being saved was in
+    the SSLv2 format. Any caller of this function would not expect that and
+    potentially overread the returned buffer by one byte.
+    
+    Fixes #2189
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2280">https://github.com/openssl/openssl/pull/2280</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem_srvr.c | 63 +++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 46 insertions(+), 17 deletions(-)
+
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index 65eeaff..8d6fd1f 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -3450,20 +3450,51 @@ STACK_OF(SSL_CIPHER) *ssl_bytes_to_cipher_list(SSL *s,
+         return NULL;
+     }
+ 
+-    if ((skp == NULL) || (*skp == NULL)) {
+-        sk = sk_SSL_CIPHER_new_null(); /* change perhaps later */
+-        if (sk == NULL) {
+-            SSLerr(SSL_F_SSL_BYTES_TO_CIPHER_LIST, ERR_R_MALLOC_FAILURE);
+-            *al = SSL_AD_INTERNAL_ERROR;
+-            return NULL;
+-        }
+-    } else {
+-        sk = *skp;
+-        sk_SSL_CIPHER_zero(sk);
++    sk = sk_SSL_CIPHER_new_null();
++    if (sk == NULL) {
++        SSLerr(SSL_F_SSL_BYTES_TO_CIPHER_LIST, ERR_R_MALLOC_FAILURE);
++        *al = SSL_AD_INTERNAL_ERROR;
++        return NULL;
+     }
+ 
+-    if (!PACKET_memdup(cipher_suites, &amp;s-&gt;s3-&gt;tmp.ciphers_raw,
+-                       &amp;s-&gt;s3-&gt;tmp.ciphers_rawlen)) {
++    if (sslv2format) {
++        size_t numciphers = PACKET_remaining(cipher_suites) / n;
++        PACKET sslv2ciphers = *cipher_suites;
++        unsigned int leadbyte;
++        unsigned char *raw;
++
++        /*
++         * We store the raw ciphers list in SSLv3+ format so we need to do some
++         * preprocessing to convert the list first. If there are any SSLv2 only
++         * ciphersuites with a non-zero leading byte then we are going to
++         * slightly over allocate because we won't store those. But that isn't a
++         * problem.
++         */
++        raw = s-&gt;s3-&gt;tmp.ciphers_raw = OPENSSL_malloc(numciphers * n);
++        if (raw == NULL) {
++            *al = SSL_AD_INTERNAL_ERROR;
++            goto err;
++        }
++        for (s-&gt;s3-&gt;tmp.ciphers_rawlen = 0;
++             PACKET_remaining(&amp;sslv2ciphers) &gt; 0;
++             raw += TLS_CIPHER_LEN) {
++            if (!PACKET_get_1(&amp;sslv2ciphers, &amp;leadbyte)
++                    || (leadbyte == 0
++                        &amp;&amp; !PACKET_copy_bytes(&amp;sslv2ciphers, raw,
++                                              TLS_CIPHER_LEN))
++                    || (leadbyte != 0
++                        &amp;&amp; !PACKET_forward(&amp;sslv2ciphers, TLS_CIPHER_LEN))) {
++                *al = SSL_AD_INTERNAL_ERROR;
++                OPENSSL_free(raw);
++                s-&gt;s3-&gt;tmp.ciphers_raw = NULL;
++                s-&gt;s3-&gt;tmp.ciphers_rawlen = 0;
++                goto err;
++            }
++            if (leadbyte == 0)
++                s-&gt;s3-&gt;tmp.ciphers_rawlen += TLS_CIPHER_LEN;
++        }
++    } else if (!PACKET_memdup(cipher_suites, &amp;s-&gt;s3-&gt;tmp.ciphers_raw,
++                           &amp;s-&gt;s3-&gt;tmp.ciphers_rawlen)) {
+         *al = SSL_AD_INTERNAL_ERROR;
+         goto err;
+     }
+@@ -3524,11 +3555,9 @@ STACK_OF(SSL_CIPHER) *ssl_bytes_to_cipher_list(SSL *s,
+         goto err;
+     }
+ 
+-    if (skp != NULL)
+-        *skp = sk;
+-    return (sk);
++    *skp = sk;
++    return sk;
+  err:
+-    if ((skp == NULL) || (*skp == NULL))
+-        sk_SSL_CIPHER_free(sk);
++    sk_SSL_CIPHER_free(sk);
+     return NULL;
+ }
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012419.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="012423.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12421">[ date ]</a>
+              <a href="thread.html#12421">[ thread ]</a>
+              <a href="subject.html#12421">[ subject ]</a>
+              <a href="author.html#12421">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,323 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1487899535.600522.11248.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013114.html">
+   <LINK REL="Next"  HREF="013141.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Dr. Stephen Henson</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1487899535.600522.11248.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">steve at openssl.org
+       </A><BR>
+    <I>Fri Feb 24 01:25:35 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013114.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="013141.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13119">[ date ]</a>
+              <a href="thread.html#13119">[ thread ]</a>
+              <a href="subject.html#13119">[ subject ]</a>
+              <a href="author.html#13119">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  75c13e7830653eee4b61dd96ceea7c446c381316 (commit)
+      from  8fce04ee3540ba3039bb66df34ea3f076a599ab9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 75c13e7830653eee4b61dd96ceea7c446c381316
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Thu Feb 23 22:12:28 2017 +0000
+
+    Tidy up certificate type handling.
+    
+    The certificate types used to be held in a fixed length array or (if
+    it was too long) a malloced buffer. This was done to retain binary
+    compatibility. The code can be simplified now SSL is opaque by always
+    using a malloced buffer.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/2733">https://github.com/openssl/openssl/pull/2733</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_lib.c             | 30 +++++++++++++-----------------
+ ssl/ssl_cert.c           | 11 +++++------
+ ssl/ssl_locl.h           | 15 ++++++---------
+ ssl/statem/statem_clnt.c | 24 ++++++------------------
+ ssl/t1_lib.c             | 19 +++++++------------
+ 5 files changed, 37 insertions(+), 62 deletions(-)
+
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index 6449f8c..1df1afa 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -2925,6 +2925,7 @@ void ssl3_free(SSL *s)
+     s-&gt;s3-&gt;tmp.pkey = NULL;
+ #endif
+ 
++    OPENSSL_free(s-&gt;s3-&gt;tmp.ctype);
+     sk_X509_NAME_pop_free(s-&gt;s3-&gt;tmp.ca_names, X509_NAME_free);
+     OPENSSL_free(s-&gt;s3-&gt;tmp.ciphers_raw);
+     OPENSSL_clear_free(s-&gt;s3-&gt;tmp.pms, s-&gt;s3-&gt;tmp.pmslen);
+@@ -2943,6 +2944,7 @@ void ssl3_free(SSL *s)
+ void ssl3_clear(SSL *s)
+ {
+     ssl3_cleanup_key_block(s);
++    OPENSSL_free(s-&gt;s3-&gt;tmp.ctype);
+     sk_X509_NAME_pop_free(s-&gt;s3-&gt;tmp.ca_names, X509_NAME_free);
+     OPENSSL_free(s-&gt;s3-&gt;tmp.ciphers_raw);
+     OPENSSL_clear_free(s-&gt;s3-&gt;tmp.pms, s-&gt;s3-&gt;tmp.pmslen);
+@@ -3234,14 +3236,9 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
+             const unsigned char **pctype = parg;
+             if (s-&gt;server || !s-&gt;s3-&gt;tmp.cert_req)
+                 return 0;
+-            if (s-&gt;cert-&gt;ctypes) {
+-                if (pctype)
+-                    *pctype = s-&gt;cert-&gt;ctypes;
+-                return (int)s-&gt;cert-&gt;ctype_num;
+-            }
+             if (pctype)
+-                *pctype = (unsigned char *)s-&gt;s3-&gt;tmp.ctype;
+-            return s-&gt;s3-&gt;tmp.ctype_num;
++                *pctype = s-&gt;s3-&gt;tmp.ctype;
++            return s-&gt;s3-&gt;tmp.ctype_len;
+         }
+ 
+     case SSL_CTRL_SET_CLIENT_CERT_TYPES:
+@@ -3787,9 +3784,8 @@ int ssl3_get_req_cert_type(SSL *s, WPACKET *pkt)
+     uint32_t alg_k, alg_a = 0;
+ 
+     /* If we have custom certificate types set, use them */
+-    if (s-&gt;cert-&gt;ctypes) {
+-        return WPACKET_memcpy(pkt, s-&gt;cert-&gt;ctypes, s-&gt;cert-&gt;ctype_num);
+-    }
++    if (s-&gt;cert-&gt;ctype)
++        return WPACKET_memcpy(pkt, s-&gt;cert-&gt;ctype, s-&gt;cert-&gt;ctype_len);
+     /* Get mask of algorithms disabled by signature list */
+     ssl_set_sig_mask(&amp;alg_a, s, SSL_SECOP_SIGALG_MASK);
+ 
+@@ -3837,17 +3833,17 @@ int ssl3_get_req_cert_type(SSL *s, WPACKET *pkt)
+ 
+ static int ssl3_set_req_cert_type(CERT *c, const unsigned char *p, size_t len)
+ {
+-    OPENSSL_free(c-&gt;ctypes);
+-    c-&gt;ctypes = NULL;
+-    if (!p || !len)
++    OPENSSL_free(c-&gt;ctype);
++    c-&gt;ctype = NULL;
++    c-&gt;ctype_len = 0;
++    if (p == NULL || len == 0)
+         return 1;
+     if (len &gt; 0xff)
+         return 0;
+-    c-&gt;ctypes = OPENSSL_malloc(len);
+-    if (c-&gt;ctypes == NULL)
++    c-&gt;ctype = OPENSSL_memdup(p, len);
++    if (c-&gt;ctype == NULL)
+         return 0;
+-    memcpy(c-&gt;ctypes, p, len);
+-    c-&gt;ctype_num = len;
++    c-&gt;ctype_len = len;
+     return 1;
+ }
+ 
+diff --git a/ssl/ssl_cert.c b/ssl/ssl_cert.c
+index a75fb65..70aa697 100644
+--- a/ssl/ssl_cert.c
++++ b/ssl/ssl_cert.c
+@@ -164,12 +164,11 @@ CERT *ssl_cert_dup(CERT *cert)
+     /* Shared sigalgs also NULL */
+     ret-&gt;shared_sigalgs = NULL;
+     /* Copy any custom client certificate types */
+-    if (cert-&gt;ctypes) {
+-        ret-&gt;ctypes = OPENSSL_malloc(cert-&gt;ctype_num);
+-        if (ret-&gt;ctypes == NULL)
++    if (cert-&gt;ctype) {
++        ret-&gt;ctype = OPENSSL_memdup(cert-&gt;ctype, cert-&gt;ctype_len);
++        if (ret-&gt;ctype == NULL)
+             goto err;
+-        memcpy(ret-&gt;ctypes, cert-&gt;ctypes, cert-&gt;ctype_num);
+-        ret-&gt;ctype_num = cert-&gt;ctype_num;
++        ret-&gt;ctype_len = cert-&gt;ctype_len;
+     }
+ 
+     ret-&gt;cert_flags = cert-&gt;cert_flags;
+@@ -252,7 +251,7 @@ void ssl_cert_free(CERT *c)
+     OPENSSL_free(c-&gt;conf_sigalgs);
+     OPENSSL_free(c-&gt;client_sigalgs);
+     OPENSSL_free(c-&gt;shared_sigalgs);
+-    OPENSSL_free(c-&gt;ctypes);
++    OPENSSL_free(c-&gt;ctype);
+     X509_STORE_free(c-&gt;verify_store);
+     X509_STORE_free(c-&gt;chain_store);
+     custom_exts_free(&amp;c-&gt;cli_ext);
+diff --git a/ssl/ssl_locl.h b/ssl/ssl_locl.h
+index 26464a5..ebfd459 100644
+--- a/ssl/ssl_locl.h
++++ b/ssl/ssl_locl.h
+@@ -1316,8 +1316,9 @@ typedef struct ssl3_state_st {
+ # endif
+         /* used for certificate requests */
+         int cert_req;
+-        int ctype_num;
+-        char ctype[SSL3_CT_NUMBER];
++        /* Certificate types in certificate request message. */
++        uint8_t *ctype;
++        size_t ctype_len;
+         STACK_OF(X509_NAME) *ca_names;
+         size_t key_block_length;
+         unsigned char *key_block;
+@@ -1606,13 +1607,9 @@ typedef struct cert_st {
+     /* Flags related to certificates */
+     uint32_t cert_flags;
+     CERT_PKEY pkeys[SSL_PKEY_NUM];
+-    /*
+-     * Certificate types (received or sent) in certificate request message.
+-     * On receive this is only set if number of certificate types exceeds
+-     * SSL3_CT_NUMBER.
+-     */
+-    unsigned char *ctypes;
+-    size_t ctype_num;
++    /* Custom certificate types sent in certificate request message. */
++    uint8_t *ctype;
++    size_t ctype_len;
+     /*
+      * supported signature algorithms. When set on a client this is sent in
+      * the client hello as the supported signature algorithms extension. For
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index bc35a3e..6e162fb 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -2196,11 +2196,11 @@ MSG_PROCESS_RETURN tls_process_key_exchange(SSL *s, PACKET *pkt)
+ MSG_PROCESS_RETURN tls_process_certificate_request(SSL *s, PACKET *pkt)
+ {
+     int ret = MSG_PROCESS_ERROR;
+-    unsigned int list_len, ctype_num, i, name_len;
++    unsigned int list_len, i, name_len;
+     X509_NAME *xn = NULL;
+-    const unsigned char *data;
+     const unsigned char *namestart, *namebytes;
+     STACK_OF(X509_NAME) *ca_sk = NULL;
++    PACKET ctypes;
+ 
+     if ((ca_sk = sk_X509_NAME_new(ca_dn_cmp)) == NULL) {
+         SSLerr(SSL_F_TLS_PROCESS_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
+@@ -2208,27 +2208,16 @@ MSG_PROCESS_RETURN tls_process_certificate_request(SSL *s, PACKET *pkt)
+     }
+ 
+     /* get the certificate types */
+-    if (!PACKET_get_1(pkt, &amp;ctype_num)
+-        || !PACKET_get_bytes(pkt, &amp;data, ctype_num)) {
++    if (!PACKET_get_length_prefixed_1(pkt, &amp;ctypes)) {
+         ssl3_send_alert(s, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+         SSLerr(SSL_F_TLS_PROCESS_CERTIFICATE_REQUEST, SSL_R_LENGTH_MISMATCH);
+         goto err;
+     }
+-    OPENSSL_free(s-&gt;cert-&gt;ctypes);
+-    s-&gt;cert-&gt;ctypes = NULL;
+-    if (ctype_num &gt; SSL3_CT_NUMBER) {
+-        /* If we exceed static buffer copy all to cert structure */
+-        s-&gt;cert-&gt;ctypes = OPENSSL_malloc(ctype_num);
+-        if (s-&gt;cert-&gt;ctypes == NULL) {
+-            SSLerr(SSL_F_TLS_PROCESS_CERTIFICATE_REQUEST, ERR_R_MALLOC_FAILURE);
++
++    if (!PACKET_memdup(&amp;ctypes, &amp;s-&gt;s3-&gt;tmp.ctype, &amp;s-&gt;s3-&gt;tmp.ctype_len)) {
++        SSLerr(SSL_F_TLS_PROCESS_CERTIFICATE_REQUEST, ERR_R_INTERNAL_ERROR);
+             goto err;
+-        }
+-        memcpy(s-&gt;cert-&gt;ctypes, data, ctype_num);
+-        s-&gt;cert-&gt;ctype_num = ctype_num;
+-        ctype_num = SSL3_CT_NUMBER;
+     }
+-    for (i = 0; i &lt; ctype_num; i++)
+-        s-&gt;s3-&gt;tmp.ctype[i] = data[i];
+ 
+     if (SSL_USE_SIGALGS(s)) {
+         PACKET sigalgs;
+@@ -2297,7 +2286,6 @@ MSG_PROCESS_RETURN tls_process_certificate_request(SSL *s, PACKET *pkt)
+ 
+     /* we should setup a certificate to return.... */
+     s-&gt;s3-&gt;tmp.cert_req = 1;
+-    s-&gt;s3-&gt;tmp.ctype_num = ctype_num;
+     sk_X509_NAME_pop_free(s-&gt;s3-&gt;tmp.ca_names, X509_NAME_free);
+     s-&gt;s3-&gt;tmp.ca_names = ca_sk;
+     ca_sk = NULL;
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index f13c0ad..8b31e84 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -2009,25 +2009,20 @@ int tls1_check_chain(SSL *s, X509 *x, EVP_PKEY *pk, STACK_OF(X509) *chain,
+             break;
+         }
+         if (check_type) {
+-            const unsigned char *ctypes;
+-            int ctypelen;
+-            if (c-&gt;ctypes) {
+-                ctypes = c-&gt;ctypes;
+-                ctypelen = (int)c-&gt;ctype_num;
+-            } else {
+-                ctypes = (unsigned char *)s-&gt;s3-&gt;tmp.ctype;
+-                ctypelen = s-&gt;s3-&gt;tmp.ctype_num;
+-            }
+-            for (i = 0; i &lt; ctypelen; i++) {
+-                if (ctypes[i] == check_type) {
++            const uint8_t *ctypes = s-&gt;s3-&gt;tmp.ctype;
++            size_t j;
++
++            for (j = 0; j &lt; s-&gt;s3-&gt;tmp.ctype_len; j++, ctypes++) {
++                if (*ctypes == check_type) {
+                     rv |= CERT_PKEY_CERT_TYPE;
+                     break;
+                 }
+             }
+             if (!(rv &amp; CERT_PKEY_CERT_TYPE) &amp;&amp; !check_flags)
+                 goto end;
+-        } else
++        } else {
+             rv |= CERT_PKEY_CERT_TYPE;
++        }
+ 
+         ca_dn = s-&gt;s3-&gt;tmp.ca_names;
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013114.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="013141.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13119">[ date ]</a>
+              <a href="thread.html#13119">[ thread ]</a>
+              <a href="subject.html#13119">[ subject ]</a>
+              <a href="author.html#13119">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

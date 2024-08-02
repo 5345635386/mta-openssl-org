@@ -1,0 +1,624 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1613663906.101356.28589.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033166.html">
+   <LINK REL="Next"  HREF="033168.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1613663906.101356.28589.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Feb 18 15:58:26 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033166.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033168.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33167">[ date ]</a>
+              <a href="thread.html#33167">[ thread ]</a>
+              <a href="subject.html#33167">[ subject ]</a>
+              <a href="author.html#33167">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3262300a2c2351c6706f37b89fef015430988a31 (commit)
+       via  247a1786e25dbf77548168572e383d57aa743af4 (commit)
+      from  c1be4d617cf9435e8326ebba643aa4d7cbcb3645 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3262300a2c2351c6706f37b89fef015430988a31
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat Feb 13 06:49:05 2021 +0100
+
+    Adjust the few places where the string length was confused
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14168">https://github.com/openssl/openssl/pull/14168</A>)
+
+commit 247a1786e25dbf77548168572e383d57aa743af4
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri Feb 12 20:30:40 2021 +0100
+
+    OSSL_PARAM: Correct the assumptions on the UTF8 string length
+    
+    When the string &quot;ABCDEFGH&quot; is passed, what's considered its data, this?
+    
+        { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H' }
+    
+    or this?
+    
+        { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', '\0' }
+    
+    If it's passed as a pass phrase, should the terminating NUL byte be
+    considered part of the pass phrase, or not?
+    
+    Our treatment of OSSL_PARAMs with the data type OSSL_PARAM_UTF8_STRING
+    set the length of the string to include the terminating NUL byte,
+    which is quite confusing.  What should the recipient of such a string
+    believe?
+    
+    Instead of perpetuating this confusion, we change the assumption to
+    set the OSSL_PARAM to the length of the string, not including the
+    terminating NUL byte, thereby giving it the same value as a strlen()
+    call would give.
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14168">https://github.com/openssl/openssl/pull/14168</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/params.c                            | 57 +++++++++++++++++++-------
+ doc/man3/OSSL_PARAM.pod                    |  7 ++++
+ doc/man3/OSSL_PARAM_int.pod                | 20 +++++----
+ doc/man7/EVP_KDF-SSHKDF.pod                |  2 +-
+ providers/fips/self_test.c                 |  3 +-
+ providers/implementations/rands/drbg_ctr.c | 10 +++--
+ test/evp_kdf_test.c                        | 19 ++++-----
+ test/params_api_test.c                     |  5 ++-
+ test/params_test.c                         | 66 +++++++++++++++---------------
+ 9 files changed, 113 insertions(+), 76 deletions(-)
+
+diff --git a/crypto/params.c b/crypto/params.c
+index e28affe708..a3263e93c3 100644
+--- a/crypto/params.c
++++ b/crypto/params.c
+@@ -1070,15 +1070,21 @@ OSSL_PARAM OSSL_PARAM_construct_double(const char *key, double *buf)
+     return ossl_param_construct(key, OSSL_PARAM_REAL, buf, sizeof(double));
+ }
+ 
+-static int get_string_internal(const OSSL_PARAM *p, void **val, size_t max_len,
+-                               size_t *used_len, unsigned int type)
++static int get_string_internal(const OSSL_PARAM *p, void **val,
++                               size_t *max_len, size_t *used_len,
++                               unsigned int type)
+ {
+-    size_t sz;
++    size_t sz, alloc_sz;
+ 
+     if ((val == NULL &amp;&amp; used_len == NULL) || p == NULL || p-&gt;data_type != type)
+         return 0;
+ 
+     sz = p-&gt;data_size;
++    /*
++     * If the input size is 0, or the input string needs NUL byte
++     * termination, allocate an extra byte.
++     */
++    alloc_sz = sz + (type == OSSL_PARAM_UTF8_STRING || sz == 0);
+ 
+     if (used_len != NULL)
+         *used_len = sz;
+@@ -1090,16 +1096,15 @@ static int get_string_internal(const OSSL_PARAM *p, void **val, size_t max_len,
+         return 1;
+ 
+     if (*val == NULL) {
+-        char *const q = OPENSSL_malloc(sz &gt; 0 ? sz : 1);
++        char *const q = OPENSSL_malloc(alloc_sz);
+ 
+         if (q == NULL)
+             return 0;
+         *val = q;
+-        if (sz != 0)
+-            memcpy(q, p-&gt;data, sz);
+-        return 1;
++        *max_len = alloc_sz;
+     }
+-    if (max_len &lt; sz)
++
++    if (*max_len &lt; sz)
+         return 0;
+     memcpy(*val, p-&gt;data, sz);
+     return 1;
+@@ -1107,14 +1112,35 @@ static int get_string_internal(const OSSL_PARAM *p, void **val, size_t max_len,
+ 
+ int OSSL_PARAM_get_utf8_string(const OSSL_PARAM *p, char **val, size_t max_len)
+ {
+-    return get_string_internal(p, (void **)val, max_len, NULL,
+-                               OSSL_PARAM_UTF8_STRING);
++    int ret = get_string_internal(p, (void **)val, &amp;max_len, NULL,
++                                  OSSL_PARAM_UTF8_STRING);
++
++    /*
++     * We try to ensure that the copied string is terminated with a
++     * NUL byte.  That should be easy, just place a NUL byte at
++     * |((char*)*val)[p-&gt;data_size]|.
++     * Unfortunately, we have seen cases where |p-&gt;data_size| doesn't
++     * correctly reflect the length of the string, and just happens
++     * to be out of bounds according to |max_len|, so in that case, we
++     * make the extra step of trying to find the true length of the
++     * string that |p-&gt;data| points at, and use that as an index to
++     * place the NUL byte in |*val|.
++     */
++    size_t data_length = p-&gt;data_size;
++
++    if (data_length &gt;= max_len)
++        data_length = OPENSSL_strnlen(p-&gt;data, data_length);
++    if (data_length &gt;= max_len)
++        return 0;            /* No space for a terminating NUL byte */
++    ((char *)*val)[data_length] = '\0';
++
++    return ret;
+ }
+ 
+ int OSSL_PARAM_get_octet_string(const OSSL_PARAM *p, void **val, size_t max_len,
+                                 size_t *used_len)
+ {
+-    return get_string_internal(p, val, max_len, used_len,
++    return get_string_internal(p, val, &amp;max_len, used_len,
+                                OSSL_PARAM_OCTET_STRING);
+ }
+ 
+@@ -1128,6 +1154,9 @@ static int set_string_internal(OSSL_PARAM *p, const void *val, size_t len,
+         return 0;
+ 
+     memcpy(p-&gt;data, val, len);
++    /* If possible within the size of p-&gt;data, add a NUL terminator byte */
++    if (type == OSSL_PARAM_UTF8_STRING &amp;&amp; p-&gt;data_size &gt; len)
++        ((char *)p-&gt;data)[len] = '\0';
+     return 1;
+ }
+ 
+@@ -1139,7 +1168,7 @@ int OSSL_PARAM_set_utf8_string(OSSL_PARAM *p, const char *val)
+     p-&gt;return_size = 0;
+     if (val == NULL)
+         return 0;
+-    return set_string_internal(p, val, strlen(val) + 1, OSSL_PARAM_UTF8_STRING);
++    return set_string_internal(p, val, strlen(val), OSSL_PARAM_UTF8_STRING);
+ }
+ 
+ int OSSL_PARAM_set_octet_string(OSSL_PARAM *p, const void *val,
+@@ -1158,7 +1187,7 @@ OSSL_PARAM OSSL_PARAM_construct_utf8_string(const char *key, char *buf,
+                                             size_t bsize)
+ {
+     if (buf != NULL &amp;&amp; bsize == 0)
+-        bsize = strlen(buf) + 1;
++        bsize = strlen(buf);
+     return ossl_param_construct(key, OSSL_PARAM_UTF8_STRING, buf, bsize);
+ }
+ 
+@@ -1207,7 +1236,7 @@ int OSSL_PARAM_set_utf8_ptr(OSSL_PARAM *p, const char *val)
+         return 0;
+     p-&gt;return_size = 0;
+     return set_ptr_internal(p, val, OSSL_PARAM_UTF8_PTR,
+-                            val == NULL ? 0 : strlen(val) + 1);
++                            val == NULL ? 0 : strlen(val));
+ }
+ 
+ int OSSL_PARAM_set_octet_ptr(OSSL_PARAM *p, const void *val,
+diff --git a/doc/man3/OSSL_PARAM.pod b/doc/man3/OSSL_PARAM.pod
+index fdf376a206..99f4e2ce62 100644
+--- a/doc/man3/OSSL_PARAM.pod
++++ b/doc/man3/OSSL_PARAM.pod
+@@ -97,6 +97,13 @@ setting parameters) or shall (when requesting parameters) be stored,
+ and I&lt;data_size&gt; is its size in bytes.
+ The organization of the data depends on the parameter type and flag.
+ 
++The I&lt;data_size&gt; needs special attention with the parameter type
++B&lt;OSSL_PARAM_UTF8_STRING&gt; in relation to C strings.  When setting
++parameters, the size should be set to the length of the string, not
++counting the terminating NUL byte.  When requesting parameters, the
++size should be set to the size of the buffer to be populated, which
++should accomodate enough space for a terminating NUL byte.
++
+ When I&lt;requesting parameters&gt;, it's acceptable for I&lt;data&gt; to be NULL.
+ This can be used by the I&lt;requestor&gt; to figure out dynamically exactly
+ how much buffer space is needed to store the parameter data.
+diff --git a/doc/man3/OSSL_PARAM_int.pod b/doc/man3/OSSL_PARAM_int.pod
+index d637d94f8a..25b87014b7 100644
+--- a/doc/man3/OSSL_PARAM_int.pod
++++ b/doc/man3/OSSL_PARAM_int.pod
+@@ -184,8 +184,7 @@ size I&lt;rsize&gt; is created.
+ OSSL_PARAM_construct_utf8_string() is a function that constructs a UTF8
+ string OSSL_PARAM structure.
+ A parameter with name I&lt;key&gt;, storage I&lt;buf&gt; and size I&lt;bsize&gt; is created.
+-If I&lt;bsize&gt; is zero, the string length is determined using strlen(3) + 1 for the
+-null termination byte.
++If I&lt;bsize&gt; is zero, the string length is determined using strlen(3).
+ Generally pass zero for I&lt;bsize&gt; instead of calling strlen(3) yourself.
+ 
+ OSSL_PARAM_construct_octet_string() is a function that constructs an OCTET
+@@ -232,15 +231,18 @@ will be assigned the size the parameter's I&lt;data&gt; buffer should have.
+ 
+ OSSL_PARAM_get_utf8_string() retrieves a UTF8 string from the parameter
+ pointed to by I&lt;p&gt;.
+-The string is either stored into I&lt;*val&gt; with a length limit of I&lt;max_len&gt; or,
+-in the case when I&lt;*val&gt; is NULL, memory is allocated for the string and
+-I&lt;max_len&gt; is ignored.
++The string is stored into I&lt;*val&gt; with a size limit of I&lt;max_len&gt;,
++which must be large enough to accomodate a terminating NUL byte,
++otherwise this function will fail.
++If I&lt;*val&gt; is NULL, memory is allocated for the string and I&lt;max_len&gt;
++is ignored.
+ If memory is allocated by this function, it must be freed by the caller.
+ 
+ OSSL_PARAM_set_utf8_string() sets a UTF8 string from the parameter pointed to
+ by I&lt;p&gt; to the value referenced by I&lt;val&gt;.
+ If the parameter's I&lt;data&gt; field is NULL, then only its I&lt;return_size&gt; field
+-will be assigned the size the parameter's I&lt;data&gt; buffer should have.
++will be assigned the minimum size the parameter's I&lt;data&gt; buffer should have
++to accomodate the string, including a terminating NUL byte.
+ 
+ OSSL_PARAM_get_octet_string() retrieves an OCTET string from the parameter
+ pointed to by I&lt;p&gt;.
+@@ -334,11 +336,11 @@ This example is for setting parameters on some object:
+     #include &lt;openssl/core.h&gt;
+ 
+     const char *foo = &quot;some string&quot;;
+-    size_t foo_l = strlen(foo) + 1;
++    size_t foo_l = strlen(foo);
+     const char bar[] = &quot;some other string&quot;;
+     const OSSL_PARAM set[] = {
+         OSSL_PARAM_utf8_ptr(&quot;foo&quot;, &amp;foo, foo_l),
+-        OSSL_PARAM_utf8_string(&quot;bar&quot;, bar, sizeof(bar)),
++        OSSL_PARAM_utf8_string(&quot;bar&quot;, bar, sizeof(bar) - 1),
+         OSSL_PARAM_END
+     };
+ 
+@@ -366,7 +368,7 @@ could fill in the parameters like this:
+     if ((p = OSSL_PARAM_locate(params, &quot;foo&quot;)) != NULL)
+         OSSL_PARAM_set_utf8_ptr(p, &quot;foo value&quot;);
+     if ((p = OSSL_PARAM_locate(params, &quot;bar&quot;)) != NULL)
+-        OSSL_PARAM_set_utf8_ptr(p, &quot;bar value&quot;);
++        OSSL_PARAM_set_utf8_string(p, &quot;bar value&quot;);
+     if ((p = OSSL_PARAM_locate(params, &quot;cookie&quot;)) != NULL)
+         OSSL_PARAM_set_utf8_ptr(p, &quot;cookie value&quot;);
+ 
+diff --git a/doc/man7/EVP_KDF-SSHKDF.pod b/doc/man7/EVP_KDF-SSHKDF.pod
+index f0e113c6c8..a2ff902cce 100644
+--- a/doc/man7/EVP_KDF-SSHKDF.pod
++++ b/doc/man7/EVP_KDF-SSHKDF.pod
+@@ -124,7 +124,7 @@ This example derives an 8 byte IV using SHA-256 with a 1K &quot;key&quot; and appropriate
+  *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
+                                           session_id, (size_t)32);
+  *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_SSHKDF_TYPE,
+-                                         type, sizeof(type));
++                                         type, sizeof(type) - 1);
+  *p = OSSL_PARAM_construct_end();
+  if (EVP_KDF_CTX_set_params(kctx, params) &lt;= 0)
+      /* Error */
+diff --git a/providers/fips/self_test.c b/providers/fips/self_test.c
+index aa9bbc770e..1848686ae3 100644
+--- a/providers/fips/self_test.c
++++ b/providers/fips/self_test.c
+@@ -182,8 +182,7 @@ static int verify_integrity(OSSL_CORE_BIO *bio, OSSL_FUNC_BIO_read_ex_fn read_ex
+     if (ctx == NULL)
+         goto err;
+ 
+-    *p++ = OSSL_PARAM_construct_utf8_string(&quot;digest&quot;, DIGEST_NAME,
+-                                            strlen(DIGEST_NAME) + 1);
++    *p++ = OSSL_PARAM_construct_utf8_string(&quot;digest&quot;, DIGEST_NAME, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(&quot;key&quot;, fixed_key,
+                                              sizeof(fixed_key));
+     *p = OSSL_PARAM_construct_end();
+diff --git a/providers/implementations/rands/drbg_ctr.c b/providers/implementations/rands/drbg_ctr.c
+index 127d85a2cc..e10b4378b5 100644
+--- a/providers/implementations/rands/drbg_ctr.c
++++ b/providers/implementations/rands/drbg_ctr.c
+@@ -685,19 +685,21 @@ static int drbg_ctr_set_ctx_params(void *vctx, const OSSL_PARAM params[])
+ 
+     if ((p = OSSL_PARAM_locate_const(params, OSSL_DRBG_PARAM_CIPHER)) != NULL) {
+         const char *base = (const char *)p-&gt;data;
++        size_t ctr_str_len = sizeof(&quot;CTR&quot;) - 1;
++        size_t ecb_str_len = sizeof(&quot;ECB&quot;) - 1;
+ 
+         if (p-&gt;data_type != OSSL_PARAM_UTF8_STRING
+-                || p-&gt;data_size &lt; 3)
++                || p-&gt;data_size &lt; ctr_str_len)
+             return 0;
+-        if (strcasecmp(&quot;CTR&quot;, base + p-&gt;data_size - sizeof(&quot;CTR&quot;)) != 0) {
++        if (strcasecmp(&quot;CTR&quot;, base + p-&gt;data_size - ctr_str_len) != 0) {
+             ERR_raise(ERR_LIB_PROV, PROV_R_REQUIRE_CTR_MODE_CIPHER);
+             return 0;
+         }
+-        if ((ecb = OPENSSL_strdup(base)) == NULL) {
++        if ((ecb = OPENSSL_strndup(base, p-&gt;data_size)) == NULL) {
+             ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
+             return 0;
+         }
+-        strcpy(ecb + p-&gt;data_size - sizeof(&quot;ECB&quot;), &quot;ECB&quot;);
++        strcpy(ecb + p-&gt;data_size - ecb_str_len, &quot;ECB&quot;);
+         EVP_CIPHER_free(ctr-&gt;cipher_ecb);
+         EVP_CIPHER_free(ctr-&gt;cipher_ctr);
+         ctr-&gt;cipher_ctr = EVP_CIPHER_fetch(libctx, base, propquery);
+diff --git a/test/evp_kdf_test.c b/test/evp_kdf_test.c
+index 621351f187..cb387bc71d 100644
+--- a/test/evp_kdf_test.c
++++ b/test/evp_kdf_test.c
+@@ -638,7 +638,7 @@ static int test_kdf_ss_hash(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+-                                            (char *)&quot;sha224&quot;, sizeof(&quot;sha224&quot;));
++                                            (char *)&quot;sha224&quot;, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, z, sizeof(z));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, other,
+                                              sizeof(other));
+@@ -692,7 +692,7 @@ static int test_kdf_x963(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+-                                            (char *)&quot;sha512&quot;, sizeof(&quot;sha512&quot;));
++                                            (char *)&quot;sha512&quot;, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, z, sizeof(z));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, shared,
+                                              sizeof(shared));
+@@ -1135,10 +1135,9 @@ static int test_kdf_ss_hmac(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_MAC,
+-                                            (char *)OSSL_MAC_NAME_HMAC,
+-                                            sizeof(OSSL_MAC_NAME_HMAC));
++                                            (char *)OSSL_MAC_NAME_HMAC, 0);
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+-                                            (char *)&quot;sha256&quot;, sizeof(&quot;sha256&quot;));
++                                            (char *)&quot;sha256&quot;, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, z, sizeof(z));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, other,
+                                              sizeof(other));
+@@ -1182,8 +1181,7 @@ static int test_kdf_ss_kmac(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_MAC,
+-                                            (char *)OSSL_MAC_NAME_KMAC128,
+-                                            sizeof(OSSL_MAC_NAME_KMAC128));
++                                            (char *)OSSL_MAC_NAME_KMAC128, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, z, sizeof(z));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, other,
+                                              sizeof(other));
+@@ -1239,7 +1237,7 @@ static int test_kdf_sshkdf(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST,
+-                                            (char *)&quot;sha256&quot;, sizeof(&quot;sha256&quot;));
++                                            (char *)&quot;sha256&quot;, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, key,
+                                              sizeof(key));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SSHKDF_XCGHASH,
+@@ -1247,7 +1245,7 @@ static int test_kdf_sshkdf(void)
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SSHKDF_SESSION_ID,
+                                              sessid, sizeof(sessid));
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_SSHKDF_TYPE,
+-                                            kdftype, sizeof(kdftype));
++                                            kdftype, 0);
+     *p = OSSL_PARAM_construct_end();
+ 
+     ret =
+@@ -1368,8 +1366,7 @@ static int test_kdf_krb5kdf(void)
+     };
+ 
+     *p++ = OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_CIPHER,
+-                                            (char *)&quot;AES-128-CBC&quot;,
+-                                            sizeof(&quot;AES-128-CBC&quot;));
++                                            (char *)&quot;AES-128-CBC&quot;, 0);
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, key,
+                                              sizeof(key));
+     *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_CONSTANT,
+diff --git a/test/params_api_test.c b/test/params_api_test.c
+index 0a68b9c462..2d69b5c327 100644
+--- a/test/params_api_test.c
++++ b/test/params_api_test.c
+@@ -538,7 +538,7 @@ static int test_param_construct(void)
+     bufp = NULL;
+     if (!TEST_ptr(cp = OSSL_PARAM_locate(params, &quot;utf8str&quot;))
+         || !TEST_true(OSSL_PARAM_set_utf8_string(cp, &quot;abcdef&quot;))
+-        || !TEST_size_t_eq(cp-&gt;return_size, sizeof(&quot;abcdef&quot;))
++        || !TEST_size_t_eq(cp-&gt;return_size, sizeof(&quot;abcdef&quot;) - 1)
+         || !TEST_true(OSSL_PARAM_get_utf8_string(cp, &amp;bufp, 0))
+         || !TEST_str_eq(bufp, &quot;abcdef&quot;))
+         goto err;
+@@ -548,10 +548,11 @@ static int test_param_construct(void)
+         || !TEST_str_eq(buf2, &quot;abcdef&quot;))
+         goto err;
+     /* UTF8 pointer */
++    /* Note that the size of a UTF8 string does *NOT* include the NUL byte */
+     bufp = buf;
+     if (!TEST_ptr(cp = OSSL_PARAM_locate(params, &quot;utf8ptr&quot;))
+         || !TEST_true(OSSL_PARAM_set_utf8_ptr(cp, &quot;tuvwxyz&quot;))
+-        || !TEST_size_t_eq(cp-&gt;return_size, sizeof(&quot;tuvwxyz&quot;))
++        || !TEST_size_t_eq(cp-&gt;return_size, sizeof(&quot;tuvwxyz&quot;) - 1)
+         || !TEST_str_eq(bufp, &quot;tuvwxyz&quot;)
+         || !TEST_true(OSSL_PARAM_get_utf8_ptr(cp, (const char **)&amp;bufp2))
+         || !TEST_ptr_eq(bufp2, bufp))
+diff --git a/test/params_test.c b/test/params_test.c
+index 9729ab892b..dd2d13b862 100644
+--- a/test/params_test.c
++++ b/test/params_test.c
+@@ -141,9 +141,20 @@ static int raw_set_params(void *vobj, const OSSL_PARAM *params)
+             if (!TEST_ptr(obj-&gt;p4 = OPENSSL_strndup(params-&gt;data,
+                                                     params-&gt;data_size)))
+                 return 0;
++            obj-&gt;p4_l = strlen(obj-&gt;p4);
+         } else if (strcmp(params-&gt;key, &quot;p5&quot;) == 0) {
+-            strncpy(obj-&gt;p5, params-&gt;data, params-&gt;data_size);
+-            obj-&gt;p5_l = strlen(obj-&gt;p5) + 1;
++            /*
++             * Protect obj-&gt;p5 against too much data.  This should not
++             * happen, we don't use that long strings.
++             */
++            size_t data_length =
++                OPENSSL_strnlen(params-&gt;data, params-&gt;data_size);
++
++            if (!TEST_size_t_lt(data_length, sizeof(obj-&gt;p5)))
++                return 0;
++            strncpy(obj-&gt;p5, params-&gt;data, data_length);
++            obj-&gt;p5[data_length] = '\0';
++            obj-&gt;p5_l = strlen(obj-&gt;p5);
+         } else if (strcmp(params-&gt;key, &quot;p6&quot;) == 0) {
+             obj-&gt;p6 = *(const char **)params-&gt;data;
+             obj-&gt;p6_l = params-&gt;data_size;
+@@ -164,36 +175,22 @@ static int raw_get_params(void *vobj, OSSL_PARAM *params)
+             params-&gt;return_size = sizeof(obj-&gt;p2);
+             *(double *)params-&gt;data = obj-&gt;p2;
+         } else if (strcmp(params-&gt;key, &quot;p3&quot;) == 0) {
+-            size_t bytes = BN_num_bytes(obj-&gt;p3);
+-
+-            params-&gt;return_size = bytes;
+-            if (!TEST_size_t_ge(params-&gt;data_size, bytes))
++            params-&gt;return_size = BN_num_bytes(obj-&gt;p3);
++            if (!TEST_size_t_ge(params-&gt;data_size, params-&gt;return_size))
+                 return 0;
+-            BN_bn2nativepad(obj-&gt;p3, params-&gt;data, bytes);
++            BN_bn2nativepad(obj-&gt;p3, params-&gt;data, params-&gt;return_size);
+         } else if (strcmp(params-&gt;key, &quot;p4&quot;) == 0) {
+-            size_t bytes = strlen(obj-&gt;p4) + 1;
+-
+-            params-&gt;return_size = bytes;
+-            if (!TEST_size_t_ge(params-&gt;data_size, bytes))
++            params-&gt;return_size = strlen(obj-&gt;p4);
++            if (!TEST_size_t_gt(params-&gt;data_size, params-&gt;return_size))
+                 return 0;
+             strcpy(params-&gt;data, obj-&gt;p4);
+         } else if (strcmp(params-&gt;key, &quot;p5&quot;) == 0) {
+-            size_t bytes = strlen(obj-&gt;p5) + 1;
+-
+-            params-&gt;return_size = bytes;
+-            if (!TEST_size_t_ge(params-&gt;data_size, bytes))
++            params-&gt;return_size = strlen(obj-&gt;p5);
++            if (!TEST_size_t_gt(params-&gt;data_size, params-&gt;return_size))
+                 return 0;
+             strcpy(params-&gt;data, obj-&gt;p5);
+         } else if (strcmp(params-&gt;key, &quot;p6&quot;) == 0) {
+-            /*
+-             * We COULD also use OPENSSL_FULL_VERSION_STR directly and
+-             * use sizeof(OPENSSL_FULL_VERSION_STR) instead of calling
+-             * strlen().
+-             * The caller wouldn't know the difference.
+-             */
+-            size_t bytes = strlen(obj-&gt;p6) + 1;
+-
+-            params-&gt;return_size = bytes;
++            params-&gt;return_size = strlen(obj-&gt;p6);
+             *(const char **)params-&gt;data = obj-&gt;p6;
+         }
+ 
+@@ -229,12 +226,12 @@ static int api_set_params(void *vobj, const OSSL_PARAM *params)
+         char *p5_ptr = obj-&gt;p5;
+         if (!TEST_true(OSSL_PARAM_get_utf8_string(p, &amp;p5_ptr, sizeof(obj-&gt;p5))))
+             return 0;
+-        obj-&gt;p5_l = strlen(obj-&gt;p5) + 1;
++        obj-&gt;p5_l = strlen(obj-&gt;p5);
+     }
+     if ((p = OSSL_PARAM_locate_const(params, &quot;p6&quot;)) != NULL) {
+         if (!TEST_true(OSSL_PARAM_get_utf8_ptr(p, &amp;obj-&gt;p6)))
+             return 0;
+-        obj-&gt;p6_l = strlen(obj-&gt;p6) + 1;
++        obj-&gt;p6_l = strlen(obj-&gt;p6);
+     }
+ 
+     return 1;
+@@ -353,8 +350,8 @@ static OSSL_PARAM static_raw_params[] = {
+     { &quot;p3&quot;, OSSL_PARAM_UNSIGNED_INTEGER, &amp;bignumbin, sizeof(bignumbin), 0 },
+     { &quot;p4&quot;, OSSL_PARAM_UTF8_STRING, &amp;app_p4, sizeof(app_p4), 0 },
+     { &quot;p5&quot;, OSSL_PARAM_UTF8_STRING, &amp;app_p5, sizeof(app_p5), 0 },
+-    /* sizeof(app_p6_init), because we know that's what we're using */
+-    { &quot;p6&quot;, OSSL_PARAM_UTF8_PTR, &amp;app_p6, sizeof(app_p6_init), 0 },
++    /* sizeof(app_p6_init) - 1, because we know that's what we're using */
++    { &quot;p6&quot;, OSSL_PARAM_UTF8_PTR, &amp;app_p6, sizeof(app_p6_init) - 1, 0 },
+     { &quot;foo&quot;, OSSL_PARAM_OCTET_STRING, &amp;foo, sizeof(foo), 0 },
+     { NULL, 0, NULL, 0, 0 }
+ };
+@@ -366,7 +363,8 @@ static OSSL_PARAM static_api_params[] = {
+     OSSL_PARAM_DEFN(&quot;p4&quot;, OSSL_PARAM_UTF8_STRING, &amp;app_p4, sizeof(app_p4)),
+     OSSL_PARAM_DEFN(&quot;p5&quot;, OSSL_PARAM_UTF8_STRING, &amp;app_p5, sizeof(app_p5)),
+     /* sizeof(app_p6_init), because we know that's what we're using */
+-    OSSL_PARAM_DEFN(&quot;p6&quot;, OSSL_PARAM_UTF8_PTR, &amp;app_p6, sizeof(app_p6_init)),
++    OSSL_PARAM_DEFN(&quot;p6&quot;, OSSL_PARAM_UTF8_PTR, &amp;app_p6,
++                    sizeof(app_p6_init) - 1),
+     OSSL_PARAM_DEFN(&quot;foo&quot;, OSSL_PARAM_OCTET_STRING, &amp;foo, sizeof(foo)),
+     OSSL_PARAM_END
+ };
+@@ -461,10 +459,12 @@ static int test_case_variant(OSSL_PARAM *params, const struct provider_dispatch_
+         || !TEST_BN_eq(app_p3, verify_p3)       /* &quot;provider&quot; value */
+         || !TEST_str_eq(app_p4, p4_init)        /* &quot;provider&quot; value */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;p5&quot;))
+-        || !TEST_size_t_eq(p-&gt;return_size, sizeof(p5_init)) /* &quot;provider&quot; value */
++        || !TEST_size_t_eq(p-&gt;return_size,
++                           sizeof(p5_init) - 1) /* &quot;provider&quot; value */
+         || !TEST_str_eq(app_p5, p5_init)        /* &quot;provider&quot; value */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;p6&quot;))
+-        || !TEST_size_t_eq(p-&gt;return_size, sizeof(p6_init)) /* &quot;provider&quot; value */
++        || !TEST_size_t_eq(p-&gt;return_size,
++                           sizeof(p6_init) - 1) /* &quot;provider&quot; value */
+         || !TEST_str_eq(app_p6, p6_init)        /* &quot;provider&quot; value */
+         || !TEST_char_eq(foo[0], app_foo_init)  /* Should remain untouched */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;foo&quot;)))
+@@ -511,11 +511,11 @@ static int test_case_variant(OSSL_PARAM *params, const struct provider_dispatch_
+         || !TEST_str_eq(app_p4, app_p4_init)    /* app value */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;p5&quot;))
+         || !TEST_size_t_eq(p-&gt;return_size,
+-                           sizeof(app_p5_init)) /* app value */
++                           sizeof(app_p5_init) - 1) /* app value */
+         || !TEST_str_eq(app_p5, app_p5_init)    /* app value */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;p6&quot;))
+         || !TEST_size_t_eq(p-&gt;return_size,
+-                           sizeof(app_p6_init)) /* app value */
++                           sizeof(app_p6_init) - 1) /* app value */
+         || !TEST_str_eq(app_p6, app_p6_init)    /* app value */
+         || !TEST_char_eq(foo[0], app_foo_init)  /* Should remain untouched */
+         || !TEST_ptr(p = OSSL_PARAM_locate(params, &quot;foo&quot;)))
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033166.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033168.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33167">[ date ]</a>
+              <a href="thread.html#33167">[ thread ]</a>
+              <a href="subject.html#33167">[ subject ]</a>
+              <a href="author.html#33167">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

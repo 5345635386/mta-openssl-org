@@ -1,0 +1,302 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  openssl-3.0 update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2022-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1644675281.878164.1704785.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="036242.html">
+   <LINK REL="Next"  HREF="036249.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  openssl-3.0 update</H1>
+    <B>bernd.edlinger at hotmail.de</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20openssl-3.0%20update&In-Reply-To=%3C1644675281.878164.1704785.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  openssl-3.0 update">bernd.edlinger at hotmail.de
+       </A><BR>
+    <I>Sat Feb 12 14:14:41 UTC 2022</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="036242.html">[openssl]  openssl-3.0 update
+</A></li>
+        <LI>Next message (by thread): <A HREF="036249.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36246">[ date ]</a>
+              <a href="thread.html#36246">[ thread ]</a>
+              <a href="subject.html#36246">[ subject ]</a>
+              <a href="author.html#36246">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch openssl-3.0 has been updated
+       via  b5bcce5df1951ba2d7dd6a167826a3fe88f1dfd9 (commit)
+      from  fc27d9f3af95aa33e5028c6cef8d56d1c7f17436 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit b5bcce5df1951ba2d7dd6a167826a3fe88f1dfd9
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Fri Jan 14 10:01:29 2022 +0100
+
+    Cleanup record length checks for KTLS
+    
+    In some corner cases the check for packets
+    which exceed the allowed record length was missing
+    when KTLS is initially enabled, when some
+    unprocessed packets are still pending.
+    
+    Add at least some tests for KTLS, since we have
+    currently not very much test coverage for KTLS.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/17504">https://github.com/openssl/openssl/pull/17504</A>)
+    
+    (cherry picked from commit 8fff986d52606e1a33f9404504535e2e2aee3e8b)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/record/ssl3_record.c       | 27 +++++++++++++++++++++------
+ test/recipes/80-test_ssl_old.t | 22 ++++++++++++++++------
+ test/ssl_old_test.c            | 11 +++++++++++
+ 3 files changed, 48 insertions(+), 12 deletions(-)
+
+diff --git a/ssl/record/ssl3_record.c b/ssl/record/ssl3_record.c
+index d4101618c6..4229c9c392 100644
+--- a/ssl/record/ssl3_record.c
++++ b/ssl/record/ssl3_record.c
+@@ -191,7 +191,7 @@ int ssl3_get_record(SSL *s)
+ 
+     rr = RECORD_LAYER_get_rrec(&amp;s-&gt;rlayer);
+     rbuf = RECORD_LAYER_get_rbuf(&amp;s-&gt;rlayer);
+-    is_ktls_left = (rbuf-&gt;left &gt; 0);
++    is_ktls_left = (SSL3_BUFFER_get_left(rbuf) &gt; 0);
+     max_recs = s-&gt;max_pipelines;
+     if (max_recs == 0)
+         max_recs = 1;
+@@ -408,7 +408,11 @@ int ssl3_get_record(SSL *s)
+                 len -= SSL3_RT_MAX_COMPRESSED_OVERHEAD;
+ #endif
+ 
+-            if (thisrr-&gt;length &gt; len &amp;&amp; !BIO_get_ktls_recv(s-&gt;rbio)) {
++            /* KTLS may use all of the buffer */
++            if (BIO_get_ktls_recv(s-&gt;rbio) &amp;&amp; !is_ktls_left)
++                len = SSL3_BUFFER_get_left(rbuf);
++
++            if (thisrr-&gt;length &gt; len) {
+                 SSLfatal(s, SSL_AD_RECORD_OVERFLOW,
+                          SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
+                 return -1;
+@@ -711,16 +715,27 @@ int ssl3_get_record(SSL *s)
+             goto end;
+         }
+ 
++        /*
++         * Usually thisrr-&gt;length is the length of a single record, but when
++         * KTLS handles the decryption, thisrr-&gt;length may be larger than
++         * SSL3_RT_MAX_PLAIN_LENGTH because the kernel may have coalesced
++         * multiple records.
++         * Therefore we have to rely on KTLS to check the plaintext length
++         * limit in the kernel.
++         */
+         if (thisrr-&gt;length &gt; SSL3_RT_MAX_PLAIN_LENGTH
+-            &amp;&amp; !BIO_get_ktls_recv(s-&gt;rbio)) {
++                &amp;&amp; (!BIO_get_ktls_recv(s-&gt;rbio) || is_ktls_left)) {
+             SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_R_DATA_LENGTH_TOO_LONG);
+             goto end;
+         }
+ 
+-        /* If received packet overflows current Max Fragment Length setting */
++        /*
++         * Check if the received packet overflows the current
++         * Max Fragment Length setting.
++         * Note: USE_MAX_FRAGMENT_LENGTH_EXT and KTLS are mutually exclusive.
++         */
+         if (s-&gt;session != NULL &amp;&amp; USE_MAX_FRAGMENT_LENGTH_EXT(s-&gt;session)
+-                &amp;&amp; thisrr-&gt;length &gt; GET_MAX_FRAGMENT_LENGTH(s-&gt;session)
+-                &amp;&amp; !BIO_get_ktls_recv(s-&gt;rbio)) {
++                &amp;&amp; thisrr-&gt;length &gt; GET_MAX_FRAGMENT_LENGTH(s-&gt;session)) {
+             SSLfatal(s, SSL_AD_RECORD_OVERFLOW, SSL_R_DATA_LENGTH_TOO_LONG);
+             goto end;
+         }
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index b144bc9fb9..c1fb30f6b2 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -346,11 +346,9 @@ sub testssl {
+     }
+ 
+ 
+-    # plan tests =&gt; 11;
+-
+     subtest 'standard SSL tests' =&gt; sub {
+         ######################################################################
+-        plan tests =&gt; 13;
++        plan tests =&gt; 19;
+ 
+       SKIP: {
+           skip &quot;SSLv3 is not supported by this OpenSSL build&quot;, 4
+@@ -378,7 +376,7 @@ sub testssl {
+         }
+ 
+       SKIP: {
+-          skip &quot;Neither SSLv3 nor any TLS version are supported by this OpenSSL build&quot;, 8
++          skip &quot;Neither SSLv3 nor any TLS version are supported by this OpenSSL build&quot;, 14
+               if $no_anytls;
+ 
+         SKIP: {
+@@ -406,17 +404,29 @@ sub testssl {
+              'test sslv2/sslv3 with both client and server authentication via BIO pair and app verify');
+ 
+         SKIP: {
+-            skip &quot;No IPv4 available on this machine&quot;, 1
++            skip &quot;No IPv4 available on this machine&quot;, 4
+                 unless !disabled(&quot;sock&quot;) &amp;&amp; have_IPv4();
+             ok(run(test([@ssltest, &quot;-ipv4&quot;])),
+                'test TLS via IPv4');
++            ok(run(test([@ssltest, &quot;-ipv4&quot;, &quot;-client_ktls&quot;])),
++               'test TLS via IPv4 + ktls(client)');
++            ok(run(test([@ssltest, &quot;-ipv4&quot;, &quot;-server_ktls&quot;])),
++               'test TLS via IPv4 + ktls(server)');
++            ok(run(test([@ssltest, &quot;-ipv4&quot;, &quot;-client_ktls&quot;, &quot;-server_ktls&quot;])),
++               'test TLS via IPv4 + ktls');
+           }
+ 
+         SKIP: {
+-            skip &quot;No IPv6 available on this machine&quot;, 1
++            skip &quot;No IPv6 available on this machine&quot;, 4
+                 unless !disabled(&quot;sock&quot;) &amp;&amp; have_IPv6();
+             ok(run(test([@ssltest, &quot;-ipv6&quot;])),
+                'test TLS via IPv6');
++            ok(run(test([@ssltest, &quot;-ipv6&quot;, &quot;-client_ktls&quot;])),
++               'test TLS via IPv6 + ktls(client)');
++            ok(run(test([@ssltest, &quot;-ipv6&quot;, &quot;-server_ktls&quot;])),
++               'test TLS via IPv6 + ktls(client)');
++            ok(run(test([@ssltest, &quot;-ipv6&quot;, &quot;-client_ktls&quot;, &quot;-server_ktls&quot;])),
++               'test TLS via IPv6 + ktls');
+           }
+         }
+     };
+diff --git a/test/ssl_old_test.c b/test/ssl_old_test.c
+index 6a206d595e..f1e678623c 100644
+--- a/test/ssl_old_test.c
++++ b/test/ssl_old_test.c
+@@ -711,6 +711,8 @@ static void sv_usage(void)
+     fprintf(stderr, &quot; -client_sess_in &lt;file&gt;     - Read the client session from a file\n&quot;);
+     fprintf(stderr, &quot; -should_reuse &lt;number&gt;     - The expected state of reusing the session\n&quot;);
+     fprintf(stderr, &quot; -no_ticket    - do not issue TLS session ticket\n&quot;);
++    fprintf(stderr, &quot; -client_ktls  - try to enable client KTLS\n&quot;);
++    fprintf(stderr, &quot; -server_ktls  - try to enable server KTLS\n&quot;);
+     fprintf(stderr, &quot; -provider &lt;name&gt;    - Load the given provider into the library context\n&quot;);
+     fprintf(stderr, &quot; -config &lt;cnf&gt;    - Load the given config file into the library context\n&quot;);
+ }
+@@ -883,6 +885,7 @@ int main(int argc, char *argv[])
+     int number = 1, reuse = 0;
+     int should_reuse = -1;
+     int no_ticket = 0;
++    int client_ktls = 0, server_ktls = 0;
+     long bytes = 256L;
+ #ifndef OPENSSL_NO_DH
+     EVP_PKEY *dhpkey;
+@@ -1167,6 +1170,10 @@ int main(int argc, char *argv[])
+             should_reuse = !!atoi(*(++argv));
+         } else if (strcmp(*argv, &quot;-no_ticket&quot;) == 0) {
+             no_ticket = 1;
++        } else if (strcmp(*argv, &quot;-client_ktls&quot;) == 0) {
++            client_ktls = 1;
++        } else if (strcmp(*argv, &quot;-server_ktls&quot;) == 0) {
++            server_ktls = 1;
+         } else if (strcmp(*argv, &quot;-provider&quot;) == 0) {
+             if (--argc &lt; 1)
+                 goto bad;
+@@ -1724,6 +1731,10 @@ int main(int argc, char *argv[])
+ 
+     if (sn_client)
+         SSL_set_tlsext_host_name(c_ssl, sn_client);
++    if (client_ktls)
++        SSL_set_options(c_ssl, SSL_OP_ENABLE_KTLS);
++    if (server_ktls)
++        SSL_set_options(s_ssl, SSL_OP_ENABLE_KTLS);
+ 
+     if (!set_protocol_version(server_min_proto, s_ssl, SSL_CTRL_SET_MIN_PROTO_VERSION))
+         goto end;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="036242.html">[openssl]  openssl-3.0 update
+</A></li>
+	<LI>Next message (by thread): <A HREF="036249.html">[openssl]  openssl-3.0 update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36246">[ date ]</a>
+              <a href="thread.html#36246">[ thread ]</a>
+              <a href="subject.html#36246">[ subject ]</a>
+              <a href="author.html#36246">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

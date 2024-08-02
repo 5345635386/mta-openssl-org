@@ -1,0 +1,523 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1455700374.092274.29128.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004153.html">
+   <LINK REL="Next"  HREF="004167.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1455700374.092274.29128.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed Feb 17 09:12:54 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004153.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="004167.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4161">[ date ]</a>
+              <a href="thread.html#4161">[ thread ]</a>
+              <a href="subject.html#4161">[ subject ]</a>
+              <a href="author.html#4161">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  fa9bb6201e1d16ba8ccab938833d140ef81a7f73 (commit)
+       via  05c7b1631b4f6884b9ef5f0943a3d16d36383f52 (commit)
+      from  e159fd154362dbaa03c2aaa80e758312bd99fbab (commit)
+
+
+- Log -----------------------------------------------------------------
+commit fa9bb6201e1d16ba8ccab938833d140ef81a7f73
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 17 02:32:27 2016 +0100
+
+    Update the documentation on heap allocators /  deallocators
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+commit 05c7b1631b4f6884b9ef5f0943a3d16d36383f52
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 17 02:24:25 2016 +0100
+
+    Implement the use of heap manipulator implementions
+    
+    - Make use of the functions given through CRYPTO_set_mem_functions().
+    - CRYPTO_free(), CRYPTO_clear_free() and CRYPTO_secure_free() now receive
+      __FILE__ and __LINE__.
+    - The API for CRYPTO_set_mem_functions() and CRYPTO_get_mem_functions()
+      is slightly changed, the implementation for free() now takes a couple
+      of extra arguments, taking __FILE__ and __LINE__.
+    - The CRYPTO_ memory functions will *always* receive __FILE__ and __LINE__
+      from the corresponding OPENSSL_ macros, regardless of if crypto-mdebug
+      has been enabled or not.  The reason is that if someone swaps out the
+      malloc(), realloc() and free() implementations, we can't know if they
+      will use them or not.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem.c                         | 65 +++++++++++++++----------------
+ crypto/mem_dbg.c                     |  3 +-
+ crypto/mem_sec.c                     |  4 +-
+ doc/crypto/OPENSSL_malloc.pod        | 27 ++++++++-----
+ doc/crypto/OPENSSL_secure_malloc.pod |  5 ++-
+ include/openssl/crypto.h             | 75 +++++++++++-------------------------
+ ssl/t1_enc.c                         |  4 +-
+ 7 files changed, 80 insertions(+), 103 deletions(-)
+
+diff --git a/crypto/mem.c b/crypto/mem.c
+index 1e34904..46f0017 100644
+--- a/crypto/mem.c
++++ b/crypto/mem.c
+@@ -66,11 +66,11 @@
+  */
+ static int allow_customize = 1;
+ 
+-static void *(*malloc_wrapper)(size_t, const char *, int)
++static void *(*malloc_impl)(size_t, const char *, int)
+     = CRYPTO_malloc;
+-static void *(*realloc_wrapper)(void *, size_t, const char *, int)
++static void *(*realloc_impl)(void *, size_t, const char *, int)
+     = CRYPTO_realloc;
+-static void (*free_wrapper)(void *)
++static void (*free_impl)(void *, const char *, int)
+     = CRYPTO_free;
+ 
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
+@@ -82,16 +82,16 @@ static int call_malloc_debug = 0;
+ int CRYPTO_set_mem_functions(
+         void *(*m)(size_t, const char *, int),
+         void *(*r)(void *, size_t, const char *, int),
+-        void (*f)(void *))
++        void (*f)(void *, const char *, int))
+ {
+     if (!allow_customize)
+         return 0;
+     if (m)
+-        malloc_wrapper = m;
++        malloc_impl = m;
+     if (r)
+-        realloc_wrapper = r;
++        realloc_impl = r;
+     if (f)
+-        free_wrapper = f;
++        free_impl = f;
+     return 1;
+ }
+ 
+@@ -106,20 +106,23 @@ int CRYPTO_set_mem_debug(int flag)
+ void CRYPTO_get_mem_functions(
+         void *(**m)(size_t, const char *, int),
+         void *(**r)(void *, size_t, const char *, int),
+-        void (**f)(void *))
++        void (**f)(void *, const char *, int))
+ {
+     if (m != NULL)
+-        *m = malloc_wrapper;
++        *m = malloc_impl;
+     if (r != NULL)
+-        *r = realloc_wrapper;
++        *r = realloc_impl;
+     if (f != NULL)
+-        *f = free_wrapper;
++        *f = free_impl;
+ }
+ 
+ void *CRYPTO_malloc(size_t num, const char *file, int line)
+ {
+     void *ret = NULL;
+ 
++    if (malloc_impl != NULL &amp;&amp; malloc_impl != CRYPTO_malloc)
++        return malloc_impl(num, file, line);
++
+     if (num &lt;= 0)
+         return NULL;
+ 
+@@ -164,11 +167,14 @@ void *CRYPTO_zalloc(size_t num, const char *file, int line)
+ 
+ void *CRYPTO_realloc(void *str, size_t num, const char *file, int line)
+ {
++    if (realloc_impl != NULL &amp;&amp; realloc_impl != &amp;CRYPTO_realloc)
++        return realloc_impl(str, num, file, line);
++
+     if (str == NULL)
+         return CRYPTO_malloc(num, file, line);
+ 
+     if (num == 0) {
+-        CRYPTO_free(str);
++        CRYPTO_free(str, file, line);
+         return NULL;
+     }
+ 
+@@ -198,7 +204,7 @@ void *CRYPTO_clear_realloc(void *str, size_t old_len, size_t num,
+         return CRYPTO_malloc(num, file, line);
+ 
+     if (num == 0) {
+-        CRYPTO_clear_free(str, old_len);
++        CRYPTO_clear_free(str, old_len, file, line);
+         return NULL;
+     }
+ 
+@@ -208,35 +214,26 @@ void *CRYPTO_clear_realloc(void *str, size_t old_len, size_t num,
+         return str;
+     }
+ 
+-    /* Allocate new memory.  Call malloc and do a copy, so that we can
+-     * cleanse the old buffer. */
+-#ifndef OPENSSL_NO_CRYPTO_MDEBUG
+-    if (call_malloc_debug) {
+-        CRYPTO_mem_debug_realloc(str, NULL, num, 0, file, line);
+-        ret = malloc(num);
+-        CRYPTO_mem_debug_realloc(str, ret, num, 1, file, line);
+-    } else {
+-        ret = malloc(num);
+-    }
+-#else
+-    (void)file;
+-    (void)line;
+-    ret = malloc(num);
+-#endif
++    ret = CRYPTO_malloc(num, file, line);
+ 
+     if (ret)
+         memcpy(ret, str, old_len);
+-    CRYPTO_clear_free(str, old_len);
++    CRYPTO_clear_free(str, old_len, file, line);
+     return ret;
+ }
+ 
+-void CRYPTO_free(void *str)
++void CRYPTO_free(void *str, const char *file, int line)
+ {
++    if (free_impl != NULL &amp;&amp; free_impl != &amp;CRYPTO_free) {
++        free_impl(str, file, line);
++        return;
++    }
++
+ #ifndef OPENSSL_NO_CRYPTO_MDEBUG
+     if (call_malloc_debug) {
+-        CRYPTO_mem_debug_free(str, 0);
++        CRYPTO_mem_debug_free(str, 0, file, line);
+         free(str);
+-        CRYPTO_mem_debug_free(str, 1);
++        CRYPTO_mem_debug_free(str, 1, file, line);
+     } else {
+         free(str);
+     }
+@@ -245,11 +242,11 @@ void CRYPTO_free(void *str)
+ #endif
+ }
+ 
+-void CRYPTO_clear_free(void *str, size_t num)
++void CRYPTO_clear_free(void *str, size_t num, const char *file, int line)
+ {
+     if (str == NULL)
+         return;
+     if (num)
+         OPENSSL_cleanse(str, num);
+-    CRYPTO_free(str);
++    CRYPTO_free(str, file, line);
+ }
+diff --git a/crypto/mem_dbg.c b/crypto/mem_dbg.c
+index b905fab..f2a1fd8 100644
+--- a/crypto/mem_dbg.c
++++ b/crypto/mem_dbg.c
+@@ -474,7 +474,8 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int before_p,
+     return;
+ }
+ 
+-void CRYPTO_mem_debug_free(void *addr, int before_p)
++void CRYPTO_mem_debug_free(void *addr, int before_p,
++        const char *file, int line)
+ {
+     MEM m, *mp;
+ 
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 196c245..be3bb9a 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -120,7 +120,7 @@ void *CRYPTO_secure_zalloc(size_t num, const char *file, int line)
+     return ret;
+ }
+ 
+-void CRYPTO_secure_free(void *ptr)
++void CRYPTO_secure_free(void *ptr, const char *file, int line)
+ {
+ #ifdef IMPLEMENTED
+     size_t actual_size;
+@@ -128,7 +128,7 @@ void CRYPTO_secure_free(void *ptr)
+     if (ptr == NULL)
+         return;
+     if (!secure_mem_initialized) {
+-        CRYPTO_free(ptr);
++        CRYPTO_free(ptr, file, line);
+         return;
+     }
+     LOCK();
+diff --git a/doc/crypto/OPENSSL_malloc.pod b/doc/crypto/OPENSSL_malloc.pod
+index 9dfeb39..04fa0b7 100644
+--- a/doc/crypto/OPENSSL_malloc.pod
++++ b/doc/crypto/OPENSSL_malloc.pod
+@@ -34,20 +34,20 @@ CRYPTO_mem_leaks, CRYPTO_mem_leaks_fp - Memory allocation functions
+  void *CRYPTO_malloc(size_t num, const char *file, int line)
+  void *CRYPTO_zalloc(size_t num, const char *file, int line)
+  void *CRYPTO_realloc(void *p, size_t num, const char *file, int line)
+- void CRYPTO_free(void *str)
++ void CRYPTO_free(void *str, const char *, int)
+  char *CRYPTO_strdup(const char *p, const char *file, int line)
+  char *CRYPTO_strndup(const char *p, size_t num, const char *file, int line)
+  void *CRYPTO_clear_realloc(void *p, size_t old_len, size_t num, const char *file, int line)
+- void CRYPTO_clear_free(void *str, size_t num)
++ void CRYPTO_clear_free(void *str, size_t num, const char *, int)
+ 
+  void CRYPTO_get_mem_functions(
+          void *(**m)(size_t, const char *, int),
+          void *(**r)(void *, size_t, const char *, int),
+-         void (**f)(void *))
++         void (**f)(void *, const char *, int))
+  int CRYPTO_set_mem_functions(
+          void *(*m)(size_t, const char *, int),
+          void *(*r)(void *, size_t, const char *, int),
+-         void (*f)(void *))
++         void (*f)(void *, const char *, int))
+ 
+  int CRYPTO_set_mem_debug(int onoff)
+ 
+@@ -96,12 +96,11 @@ OPENSSL_strlcat() and OPENSSL_strnlen() are equivalents of the common C
+ library functions and are provided for portability.
+ 
+ If no allocations have been done, it is possible to &quot;swap out&quot; the default
+-implementations and replace them with alternate versions, or wrappers that
+-do some additional housekeeping and then defer to the OpenSSL implementation.
+-The CRYPTO_get_mem_functions() function fills in the function pointers for
+-with the current functions (normally, and by default,
+-CRYPTO_malloc(), CRYPTO_realloc(), and CRYPTO_free()).
+-The CRYPTO_set_mem_functions() specifies a different set of functions.
++implementations for OPENSSL_malloc(), OPENSSL_realloc and OPENSSL_free()
++and replace them with alternate versions (hooks).
++CRYPTO_get_mem_functions() function fills in the given arguments with the
++function pointers for the current implementations.
++With CRYPTO_set_mem_functions(), you can specify a different set of functions.
+ If any of B&lt;m&gt;, B&lt;r&gt;, or B&lt;f&gt; are NULL, then the function is not changed.
+ 
+ The default implementation can include some debugging capability (if enabled
+@@ -160,4 +159,12 @@ CRYPTO_mem_ctrl() returns the previous value of the mode.
+ OPENSSL_mem_debug_push() and OPENSSL_mem_debug_pop()
+ return 1 on success or 0 on failure.
+ 
++=head1 NOTES
++
++While it's permitted to swap out only a few and not all the functions
++with CRYPTO_set_mem_functions(), it's recommended to swap them all out
++at once.  I&lt;This applies specially if OpenSSL was built with the
++configuration option&gt; C&lt;crypto-mdebug&gt; I&lt;enabled.  In case, swapping out
++only, say, the malloc() implementation is outright dangerous.&gt;
++
+ =cut
+diff --git a/doc/crypto/OPENSSL_secure_malloc.pod b/doc/crypto/OPENSSL_secure_malloc.pod
+index a055f1d..3423eb0 100644
+--- a/doc/crypto/OPENSSL_secure_malloc.pod
++++ b/doc/crypto/OPENSSL_secure_malloc.pod
+@@ -25,7 +25,7 @@ CYRPTO_secure_malloc_used - secure heap storage
+  void *CRYPTO_secure_zalloc(int num, const char *file, int line);
+ 
+  void OPENSSL_secure_free(void* ptr);
+- void CRYPTO_secure_free(void *ptr);
++ void CRYPTO_secure_free(void *ptr, const char *, int);
+ 
+  size_t OPENSSL_secure_actual_size(const void *ptr);
+  int OPENSSL_secure_allocated(const void *ptr);
+@@ -74,7 +74,8 @@ OPENSSL_secure_malloc().
+ If CRYPTO_secure_malloc_init() is not called, this is equivalent to
+ calling OPENSSL_free().
+ It exists for consistency with OPENSSL_secure_malloc() , and
+-is a macro that expands to CRYPTO_secure_free().
++is a macro that expands to CRYPTO_secure_free() and adds the C&lt;__FILE__&gt;
++and C&lt;__LINE__&gt; parameters..
+ 
+ OPENSSL_secure_allocated() tells whether or not a pointer is within
+ the secure heap.
+diff --git a/include/openssl/crypto.h b/include/openssl/crypto.h
+index 7191915..0a88b66 100644
+--- a/include/openssl/crypto.h
++++ b/include/openssl/crypto.h
+@@ -292,63 +292,33 @@ DEFINE_STACK_OF(void)
+ 
+ int CRYPTO_mem_ctrl(int mode);
+ 
+-# ifndef OPENSSL_NO_CRYPTO_MDEBUG
+-#  define OPENSSL_malloc(num) \
++# define OPENSSL_malloc(num) \
+         CRYPTO_malloc(num, __FILE__, __LINE__)
+-#  define OPENSSL_zalloc(num) \
++# define OPENSSL_zalloc(num) \
+         CRYPTO_zalloc(num, __FILE__, __LINE__)
+-#  define OPENSSL_realloc(addr, num) \
++# define OPENSSL_realloc(addr, num) \
+         CRYPTO_realloc(addr, num, __FILE__, __LINE__)
+-#  define OPENSSL_clear_realloc(addr, old_num, num) \
++# define OPENSSL_clear_realloc(addr, old_num, num) \
+         CRYPTO_clear_realloc(addr, old_num, num, __FILE__, __LINE__)
+-#  define OPENSSL_clear_free(addr, num) \
+-        CRYPTO_clear_free(addr, num)
+-#  define OPENSSL_free(addr) \
+-        CRYPTO_free(addr)
+-#  define OPENSSL_memdup(str, s) \
++# define OPENSSL_clear_free(addr, num) \
++        CRYPTO_clear_free(addr, num, __FILE__, __LINE__)
++# define OPENSSL_free(addr) \
++        CRYPTO_free(addr, __FILE__, __LINE__)
++# define OPENSSL_memdup(str, s) \
+         CRYPTO_memdup((str), s, __FILE__, __LINE__)
+-#  define OPENSSL_strdup(str) \
++# define OPENSSL_strdup(str) \
+         CRYPTO_strdup(str, __FILE__, __LINE__)
+-#  define OPENSSL_strndup(str, n) \
++# define OPENSSL_strndup(str, n) \
+         CRYPTO_strndup(str, n, __FILE__, __LINE__)
+-#  define OPENSSL_secure_malloc(num) \
++# define OPENSSL_secure_malloc(num) \
+         CRYPTO_secure_malloc(num, __FILE__, __LINE__)
+-#  define OPENSSL_secure_zalloc(num) \
++# define OPENSSL_secure_zalloc(num) \
+         CRYPTO_secure_zalloc(num, __FILE__, __LINE__)
+-#  define OPENSSL_secure_free(addr) \
+-        CRYPTO_secure_free(addr)
+-#  define OPENSSL_secure_actual_size(ptr) \
+-        CRYPTO_secure_actual_size(ptr)
+-# else
+-#  define OPENSSL_malloc(num) \
+-        CRYPTO_malloc(num, NULL, 0)
+-#  define OPENSSL_zalloc(num) \
+-        CRYPTO_zalloc(num, NULL, 0)
+-#  define OPENSSL_realloc(addr, num) \
+-        CRYPTO_realloc(addr, num, NULL, 0)
+-#  define OPENSSL_clear_realloc(addr, old_num, num) \
+-        CRYPTO_clear_realloc(addr, old_num, num, NULL, 0)
+-#  define OPENSSL_clear_free(addr, num) \
+-        CRYPTO_clear_free(addr, num)
+-#  define OPENSSL_free(addr) \
+-        CRYPTO_free(addr)
+-#  define OPENSSL_memdup(str, s) \
+-        CRYPTO_memdup(str, s, NULL, 0)
+-#  define OPENSSL_strdup(str) \
+-        CRYPTO_strdup(str, NULL, 0)
+-#  define OPENSSL_strndup(str, s) \
+-        CRYPTO_strndup(str, s, NULL, 0)
+-#  define OPENSSL_secure_malloc(num) \
+-        CRYPTO_secure_malloc(num, NULL, 0)
+-#  define OPENSSL_secure_zalloc(num) \
+-        CRYPTO_secure_zalloc(num, NULL, 0)
+-#  define OPENSSL_secure_free(addr) \
+-        CRYPTO_secure_free(addr)
+-#  define OPENSSL_secure_actual_size(ptr) \
++# define OPENSSL_secure_free(addr) \
++        CRYPTO_secure_free(addr, __FILE__, __LINE__)
++# define OPENSSL_secure_actual_size(ptr) \
+         CRYPTO_secure_actual_size(ptr)
+ 
+-# endif
+-
+ size_t OPENSSL_strlcpy(char *dst, const char *src, size_t siz);
+ size_t OPENSSL_strlcat(char *dst, const char *src, size_t siz);
+ size_t OPENSSL_strnlen(const char *str, size_t maxlen);
+@@ -463,20 +433,20 @@ void (*CRYPTO_get_dynlock_destroy_callback(void)) (struct CRYPTO_dynlock_value
+ int CRYPTO_set_mem_functions(
+         void *(*m) (size_t, const char *, int),
+         void *(*r) (void *, size_t, const char *, int),
+-        void (*f) (void *));
++        void (*f) (void *, const char *, int));
+ int CRYPTO_set_mem_debug(int flag);
+ void CRYPTO_get_mem_functions(
+         void *(**m) (size_t, const char *, int),
+         void *(**r) (void *, size_t, const char *, int),
+-        void (**f) (void *));
++        void (**f) (void *, const char *, int));
+ 
+ void *CRYPTO_malloc(size_t num, const char *file, int line);
+ void *CRYPTO_zalloc(size_t num, const char *file, int line);
+ void *CRYPTO_memdup(const void *str, size_t siz, const char *file, int line);
+ char *CRYPTO_strdup(const char *str, const char *file, int line);
+ char *CRYPTO_strndup(const char *str, size_t s, const char *file, int line);
+-void CRYPTO_free(void *ptr);
+-void CRYPTO_clear_free(void *ptr, size_t num);
++void CRYPTO_free(void *ptr, const char *file, int line);
++void CRYPTO_clear_free(void *ptr, size_t num, const char *file, int line);
+ void *CRYPTO_realloc(void *addr, size_t num, const char *file, int line);
+ void *CRYPTO_clear_realloc(void *addr, size_t old_num, size_t num,
+                            const char *file, int line);
+@@ -485,7 +455,7 @@ int CRYPTO_secure_malloc_init(size_t sz, int minsize);
+ void CRYPTO_secure_malloc_done(void);
+ void *CRYPTO_secure_malloc(size_t num, const char *file, int line);
+ void *CRYPTO_secure_zalloc(size_t num, const char *file, int line);
+-void CRYPTO_secure_free(void *ptr);
++void CRYPTO_secure_free(void *ptr, const char *file, int line);
+ int CRYPTO_secure_allocated(const void *ptr);
+ int CRYPTO_secure_malloc_initialized(void);
+ size_t CRYPTO_secure_actual_size(void *ptr);
+@@ -511,7 +481,8 @@ void CRYPTO_mem_debug_malloc(void *addr, size_t num, int flag,
+         const char *file, int line);
+ void CRYPTO_mem_debug_realloc(void *addr1, void *addr2, size_t num, int flag,
+         const char *file, int line);
+-void CRYPTO_mem_debug_free(void *addr, int flag);
++void CRYPTO_mem_debug_free(void *addr, int flag,
++        const char *file, int line);
+ 
+ #  ifndef OPENSSL_NO_STDIO
+ int CRYPTO_mem_leaks_fp(FILE *);
+diff --git a/ssl/t1_enc.c b/ssl/t1_enc.c
+index f3593f1..804803a 100644
+--- a/ssl/t1_enc.c
++++ b/ssl/t1_enc.c
+@@ -728,8 +728,8 @@ int tls1_export_keying_material(SSL *s, unsigned char *out, size_t olen,
+     SSLerr(SSL_F_TLS1_EXPORT_KEYING_MATERIAL, ERR_R_MALLOC_FAILURE);
+     rv = 0;
+  ret:
+-    CRYPTO_clear_free(val, vallen);
+-    CRYPTO_clear_free(buff, olen);
++    OPENSSL_clear_free(val, vallen);
++    OPENSSL_clear_free(buff, olen);
+     return (rv);
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004153.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="004167.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4161">[ date ]</a>
+              <a href="thread.html#4161">[ thread ]</a>
+              <a href="subject.html#4161">[ subject ]</a>
+              <a href="author.html#4161">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

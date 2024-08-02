@@ -1,0 +1,322 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1566281511.817466.12498.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024550.html">
+   <LINK REL="Next"  HREF="024560.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1566281511.817466.12498.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Tue Aug 20 06:11:51 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024550.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="024560.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24554">[ date ]</a>
+              <a href="thread.html#24554">[ thread ]</a>
+              <a href="subject.html#24554">[ subject ]</a>
+              <a href="author.html#24554">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3a5777501a97cc3fbf2884f6f3f966661a3f2e41 (commit)
+      from  cf0932cdd94f067ed18ce78bea038d919f69038f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3a5777501a97cc3fbf2884f6f3f966661a3f2e41
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Tue Aug 20 16:10:49 2019 +1000
+
+    Start up DEVRANDOM entropy improvement for older Linux devices.
+    
+    Improve handling of low entropy at start up from /dev/urandom by waiting for
+    a read(2) call on /dev/random to succeed.  Once one such call has succeeded,
+    a shared memory segment is created and persisted as an indicator to other
+    processes that /dev/urandom is properly seeded.
+    
+    This does not fully prevent against attacks weakening the entropy source.
+    An attacker who has control of the machine early in its boot sequence
+    could create the shared memory segment preventing detection of low entropy
+    conditions.  However, this is no worse than the current situation.
+    
+    An attacker would also be capable of removing the shared memory segment
+    and causing seeding to reoccur resulting in a denial of service attack.
+    This is partially mitigated by keeping the shared memory alive for the
+    duration of the process's existence.  Thus, an attacker would not only need
+    to have called call shmctl(2) with the IPC_RMID command but the system
+    must subsequently enter a state where no instances of libcrypto exist in
+    any process.  Even one long running process will prevent this attack.
+    
+    The System V shared memory calls used here go back at least as far as
+    Linux kernel 2.0.  Linux kernels 4.8 and later, don't have a reliable way
+    to detect that /dev/urandom has been properly seeded, so a failure is raised
+    for this case (i.e. the getentropy(2) call has already failed).
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9595">https://github.com/openssl/openssl/pull/9595</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES                 |   9 ++++
+ crypto/rand/rand_unix.c | 107 +++++++++++++++++++++++++++++++++++++++++++++---
+ e_os.h                  |  29 +++++++++++++
+ 3 files changed, 139 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index e3131f0ef8..c5f42ecce0 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -9,6 +9,15 @@
+ 
+  Changes between 1.1.1 and 3.0.0 [xx XXX xxxx]
+ 
++  *) Early start up entropy quality from the DEVRANDOM seed source has been
++     improved for older Linux systems.  The RAND subsystem will wait for
++     /dev/random to be producing output before seeding from /dev/urandom.
++     The seeded state is stored for future library initialisations using
++     a system global shared memory segment.  The shared memory identifier
++     can be configured by defining OSSL_SHM_SEEDED to the desired value.
++     The default identifier is 114.
++     [Paul Dale]
++
+   *) Revised BN_generate_prime_ex to not avoid factors 2..17863 in p-1
+      when primes for RSA keys are computed.
+      Since we previously always generated primes == 2 (mod 3) for RSA keys,
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index bf5c4c3499..0ca66e41ff 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -14,12 +14,16 @@
+ #include &lt;stdio.h&gt;
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/rand.h&gt;
++#include &lt;openssl/crypto.h&gt;
+ #include &quot;rand_lcl.h&quot;
+ #include &quot;internal/rand_int.h&quot;
+ #include &lt;stdio.h&gt;
+ #include &quot;internal/dso.h&quot;
+ #if defined(__linux)
+ # include &lt;asm/unistd.h&gt;
++# include &lt;sys/ipc.h&gt;
++# include &lt;sys/shm.h&gt;
++# include &lt;sys/utsname.h&gt;
+ #endif
+ #if defined(__FreeBSD__) &amp;&amp; !defined(OPENSSL_SYS_UEFI)
+ # include &lt;sys/types.h&gt;
+@@ -336,6 +340,96 @@ static struct random_device {
+ } random_devices[OSSL_NELEM(random_device_paths)];
+ static int keep_random_devices_open = 1;
+ 
++#   if defined(__linux) &amp;&amp; defined(DEVRANDOM_WAIT)
++static void *shm_addr;
++
++#    if !defined(FIPS_MODE)
++static void cleanup_shm(void)
++{
++    shmdt(shm_addr);
++}
++#    endif
++
++/*
++ * Ensure that the system randomness source has been adequately seeded.
++ * This is done by having the first start of libcrypto, wait until the device
++ * /dev/random becomes able to supply a byte of entropy.  Subsequent starts
++ * of the library and later reseedings do not need to do this.
++ */
++static int wait_random_seeded(void)
++{
++    static int seeded = OPENSSL_RAND_SEED_DEVRANDOM_SHM_ID &lt; 0;
++    static const int kernel_version[] = { DEVRANDOM_SAFE_KERNEL };
++    int kernel[2];
++    int shm_id, fd, r;
++    char c, *p;
++    struct utsname un;
++    fd_set fds;
++
++    if (!seeded) {
++        /* See if anthing has created the global seeded indication */
++        if ((shm_id = shmget(OPENSSL_RAND_SEED_DEVRANDOM_SHM_ID, 1, 0)) == -1) {
++            /*
++             * Check the kernel's version and fail if it is too recent.
++             *
++             * Linux kernels from 4.8 onwards do not guarantee that
++             * /dev/urandom is properly seeded when /dev/random becomes
++             * readable.  However, such kernels support the getentropy(2)
++             * system call and this should always succeed which renders
++             * this alternative but essentially identical source moot.
++             */
++            if (uname(&amp;un) == 0) {
++                kernel[0] = atoi(un.release);
++                p = strchr(un.release, '.');
++                kernel[1] = p == NULL ? 0 : atoi(p + 1);
++                if (kernel[0] &gt; kernel_version[0]
++                    || (kernel[0] == kernel_version[0]
++                        &amp;&amp; kernel[1] &gt;= kernel_version[1])) {
++                    return 0;
++                }
++            }
++            /* Open /dev/random and wait for it to be readable */
++            if ((fd = open(DEVRANDOM_WAIT, O_RDONLY)) != -1) {
++                if (DEVRANDM_WAIT_USE_SELECT) {
++                    FD_ZERO(&amp;fds);
++                    FD_SET(fd, &amp;fds);
++                    while ((r = select(fd + 1, &amp;fds, NULL, NULL, NULL)) &lt; 0
++                           &amp;&amp; errno == EINTR);
++                } else {
++                    while ((r = read(fd, &amp;c, 1)) &lt; 0 &amp;&amp; errno == EINTR);
++                }
++                close(fd);
++                if (r == 1) {
++                    seeded = 1;
++                    /* Craete the shared memory indicator */
++                    shm_id = shmget(OPENSSL_RAND_SEED_DEVRANDOM_SHM_ID, 1,
++                                    IPC_CREAT | S_IRUSR | S_IRGRP | S_IROTH);
++                }
++            }
++        }
++        if (shm_id != -1) {
++            seeded = 1;
++            /*
++             * Map the shared memory to prevent its premature destruction.
++             * If this call fails, it isn't a big problem.
++             */
++            shm_addr = shmat(shm_id, NULL, SHM_RDONLY);
++#    ifndef FIPS_MODE
++            /* TODO 3.0: The FIPS provider doesn't have OPENSSL_atexit */
++            if (shm_addr != (void *)-1)
++                OPENSSL_atexit(&amp;cleanup_shm);
++#    endif
++        }
++    }
++    return seeded;
++}
++#   else /* defined __linux */
++static int wait_random_seeded(void)
++{
++    return 1;
++}
++#   endif
++
+ /*
+  * Verify that the file descriptor associated with the random source is
+  * still valid. The rationale for doing this is the fact that it is not
+@@ -497,13 +591,14 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ #   endif
+ 
+ #   if defined(OPENSSL_RAND_SEED_DEVRANDOM)
+-    bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
+-    {
++    if (wait_random_seeded()) {
+         size_t i;
+ 
+-        for (i = 0; bytes_needed &gt; 0 &amp;&amp; i &lt; OSSL_NELEM(random_device_paths); i++) {
++        bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
++        for (i = 0; bytes_needed &gt; 0 &amp;&amp; i &lt; OSSL_NELEM(random_device_paths);
++             i++) {
+             ssize_t bytes = 0;
+-            /* Maximum allowed number of consecutive unsuccessful attempts */
++            /* Maximum number of consecutive unsuccessful attempts */
+             int attempts = 3;
+             const int fd = get_random_device(i);
+ 
+@@ -517,7 +612,7 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+                 if (bytes &gt; 0) {
+                     rand_pool_add_end(pool, bytes, 8 * bytes);
+                     bytes_needed -= bytes;
+-                    attempts = 3; /* reset counter after successful attempt */
++                    attempts = 3; /* reset counter on successful attempt */
+                 } else if (bytes &lt; 0 &amp;&amp; errno != EINTR) {
+                     break;
+                 }
+@@ -525,7 +620,7 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+             if (bytes &lt; 0 || !keep_random_devices_open)
+                 close_random_device(i);
+ 
+-            bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
++            bytes_needed = rand_pool_bytes_needed(pool, 1);
+         }
+         entropy_available = rand_pool_entropy_available(pool);
+         if (entropy_available &gt; 0)
+diff --git a/e_os.h b/e_os.h
+index 5c887d4279..62d5c5ab1d 100644
+--- a/e_os.h
++++ b/e_os.h
+@@ -28,6 +28,35 @@
+  * default, we will try to read at least one of these files
+  */
+ #  define DEVRANDOM &quot;/dev/urandom&quot;, &quot;/dev/random&quot;, &quot;/dev/hwrng&quot;, &quot;/dev/srandom&quot;
++#  ifdef __linux
++#   ifndef DEVRANDOM_WAIT
++#    define DEVRANDOM_WAIT   &quot;/dev/random&quot;
++#   endif
++/*
++ * Linux kernels 4.8 and later changes how their random device works and there
++ * is no reliable way to tell that /dev/urandom has been seeded -- getentropy(2)
++ * should be used instead.
++ */
++#   ifndef DEVRANDOM_SAFE_KERNEL
++#    define DEVRANDOM_SAFE_KERNEL        4, 8
++#   endif
++/*
++ * Some operating systems do not permit select(2) on their random devices,
++ * defining this to zero will force the used of read(2) to extract one byte
++ * from /dev/random.
++ */
++#   ifndef DEVRANDM_WAIT_USE_SELECT
++#    define DEVRANDM_WAIT_USE_SELECT     1
++#   endif
++/*
++ * Define the shared memory identifier used to indicate if the operating
++ * system has properly seeded the DEVRANDOM source.
++ */
++#   ifndef OPENSSL_RAND_SEED_DEVRANDOM_SHM_ID
++#    define OPENSSL_RAND_SEED_DEVRANDOM_SHM_ID 114
++#   endif
++
++#  endif
+ # endif
+ # if !defined(OPENSSL_NO_EGD) &amp;&amp; !defined(DEVRANDOM_EGD)
+ /*
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024550.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="024560.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24554">[ date ]</a>
+              <a href="thread.html#24554">[ thread ]</a>
+              <a href="subject.html#24554">[ subject ]</a>
+              <a href="author.html#24554">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

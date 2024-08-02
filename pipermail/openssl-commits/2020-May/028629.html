@@ -1,0 +1,798 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1588667315.487432.8145.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028624.html">
+   <LINK REL="Next"  HREF="028636.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1588667315.487432.8145.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Tue May  5 08:28:35 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028624.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028636.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28629">[ date ]</a>
+              <a href="thread.html#28629">[ thread ]</a>
+              <a href="subject.html#28629">[ subject ]</a>
+              <a href="author.html#28629">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  278260bfa238aefef5a1abe2043d2f812c3a4bd5 (commit)
+      from  e307e616f25a6b7b0f343fc1e62a35b2cba888f3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 278260bfa238aefef5a1abe2043d2f812c3a4bd5
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Thu Apr 30 19:31:07 2020 +0200
+
+    Strengthen X509_STORE_CTX_print_verify_cb() to print expected host etc.
+    
+    Add X509_VERIFY_PARAM_get0_host(), X509_VERIFY_PARAM_get0_email(),
+    and X509_VERIFY_PARAM_get1_ip_asc() to support this,
+    as well as the internal helper function ipaddr_to_asc(), which
+    is used also for simplifying other IP address output functions.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">david.von.oheimb at siemens.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11693">https://github.com/openssl/openssl/pull/11693</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/t_x509.c                     | 49 ++++++++++++++++-----
+ crypto/x509/v3_addr.c                    |  1 +
+ crypto/x509/v3_alt.c                     | 50 +++++----------------
+ crypto/x509/v3_ncons.c                   | 31 +++++--------
+ crypto/x509/v3_utl.c                     | 75 ++++++++++++++++++++++++--------
+ crypto/x509/x509_vpm.c                   | 42 +++++++++++++++---
+ doc/man3/X509_VERIFY_PARAM_set_flags.pod | 24 +++++++++-
+ include/internal/cryptlib.h              |  1 +
+ include/openssl/x509_vfy.h               |  3 ++
+ util/libcrypto.num                       |  3 ++
+ 10 files changed, 187 insertions(+), 92 deletions(-)
+
+diff --git a/crypto/x509/t_x509.c b/crypto/x509/t_x509.c
+index e3c21b084d..75d688c50e 100644
+--- a/crypto/x509/t_x509.c
++++ b/crypto/x509/t_x509.c
+@@ -452,17 +452,46 @@ int X509_STORE_CTX_print_verify_cb(int ok, X509_STORE_CTX *ctx)
+ {
+     if (ok == 0 &amp;&amp; ctx != NULL) {
+         int cert_error = X509_STORE_CTX_get_error(ctx);
+-        int depth = X509_STORE_CTX_get_error_depth(ctx);
+-        X509 *cert = X509_STORE_CTX_get_current_cert(ctx);
+         BIO *bio = BIO_new(BIO_s_mem()); /* may be NULL */
+ 
+-        BIO_printf(bio, &quot;%s at depth=%d error=%d (%s)\n&quot;,
++        BIO_printf(bio, &quot;%s at depth = %d error = %d (%s)\n&quot;,
+                    X509_STORE_CTX_get0_parent_ctx(ctx) != NULL
+-                   ? &quot;CRL path validation&quot; : &quot;certificate verification&quot;,
+-                   depth, cert_error,
+-                   X509_verify_cert_error_string(cert_error));
+-        BIO_printf(bio, &quot;failure for:\n&quot;);
+-        x509_print_ex_brief(bio, cert, X509_FLAG_NO_EXTENSIONS);
++                   ? &quot;CRL path validation&quot;
++                   : &quot;Certificate verification&quot;,
++                   X509_STORE_CTX_get_error_depth(ctx),
++                   cert_error, X509_verify_cert_error_string(cert_error));
++        {
++            X509_STORE *ts = X509_STORE_CTX_get0_store(ctx);
++            X509_VERIFY_PARAM *vpm = X509_STORE_get0_param(ts);
++            char *str;
++            int idx = 0;
++
++            switch (cert_error) {
++            case X509_V_ERR_HOSTNAME_MISMATCH:
++                BIO_printf(bio, &quot;Expected hostname(s) = &quot;);
++                while ((str = X509_VERIFY_PARAM_get0_host(vpm, idx++)) != NULL)
++                    BIO_printf(bio, &quot;%s%s&quot;, idx == 1 ? &quot;&quot; : &quot;, &quot;, str);
++                BIO_printf(bio, &quot;\n&quot;);
++                break;
++            case X509_V_ERR_EMAIL_MISMATCH:
++                str = X509_VERIFY_PARAM_get0_email(vpm);
++                if (str != NULL)
++                    BIO_printf(bio, &quot;Expected email address = %s\n&quot;, str);
++                break;
++            case X509_V_ERR_IP_ADDRESS_MISMATCH:
++                str = X509_VERIFY_PARAM_get1_ip_asc(vpm);
++                if (str != NULL)
++                    BIO_printf(bio, &quot;Expected IP address = %s\n&quot;, str);
++                OPENSSL_free(str);
++                break;
++            default:
++                break;
++            }
++        }
++
++        BIO_printf(bio, &quot;Failure for:\n&quot;);
++        x509_print_ex_brief(bio, X509_STORE_CTX_get_current_cert(ctx),
++                            X509_FLAG_NO_EXTENSIONS);
+         if (cert_error == X509_V_ERR_CERT_UNTRUSTED
+                 || cert_error == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT
+                 || cert_error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN
+@@ -470,9 +499,9 @@ int X509_STORE_CTX_print_verify_cb(int ok, X509_STORE_CTX *ctx)
+                 || cert_error == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+                 || cert_error == X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER
+                 || cert_error == X509_V_ERR_STORE_LOOKUP) {
+-            BIO_printf(bio, &quot;non-trusted certs:\n&quot;);
++            BIO_printf(bio, &quot;Non-trusted certs:\n&quot;);
+             print_certs(bio, X509_STORE_CTX_get0_untrusted(ctx));
+-            BIO_printf(bio, &quot;certs in trust store:\n&quot;);
++            BIO_printf(bio, &quot;Certs in trust store:\n&quot;);
+             print_store_certs(bio, X509_STORE_CTX_get0_store(ctx));
+         }
+         X509err(0, X509_R_CERTIFICATE_VERIFICATION_FAILED);
+diff --git a/crypto/x509/v3_addr.c b/crypto/x509/v3_addr.c
+index 51f5cd8fa9..943423f301 100644
+--- a/crypto/x509/v3_addr.c
++++ b/crypto/x509/v3_addr.c
+@@ -144,6 +144,7 @@ static int i2r_address(BIO *out,
+             return 0;
+         BIO_printf(out, &quot;%d.%d.%d.%d&quot;, addr[0], addr[1], addr[2], addr[3]);
+         break;
++        /* TODO possibly combine with ipaddr_to_asc() */
+     case IANA_AFI_IPV6:
+         if (!addr_expand(addr, bs, 16, fill))
+             return 0;
+diff --git a/crypto/x509/v3_alt.c b/crypto/x509/v3_alt.c
+index 98ff0bca94..45f7bac271 100644
+--- a/crypto/x509/v3_alt.c
++++ b/crypto/x509/v3_alt.c
+@@ -82,10 +82,8 @@ STACK_OF(CONF_VALUE) *i2v_GENERAL_NAME(X509V3_EXT_METHOD *method,
+                                        GENERAL_NAME *gen,
+                                        STACK_OF(CONF_VALUE) *ret)
+ {
+-    unsigned char *p;
+     char othername[300];
+-    char oline[256], htmp[5];
+-    int i;
++    char oline[256], *tmp;
+ 
+     switch (gen-&gt;type) {
+     case GEN_OTHERNAME:
+@@ -183,26 +181,10 @@ STACK_OF(CONF_VALUE) *i2v_GENERAL_NAME(X509V3_EXT_METHOD *method,
+         break;
+ 
+     case GEN_IPADD:
+-        p = gen-&gt;d.ip-&gt;data;
+-        if (gen-&gt;d.ip-&gt;length == 4)
+-            BIO_snprintf(oline, sizeof(oline), &quot;%d.%d.%d.%d&quot;,
+-                         p[0], p[1], p[2], p[3]);
+-        else if (gen-&gt;d.ip-&gt;length == 16) {
+-            oline[0] = 0;
+-            for (i = 0; i &lt; 8; i++) {
+-                BIO_snprintf(htmp, sizeof(htmp), &quot;%X&quot;, p[0] &lt;&lt; 8 | p[1]);
+-                p += 2;
+-                strcat(oline, htmp);
+-                if (i != 7)
+-                    strcat(oline, &quot;:&quot;);
+-            }
+-        } else {
+-            if (!X509V3_add_value(&quot;IP Address&quot;, &quot;&lt;invalid&gt;&quot;, &amp;ret))
+-                return NULL;
+-            break;
+-        }
+-        if (!X509V3_add_value(&quot;IP Address&quot;, oline, &amp;ret))
+-            return NULL;
++        tmp = ipaddr_to_asc(gen-&gt;d.ip-&gt;data, gen-&gt;d.ip-&gt;length);
++        if (tmp == NULL || !X509V3_add_value(&quot;IP Address&quot;, tmp, &amp;ret))
++            ret = NULL;
++        OPENSSL_free(tmp);
+         break;
+ 
+     case GEN_RID:
+@@ -216,8 +198,8 @@ STACK_OF(CONF_VALUE) *i2v_GENERAL_NAME(X509V3_EXT_METHOD *method,
+ 
+ int GENERAL_NAME_print(BIO *out, GENERAL_NAME *gen)
+ {
+-    unsigned char *p;
+-    int i, nid;
++    char *tmp;
++    int nid;
+ 
+     switch (gen-&gt;type) {
+     case GEN_OTHERNAME:
+@@ -288,19 +270,11 @@ int GENERAL_NAME_print(BIO *out, GENERAL_NAME *gen)
+         break;
+ 
+     case GEN_IPADD:
+-        p = gen-&gt;d.ip-&gt;data;
+-        if (gen-&gt;d.ip-&gt;length == 4)
+-            BIO_printf(out, &quot;IP Address:%d.%d.%d.%d&quot;, p[0], p[1], p[2], p[3]);
+-        else if (gen-&gt;d.ip-&gt;length == 16) {
+-            BIO_printf(out, &quot;IP Address&quot;);
+-            for (i = 0; i &lt; 8; i++) {
+-                BIO_printf(out, &quot;:%X&quot;, p[0] &lt;&lt; 8 | p[1]);
+-                p += 2;
+-            }
+-        } else {
+-            BIO_printf(out, &quot;IP Address:&lt;invalid&gt;&quot;);
+-            break;
+-        }
++        tmp = ipaddr_to_asc(gen-&gt;d.ip-&gt;data, gen-&gt;d.ip-&gt;length);
++        if (tmp == NULL)
++            return 0;
++        BIO_printf(out, &quot;IP Address:%s&quot;, tmp);
++        OPENSSL_free(tmp);
+         break;
+ 
+     case GEN_RID:
+diff --git a/crypto/x509/v3_ncons.c b/crypto/x509/v3_ncons.c
+index 88ad8ba74f..d7b82b775e 100644
+--- a/crypto/x509/v3_ncons.c
++++ b/crypto/x509/v3_ncons.c
+@@ -192,26 +192,17 @@ static int do_i2r_name_constraints(const X509V3_EXT_METHOD *method,
+ 
+ static int print_nc_ipadd(BIO *bp, ASN1_OCTET_STRING *ip)
+ {
+-    int i, len;
+-    unsigned char *p;
+-    p = ip-&gt;data;
+-    len = ip-&gt;length;
+-    BIO_puts(bp, &quot;IP:&quot;);
+-    if (len == 8) {
+-        BIO_printf(bp, &quot;%d.%d.%d.%d/%d.%d.%d.%d&quot;,
+-                   p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+-    } else if (len == 32) {
+-        for (i = 0; i &lt; 16; i++) {
+-            BIO_printf(bp, &quot;%X&quot;, p[0] &lt;&lt; 8 | p[1]);
+-            p += 2;
+-            if (i == 7)
+-                BIO_puts(bp, &quot;/&quot;);
+-            else if (i != 15)
+-                BIO_puts(bp, &quot;:&quot;);
+-        }
+-    } else
+-        BIO_printf(bp, &quot;IP Address:&lt;invalid&gt;&quot;);
+-    return 1;
++    /* ip-&gt;length should be 8 or 32 and len1 == len2 == 4 or len1 == len2 == 16 */
++    int len1 = ip-&gt;length &gt;= 16 ? 16 : ip-&gt;length &gt;= 4 ? 4 : ip-&gt;length;
++    int len2 = ip-&gt;length - len1;
++    char *ip1 = ipaddr_to_asc(ip-&gt;data, len1);
++    char *ip2 = ipaddr_to_asc(ip-&gt;data + len1, len2);
++    int ret = ret = ip1 != NULL &amp;&amp; ip2 != NULL
++        &amp;&amp; BIO_printf(bp, &quot;IP:%s/%s&quot;, ip1, ip2) &gt; 0;
++
++    OPENSSL_free(ip1);
++    OPENSSL_free(ip2);
++    return ret;
+ }
+ 
+ #define NAME_CHECK_MAX (1 &lt;&lt; 20)
+diff --git a/crypto/x509/v3_utl.c b/crypto/x509/v3_utl.c
+index 4be395397c..aefb589743 100644
+--- a/crypto/x509/v3_utl.c
++++ b/crypto/x509/v3_utl.c
+@@ -31,7 +31,8 @@ static int sk_strcmp(const char *const *a, const char *const *b);
+ static STACK_OF(OPENSSL_STRING) *get_email(const X509_NAME *name,
+                                            GENERAL_NAMES *gens);
+ static void str_free(OPENSSL_STRING str);
+-static int append_ia5(STACK_OF(OPENSSL_STRING) **sk, const ASN1_IA5STRING *email);
++static int append_ia5(STACK_OF(OPENSSL_STRING) **sk,
++                      const ASN1_IA5STRING *email);
+ 
+ static int ipv4_from_asc(unsigned char *v4, const char *in);
+ static int ipv6_from_asc(unsigned char *v6, const char *in);
+@@ -178,6 +179,7 @@ ASN1_INTEGER *s2i_ASN1_INTEGER(X509V3_EXT_METHOD *method, const char *value)
+     ASN1_INTEGER *aint;
+     int isneg, ishex;
+     int ret;
++
+     if (value == NULL) {
+         X509V3err(X509V3_F_S2I_ASN1_INTEGER, X509V3_R_INVALID_NULL_VALUE);
+         return NULL;
+@@ -190,14 +192,16 @@ ASN1_INTEGER *s2i_ASN1_INTEGER(X509V3_EXT_METHOD *method, const char *value)
+     if (value[0] == '-') {
+         value++;
+         isneg = 1;
+-    } else
++    } else {
+         isneg = 0;
++    }
+ 
+     if (value[0] == '0' &amp;&amp; ((value[1] == 'x') || (value[1] == 'X'))) {
+         value += 2;
+         ishex = 1;
+-    } else
++    } else {
+         ishex = 0;
++    }
+ 
+     if (ishex)
+         ret = BN_hex2bn(&amp;bn, value);
+@@ -297,6 +301,7 @@ STACK_OF(CONF_VALUE) *X509V3_parse_list(const char *line)
+     STACK_OF(CONF_VALUE) *values = NULL;
+     char *linebuf;
+     int state;
++
+     /* We are going to modify the line so copy it first */
+     linebuf = OPENSSL_strdup(line);
+     if (linebuf == NULL) {
+@@ -382,6 +387,7 @@ STACK_OF(CONF_VALUE) *X509V3_parse_list(const char *line)
+ static char *strip_spaces(char *name)
+ {
+     char *p, *q;
++
+     /* Skip over leading spaces */
+     p = name;
+     while (*p &amp;&amp; ossl_isspace(*p))
+@@ -407,6 +413,7 @@ int v3_name_cmp(const char *name, const char *cmp)
+ {
+     int len, ret;
+     char c;
++
+     len = strlen(cmp);
+     if ((ret = strncmp(name, cmp, len)))
+         return ret;
+@@ -502,9 +509,11 @@ static void str_free(OPENSSL_STRING str)
+     OPENSSL_free(str);
+ }
+ 
+-static int append_ia5(STACK_OF(OPENSSL_STRING) **sk, const ASN1_IA5STRING *email)
++static int append_ia5(STACK_OF(OPENSSL_STRING) **sk,
++                      const ASN1_IA5STRING *email)
+ {
+     char *emtmp;
++
+     /* First some sanity checks */
+     if (email-&gt;type != V_ASN1_IA5STRING)
+         return 1;
+@@ -519,7 +528,7 @@ static int append_ia5(STACK_OF(OPENSSL_STRING) **sk, const ASN1_IA5STRING *email
+         return 1;
+     emtmp = OPENSSL_strdup((char *)email-&gt;data);
+     if (emtmp == NULL || !sk_OPENSSL_STRING_push(*sk, emtmp)) {
+-        OPENSSL_free(emtmp);    /* free on push failure */
++        OPENSSL_free(emtmp); /* free on push failure */
+         X509_email_free(*sk);
+         *sk = NULL;
+         return 0;
+@@ -576,9 +585,10 @@ static int equal_nocase(const unsigned char *pattern, size_t pattern_len,
+     skip_prefix(&amp;pattern, &amp;pattern_len, subject_len, flags);
+     if (pattern_len != subject_len)
+         return 0;
+-    while (pattern_len) {
++    while (pattern_len != 0) {
+         unsigned char l = *pattern;
+         unsigned char r = *subject;
++
+         /* The pattern must not contain NUL characters. */
+         if (l == 0)
+             return 0;
+@@ -617,6 +627,7 @@ static int equal_email(const unsigned char *a, size_t a_len,
+                        unsigned int unused_flags)
+ {
+     size_t i = a_len;
++
+     if (a_len != b_len)
+         return 0;
+     /*
+@@ -704,6 +715,7 @@ static const unsigned char *valid_star(const unsigned char *p, size_t len,
+     size_t i;
+     int state = LABEL_START;
+     int dots = 0;
++
+     for (i = 0; i &lt; len; ++i) {
+         /*
+          * Locate first and only legal wildcard, either at the start
+@@ -745,8 +757,9 @@ static const unsigned char *valid_star(const unsigned char *p, size_t len,
+             if ((state &amp; LABEL_START) != 0)
+                 return NULL;
+             state |= LABEL_HYPHEN;
+-        } else
++        } else {
+             return NULL;
++        }
+     }
+ 
+     /*
+@@ -862,6 +875,7 @@ static int do_x509_check(X509 *x, const char *chk, size_t chklen,
+         for (i = 0; i &lt; sk_GENERAL_NAME_num(gens); i++) {
+             GENERAL_NAME *gen;
+             ASN1_STRING *cstr;
++
+             gen = sk_GENERAL_NAME_value(gens, i);
+             if (gen-&gt;type != check_type)
+                 continue;
+@@ -961,6 +975,29 @@ int X509_check_ip_asc(X509 *x, const char *ipasc, unsigned int flags)
+     return do_x509_check(x, (char *)ipout, iplen, flags, GEN_IPADD, NULL);
+ }
+ 
++char *ipaddr_to_asc(unsigned char *p, int len)
++{
++    char buf[40], *out;
++
++    switch (len) {
++    case 4: /* IPv4 */
++        BIO_snprintf(buf, sizeof(buf), &quot;%d.%d.%d.%d&quot;, p[0], p[1], p[2], p[3]);
++        break;
++        /* TODO possibly combine with static i2r_address() in v3_addr.c */
++    case 16: /* IPv6 */
++        for (out = buf; out &lt; buf + 8 * 3; out += 3) {
++            BIO_snprintf(out, 3 + 1, &quot;%X:&quot;, p[0] &lt;&lt; 8 | p[1]);
++            p += 2;
++        }
++        out[-1] = '\0';
++        break;
++    default:
++        BIO_snprintf(buf, sizeof(buf), &quot;&lt;invalid length=%d&gt;&quot;, len);
++        break;
++    }
++    return OPENSSL_strdup(buf);
++}
++
+ /*
+  * Convert IP addresses both IPv4 and IPv6 into an OCTET STRING compatible
+  * with RFC3280.
+@@ -1050,6 +1087,7 @@ int a2i_ipadd(unsigned char *ipout, const char *ipasc)
+ static int ipv4_from_asc(unsigned char *v4, const char *in)
+ {
+     int a0, a1, a2, a3;
++
+     if (sscanf(in, &quot;%d.%d.%d.%d&quot;, &amp;a0, &amp;a1, &amp;a2, &amp;a3) != 4)
+         return 0;
+     if ((a0 &lt; 0) || (a0 &gt; 255) || (a1 &lt; 0) || (a1 &gt; 255)
+@@ -1076,6 +1114,7 @@ typedef struct {
+ static int ipv6_from_asc(unsigned char *v6, const char *in)
+ {
+     IPV6_STAT v6stat;
++
+     v6stat.total = 0;
+     v6stat.zero_pos = -1;
+     v6stat.zero_cnt = 0;
+@@ -1098,21 +1137,19 @@ static int ipv6_from_asc(unsigned char *v6, const char *in)
+         if (v6stat.total == 16)
+             return 0;
+         /* More than three zeroes is an error */
+-        if (v6stat.zero_cnt &gt; 3)
++        if (v6stat.zero_cnt &gt; 3) {
+             return 0;
+         /* Can only have three zeroes if nothing else present */
+-        else if (v6stat.zero_cnt == 3) {
++        } else if (v6stat.zero_cnt == 3) {
+             if (v6stat.total &gt; 0)
+                 return 0;
+-        }
+-        /* Can only have two zeroes if at start or end */
+-        else if (v6stat.zero_cnt == 2) {
++        } else if (v6stat.zero_cnt == 2) {
++            /* Can only have two zeroes if at start or end */
+             if ((v6stat.zero_pos != 0)
+                 &amp;&amp; (v6stat.zero_pos != v6stat.total))
+                 return 0;
+-        } else
++        } else {
+             /* Can only have one zero if *not* start or end */
+-        {
+             if ((v6stat.zero_pos == 0)
+                 || (v6stat.zero_pos == v6stat.total))
+                 return 0;
+@@ -1131,8 +1168,9 @@ static int ipv6_from_asc(unsigned char *v6, const char *in)
+             memcpy(v6 + v6stat.zero_pos + 16 - v6stat.total,
+                    v6stat.tmp + v6stat.zero_pos,
+                    v6stat.total - v6stat.zero_pos);
+-    } else
++    } else {
+         memcpy(v6, v6stat.tmp, 16);
++    }
+ 
+     return 1;
+ }
+@@ -1140,6 +1178,7 @@ static int ipv6_from_asc(unsigned char *v6, const char *in)
+ static int ipv6_cb(const char *elem, int len, void *usr)
+ {
+     IPV6_STAT *s = usr;
++
+     /* Error if 16 bytes written */
+     if (s-&gt;total == 16)
+         return 0;
+@@ -1203,6 +1242,7 @@ int X509V3_NAME_from_section(X509_NAME *nm, STACK_OF(CONF_VALUE) *dn_sk,
+     CONF_VALUE *v;
+     int i, mval, spec_char, plus_char;
+     char *p, *type;
++
+     if (!nm)
+         return 0;
+ 
+@@ -1217,7 +1257,7 @@ int X509V3_NAME_from_section(X509_NAME *nm, STACK_OF(CONF_VALUE) *dn_sk,
+             spec_char = ((*p == ':') || (*p == ',') || (*p == '.'));
+ #else
+             spec_char = ((*p == os_toascii[':']) || (*p == os_toascii[','])
+-                    || (*p == os_toascii['.']));
++                         || (*p == os_toascii['.']));
+ #endif
+             if (spec_char) {
+                 p++;
+@@ -1234,8 +1274,9 @@ int X509V3_NAME_from_section(X509_NAME *nm, STACK_OF(CONF_VALUE) *dn_sk,
+         if (plus_char) {
+             mval = -1;
+             type++;
+-        } else
++        } else {
+             mval = 0;
++        }
+         if (!X509_NAME_add_entry_by_txt(nm, type, chtype,
+                                         (unsigned char *)v-&gt;value, -1, -1,
+                                         mval))
+diff --git a/crypto/x509/x509_vpm.c b/crypto/x509/x509_vpm.c
+index c3af2d3d78..f87dfd0726 100644
+--- a/crypto/x509/x509_vpm.c
++++ b/crypto/x509/x509_vpm.c
+@@ -146,14 +146,14 @@ void X509_VERIFY_PARAM_free(X509_VERIFY_PARAM *param)
+ /* Macro to test if a field should be copied from src to dest */
+ 
+ #define test_x509_verify_param_copy(field, def) \
+-        (to_overwrite || \
+-                ((src-&gt;field != def) &amp;&amp; (to_default || (dest-&gt;field == def))))
++    (to_overwrite \
++         || ((src-&gt;field != def) &amp;&amp; (to_default || (dest-&gt;field == def))))
+ 
+ /* Macro to test and copy a field if necessary */
+ 
+ #define x509_verify_param_copy(field, def) \
+-        if (test_x509_verify_param_copy(field, def)) \
+-                dest-&gt;field = src-&gt;field
++    if (test_x509_verify_param_copy(field, def)) \
++        dest-&gt;field = src-&gt;field;
+ 
+ int X509_VERIFY_PARAM_inherit(X509_VERIFY_PARAM *dest,
+                               const X509_VERIFY_PARAM *src)
+@@ -243,14 +243,16 @@ int X509_VERIFY_PARAM_set1(X509_VERIFY_PARAM *to,
+ static int int_x509_param_set1(char **pdest, size_t *pdestlen,
+                                const char *src, size_t srclen)
+ {
+-    void *tmp;
++    char *tmp;
+     if (src) {
+         if (srclen == 0)
+             srclen = strlen(src);
+ 
+-        tmp = OPENSSL_memdup(src, srclen);
++        tmp = OPENSSL_malloc(srclen + 1);
+         if (tmp == NULL)
+             return 0;
++        memcpy(tmp, src, srclen);
++        tmp[srclen] = '\0'; /* enforce NUL termination */
+     } else {
+         tmp = NULL;
+         srclen = 0;
+@@ -379,6 +381,11 @@ int X509_VERIFY_PARAM_set1_policies(X509_VERIFY_PARAM *param,
+     return 1;
+ }
+ 
++char *X509_VERIFY_PARAM_get0_host(X509_VERIFY_PARAM *param, int idx)
++{
++    return sk_OPENSSL_STRING_value(param-&gt;hosts, idx);
++}
++
+ int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM *param,
+                                 const char *name, size_t namelen)
+ {
+@@ -425,6 +432,11 @@ void X509_VERIFY_PARAM_move_peername(X509_VERIFY_PARAM *to,
+         from-&gt;peername = NULL;
+ }
+ 
++char *X509_VERIFY_PARAM_get0_email(X509_VERIFY_PARAM *param)
++{
++    return param-&gt;email;
++}
++
+ int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                  const char *email, size_t emaillen)
+ {
+@@ -432,6 +444,24 @@ int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                email, emaillen);
+ }
+ 
++static unsigned char
++*int_X509_VERIFY_PARAM_get0_ip(X509_VERIFY_PARAM *param, size_t *plen)
++{
++    if (param == NULL || param-&gt;ip == NULL)
++        return NULL;
++    if (plen != NULL)
++        *plen = param-&gt;iplen;
++    return param-&gt;ip;
++}
++
++char *X509_VERIFY_PARAM_get1_ip_asc(X509_VERIFY_PARAM *param)
++{
++    size_t iplen;
++    unsigned char *ip = int_X509_VERIFY_PARAM_get0_ip(param, &amp;iplen);
++
++    return  ip == NULL ? NULL : ipaddr_to_asc(ip, iplen);
++}
++
+ int X509_VERIFY_PARAM_set1_ip(X509_VERIFY_PARAM *param,
+                               const unsigned char *ip, size_t iplen)
+ {
+diff --git a/doc/man3/X509_VERIFY_PARAM_set_flags.pod b/doc/man3/X509_VERIFY_PARAM_set_flags.pod
+index 27e0a73969..f34020cbaa 100644
+--- a/doc/man3/X509_VERIFY_PARAM_set_flags.pod
++++ b/doc/man3/X509_VERIFY_PARAM_set_flags.pod
+@@ -10,11 +10,13 @@ X509_VERIFY_PARAM_get_depth, X509_VERIFY_PARAM_set_auth_level,
+ X509_VERIFY_PARAM_get_auth_level, X509_VERIFY_PARAM_set_time,
+ X509_VERIFY_PARAM_get_time,
+ X509_VERIFY_PARAM_add0_policy, X509_VERIFY_PARAM_set1_policies,
++X509_VERIFY_PARAM_get0_host,
+ X509_VERIFY_PARAM_set1_host, X509_VERIFY_PARAM_add1_host,
+ X509_VERIFY_PARAM_set_hostflags,
+ X509_VERIFY_PARAM_get_hostflags,
+ X509_VERIFY_PARAM_get0_peername,
+-X509_VERIFY_PARAM_set1_email, X509_VERIFY_PARAM_set1_ip,
++X509_VERIFY_PARAM_get0_email, X509_VERIFY_PARAM_set1_email,
++X509_VERIFY_PARAM_set1_ip, X509_VERIFY_PARAM_get1_ip_asc,
+ X509_VERIFY_PARAM_set1_ip_asc
+ - X509 verification parameters
+ 
+@@ -50,6 +52,7 @@ X509_VERIFY_PARAM_set1_ip_asc
+                                        int auth_level);
+  int X509_VERIFY_PARAM_get_auth_level(const X509_VERIFY_PARAM *param);
+ 
++ char *X509_VERIFY_PARAM_get0_host(X509_VERIFY_PARAM *param, int n);
+  int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM *param,
+                                  const char *name, size_t namelen);
+  int X509_VERIFY_PARAM_add1_host(X509_VERIFY_PARAM *param,
+@@ -58,8 +61,10 @@ X509_VERIFY_PARAM_set1_ip_asc
+                                       unsigned int flags);
+  unsigned int X509_VERIFY_PARAM_get_hostflags(const X509_VERIFY_PARAM *param);
+  char *X509_VERIFY_PARAM_get0_peername(const X509_VERIFY_PARAM *param);
++ char *X509_VERIFY_PARAM_get0_email(X509_VERIFY_PARAM *param);
+  int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                   const char *email, size_t emaillen);
++ char *X509_VERIFY_PARAM_get1_ip_asc(X509_VERIFY_PARAM *param);
+  int X509_VERIFY_PARAM_set1_ip(X509_VERIFY_PARAM *param,
+                                const unsigned char *ip, size_t iplen);
+  int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM *param, const char *ipasc);
+@@ -128,6 +133,11 @@ Security level 1 requires at least 80-bit-equivalent security and is broadly
+ interoperable, though it will, for example, reject MD5 signatures or RSA keys
+ shorter than 1024 bits.
+ 
++X509_VERIFY_PARAM_get0_host() returns the B&lt;n&gt;th expected DNS hostname that has
++been set using X509_VERIFY_PARAM_set1_host() or X509_VERIFY_PARAM_add1_host().
++To obtain all names start with B&lt;n&gt; = 0 and increment B&lt;n&gt; as long as no NULL
++pointer is returned.
++
+ X509_VERIFY_PARAM_set1_host() sets the expected DNS hostname to
+ B&lt;name&gt; clearing any previously specified hostname.  If
+ B&lt;name&gt; is NULL, or empty the list of hostnames is cleared, and
+@@ -177,12 +187,17 @@ string is allocated by the library and is no longer valid once the
+ associated B&lt;param&gt; argument is freed.  Applications must not free
+ the return value.
+ 
++X509_VERIFY_PARAM_get0_email() returns the expected RFC822 email address.
++
+ X509_VERIFY_PARAM_set1_email() sets the expected RFC822 email address to
+ B&lt;email&gt;.  If B&lt;email&gt; is NUL-terminated, B&lt;emaillen&gt; may be zero, otherwise
+ B&lt;emaillen&gt; must be set to the length of B&lt;email&gt;.  When an email address
+ is specified, certificate verification automatically invokes
+ L&lt;X509_check_email(3)&gt;.
+ 
++X509_VERIFY_PARAM_get1_ip_asc() returns the expected IP address as a string.
++The caller is responsible for freeing it.
++
+ X509_VERIFY_PARAM_set1_ip() sets the expected IP address to B&lt;ip&gt;.
+ The B&lt;ip&gt; argument is in binary format, in network byte-order and
+ B&lt;iplen&gt; must be set to 4 for IPv4 and 16 for IPv6.  When an IP
+@@ -205,6 +220,10 @@ X509_VERIFY_PARAM_set1_email(), X509_VERIFY_PARAM_set1_ip() and
+ X509_VERIFY_PARAM_set1_ip_asc() return 1 for success and 0 for
+ failure.
+ 
++X509_VERIFY_PARAM_get0_host(), X509_VERIFY_PARAM_get0_email(), and
++X509_VERIFY_PARAM_get1_ip_asc(), return the string pointers pecified above
++or NULL if the respective value has not been set or on error.
++
+ X509_VERIFY_PARAM_get_flags() returns the current verification flags.
+ 
+ X509_VERIFY_PARAM_get_hostflags() returns any current host flags.
+@@ -374,6 +393,9 @@ and has no effect.
+ 
+ The X509_VERIFY_PARAM_get_hostflags() function was added in OpenSSL 1.1.0i.
+ 
++The X509_VERIFY_PARAM_get0_host(), X509_VERIFY_PARAM_get0_email(),
++and X509_VERIFY_PARAM_get1_ip_asc() functions were added in OpenSSL 3.0.
++
+ =head1 COPYRIGHT
+ 
+ Copyright 2009-2020 The OpenSSL Project Authors. All Rights Reserved.
+diff --git a/include/internal/cryptlib.h b/include/internal/cryptlib.h
+index 615cd21ae8..03f147888a 100644
+--- a/include/internal/cryptlib.h
++++ b/include/internal/cryptlib.h
+@@ -238,5 +238,6 @@ static ossl_inline void ossl_sleep(unsigned long millis)
+ 
+ char *sk_ASN1_UTF8STRING2text(STACK_OF(ASN1_UTF8STRING) *text, const char *sep,
+                               size_t max_len);
++char *ipaddr_to_asc(unsigned char *p, int len);
+ 
+ #endif
+diff --git a/include/openssl/x509_vfy.h b/include/openssl/x509_vfy.h
+index 84b076a1cb..92aed08380 100644
+--- a/include/openssl/x509_vfy.h
++++ b/include/openssl/x509_vfy.h
+@@ -585,6 +585,7 @@ int X509_VERIFY_PARAM_set_inh_flags(X509_VERIFY_PARAM *param,
+                                     uint32_t flags);
+ uint32_t X509_VERIFY_PARAM_get_inh_flags(const X509_VERIFY_PARAM *param);
+ 
++char *X509_VERIFY_PARAM_get0_host(X509_VERIFY_PARAM *param, int idx);
+ int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM *param,
+                                 const char *name, size_t namelen);
+ int X509_VERIFY_PARAM_add1_host(X509_VERIFY_PARAM *param,
+@@ -594,8 +595,10 @@ void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM *param,
+ unsigned int X509_VERIFY_PARAM_get_hostflags(const X509_VERIFY_PARAM *param);
+ char *X509_VERIFY_PARAM_get0_peername(const X509_VERIFY_PARAM *param);
+ void X509_VERIFY_PARAM_move_peername(X509_VERIFY_PARAM *, X509_VERIFY_PARAM *);
++char *X509_VERIFY_PARAM_get0_email(X509_VERIFY_PARAM *param);
+ int X509_VERIFY_PARAM_set1_email(X509_VERIFY_PARAM *param,
+                                  const char *email, size_t emaillen);
++char *X509_VERIFY_PARAM_get1_ip_asc(X509_VERIFY_PARAM *param);
+ int X509_VERIFY_PARAM_set1_ip(X509_VERIFY_PARAM *param,
+                               const unsigned char *ip, size_t iplen);
+ int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM *param,
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 82ae2e7e84..32942a53de 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -5072,6 +5072,9 @@ EVP_PKEY_CTX_set_dh_paramgen_generator  ?	3_0_0	EXIST::FUNCTION:DH
+ EVP_PKEY_CTX_set_dh_nid                 ?	3_0_0	EXIST::FUNCTION:DH
+ EVP_PKEY_CTX_set_dh_rfc5114             ?	3_0_0	EXIST::FUNCTION:DH
+ EVP_PKEY_CTX_set_dhx_rfc5114            ?	3_0_0	EXIST::FUNCTION:DH
++X509_VERIFY_PARAM_get0_host             ?	3_0_0	EXIST::FUNCTION:
++X509_VERIFY_PARAM_get0_email            ?	3_0_0	EXIST::FUNCTION:
++X509_VERIFY_PARAM_get1_ip_asc           ?	3_0_0	EXIST::FUNCTION:
+ X509_verify_ex                          ?	3_0_0	EXIST::FUNCTION:
+ X509_REQ_verify_ex                      ?	3_0_0	EXIST::FUNCTION:
+ X509_ALGOR_copy                         ?	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028624.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028636.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28629">[ date ]</a>
+              <a href="thread.html#28629">[ thread ]</a>
+              <a href="subject.html#28629">[ subject ]</a>
+              <a href="author.html#28629">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,2019 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469108743.605367.27077.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009181.html">
+   <LINK REL="Next"  HREF="009203.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469108743.605367.27077.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Thu Jul 21 13:45:43 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009181.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009203.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9195">[ date ]</a>
+              <a href="thread.html#9195">[ thread ]</a>
+              <a href="subject.html#9195">[ subject ]</a>
+              <a href="author.html#9195">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  11279b13f586441a8fcc5109ee1907f33eb0cc24 (commit)
+      from  2980ae2e78169b3b4d0b140c0c5796c441c5902c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 11279b13f586441a8fcc5109ee1907f33eb0cc24
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Thu Jul 21 14:04:00 2016 +0200
+
+    Test client-side resumption
+    
+    Add tests for resuming with a different client version.
+    
+    This happens in reality when clients persist sessions on disk through
+    upgrades.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/README.ssltest.md                 |   7 +-
+ test/generate_ssl_tests.pl             |  10 +
+ test/handshake_helper.c                |   5 +-
+ test/handshake_helper.h                |   1 +
+ test/ssl-tests/10-resumption.conf      | 884 ++++++++++++++++++++++++++++++++-
+ test/ssl-tests/11-dtls_resumption.conf | 402 ++++++++++++++-
+ test/ssl-tests/protocol_version.pm     |  32 +-
+ test/ssl_test.c                        |  15 +-
+ test/ssl_test.tmpl                     |   9 +
+ 9 files changed, 1352 insertions(+), 13 deletions(-)
+
+diff --git a/test/README.ssltest.md b/test/README.ssltest.md
+index 8cd55ed..445fda9 100644
+--- a/test/README.ssltest.md
++++ b/test/README.ssltest.md
+@@ -124,8 +124,13 @@ The following sections may optionally be defined:
+   matches server.
+ * resume_server - this section configures the client to resume its session
+   against a different server. This context is used whenever HandshakeMode is
+-  Resume. If the resume-server section is not present, then the configuration
++  Resume. If the resume_server section is not present, then the configuration
+   matches server.
++* resume_client - this section configures the client to resume its session with
++  a different configuration. In practice this may occur when, for example,
++  upgraded clients reuse sessions persisted on disk.  This context is used
++  whenever HandshakeMode is Resume. If the resume_client section is not present,
++  then the configuration matches client.
+ 
+ ### Default server and client configurations
+ 
+diff --git a/test/generate_ssl_tests.pl b/test/generate_ssl_tests.pl
+index a2f4714..951421b 100644
+--- a/test/generate_ssl_tests.pl
++++ b/test/generate_ssl_tests.pl
+@@ -63,6 +63,16 @@ sub print_templates {
+             $test-&gt;{&quot;resume_server&quot;} = { };
+         }
+         $test-&gt;{&quot;client&quot;} = { (%ssltests::base_client, %{$test-&gt;{&quot;client&quot;}}) };
++        if (defined $test-&gt;{&quot;resume_client&quot;}) {
++            $test-&gt;{&quot;resume_client&quot;} = { (%ssltests::base_client, %{$test-&gt;{&quot;resume_client&quot;}}) };
++        } elsif (defined $test-&gt;{&quot;test&quot;}-&gt;{&quot;HandshakeMode&quot;} &amp;&amp;
++                 $test-&gt;{&quot;test&quot;}-&gt;{&quot;HandshakeMode&quot;} eq &quot;Resume&quot;) {
++            # Default is the same as client.
++            $test-&gt;{&quot;resume_client&quot;} = { (%ssltests::base_client, %{$test-&gt;{&quot;client&quot;}}) };
++        } else {
++            # Do not emit an empty &quot;resume-client&quot; section.
++            $test-&gt;{&quot;resume_client&quot;} = { };
++        }
+     }
+ 
+     # ssl_test expects to find a
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index c4f298e..eecc6f7 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -673,6 +673,7 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+ 
+ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+                                SSL_CTX *client_ctx, SSL_CTX *resume_server_ctx,
++                               SSL_CTX *resume_client_ctx,
+                                const SSL_TEST_CTX *test_ctx)
+ {
+     HANDSHAKE_RESULT *result;
+@@ -692,8 +693,8 @@ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+ 
+     HANDSHAKE_RESULT_free(result);
+     /* We don't support SNI on second handshake yet, so server2_ctx is NULL. */
+-    result = do_handshake_internal(resume_server_ctx, NULL, client_ctx, test_ctx,
+-                                   session, NULL);
++    result = do_handshake_internal(resume_server_ctx, NULL, resume_client_ctx,
++                                   test_ctx, session, NULL);
+  end:
+     SSL_SESSION_free(session);
+     return result;
+diff --git a/test/handshake_helper.h b/test/handshake_helper.h
+index 5027bef..2fb8ac0 100644
+--- a/test/handshake_helper.h
++++ b/test/handshake_helper.h
+@@ -47,6 +47,7 @@ void HANDSHAKE_RESULT_free(HANDSHAKE_RESULT *result);
+ /* Do a handshake and report some information about the result. */
+ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+                                SSL_CTX *client_ctx, SSL_CTX *resume_server_ctx,
++                               SSL_CTX *resume_client_ctx,
+                                const SSL_TEST_CTX *test_ctx);
+ 
+ #endif  /* HEADER_HANDSHAKE_HELPER_H */
+diff --git a/test/ssl-tests/10-resumption.conf b/test/ssl-tests/10-resumption.conf
+index 899f321..bea91fe 100644
+--- a/test/ssl-tests/10-resumption.conf
++++ b/test/ssl-tests/10-resumption.conf
+@@ -1,6 +1,6 @@
+ # Generated with generate_ssl_tests.pl
+ 
+-num_tests = 18
++num_tests = 36
+ 
+ test-0 = 0-resumption
+ test-1 = 1-resumption
+@@ -20,6 +20,24 @@ test-14 = 14-resumption
+ test-15 = 15-resumption
+ test-16 = 16-resumption
+ test-17 = 17-resumption
++test-18 = 18-resumption
++test-19 = 19-resumption
++test-20 = 20-resumption
++test-21 = 21-resumption
++test-22 = 22-resumption
++test-23 = 23-resumption
++test-24 = 24-resumption
++test-25 = 25-resumption
++test-26 = 26-resumption
++test-27 = 27-resumption
++test-28 = 28-resumption
++test-29 = 29-resumption
++test-30 = 30-resumption
++test-31 = 31-resumption
++test-32 = 32-resumption
++test-33 = 33-resumption
++test-34 = 34-resumption
++test-35 = 35-resumption
+ # ===========================================================
+ 
+ [0-resumption]
+@@ -28,6 +46,7 @@ ssl_conf = 0-resumption-ssl
+ [0-resumption-ssl]
+ server = 0-resumption-server
+ resume-server = 0-resumption-resume-server
++resume-client = 0-resumption-resume-client
+ client = 0-resumption-client
+ 
+ [0-resumption-server]
+@@ -49,6 +68,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[0-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-0]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -63,6 +87,7 @@ ssl_conf = 1-resumption-ssl
+ [1-resumption-ssl]
+ server = 1-resumption-server
+ resume-server = 1-resumption-resume-server
++resume-client = 1-resumption-resume-client
+ client = 1-resumption-client
+ 
+ [1-resumption-server]
+@@ -84,6 +109,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[1-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-1]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -98,6 +128,7 @@ ssl_conf = 2-resumption-ssl
+ [2-resumption-ssl]
+ server = 2-resumption-server
+ resume-server = 2-resumption-resume-server
++resume-client = 2-resumption-resume-client
+ client = 2-resumption-client
+ 
+ [2-resumption-server]
+@@ -119,6 +150,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[2-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-2]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -133,6 +169,7 @@ ssl_conf = 3-resumption-ssl
+ [3-resumption-ssl]
+ server = 3-resumption-server
+ resume-server = 3-resumption-resume-server
++resume-client = 3-resumption-resume-client
+ client = 3-resumption-client
+ 
+ [3-resumption-server]
+@@ -154,6 +191,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[3-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-3]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -168,6 +210,7 @@ ssl_conf = 4-resumption-ssl
+ [4-resumption-ssl]
+ server = 4-resumption-server
+ resume-server = 4-resumption-resume-server
++resume-client = 4-resumption-resume-client
+ client = 4-resumption-client
+ 
+ [4-resumption-server]
+@@ -189,6 +232,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[4-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-4]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+@@ -203,6 +251,7 @@ ssl_conf = 5-resumption-ssl
+ [5-resumption-ssl]
+ server = 5-resumption-server
+ resume-server = 5-resumption-resume-server
++resume-client = 5-resumption-resume-client
+ client = 5-resumption-client
+ 
+ [5-resumption-server]
+@@ -224,6 +273,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[5-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-5]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+@@ -238,6 +292,7 @@ ssl_conf = 6-resumption-ssl
+ [6-resumption-ssl]
+ server = 6-resumption-server
+ resume-server = 6-resumption-resume-server
++resume-client = 6-resumption-resume-client
+ client = 6-resumption-client
+ 
+ [6-resumption-server]
+@@ -259,6 +314,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[6-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-6]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -273,6 +333,7 @@ ssl_conf = 7-resumption-ssl
+ [7-resumption-ssl]
+ server = 7-resumption-server
+ resume-server = 7-resumption-resume-server
++resume-client = 7-resumption-resume-client
+ client = 7-resumption-client
+ 
+ [7-resumption-server]
+@@ -294,6 +355,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[7-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-7]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -308,6 +374,7 @@ ssl_conf = 8-resumption-ssl
+ [8-resumption-ssl]
+ server = 8-resumption-server
+ resume-server = 8-resumption-resume-server
++resume-client = 8-resumption-resume-client
+ client = 8-resumption-client
+ 
+ [8-resumption-server]
+@@ -329,6 +396,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[8-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-8]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -343,6 +415,7 @@ ssl_conf = 9-resumption-ssl
+ [9-resumption-ssl]
+ server = 9-resumption-server
+ resume-server = 9-resumption-resume-server
++resume-client = 9-resumption-resume-client
+ client = 9-resumption-client
+ 
+ [9-resumption-server]
+@@ -364,6 +437,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[9-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-9]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -378,6 +456,7 @@ ssl_conf = 10-resumption-ssl
+ [10-resumption-ssl]
+ server = 10-resumption-server
+ resume-server = 10-resumption-resume-server
++resume-client = 10-resumption-resume-client
+ client = 10-resumption-client
+ 
+ [10-resumption-server]
+@@ -399,6 +478,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[10-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-10]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+@@ -413,6 +497,7 @@ ssl_conf = 11-resumption-ssl
+ [11-resumption-ssl]
+ server = 11-resumption-server
+ resume-server = 11-resumption-resume-server
++resume-client = 11-resumption-resume-client
+ client = 11-resumption-client
+ 
+ [11-resumption-server]
+@@ -434,6 +519,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[11-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-11]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+@@ -448,6 +538,7 @@ ssl_conf = 12-resumption-ssl
+ [12-resumption-ssl]
+ server = 12-resumption-server
+ resume-server = 12-resumption-resume-server
++resume-client = 12-resumption-resume-client
+ client = 12-resumption-client
+ 
+ [12-resumption-server]
+@@ -469,6 +560,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[12-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-12]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -483,6 +579,7 @@ ssl_conf = 13-resumption-ssl
+ [13-resumption-ssl]
+ server = 13-resumption-server
+ resume-server = 13-resumption-resume-server
++resume-client = 13-resumption-resume-client
+ client = 13-resumption-client
+ 
+ [13-resumption-server]
+@@ -504,6 +601,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[13-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-13]
+ HandshakeMode = Resume
+ Protocol = TLSv1
+@@ -518,6 +620,7 @@ ssl_conf = 14-resumption-ssl
+ [14-resumption-ssl]
+ server = 14-resumption-server
+ resume-server = 14-resumption-resume-server
++resume-client = 14-resumption-resume-client
+ client = 14-resumption-client
+ 
+ [14-resumption-server]
+@@ -539,6 +642,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[14-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-14]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -553,6 +661,7 @@ ssl_conf = 15-resumption-ssl
+ [15-resumption-ssl]
+ server = 15-resumption-server
+ resume-server = 15-resumption-resume-server
++resume-client = 15-resumption-resume-client
+ client = 15-resumption-client
+ 
+ [15-resumption-server]
+@@ -574,6 +683,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[15-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-15]
+ HandshakeMode = Resume
+ Protocol = TLSv1.1
+@@ -588,6 +702,7 @@ ssl_conf = 16-resumption-ssl
+ [16-resumption-ssl]
+ server = 16-resumption-server
+ resume-server = 16-resumption-resume-server
++resume-client = 16-resumption-resume-client
+ client = 16-resumption-client
+ 
+ [16-resumption-server]
+@@ -609,6 +724,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[16-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-16]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+@@ -623,6 +743,7 @@ ssl_conf = 17-resumption-ssl
+ [17-resumption-ssl]
+ server = 17-resumption-server
+ resume-server = 17-resumption-resume-server
++resume-client = 17-resumption-resume-client
+ client = 17-resumption-client
+ 
+ [17-resumption-server]
+@@ -644,9 +765,770 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[17-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-17]
+ HandshakeMode = Resume
+ Protocol = TLSv1.2
+ ResumptionExpected = Yes
+ 
+ 
++# ===========================================================
++
++[18-resumption]
++ssl_conf = 18-resumption-ssl
++
++[18-resumption-ssl]
++server = 18-resumption-server
++resume-server = 18-resumption-resume-server
++resume-client = 18-resumption-resume-client
++client = 18-resumption-client
++
++[18-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[18-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[18-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[18-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-18]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[19-resumption]
++ssl_conf = 19-resumption-ssl
++
++[19-resumption-ssl]
++server = 19-resumption-server
++resume-server = 19-resumption-resume-server
++resume-client = 19-resumption-resume-client
++client = 19-resumption-client
++
++[19-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[19-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[19-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[19-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-19]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[20-resumption]
++ssl_conf = 20-resumption-ssl
++
++[20-resumption-ssl]
++server = 20-resumption-server
++resume-server = 20-resumption-resume-server
++resume-client = 20-resumption-resume-client
++client = 20-resumption-client
++
++[20-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[20-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[20-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[20-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-20]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[21-resumption]
++ssl_conf = 21-resumption-ssl
++
++[21-resumption-ssl]
++server = 21-resumption-server
++resume-server = 21-resumption-resume-server
++resume-client = 21-resumption-resume-client
++client = 21-resumption-client
++
++[21-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[21-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[21-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[21-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-21]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[22-resumption]
++ssl_conf = 22-resumption-ssl
++
++[22-resumption-ssl]
++server = 22-resumption-server
++resume-server = 22-resumption-resume-server
++resume-client = 22-resumption-resume-client
++client = 22-resumption-client
++
++[22-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[22-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[22-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[22-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-22]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[23-resumption]
++ssl_conf = 23-resumption-ssl
++
++[23-resumption-ssl]
++server = 23-resumption-server
++resume-server = 23-resumption-resume-server
++resume-client = 23-resumption-resume-client
++client = 23-resumption-client
++
++[23-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[23-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[23-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++MinProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[23-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-23]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[24-resumption]
++ssl_conf = 24-resumption-ssl
++
++[24-resumption-ssl]
++server = 24-resumption-server
++resume-server = 24-resumption-resume-server
++resume-client = 24-resumption-resume-client
++client = 24-resumption-client
++
++[24-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[24-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[24-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[24-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-24]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[25-resumption]
++ssl_conf = 25-resumption-ssl
++
++[25-resumption-ssl]
++server = 25-resumption-server
++resume-server = 25-resumption-resume-server
++resume-client = 25-resumption-resume-client
++client = 25-resumption-client
++
++[25-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[25-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[25-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[25-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-25]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[26-resumption]
++ssl_conf = 26-resumption-ssl
++
++[26-resumption-ssl]
++server = 26-resumption-server
++resume-server = 26-resumption-resume-server
++resume-client = 26-resumption-resume-client
++client = 26-resumption-client
++
++[26-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[26-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[26-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[26-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-26]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[27-resumption]
++ssl_conf = 27-resumption-ssl
++
++[27-resumption-ssl]
++server = 27-resumption-server
++resume-server = 27-resumption-resume-server
++resume-client = 27-resumption-resume-client
++client = 27-resumption-client
++
++[27-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[27-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[27-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[27-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-27]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[28-resumption]
++ssl_conf = 28-resumption-ssl
++
++[28-resumption-ssl]
++server = 28-resumption-server
++resume-server = 28-resumption-resume-server
++resume-client = 28-resumption-resume-client
++client = 28-resumption-client
++
++[28-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[28-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[28-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[28-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-28]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[29-resumption]
++ssl_conf = 29-resumption-ssl
++
++[29-resumption-ssl]
++server = 29-resumption-server
++resume-server = 29-resumption-resume-server
++resume-client = 29-resumption-resume-client
++client = 29-resumption-client
++
++[29-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[29-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[29-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++MinProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[29-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-29]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[30-resumption]
++ssl_conf = 30-resumption-ssl
++
++[30-resumption-ssl]
++server = 30-resumption-server
++resume-server = 30-resumption-resume-server
++resume-client = 30-resumption-resume-client
++client = 30-resumption-client
++
++[30-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[30-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[30-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[30-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-30]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[31-resumption]
++ssl_conf = 31-resumption-ssl
++
++[31-resumption-ssl]
++server = 31-resumption-server
++resume-server = 31-resumption-resume-server
++resume-client = 31-resumption-resume-client
++client = 31-resumption-client
++
++[31-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[31-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[31-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[31-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-31]
++HandshakeMode = Resume
++Protocol = TLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[32-resumption]
++ssl_conf = 32-resumption-ssl
++
++[32-resumption-ssl]
++server = 32-resumption-server
++resume-server = 32-resumption-resume-server
++resume-client = 32-resumption-resume-client
++client = 32-resumption-client
++
++[32-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[32-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[32-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[32-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-32]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[33-resumption]
++ssl_conf = 33-resumption-ssl
++
++[33-resumption-ssl]
++server = 33-resumption-server
++resume-server = 33-resumption-resume-server
++resume-client = 33-resumption-resume-client
++client = 33-resumption-client
++
++[33-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[33-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[33-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[33-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-33]
++HandshakeMode = Resume
++Protocol = TLSv1.1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[34-resumption]
++ssl_conf = 34-resumption-ssl
++
++[34-resumption-ssl]
++server = 34-resumption-server
++resume-server = 34-resumption-resume-server
++resume-client = 34-resumption-resume-client
++client = 34-resumption-client
++
++[34-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[34-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[34-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[34-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-34]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[35-resumption]
++ssl_conf = 35-resumption-ssl
++
++[35-resumption-ssl]
++server = 35-resumption-server
++resume-server = 35-resumption-resume-server
++resume-client = 35-resumption-resume-client
++client = 35-resumption-client
++
++[35-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[35-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[35-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++MinProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[35-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-35]
++HandshakeMode = Resume
++Protocol = TLSv1.2
++ResumptionExpected = Yes
++
++
+diff --git a/test/ssl-tests/11-dtls_resumption.conf b/test/ssl-tests/11-dtls_resumption.conf
+index 3433944..62e1799 100644
+--- a/test/ssl-tests/11-dtls_resumption.conf
++++ b/test/ssl-tests/11-dtls_resumption.conf
+@@ -1,6 +1,6 @@
+ # Generated with generate_ssl_tests.pl
+ 
+-num_tests = 8
++num_tests = 16
+ 
+ test-0 = 0-resumption
+ test-1 = 1-resumption
+@@ -10,6 +10,14 @@ test-4 = 4-resumption
+ test-5 = 5-resumption
+ test-6 = 6-resumption
+ test-7 = 7-resumption
++test-8 = 8-resumption
++test-9 = 9-resumption
++test-10 = 10-resumption
++test-11 = 11-resumption
++test-12 = 12-resumption
++test-13 = 13-resumption
++test-14 = 14-resumption
++test-15 = 15-resumption
+ # ===========================================================
+ 
+ [0-resumption]
+@@ -18,6 +26,7 @@ ssl_conf = 0-resumption-ssl
+ [0-resumption-ssl]
+ server = 0-resumption-server
+ resume-server = 0-resumption-resume-server
++resume-client = 0-resumption-resume-client
+ client = 0-resumption-client
+ 
+ [0-resumption-server]
+@@ -39,6 +48,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[0-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-0]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -54,6 +68,7 @@ ssl_conf = 1-resumption-ssl
+ [1-resumption-ssl]
+ server = 1-resumption-server
+ resume-server = 1-resumption-resume-server
++resume-client = 1-resumption-resume-client
+ client = 1-resumption-client
+ 
+ [1-resumption-server]
+@@ -75,6 +90,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[1-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-1]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -90,6 +110,7 @@ ssl_conf = 2-resumption-ssl
+ [2-resumption-ssl]
+ server = 2-resumption-server
+ resume-server = 2-resumption-resume-server
++resume-client = 2-resumption-resume-client
+ client = 2-resumption-client
+ 
+ [2-resumption-server]
+@@ -111,6 +132,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[2-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-2]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -126,6 +152,7 @@ ssl_conf = 3-resumption-ssl
+ [3-resumption-ssl]
+ server = 3-resumption-server
+ resume-server = 3-resumption-resume-server
++resume-client = 3-resumption-resume-client
+ client = 3-resumption-client
+ 
+ [3-resumption-server]
+@@ -147,6 +174,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[3-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-3]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -162,6 +194,7 @@ ssl_conf = 4-resumption-ssl
+ [4-resumption-ssl]
+ server = 4-resumption-server
+ resume-server = 4-resumption-resume-server
++resume-client = 4-resumption-resume-client
+ client = 4-resumption-client
+ 
+ [4-resumption-server]
+@@ -183,6 +216,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[4-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-4]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -198,6 +236,7 @@ ssl_conf = 5-resumption-ssl
+ [5-resumption-ssl]
+ server = 5-resumption-server
+ resume-server = 5-resumption-resume-server
++resume-client = 5-resumption-resume-client
+ client = 5-resumption-client
+ 
+ [5-resumption-server]
+@@ -219,6 +258,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[5-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-5]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -234,6 +278,7 @@ ssl_conf = 6-resumption-ssl
+ [6-resumption-ssl]
+ server = 6-resumption-server
+ resume-server = 6-resumption-resume-server
++resume-client = 6-resumption-resume-client
+ client = 6-resumption-client
+ 
+ [6-resumption-server]
+@@ -255,6 +300,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[6-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-6]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -270,6 +320,7 @@ ssl_conf = 7-resumption-ssl
+ [7-resumption-ssl]
+ server = 7-resumption-server
+ resume-server = 7-resumption-resume-server
++resume-client = 7-resumption-resume-client
+ client = 7-resumption-client
+ 
+ [7-resumption-server]
+@@ -291,6 +342,11 @@ CipherString = DEFAULT
+ VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
+ VerifyMode = Peer
+ 
++[7-resumption-resume-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
+ [test-7]
+ HandshakeMode = Resume
+ Method = DTLS
+@@ -298,3 +354,347 @@ Protocol = DTLSv1.2
+ ResumptionExpected = Yes
+ 
+ 
++# ===========================================================
++
++[8-resumption]
++ssl_conf = 8-resumption-ssl
++
++[8-resumption-ssl]
++server = 8-resumption-server
++resume-server = 8-resumption-resume-server
++resume-client = 8-resumption-resume-client
++client = 8-resumption-client
++
++[8-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[8-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[8-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++MinProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[8-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-8]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[9-resumption]
++ssl_conf = 9-resumption-ssl
++
++[9-resumption-ssl]
++server = 9-resumption-server
++resume-server = 9-resumption-resume-server
++resume-client = 9-resumption-resume-client
++client = 9-resumption-client
++
++[9-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[9-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[9-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++MinProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[9-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-9]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[10-resumption]
++ssl_conf = 10-resumption-ssl
++
++[10-resumption-ssl]
++server = 10-resumption-server
++resume-server = 10-resumption-resume-server
++resume-client = 10-resumption-resume-client
++client = 10-resumption-client
++
++[10-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[10-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[10-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++MinProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[10-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-10]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[11-resumption]
++ssl_conf = 11-resumption-ssl
++
++[11-resumption-ssl]
++server = 11-resumption-server
++resume-server = 11-resumption-resume-server
++resume-client = 11-resumption-resume-client
++client = 11-resumption-client
++
++[11-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[11-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[11-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++MinProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[11-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-11]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1.2
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[12-resumption]
++ssl_conf = 12-resumption-ssl
++
++[12-resumption-ssl]
++server = 12-resumption-server
++resume-server = 12-resumption-resume-server
++resume-client = 12-resumption-resume-client
++client = 12-resumption-client
++
++[12-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[12-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[12-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++MinProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[12-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-12]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[13-resumption]
++ssl_conf = 13-resumption-ssl
++
++[13-resumption-ssl]
++server = 13-resumption-server
++resume-server = 13-resumption-resume-server
++resume-client = 13-resumption-resume-client
++client = 13-resumption-client
++
++[13-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[13-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[13-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++MinProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[13-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-13]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1
++ResumptionExpected = No
++
++
++# ===========================================================
++
++[14-resumption]
++ssl_conf = 14-resumption-ssl
++
++[14-resumption-ssl]
++server = 14-resumption-server
++resume-server = 14-resumption-resume-server
++resume-client = 14-resumption-resume-client
++client = 14-resumption-client
++
++[14-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[14-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[14-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++MinProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[14-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-14]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1.2
++ResumptionExpected = Yes
++
++
++# ===========================================================
++
++[15-resumption]
++ssl_conf = 15-resumption-ssl
++
++[15-resumption-ssl]
++server = 15-resumption-server
++resume-server = 15-resumption-resume-server
++resume-client = 15-resumption-resume-client
++client = 15-resumption-client
++
++[15-resumption-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[15-resumption-resume-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++Options = -SessionTicket
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[15-resumption-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++MinProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[15-resumption-resume-client]
++CipherString = DEFAULT
++MaxProtocol = DTLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-15]
++HandshakeMode = Resume
++Method = DTLS
++Protocol = DTLSv1.2
++ResumptionExpected = Yes
++
++
+diff --git a/test/ssl-tests/protocol_version.pm b/test/ssl-tests/protocol_version.pm
+index 276adfd..059b1d0 100644
+--- a/test/ssl-tests/protocol_version.pm
++++ b/test/ssl-tests/protocol_version.pm
+@@ -142,11 +142,12 @@ sub generate_resumption_tests {
+         return;
+     }
+ 
+-    my @tests = ();
++    my @server_tests = ();
++    my @client_tests = ();
+ 
+-    # Obtain the first session against a fixed-version server.
++    # Obtain the first session against a fixed-version server/client.
+     foreach my $original_protocol($min_enabled..$#protocols) {
+-        # Upgrade or downgrade the server max version support and test
++        # Upgrade or downgrade the server/client max version support and test
+         # that it upgrades, downgrades or resumes the session as well.
+         foreach my $resume_protocol($min_enabled..$#protocols) {
+             my $resumption_expected;
+@@ -158,7 +159,8 @@ sub generate_resumption_tests {
+             }
+ 
+             foreach my $ticket (&quot;SessionTicket&quot;, &quot;-SessionTicket&quot;) {
+-                push @tests, {
++                # Client is flexible, server upgrades/downgrades.
++                push @server_tests, {
+                     &quot;name&quot; =&gt; &quot;resumption&quot;,
+                     &quot;client&quot; =&gt; { },
+                     &quot;server&quot; =&gt; {
+@@ -176,11 +178,31 @@ sub generate_resumption_tests {
+                         &quot;ResumptionExpected&quot; =&gt; $resumption_expected,
+                     }
+                 };
++                # Server is flexible, client upgrades/downgrades.
++                push @client_tests, {
++                    &quot;name&quot; =&gt; &quot;resumption&quot;,
++                    &quot;client&quot; =&gt; {
++                        &quot;MinProtocol&quot; =&gt; $protocols[$original_protocol],
++                        &quot;MaxProtocol&quot; =&gt; $protocols[$original_protocol],
++                    },
++                    &quot;server&quot; =&gt; {
++                        &quot;Options&quot; =&gt; $ticket,
++                    },
++                    &quot;resume_client&quot; =&gt; {
++                        &quot;MaxProtocol&quot; =&gt; $protocols[$resume_protocol],
++                    },
++                    &quot;test&quot; =&gt; {
++                        &quot;Protocol&quot; =&gt; $protocols[$resume_protocol],
++                        &quot;Method&quot; =&gt; $method,
++                        &quot;HandshakeMode&quot; =&gt; &quot;Resume&quot;,
++                        &quot;ResumptionExpected&quot; =&gt; $resumption_expected,
++                    }
++                };
+             }
+         }
+     }
+ 
+-    return @tests;
++    return (@server_tests, @client_tests);
+ }
+ 
+ sub expected_result {
+diff --git a/test/ssl_test.c b/test/ssl_test.c
+index c5deeb2..b28d308 100644
+--- a/test/ssl_test.c
++++ b/test/ssl_test.c
+@@ -215,7 +215,7 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+ {
+     int ret = 0;
+     SSL_CTX *server_ctx = NULL, *server2_ctx = NULL, *client_ctx = NULL,
+-        *resume_server_ctx = NULL;
++        *resume_server_ctx = NULL, *resume_client_ctx = NULL;
+     SSL_TEST_CTX *test_ctx = NULL;
+     HANDSHAKE_RESULT *result = NULL;
+ 
+@@ -233,7 +233,9 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+         client_ctx = SSL_CTX_new(DTLS_client_method());
+         if (test_ctx-&gt;handshake_mode == SSL_TEST_HANDSHAKE_RESUME) {
+             resume_server_ctx = SSL_CTX_new(DTLS_server_method());
++            resume_client_ctx = SSL_CTX_new(DTLS_client_method());
+             OPENSSL_assert(resume_server_ctx != NULL);
++            OPENSSL_assert(resume_client_ctx != NULL);
+         }
+     }
+ #endif
+@@ -247,11 +249,14 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+ 
+         if (test_ctx-&gt;handshake_mode == SSL_TEST_HANDSHAKE_RESUME) {
+             resume_server_ctx = SSL_CTX_new(TLS_server_method());
++            resume_client_ctx = SSL_CTX_new(TLS_client_method());
+             OPENSSL_assert(resume_server_ctx != NULL);
++            OPENSSL_assert(resume_client_ctx != NULL);
+         }
+     }
+ 
+-    OPENSSL_assert(server_ctx != NULL &amp;&amp; client_ctx != NULL);
++    OPENSSL_assert(server_ctx != NULL);
++    OPENSSL_assert(client_ctx != NULL);
+ 
+     OPENSSL_assert(CONF_modules_load(conf, fixture.test_app, 0) &gt; 0);
+ 
+@@ -265,9 +270,12 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+     if (resume_server_ctx != NULL
+         &amp;&amp; !SSL_CTX_config(resume_server_ctx, &quot;resume-server&quot;))
+         goto err;
++    if (resume_client_ctx != NULL
++        &amp;&amp; !SSL_CTX_config(resume_client_ctx, &quot;resume-client&quot;))
++        goto err;
+ 
+     result = do_handshake(server_ctx, server2_ctx, client_ctx,
+-                          resume_server_ctx, test_ctx);
++                          resume_server_ctx, resume_client_ctx, test_ctx);
+ 
+     ret = check_test(result, test_ctx);
+ 
+@@ -277,6 +285,7 @@ err:
+     SSL_CTX_free(server2_ctx);
+     SSL_CTX_free(client_ctx);
+     SSL_CTX_free(resume_server_ctx);
++    SSL_CTX_free(resume_client_ctx);
+     SSL_TEST_CTX_free(test_ctx);
+     if (ret != 1)
+         ERR_print_errors_fp(stderr);
+diff --git a/test/ssl_test.tmpl b/test/ssl_test.tmpl
+index 3169918..206c4a1 100644
+--- a/test/ssl_test.tmpl
++++ b/test/ssl_test.tmpl
+@@ -11,6 +11,9 @@ server = {-$testname-}-server{-
+     if (%resume_server) {
+         $OUT .= &quot;\nresume-server = $testname-resume-server&quot;;
+     }
++    if (%resume_client) {
++        $OUT .= &quot;\nresume-client = $testname-resume-client&quot;;
++    }
+ -}
+ client = {-$testname-}-client
+ 
+@@ -37,6 +40,12 @@ client = {-$testname-}-client
+     foreach my $key (sort keys %client) {
+         $OUT .= qq{$key} . &quot; = &quot; . qq{$client{$key}\n} if defined $client{$key};
+     }
++    if (%resume_client) {
++        $OUT .= &quot;\n[$testname-resume-client]\n&quot;;
++        foreach my $key (sort keys %resume_client) {
++            $OUT .= qq{$key} . &quot; = &quot; . qq{$resume_client{$key}\n} if defined $resume_client{$key};
++        }
++    }
+ -}
+ [test-{-$idx-}]
+ {-
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009181.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009203.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9195">[ date ]</a>
+              <a href="thread.html#9195">[ thread ]</a>
+              <a href="subject.html#9195">[ subject ]</a>
+              <a href="author.html#9195">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

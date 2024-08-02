@@ -1,0 +1,341 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469016619.489483.13600.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009171.html">
+   <LINK REL="Next"  HREF="009174.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1469016619.489483.13600.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Jul 20 12:10:19 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009171.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009174.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9172">[ date ]</a>
+              <a href="thread.html#9172">[ thread ]</a>
+              <a href="subject.html#9172">[ subject ]</a>
+              <a href="author.html#9172">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  2e7dc7cd6886b8006386e9f37e1defef66cbab55 (commit)
+      from  590ed3d7ea555b877859f6b491020112588fe1be (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 2e7dc7cd6886b8006386e9f37e1defef66cbab55
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri Jun 17 13:59:59 2016 +0100
+
+    Never expose ssl-&gt;bbio in the public API.
+    
+    This is adapted from BoringSSL commit 2f87112b963.
+    
+    This fixes a number of bugs where the existence of bbio was leaked in the
+    public API and broke things.
+    
+    - SSL_get_wbio returned the bbio during the handshake. It must always return
+      the BIO the consumer configured. In doing so, some internal accesses of
+      SSL_get_wbio should be switched to ssl-&gt;wbio since those want to see bbio.
+    
+    - The logic in SSL_set_rfd, etc. (which I doubt is quite right since
+      SSL_set_bio's lifetime is unclear) would get confused once wbio got
+      wrapped. Those want to compare to SSL_get_wbio.
+    
+    - If SSL_set_bio was called mid-handshake, bbio would get disconnected and
+      lose state. It forgets to reattach the bbio afterwards. Unfortunately,
+      Conscrypt does this a lot. It just never ended up calling it at a point
+      where the bbio would cause problems.
+    
+    - Make more explicit the invariant that any bbio's which exist are always
+      attached. Simplify a few things as part of that.
+    
+    RT#4572
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_lib.c            | 112 +++++++++++++++++++++++------------------------
+ ssl/statem/statem_dtls.c |   6 +--
+ 2 files changed, 58 insertions(+), 60 deletions(-)
+
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index bf63a6c..4288c6f 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -977,14 +977,8 @@ void SSL_free(SSL *s)
+     dane_final(&amp;s-&gt;dane);
+     CRYPTO_free_ex_data(CRYPTO_EX_INDEX_SSL, s, &amp;s-&gt;ex_data);
+ 
+-    if (s-&gt;bbio != NULL) {
+-        /* If the buffering BIO is in place, pop it off */
+-        if (s-&gt;bbio == s-&gt;wbio) {
+-            s-&gt;wbio = BIO_pop(s-&gt;wbio);
+-        }
+-        BIO_free(s-&gt;bbio);
+-        s-&gt;bbio = NULL;
+-    }
++    ssl_free_wbio_buffer(s);
++
+     if (s-&gt;wbio != s-&gt;rbio)
+         BIO_free_all(s-&gt;wbio);
+     BIO_free_all(s-&gt;rbio);
+@@ -1061,15 +1055,16 @@ void SSL_set_wbio(SSL *s, BIO *wbio)
+     /*
+      * If the output buffering BIO is still in place, remove it
+      */
+-    if (s-&gt;bbio != NULL) {
+-        if (s-&gt;wbio == s-&gt;bbio) {
+-            s-&gt;wbio = BIO_next(s-&gt;wbio);
+-            BIO_set_next(s-&gt;bbio, NULL);
+-        }
+-    }
++    if (s-&gt;bbio != NULL)
++        s-&gt;wbio = BIO_pop(s-&gt;wbio);
++
+     if (s-&gt;wbio != wbio &amp;&amp; s-&gt;rbio != s-&gt;wbio)
+         BIO_free_all(s-&gt;wbio);
+     s-&gt;wbio = wbio;
++
++    /* Re-attach |bbio| to the new |wbio|. */
++    if (s-&gt;bbio != NULL)
++        s-&gt;wbio = BIO_push(s-&gt;bbio, s-&gt;wbio);
+ }
+ 
+ void SSL_set_bio(SSL *s, BIO *rbio, BIO *wbio)
+@@ -1080,17 +1075,24 @@ void SSL_set_bio(SSL *s, BIO *rbio, BIO *wbio)
+ 
+ BIO *SSL_get_rbio(const SSL *s)
+ {
+-    return (s-&gt;rbio);
++    return s-&gt;rbio;
+ }
+ 
+ BIO *SSL_get_wbio(const SSL *s)
+ {
+-    return (s-&gt;wbio);
++    if (s-&gt;bbio != NULL) {
++        /*
++         * If |bbio| is active, the true caller-configured BIO is its
++         * |next_bio|.
++         */
++        return BIO_next(s-&gt;bbio);
++    }
++    return s-&gt;wbio;
+ }
+ 
+ int SSL_get_fd(const SSL *s)
+ {
+-    return (SSL_get_rfd(s));
++    return SSL_get_rfd(s);
+ }
+ 
+ int SSL_get_rfd(const SSL *s)
+@@ -1138,46 +1140,43 @@ int SSL_set_fd(SSL *s, int fd)
+ 
+ int SSL_set_wfd(SSL *s, int fd)
+ {
+-    int ret = 0;
+-    BIO *bio = NULL;
++    BIO *rbio = SSL_get_rbio(s);
+ 
+-    if ((s-&gt;rbio == NULL) || (BIO_method_type(s-&gt;rbio) != BIO_TYPE_SOCKET)
+-        || ((int)BIO_get_fd(s-&gt;rbio, NULL) != fd)) {
+-        bio = BIO_new(BIO_s_socket());
++    if (rbio == NULL || BIO_method_type(rbio) != BIO_TYPE_SOCKET
++        || (int)BIO_get_fd(rbio, NULL) != fd) {
++        BIO *bio = BIO_new(BIO_s_socket());
+ 
+         if (bio == NULL) {
+             SSLerr(SSL_F_SSL_SET_WFD, ERR_R_BUF_LIB);
+-            goto err;
++            return 0;
+         }
+         BIO_set_fd(bio, fd, BIO_NOCLOSE);
+-        SSL_set_bio(s, SSL_get_rbio(s), bio);
+-    } else
+-        SSL_set_bio(s, SSL_get_rbio(s), SSL_get_rbio(s));
+-    ret = 1;
+- err:
+-    return (ret);
++        SSL_set_wbio(s, bio);
++    } else {
++        SSL_set_wbio(s, rbio);
++    }
++    return 1;
+ }
+ 
+ int SSL_set_rfd(SSL *s, int fd)
+ {
+-    int ret = 0;
+-    BIO *bio = NULL;
++    BIO *wbio = SSL_get_wbio(s);
+ 
+-    if ((s-&gt;wbio == NULL) || (BIO_method_type(s-&gt;wbio) != BIO_TYPE_SOCKET)
+-        || ((int)BIO_get_fd(s-&gt;wbio, NULL) != fd)) {
+-        bio = BIO_new(BIO_s_socket());
++    if (wbio == NULL || BIO_method_type(wbio) != BIO_TYPE_SOCKET
++        || ((int)BIO_get_fd(wbio, NULL) != fd)) {
++        BIO *bio = BIO_new(BIO_s_socket());
+ 
+         if (bio == NULL) {
+             SSLerr(SSL_F_SSL_SET_RFD, ERR_R_BUF_LIB);
+-            goto err;
++            return 0;
+         }
+         BIO_set_fd(bio, fd, BIO_NOCLOSE);
+-        SSL_set_bio(s, bio, SSL_get_wbio(s));
+-    } else
+-        SSL_set_bio(s, SSL_get_wbio(s), SSL_get_wbio(s));
+-    ret = 1;
+- err:
+-    return (ret);
++        SSL_set_rbio(s, bio);
++    } else {
++        SSL_set_rbio(s, wbio);
++    }
++
++    return 1;
+ }
+ #endif
+ 
+@@ -2923,7 +2922,11 @@ int SSL_get_error(const SSL *s, int i)
+         }
+ 
+         if (SSL_want_write(s)) {
+-            bio = SSL_get_wbio(s);
++            /*
++             * Access wbio directly - in order to use the buffered bio if
++             * present
++             */
++            bio = s-&gt;wbio;
+             if (BIO_should_write(bio))
+                 return (SSL_ERROR_WANT_WRITE);
+             else if (BIO_should_read(bio))
+@@ -3266,21 +3269,19 @@ int ssl_init_wbio_buffer(SSL *s)
+ {
+     BIO *bbio;
+ 
+-    if (s-&gt;bbio == NULL) {
+-        bbio = BIO_new(BIO_f_buffer());
+-        if (bbio == NULL)
+-            return 0;
+-        s-&gt;bbio = bbio;
+-        s-&gt;wbio = BIO_push(bbio, s-&gt;wbio);
+-    } else {
+-        bbio = s-&gt;bbio;
+-        (void)BIO_reset(bbio);
++    if (s-&gt;bbio != NULL) {
++        /* Already buffered. */
++        return 1;
+     }
+ 
+-    if (!BIO_set_read_buffer_size(bbio, 1)) {
++    bbio = BIO_new(BIO_f_buffer());
++    if (bbio == NULL || !BIO_set_read_buffer_size(bbio, 1)) {
++        BIO_free(bbio);
+         SSLerr(SSL_F_SSL_INIT_WBIO_BUFFER, ERR_R_BUF_LIB);
+         return 0;
+     }
++    s-&gt;bbio = bbio;
++    s-&gt;wbio = BIO_push(bbio, s-&gt;wbio);
+ 
+     return 1;
+ }
+@@ -3291,11 +3292,8 @@ void ssl_free_wbio_buffer(SSL *s)
+     if (s-&gt;bbio == NULL)
+         return;
+ 
+-    if (s-&gt;bbio == s-&gt;wbio) {
+-        /* remove buffering */
+-        s-&gt;wbio = BIO_pop(s-&gt;wbio);
+-        assert(s-&gt;wbio != NULL);
+-    }
++    s-&gt;wbio = BIO_pop(s-&gt;wbio);
++    assert(s-&gt;wbio != NULL);
+     BIO_free(s-&gt;bbio);
+     s-&gt;bbio = NULL;
+ }
+diff --git a/ssl/statem/statem_dtls.c b/ssl/statem/statem_dtls.c
+index 5929113..31ae1cb 100644
+--- a/ssl/statem/statem_dtls.c
++++ b/ssl/statem/statem_dtls.c
+@@ -182,7 +182,7 @@ int dtls1_do_write(SSL *s, int type)
+             }
+         }
+ 
+-        used_len = BIO_wpending(SSL_get_wbio(s)) + DTLS1_RT_HEADER_LENGTH
++        used_len = BIO_wpending(s-&gt;wbio) + DTLS1_RT_HEADER_LENGTH
+             + mac_size + blocksize;
+         if (s-&gt;d1-&gt;mtu &gt; used_len)
+             curr_mtu = s-&gt;d1-&gt;mtu - used_len;
+@@ -193,7 +193,7 @@ int dtls1_do_write(SSL *s, int type)
+             /*
+              * grr.. we could get an error if MTU picked was wrong
+              */
+-            ret = BIO_flush(SSL_get_wbio(s));
++            ret = BIO_flush(s-&gt;wbio);
+             if (ret &lt;= 0) {
+                 s-&gt;rwstate = SSL_WRITING;
+                 return ret;
+@@ -1120,7 +1120,7 @@ dtls1_retransmit_message(SSL *s, unsigned short seq, int *found)
+ 
+     s-&gt;d1-&gt;retransmitting = 0;
+ 
+-    (void)BIO_flush(SSL_get_wbio(s));
++    (void)BIO_flush(s-&gt;wbio);
+     return ret;
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009171.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009174.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9172">[ date ]</a>
+              <a href="thread.html#9172">[ thread ]</a>
+              <a href="subject.html#9172">[ subject ]</a>
+              <a href="author.html#9172">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,619 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1466625225.559251.1713.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008510.html">
+   <LINK REL="Next"  HREF="008512.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1466625225.559251.1713.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Wed Jun 22 19:53:45 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008510.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="008512.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8511">[ date ]</a>
+              <a href="thread.html#8511">[ thread ]</a>
+              <a href="subject.html#8511">[ subject ]</a>
+              <a href="author.html#8511">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  fc6076ca272f74eb1364c29e6974ad5da5ef9777 (commit)
+       via  094878164de102cf97c4e9f2392f41e03ef2f11c (commit)
+      from  eeac54ef6d7eedd42a97025ddddaf06777be3c6b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit fc6076ca272f74eb1364c29e6974ad5da5ef9777
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Tue Jun 21 15:28:23 2016 +0200
+
+    rand/randfile.c: make it non-ASCII-savvy.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit 094878164de102cf97c4e9f2392f41e03ef2f11c
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Tue Jun 21 15:26:18 2016 +0200
+
+    Move OS-specific fopen quirks to o_fopen.c.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bss_file.c              |  85 +----------------------
+ crypto/build.info                  |   2 +-
+ crypto/include/internal/cryptlib.h |   6 +-
+ crypto/o_fopen.c                   | 103 ++++++++++++++++++++++++++++
+ crypto/rand/randfile.c             | 134 +++++++++++++++++++++++--------------
+ 5 files changed, 196 insertions(+), 134 deletions(-)
+ create mode 100644 crypto/o_fopen.c
+
+diff --git a/crypto/bio/bss_file.c b/crypto/bio/bss_file.c
+index 36099f8..4f79c32 100644
+--- a/crypto/bio/bss_file.c
++++ b/crypto/bio/bss_file.c
+@@ -61,91 +61,10 @@ static const BIO_METHOD methods_filep = {
+     NULL,
+ };
+ 
+-static FILE *file_fopen(const char *filename, const char *mode)
+-{
+-    FILE *file = NULL;
+-
+-#  if defined(_WIN32) &amp;&amp; defined(CP_UTF8)
+-    int sz, len_0 = (int)strlen(filename) + 1;
+-    DWORD flags;
+-
+-    /*
+-     * Basically there are three cases to cover: a) filename is
+-     * pure ASCII string; b) actual UTF-8 encoded string and
+-     * c) locale-ized string, i.e. one containing 8-bit
+-     * characters that are meaningful in current system locale.
+-     * If filename is pure ASCII or real UTF-8 encoded string,
+-     * MultiByteToWideChar succeeds and _wfopen works. If
+-     * filename is locale-ized string, chances are that
+-     * MultiByteToWideChar fails reporting
+-     * ERROR_NO_UNICODE_TRANSLATION, in which case we fall
+-     * back to fopen...
+-     */
+-    if ((sz = MultiByteToWideChar(CP_UTF8, (flags = MB_ERR_INVALID_CHARS),
+-                                  filename, len_0, NULL, 0)) &gt; 0 ||
+-        (GetLastError() == ERROR_INVALID_FLAGS &amp;&amp;
+-         (sz = MultiByteToWideChar(CP_UTF8, (flags = 0),
+-                                   filename, len_0, NULL, 0)) &gt; 0)
+-        ) {
+-        WCHAR wmode[8];
+-        WCHAR *wfilename = _alloca(sz * sizeof(WCHAR));
+-
+-        if (MultiByteToWideChar(CP_UTF8, flags,
+-                                filename, len_0, wfilename, sz) &amp;&amp;
+-            MultiByteToWideChar(CP_UTF8, 0, mode, strlen(mode) + 1,
+-                                wmode, OSSL_NELEM(wmode)) &amp;&amp;
+-            (file = _wfopen(wfilename, wmode)) == NULL &amp;&amp;
+-            (errno == ENOENT || errno == EBADF)
+-            ) {
+-            /*
+-             * UTF-8 decode succeeded, but no file, filename
+-             * could still have been locale-ized...
+-             */
+-            file = fopen(filename, mode);
+-        }
+-    } else if (GetLastError() == ERROR_NO_UNICODE_TRANSLATION) {
+-        file = fopen(filename, mode);
+-    }
+-#  elif defined(__DJGPP__)
+-    {
+-        char *newname = NULL;
+-
+-        if (!HAS_LFN_SUPPORT(filename)) {
+-            char *iterator;
+-            char lastchar;
+-
+-            newname = OPENSSL_malloc(strlen(filename) + 1);
+-            if (newname == NULL)
+-                return NULL;
+-
+-            for(iterator = newname, lastchar = '\0';
+-                *filename; filename++, iterator++) {
+-                if (lastchar == '/' &amp;&amp; filename[0] == '.'
+-                    &amp;&amp; filename[1] != '.' &amp;&amp; filename[1] != '/') {
+-                    /* Leading dots are not permitted in plain DOS. */
+-                    *iterator = '_';
+-                } else {
+-                    *iterator = *filename;
+-                }
+-                lastchar = *filename;
+-            }
+-            *iterator = '\0';
+-            filename = newname;
+-        }
+-        file = fopen(filename, mode);
+-
+-        OPENSSL_free(newname);
+-    }
+-#  else
+-    file = fopen(filename, mode);
+-#  endif
+-    return (file);
+-}
+-
+ BIO *BIO_new_file(const char *filename, const char *mode)
+ {
+     BIO  *ret;
+-    FILE *file = file_fopen(filename, mode);
++    FILE *file = openssl_fopen(filename, mode);
+     int fp_flags = BIO_CLOSE;
+ 
+     if (strchr(mode, 'b') == NULL)
+@@ -363,7 +282,7 @@ static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+         else
+             strcat(p, &quot;t&quot;);
+ #  endif
+-        fp = file_fopen(ptr, p);
++        fp = openssl_fopen(ptr, p);
+         if (fp == NULL) {
+             SYSerr(SYS_F_FOPEN, get_last_sys_error());
+             ERR_add_error_data(5, &quot;fopen('&quot;, ptr, &quot;','&quot;, p, &quot;')&quot;);
+diff --git a/crypto/build.info b/crypto/build.info
+index 1b4ed14..916d24f 100644
+--- a/crypto/build.info
++++ b/crypto/build.info
+@@ -2,7 +2,7 @@
+ LIBS=../libcrypto
+ SOURCE[../libcrypto]=\
+         cryptlib.c mem.c mem_dbg.c cversion.c ex_data.c cpt_err.c \
+-        ebcdic.c uid.c o_time.c o_str.c o_dir.c \
++        ebcdic.c uid.c o_time.c o_str.c o_dir.c o_fopen.c \
+         threads_pthread.c threads_win.c threads_none.c \
+         o_init.c o_fips.c mem_sec.c init.c {- $target{cpuid_asm_src} -} \
+         {- $target{uplink_aux_src} -}
+diff --git a/crypto/include/internal/cryptlib.h b/crypto/include/internal/cryptlib.h
+index 05b8dc0..c9f76ba 100644
+--- a/crypto/include/internal/cryptlib.h
++++ b/crypto/include/internal/cryptlib.h
+@@ -25,7 +25,6 @@
+ # include &lt;openssl/buffer.h&gt;
+ # include &lt;openssl/bio.h&gt;
+ # include &lt;openssl/err.h&gt;
+-# include &lt;openssl/opensslconf.h&gt;
+ 
+ #ifdef  __cplusplus
+ extern &quot;C&quot; {
+@@ -69,6 +68,11 @@ extern int OPENSSL_NONPIC_relocated;
+ void crypto_cleanup_all_ex_data_int(void);
+ 
+ int openssl_strerror_r(int errnum, char *buf, size_t buflen);
++# if !defined(OPENSSL_NO_STDIO)
++FILE *openssl_fopen(const char *filename, const char *mode);
++# else
++void *openssl_fopen(const char *filename, const char *mode);
++# endif
+ 
+ #ifdef  __cplusplus
+ }
+diff --git a/crypto/o_fopen.c b/crypto/o_fopen.c
+new file mode 100644
+index 0000000..0bdb53f
+--- /dev/null
++++ b/crypto/o_fopen.c
+@@ -0,0 +1,103 @@
++/*
++ * Copyright 2016 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &quot;internal/cryptlib.h&quot;
++
++#if !defined(OPENSSL_NO_STDIO)
++
++# include &lt;stdio.h&gt;
++
++FILE *openssl_fopen(const char *filename, const char *mode)
++{
++    FILE *file = NULL;
++# if defined(_WIN32) &amp;&amp; defined(CP_UTF8)
++    int sz, len_0 = (int)strlen(filename) + 1;
++    DWORD flags;
++
++    /*
++     * Basically there are three cases to cover: a) filename is
++     * pure ASCII string; b) actual UTF-8 encoded string and
++     * c) locale-ized string, i.e. one containing 8-bit
++     * characters that are meaningful in current system locale.
++     * If filename is pure ASCII or real UTF-8 encoded string,
++     * MultiByteToWideChar succeeds and _wfopen works. If
++     * filename is locale-ized string, chances are that
++     * MultiByteToWideChar fails reporting
++     * ERROR_NO_UNICODE_TRANSLATION, in which case we fall
++     * back to fopen...
++     */
++    if ((sz = MultiByteToWideChar(CP_UTF8, (flags = MB_ERR_INVALID_CHARS),
++                                  filename, len_0, NULL, 0)) &gt; 0 ||
++        (GetLastError() == ERROR_INVALID_FLAGS &amp;&amp;
++         (sz = MultiByteToWideChar(CP_UTF8, (flags = 0),
++                                   filename, len_0, NULL, 0)) &gt; 0)
++        ) {
++        WCHAR wmode[8];
++        WCHAR *wfilename = _alloca(sz * sizeof(WCHAR));
++
++        if (MultiByteToWideChar(CP_UTF8, flags,
++                                filename, len_0, wfilename, sz) &amp;&amp;
++            MultiByteToWideChar(CP_UTF8, 0, mode, strlen(mode) + 1,
++                                wmode, OSSL_NELEM(wmode)) &amp;&amp;
++            (file = _wfopen(wfilename, wmode)) == NULL &amp;&amp;
++            (errno == ENOENT || errno == EBADF)
++            ) {
++            /*
++             * UTF-8 decode succeeded, but no file, filename
++             * could still have been locale-ized...
++             */
++            file = fopen(filename, mode);
++        }
++    } else if (GetLastError() == ERROR_NO_UNICODE_TRANSLATION) {
++        file = fopen(filename, mode);
++    }
++# elif defined(__DJGPP__)
++    {
++        char *newname = NULL;
++
++        if (!HAS_LFN_SUPPORT(filename)) {
++            char *iterator;
++            char lastchar;
++
++            newname = OPENSSL_malloc(strlen(filename) + 1);
++            if (newname == NULL)
++                return NULL;
++
++            for(iterator = newname, lastchar = '\0';
++                *filename; filename++, iterator++) {
++                if (lastchar == '/' &amp;&amp; filename[0] == '.'
++                    &amp;&amp; filename[1] != '.' &amp;&amp; filename[1] != '/') {
++                    /* Leading dots are not permitted in plain DOS. */
++                    *iterator = '_';
++                } else {
++                    *iterator = *filename;
++                }
++                lastchar = *filename;
++            }
++            *iterator = '\0';
++            filename = newname;
++        }
++        file = fopen(filename, mode);
++
++        OPENSSL_free(newname);
++    }
++# else
++    file = fopen(filename, mode);
++# endif
++    return file;
++}
++
++#else
++
++void *openssl_fopen(const char *filename, const char *mode)
++{
++    return NULL;
++}
++
++#endif
+diff --git a/crypto/rand/randfile.c b/crypto/rand/randfile.c
+index c322268..7aeb871 100644
+--- a/crypto/rand/randfile.c
++++ b/crypto/rand/randfile.c
+@@ -7,7 +7,7 @@
+  * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
+  */
+ 
+-#include &quot;e_os.h&quot;
++#include &quot;internal/cryptlib.h&quot;
+ 
+ #include &lt;errno.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -57,6 +57,8 @@
+ # define chmod   _chmod
+ # define open    _open
+ # define fdopen  _fdopen
++# define fstat   _fstat
++# define fileno  _fileno
+ #endif
+ 
+ #undef BUFSIZE
+@@ -76,12 +78,8 @@
+ # if __INITIAL_POINTER_SIZE == 64
+ #  pragma pointer_size save
+ #  pragma pointer_size 32
+-# endif
+ typedef char *char_ptr32;
+-# if __INITIAL_POINTER_SIZE == 64
+ #  pragma pointer_size restore
+-# endif
+-
+ /*
+  * On VMS, setbuf() will only take 32-bit pointers, and a compilation
+  * with /POINTER_SIZE=64 will give off a MAYLOSEDATA2 warning here.
+@@ -90,20 +88,18 @@ typedef char *char_ptr32;
+  * As for the buffer parameter, we only use NULL here, so that passes as
+  * well...
+  */
+-static void vms_setbuf(FILE *fp, char *buf)
+-{
+-    setbuf((__FILE_ptr32)fp, (char_ptr32)buf);
+-}
++#  define setbuf(fp,buf) (setbuf)((__FILE_ptr32)(fp), (char_ptr32)(buf))
++# endif
++
+ /*
+  * This declaration is a nasty hack to get around vms' extension to fopen for
+  * passing in sharing options being disabled by /STANDARD=ANSI89
+  */
+ static __FILE_ptr32 (*const vms_fopen)(const char *, const char *, ...) =
+-    (__FILE_ptr32 (*)(const char *, const char *, ...))fopen;
++      (__FILE_ptr32 (*)(const char *, const char *, ...))fopen;
+ # define VMS_OPEN_ATTRS &quot;shr=get,put,upd,del&quot;,&quot;ctx=bin,stm&quot;,&quot;rfm=stm&quot;,&quot;rat=none&quot;,&quot;mrs=0&quot;
+ 
+-# define fopen(fname,mode) vms_fopen((fname), (mode), VMS_OPEN_ATTRS)
+-# define setbuf(fp,buf) vms_setbuf((fp), (buf))
++# define openssl_fopen(fname,mode) vms_fopen((fname), (mode), VMS_OPEN_ATTRS)
+ #endif
+ 
+ #define RFILE &quot;.rnd&quot;
+@@ -125,10 +121,17 @@ int RAND_load_file(const char *file, long bytes)
+     struct stat sb;
+ #endif
+     int i, ret = 0, n;
+-    FILE *in;
++    FILE *in = NULL;
+ 
+     if (file == NULL)
+-        return (0);
++        return 0;
++
++    if (bytes == 0)
++        return ret;
++
++    in = openssl_fopen(file, &quot;rb&quot;);
++    if (in == NULL)
++        goto err;
+ 
+ #ifndef OPENSSL_NO_POSIX_IO
+     /*
+@@ -138,17 +141,11 @@ int RAND_load_file(const char *file, long bytes)
+      * applications such as Valgrind.
+      */
+     memset(&amp;sb, 0, sizeof(sb));
+-    if (stat(file, &amp;sb) &lt; 0)
+-        return (0);
++    if (fstat(fileno(in), &amp;sb) &lt; 0)
++        goto err;
+     RAND_add(&amp;sb, sizeof(sb), 0.0);
+-#endif
+-    if (bytes == 0)
+-        return (ret);
+ 
+-    in = fopen(file, &quot;rb&quot;);
+-    if (in == NULL)
+-        goto err;
+-#if defined(S_ISBLK) &amp;&amp; defined(S_ISCHR) &amp;&amp; !defined(OPENSSL_NO_POSIX_IO)
++# if defined(S_ISBLK) &amp;&amp; defined(S_ISCHR)
+     if (S_ISBLK(sb.st_mode) || S_ISCHR(sb.st_mode)) {
+         /*
+          * this file is a device. we don't want read an infinite number of
+@@ -158,6 +155,7 @@ int RAND_load_file(const char *file, long bytes)
+         bytes = (bytes == -1) ? 2048 : bytes; /* ok, is 2048 enough? */
+         setbuf(in, NULL); /* don't do buffered reads */
+     }
++# endif
+ #endif
+     for (;;) {
+         if (bytes &gt; 0)
+@@ -176,10 +174,11 @@ int RAND_load_file(const char *file, long bytes)
+                 break;
+         }
+     }
+-    fclose(in);
+     OPENSSL_cleanse(buf, BUFSIZE);
+  err:
+-    return (ret);
++    if (in != NULL)
++        fclose(in);
++    return ret;
+ }
+ 
+ int RAND_write_file(const char *file)
+@@ -191,9 +190,15 @@ int RAND_write_file(const char *file)
+ #ifndef OPENSSL_NO_POSIX_IO
+     struct stat sb;
+ 
++# if defined(S_ISBLK) &amp;&amp; defined(S_ISCHR)
++# ifdef _WIN32
++    /*
++     * Check for |file| being a driver as &quot;ASCII-safe&quot; on Windows,
++     * because driver paths are always ASCII.
++     */
++# endif
+     i = stat(file, &amp;sb);
+     if (i != -1) {
+-# if defined(S_ISBLK) &amp;&amp; defined(S_ISCHR)
+         if (S_ISBLK(sb.st_mode) || S_ISCHR(sb.st_mode)) {
+             /*
+              * this file is a device. we don't write back to it. we
+@@ -201,13 +206,14 @@ int RAND_write_file(const char *file)
+              * device. Otherwise attempting to write to and chmod the device
+              * causes problems.
+              */
+-            return (1);
++            return 1;
+         }
+ # endif
+     }
+ #endif
+ 
+-#if defined(O_CREAT) &amp;&amp; !defined(OPENSSL_NO_POSIX_IO) &amp;&amp; !defined(OPENSSL_SYS_VMS)
++#if defined(O_CREAT) &amp;&amp; !defined(OPENSSL_NO_POSIX_IO) &amp;&amp; \
++    !defined(OPENSSL_SYS_VMS) &amp;&amp; !defined(OPENSSL_SYS_WINDOWS)
+     {
+ # ifndef O_BINARY
+ #  define O_BINARY 0
+@@ -241,10 +247,10 @@ int RAND_write_file(const char *file)
+      * rand file in a concurrent use situation.
+      */
+ 
+-    out = fopen(file, &quot;rb+&quot;);
++    out = openssl_fopen(file, &quot;rb+&quot;);
+ #endif
+     if (out == NULL)
+-        out = fopen(file, &quot;wb&quot;);
++        out = openssl_fopen(file, &quot;wb&quot;);
+     if (out == NULL)
+         goto err;
+ 
+@@ -276,38 +282,68 @@ int RAND_write_file(const char *file)
+ const char *RAND_file_name(char *buf, size_t size)
+ {
+     char *s = NULL;
++    int use_randfile = 1;
+ #ifdef __OpenBSD__
+     struct stat sb;
+ #endif
+ 
+-    if (OPENSSL_issetugid() == 0)
+-        s = getenv(&quot;RANDFILE&quot;);
+-    if (s != NULL &amp;&amp; *s &amp;&amp; strlen(s) + 1 &lt; size) {
+-        if (OPENSSL_strlcpy(buf, s, size) &gt;= size)
+-            return NULL;
+-    } else {
+-#ifdef OPENSSL_SYS_WINDOWS
+-        if ((s = getenv(&quot;HOME&quot;)) == NULL
+-            &amp;&amp; (s = getenv(&quot;USERPROFILE&quot;)) == NULL) {
+-            s = getenv(&quot;SYSTEMROOT&quot;);
++#if defined(_WIN32) &amp;&amp; defined(CP_UTF8)
++    DWORD len;
++    WCHAR *var, *val;
++
++    if ((var = L&quot;RANDFILE&quot;,
++         len = GetEnvironmentVariableW(var, NULL, 0)) == 0
++        &amp;&amp; (var = L&quot;HOME&quot;, use_randfile = 0,
++            len = GetEnvironmentVariableW(var, NULL, 0)) == 0
++        &amp;&amp; (var = L&quot;USERPROFILE&quot;,
++            len = GetEnvironmentVariableW(var, NULL, 0)) == 0) {
++        var = L&quot;SYSTEMROOT&quot;,
++        len = GetEnvironmentVariableW(var, NULL, 0);
++    }
++
++    if (len != 0) {
++        int sz;
++
++        val = _alloca(len * sizeof(WCHAR));
++
++        if (GetEnvironmentVariableW(var, val, len) &lt; len
++            &amp;&amp; (sz = WideCharToMultiByte(CP_UTF8, 0, val, -1, NULL, 0,
++                                         NULL, NULL)) != 0) {
++            s = _alloca(sz);
++            if (WideCharToMultiByte(CP_UTF8, 0, val, -1, s, sz,
++                                    NULL, NULL) == 0)
++                s = NULL;
+         }
++    }
+ #else
++    if (OPENSSL_issetugid() == 0) {
++        s = getenv(&quot;RANDFILE&quot;);
++    } else {
++        use_randfile = 0;
+         if (OPENSSL_issetugid() == 0)
+             s = getenv(&quot;HOME&quot;);
++    }
+ #endif
+ #ifdef DEFAULT_HOME
+-        if (s == NULL) {
+-            s = DEFAULT_HOME;
+-        }
++    if (!use_randfile &amp;&amp; s == NULL) {
++        s = DEFAULT_HOME;
++    }
+ #endif
+-        if (s &amp;&amp; *s &amp;&amp; strlen(s) + strlen(RFILE) + 2 &lt; size) {
++    if (s != NULL &amp;&amp; *s) {
++        size_t len = strlen(s);
++
++        if (use_randfile &amp;&amp; len + 1 &lt; size) {
++            if (OPENSSL_strlcpy(buf, s, size) &gt;= size)
++                return NULL;
++        } else if (len + strlen(RFILE) + 2 &lt; size) {
+             OPENSSL_strlcpy(buf, s, size);
+ #ifndef OPENSSL_SYS_VMS
+             OPENSSL_strlcat(buf, &quot;/&quot;, size);
+ #endif
+             OPENSSL_strlcat(buf, RFILE, size);
+-        } else
+-            buf[0] = '\0';      /* no file name */
++        }
++    } else {
++        buf[0] = '\0';      /* no file name */
+     }
+ 
+ #ifdef __OpenBSD__
+@@ -321,12 +357,12 @@ const char *RAND_file_name(char *buf, size_t size)
+ 
+     if (!buf[0])
+         if (OPENSSL_strlcpy(buf, &quot;/dev/arandom&quot;, size) &gt;= size) {
+-            return (NULL);
++            return NULL;
+         }
+     if (stat(buf, &amp;sb) == -1)
+         if (OPENSSL_strlcpy(buf, &quot;/dev/arandom&quot;, size) &gt;= size) {
+-            return (NULL);
++            return NULL;
+         }
+ #endif
+-    return (buf);
++    return buf;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008510.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="008512.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8511">[ date ]</a>
+              <a href="thread.html#8511">[ thread ]</a>
+              <a href="subject.html#8511">[ subject ]</a>
+              <a href="author.html#8511">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

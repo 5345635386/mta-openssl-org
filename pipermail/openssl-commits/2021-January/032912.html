@@ -1,0 +1,970 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1611677901.071468.2267.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032911.html">
+   <LINK REL="Next"  HREF="032918.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>dev at ddvo.net</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1611677901.071468.2267.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">dev at ddvo.net
+       </A><BR>
+    <I>Tue Jan 26 16:18:21 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032911.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032918.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32912">[ date ]</a>
+              <a href="thread.html#32912">[ thread ]</a>
+              <a href="subject.html#32912">[ subject ]</a>
+              <a href="author.html#32912">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0c3eb2793b2a1fe35beeb90ba8f5cb2a0fdc3270 (commit)
+      from  1395a84e48e1369939ff47ca54163a210a0de4e8 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0c3eb2793b2a1fe35beeb90ba8f5cb2a0fdc3270
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">dev at ddvo.net</A>&gt;
+Date:   Sat Jan 16 20:43:00 2021 +0100
+
+    TLS client: allow cert verify callback return -1 for SSL_ERROR_WANT_RETRY_VERIFY
+    
+    The client-side cert verification callback function may not only return
+    as usual for success or 0 for failure, but also -1,
+    typically on failure verifying the server certificate.
+    This makes the handshake suspend and return control to the calling application
+    with SSL_ERROR_WANT_RETRY_VERIFY.
+    The app can for instance fetch further certificates or cert status information
+    needed for the verification.
+    Calling SSL_connect() again resumes the connection attempt
+    by retrying the server certificate verification step.
+    This process may even be repeated if need be.
+    
+    The core implementation of the feature is in ssl/statem/statem_clnt.c,
+    splitting tls_process_server_certificate() into a preparation step
+    that just copies the certificates received from the server to s-&gt;session-&gt;peer_chain
+    (rather than having them in a local variable at first) and returns to the state machine,
+    and a post-processing step in tls_post_process_server_certificate() that can be repeated:
+    Try verifying the current contents of s-&gt;session-&gt;peer_chain basically as before,
+    but give the verification callback function the chance to pause connecting and
+    make the TLS state machine later call tls_post_process_server_certificate() again.
+    Otherwise processing continues as usual.
+    
+    The documentation of the new feature is added to SSL_CTX_set_cert_verify_callback.pod
+    and SSL_want.pod.
+    
+    This adds two tests:
+    * A generic test in test/helpers/handshake.c
+      on the usability of the new server cert verification retry feature.
+      It is triggered via test/ssl-tests/03-custom_verify.cnf.in (while the bulky auto-
+      generated changes to test/ssl-tests/03-custom_verify.cnf can be basically ignored).
+    * A test in test/sslapitest.c that demonstrates the effectiveness of the approach
+      for augmenting the cert chain provided by the server in between SSL_connect() calls.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13906">https://github.com/openssl/openssl/pull/13906</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ doc/man3/SSL_CTX_set_cert_verify_callback.pod |  14 ++-
+ doc/man3/SSL_want.pod                         |  36 ++++---
+ include/openssl/ssl.h.in                      |   3 +
+ ssl/ssl_lib.c                                 |   2 +
+ ssl/statem/statem_clnt.c                      |  72 +++++++------
+ ssl/statem/statem_local.h                     |   1 +
+ test/helpers/handshake.c                      |  20 +++-
+ test/helpers/ssl_test_ctx.c                   |   2 +
+ test/helpers/ssl_test_ctx.h                   |   1 +
+ test/recipes/80-test_ssl_new.t                |   4 +-
+ test/ssl-tests/03-custom_verify.cnf           | 150 +++++++++++++++-----------
+ test/ssl-tests/03-custom_verify.cnf.in        |  14 +++
+ test/sslapitest.c                             |  86 +++++++++++++++
+ util/other.syms                               |   1 +
+ 14 files changed, 295 insertions(+), 111 deletions(-)
+
+diff --git a/doc/man3/SSL_CTX_set_cert_verify_callback.pod b/doc/man3/SSL_CTX_set_cert_verify_callback.pod
+index fa47e49516..4dff998399 100644
+--- a/doc/man3/SSL_CTX_set_cert_verify_callback.pod
++++ b/doc/man3/SSL_CTX_set_cert_verify_callback.pod
+@@ -33,7 +33,19 @@ argument I&lt;arg&gt; is specified by the application when setting I&lt;callback&gt;.
+ 
+ I&lt;callback&gt; should return 1 to indicate verification success and 0 to
+ indicate verification failure. If SSL_VERIFY_PEER is set and I&lt;callback&gt;
+-returns 0, the handshake will fail. As the verification procedure may
++returns 0, the handshake will fail.
++
++In client mode I&lt;callback&gt; may also return -1,
++typically on failure verifying the server certificate.
++This makes the handshake suspend and return control to the calling application
++with B&lt;SSL_ERROR_WANT_RETRY_VERIFY&gt;.
++The app can for instance fetch further certificates or cert status information
++needed for the verification.
++Calling L&lt;SSL_connect(3)&gt; again resumes the connection attempt
++by retrying the server certificate verification step.
++This process may even be repeated if need be.
++
++As the verification procedure may
+ allow the connection to continue in the case of failure (by always
+ returning 1) the verification result must be set in any case using the
+ B&lt;error&gt; member of I&lt;x509_store_ctx&gt; so that the calling application
+diff --git a/doc/man3/SSL_want.pod b/doc/man3/SSL_want.pod
+index 5b7955546c..fcd128783b 100644
+--- a/doc/man3/SSL_want.pod
++++ b/doc/man3/SSL_want.pod
+@@ -2,9 +2,9 @@
+ 
+ =head1 NAME
+ 
+-SSL_want, SSL_want_nothing, SSL_want_read, SSL_want_write, SSL_want_x509_lookup,
+-SSL_want_async, SSL_want_async_job, SSL_want_client_hello_cb - obtain state
+-information TLS/SSL I/O operation
++SSL_want, SSL_want_nothing, SSL_want_read, SSL_want_write,
++SSL_want_x509_lookup, SSL_want_retry_verify, SSL_want_async, SSL_want_async_job,
++SSL_want_client_hello_cb - obtain state information TLS/SSL I/O operation
+ 
+ =head1 SYNOPSIS
+ 
+@@ -15,6 +15,7 @@ information TLS/SSL I/O operation
+  int SSL_want_read(const SSL *ssl);
+  int SSL_want_write(const SSL *ssl);
+  int SSL_want_x509_lookup(const SSL *ssl);
++ int SSL_want_retry_verify(const SSL *ssl);
+  int SSL_want_async(const SSL *ssl);
+  int SSL_want_async_job(const SSL *ssl);
+  int SSL_want_client_hello_cb(const SSL *ssl);
+@@ -53,47 +54,50 @@ There is no data to be written or to be read.
+ 
+ There are data in the SSL buffer that must be written to the underlying
+ B&lt;BIO&gt; layer in order to complete the actual SSL_*() operation.
+-A call to L&lt;SSL_get_error(3)&gt; should return
+-SSL_ERROR_WANT_WRITE.
++A call to L&lt;SSL_get_error(3)&gt; should return B&lt;SSL_ERROR_WANT_WRITE&gt;.
+ 
+ =item SSL_READING
+ 
+ More data must be read from the underlying B&lt;BIO&gt; layer in order to
+ complete the actual SSL_*() operation.
+-A call to L&lt;SSL_get_error(3)&gt; should return
+-SSL_ERROR_WANT_READ.
++A call to L&lt;SSL_get_error(3)&gt; should return B&lt;SSL_ERROR_WANT_READ&gt;.
+ 
+ =item SSL_X509_LOOKUP
+ 
+ The operation did not complete because an application callback set by
+ SSL_CTX_set_client_cert_cb() has asked to be called again.
+-A call to L&lt;SSL_get_error(3)&gt; should return
+-SSL_ERROR_WANT_X509_LOOKUP.
++A call to L&lt;SSL_get_error(3)&gt; should return B&lt;SSL_ERROR_WANT_X509_LOOKUP&gt;.
++
++=item SSL_RETRY_VERIFY
++
++The operation did not complete because an application callback set by
++SSL_CTX_set_cert_verify_callback() has asked to be called again.
++A call to L&lt;SSL_get_error(3)&gt; should return B&lt;SSL_ERROR_WANT_RETRY_VERIFY&gt;.
+ 
+ =item SSL_ASYNC_PAUSED
+ 
+ An asynchronous operation partially completed and was then paused. See
+ L&lt;SSL_get_all_async_fds(3)&gt;. A call to L&lt;SSL_get_error(3)&gt; should return
+-SSL_ERROR_WANT_ASYNC.
++B&lt;SSL_ERROR_WANT_ASYNC&gt;.
+ 
+ =item SSL_ASYNC_NO_JOBS
+ 
+ The asynchronous job could not be started because there were no async jobs
+ available in the pool (see ASYNC_init_thread(3)). A call to L&lt;SSL_get_error(3)&gt;
+-should return SSL_ERROR_WANT_ASYNC_JOB.
++should return B&lt;SSL_ERROR_WANT_ASYNC_JOB&gt;.
+ 
+ =item SSL_CLIENT_HELLO_CB
+ 
+ The operation did not complete because an application callback set by
+ SSL_CTX_set_client_hello_cb() has asked to be called again.
+-A call to L&lt;SSL_get_error(3)&gt; should return
+-SSL_ERROR_WANT_CLIENT_HELLO_CB.
++A call to L&lt;SSL_get_error(3)&gt; should return B&lt;SSL_ERROR_WANT_CLIENT_HELLO_CB&gt;.
+ 
+ =back
+ 
+-SSL_want_nothing(), SSL_want_read(), SSL_want_write(), SSL_want_x509_lookup(),
+-SSL_want_async(), SSL_want_async_job(), and SSL_want_client_hello_cb() return
+-1, when the corresponding condition is true or 0 otherwise.
++SSL_want_nothing(), SSL_want_read(), SSL_want_write(),
++SSL_want_x509_lookup(), SSL_want_retry_verify(),
++SSL_want_async(), SSL_want_async_job(), and SSL_want_client_hello_cb()
++return 1 when the corresponding condition is true or 0 otherwise.
+ 
+ =head1 SEE ALSO
+ 
+diff --git a/include/openssl/ssl.h.in b/include/openssl/ssl.h.in
+index 8c01334f49..17ada3c4f9 100644
+--- a/include/openssl/ssl.h.in
++++ b/include/openssl/ssl.h.in
+@@ -927,12 +927,14 @@ __owur int SSL_extension_supported(unsigned int ext_type);
+ # define SSL_ASYNC_PAUSED       5
+ # define SSL_ASYNC_NO_JOBS      6
+ # define SSL_CLIENT_HELLO_CB    7
++# define SSL_RETRY_VERIFY       8
+ 
+ /* These will only be used when doing non-blocking IO */
+ # define SSL_want_nothing(s)         (SSL_want(s) == SSL_NOTHING)
+ # define SSL_want_read(s)            (SSL_want(s) == SSL_READING)
+ # define SSL_want_write(s)           (SSL_want(s) == SSL_WRITING)
+ # define SSL_want_x509_lookup(s)     (SSL_want(s) == SSL_X509_LOOKUP)
++# define SSL_want_retry_verify(s)    (SSL_want(s) == SSL_RETRY_VERIFY)
+ # define SSL_want_async(s)           (SSL_want(s) == SSL_ASYNC_PAUSED)
+ # define SSL_want_async_job(s)       (SSL_want(s) == SSL_ASYNC_NO_JOBS)
+ # define SSL_want_client_hello_cb(s) (SSL_want(s) == SSL_CLIENT_HELLO_CB)
+@@ -1227,6 +1229,7 @@ DECLARE_PEM_rw(SSL_SESSION, SSL_SESSION)
+ # define SSL_ERROR_WANT_ASYNC            9
+ # define SSL_ERROR_WANT_ASYNC_JOB       10
+ # define SSL_ERROR_WANT_CLIENT_HELLO_CB 11
++# define SSL_ERROR_WANT_RETRY_VERIFY    12
+ 
+ # ifndef OPENSSL_NO_DEPRECATED_3_0
+ #  define SSL_CTRL_SET_TMP_DH                    3
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index a8a1416073..c345a6b405 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -3808,6 +3808,8 @@ int SSL_get_error(const SSL *s, int i)
+     }
+     if (SSL_want_x509_lookup(s))
+         return SSL_ERROR_WANT_X509_LOOKUP;
++    if (SSL_want_retry_verify(s))
++        return SSL_ERROR_WANT_RETRY_VERIFY;
+     if (SSL_want_async(s))
+         return SSL_ERROR_WANT_ASYNC;
+     if (SSL_want_async_job(s))
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 045db8265e..00594ec352 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1009,7 +1009,7 @@ size_t ossl_statem_client_max_message_size(SSL *s)
+ }
+ 
+ /*
+- * Process a message that the client has been received from the server.
++ * Process a message that the client has received from the server.
+  */
+ MSG_PROCESS_RETURN ossl_statem_client_process_message(SSL *s, PACKET *pkt)
+ {
+@@ -1079,6 +1079,9 @@ WORK_STATE ossl_statem_client_post_process_message(SSL *s, WORK_STATE wst)
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+         return WORK_ERROR;
+ 
++    case TLS_ST_CR_CERT:
++        return tls_post_process_server_certificate(s, wst);
++
+     case TLS_ST_CR_CERT_VRFY:
+     case TLS_ST_CR_CERT_REQ:
+         return tls_prepare_client_certificate(s, wst);
+@@ -1762,20 +1765,16 @@ static MSG_PROCESS_RETURN tls_process_as_hello_retry_request(SSL *s,
+     return MSG_PROCESS_ERROR;
+ }
+ 
++/* prepare server cert verificaton by setting s-&gt;session-&gt;peer_chain from pkt */
+ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+ {
+-    int i;
+-    MSG_PROCESS_RETURN ret = MSG_PROCESS_ERROR;
+     unsigned long cert_list_len, cert_len;
+     X509 *x = NULL;
+     const unsigned char *certstart, *certbytes;
+-    STACK_OF(X509) *sk = NULL;
+-    EVP_PKEY *pkey = NULL;
+-    size_t chainidx, certidx;
++    size_t chainidx;
+     unsigned int context = 0;
+-    const SSL_CERT_LOOKUP *clu;
+ 
+-    if ((sk = sk_X509_new_null()) == NULL) {
++    if ((s-&gt;session-&gt;peer_chain = sk_X509_new_null()) == NULL) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
+         goto err;
+     }
+@@ -1834,14 +1833,39 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+             OPENSSL_free(rawexts);
+         }
+ 
+-        if (!sk_X509_push(sk, x)) {
++        if (!sk_X509_push(s-&gt;session-&gt;peer_chain, x)) {
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
+             goto err;
+         }
+         x = NULL;
+     }
++    return MSG_PROCESS_CONTINUE_PROCESSING;
++
++ err:
++    X509_free(x);
++    sk_X509_pop_free(s-&gt;session-&gt;peer_chain, X509_free);
++    s-&gt;session-&gt;peer_chain = NULL;
++    return MSG_PROCESS_ERROR;
++}
++
++/*
++ * Verify the s-&gt;session-&gt;peer_chain and check server cert type.
++ * On success set s-&gt;session-&gt;peer and s-&gt;session-&gt;verify_result.
++ * Else the peer certificate verification callback may request retry.
++ */
++WORK_STATE tls_post_process_server_certificate(SSL *s, WORK_STATE wst)
++{
++    X509 *x;
++    EVP_PKEY *pkey = NULL;
++    const SSL_CERT_LOOKUP *clu;
++    size_t certidx;
++    int i;
+ 
+-    i = ssl_verify_cert_chain(s, sk);
++    i = ssl_verify_cert_chain(s, s-&gt;session-&gt;peer_chain);
++    if (i == -1) {
++        s-&gt;rwstate = SSL_RETRY_VERIFY;
++        return WORK_MORE_A;
++    }
+     /*
+      * The documented interface is that SSL_VERIFY_PEER should be set in order
+      * for client side verification of the server certificate to take place.
+@@ -1859,35 +1883,31 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+     if (s-&gt;verify_mode != SSL_VERIFY_NONE &amp;&amp; i &lt;= 0) {
+         SSLfatal(s, ssl_x509err2alert(s-&gt;verify_result),
+                  SSL_R_CERTIFICATE_VERIFY_FAILED);
+-        goto err;
++        return WORK_ERROR;
+     }
+     ERR_clear_error();          /* but we keep s-&gt;verify_result */
+     if (i &gt; 1) {
+         SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, i);
+-        goto err;
++        return WORK_ERROR;
+     }
+ 
+-    s-&gt;session-&gt;peer_chain = sk;
+     /*
+      * Inconsistency alert: cert_chain does include the peer's certificate,
+      * which we don't include in statem_srvr.c
+      */
+-    x = sk_X509_value(sk, 0);
+-    sk = NULL;
++    x = sk_X509_value(s-&gt;session-&gt;peer_chain, 0);
+ 
+     pkey = X509_get0_pubkey(x);
+ 
+     if (pkey == NULL || EVP_PKEY_missing_parameters(pkey)) {
+-        x = NULL;
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR,
+                  SSL_R_UNABLE_TO_FIND_PUBLIC_KEY_PARAMETERS);
+-        goto err;
++        return WORK_ERROR;
+     }
+ 
+     if ((clu = ssl_cert_lookup_by_pkey(pkey, &amp;certidx)) == NULL) {
+-        x = NULL;
+         SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_UNKNOWN_CERTIFICATE_TYPE);
+-        goto err;
++        return WORK_ERROR;
+     }
+     /*
+      * Check certificate type is consistent with ciphersuite. For TLS 1.3
+@@ -1896,9 +1916,8 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+      */
+     if (!SSL_IS_TLS13(s)) {
+         if ((clu-&gt;amask &amp; s-&gt;s3.tmp.new_cipher-&gt;algorithm_auth) == 0) {
+-            x = NULL;
+             SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_WRONG_CERTIFICATE_TYPE);
+-            goto err;
++            return WORK_ERROR;
+         }
+     }
+     s-&gt;session-&gt;peer_type = certidx;
+@@ -1907,7 +1926,6 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+     X509_up_ref(x);
+     s-&gt;session-&gt;peer = x;
+     s-&gt;session-&gt;verify_result = s-&gt;verify_result;
+-    x = NULL;
+ 
+     /* Save the current hash state for when we receive the CertificateVerify */
+     if (SSL_IS_TLS13(s)
+@@ -1915,15 +1933,9 @@ MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt)
+                                    sizeof(s-&gt;cert_verify_hash),
+                                    &amp;s-&gt;cert_verify_hash_len)) {
+         /* SSLfatal() already called */;
+-        goto err;
++        return WORK_ERROR;
+     }
+-
+-    ret = MSG_PROCESS_CONTINUE_READING;
+-
+- err:
+-    X509_free(x);
+-    sk_X509_pop_free(sk, X509_free);
+-    return ret;
++    return WORK_FINISHED_CONTINUE;
+ }
+ 
+ static int tls_process_ske_psk_preamble(SSL *s, PACKET *pkt)
+diff --git a/ssl/statem/statem_local.h b/ssl/statem/statem_local.h
+index 40c3724bed..bae55435bd 100644
+--- a/ssl/statem/statem_local.h
++++ b/ssl/statem/statem_local.h
+@@ -129,6 +129,7 @@ __owur int tls_construct_cert_status_body(SSL *s, WPACKET *pkt);
+ __owur int tls_construct_cert_status(SSL *s, WPACKET *pkt);
+ __owur MSG_PROCESS_RETURN tls_process_key_exchange(SSL *s, PACKET *pkt);
+ __owur MSG_PROCESS_RETURN tls_process_server_certificate(SSL *s, PACKET *pkt);
++__owur WORK_STATE tls_post_process_server_certificate(SSL *s, WORK_STATE wst);
+ __owur int ssl3_check_cert_and_algorithm(SSL *s);
+ #ifndef OPENSSL_NO_NEXTPROTONEG
+ __owur int tls_construct_next_proto(SSL *s, WPACKET *pkt);
+diff --git a/test/helpers/handshake.c b/test/helpers/handshake.c
+index e286df6cf0..03ee9a004a 100644
+--- a/test/helpers/handshake.c
++++ b/test/helpers/handshake.c
+@@ -314,6 +314,14 @@ static int verify_reject_cb(X509_STORE_CTX *ctx, void *arg) {
+     return 0;
+ }
+ 
++static int n_retries = 0;
++static int verify_retry_cb(X509_STORE_CTX *ctx, void *arg) {
++    if (--n_retries &lt; 0)
++        return 1;
++    X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
++    return -1;
++}
++
+ static int verify_accept_cb(X509_STORE_CTX *ctx, void *arg) {
+     return 1;
+ }
+@@ -527,6 +535,10 @@ static int configure_handshake_ctx(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     case SSL_TEST_VERIFY_ACCEPT_ALL:
+         SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_accept_cb, NULL);
+         break;
++    case SSL_TEST_VERIFY_RETRY_ONCE:
++        n_retries = 1;
++        SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_retry_cb, NULL);
++        break;
+     case SSL_TEST_VERIFY_REJECT_ALL:
+         SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_reject_cb, NULL);
+         break;
+@@ -807,8 +819,10 @@ static void do_handshake_step(PEER *peer)
+             peer-&gt;status = PEER_ERROR;
+         } else {
+             int error = SSL_get_error(peer-&gt;ssl, ret);
++
+             /* Memory bios should never block with SSL_ERROR_WANT_WRITE. */
+-            if (error != SSL_ERROR_WANT_READ)
++            if (error != SSL_ERROR_WANT_READ
++                    &amp;&amp; error != SSL_ERROR_WANT_RETRY_VERIFY)
+                 peer-&gt;status = PEER_ERROR;
+         }
+     }
+@@ -1674,6 +1688,10 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+         ret-&gt;session_id = SSL_TEST_SESSION_ID_YES;
+     ret-&gt;session_ticket_do_not_call = server_ex_data.session_ticket_do_not_call;
+ 
++    if (extra-&gt;client.verify_callback == SSL_TEST_VERIFY_RETRY_ONCE
++            &amp;&amp; n_retries != -1)
++        ret-&gt;result = SSL_TEST_SERVER_FAIL;
++
+ #ifndef OPENSSL_NO_NEXTPROTONEG
+     SSL_get0_next_proto_negotiated(client.ssl, &amp;proto, &amp;proto_len);
+     ret-&gt;client_npn_negotiated = dup_str(proto, proto_len);
+diff --git a/test/helpers/ssl_test_ctx.c b/test/helpers/ssl_test_ctx.c
+index db4752c54f..0921416be2 100644
+--- a/test/helpers/ssl_test_ctx.c
++++ b/test/helpers/ssl_test_ctx.c
+@@ -177,6 +177,7 @@ const char *ssl_protocol_name(int protocol)
+ static const test_enum ssl_verify_callbacks[] = {
+     {&quot;None&quot;, SSL_TEST_VERIFY_NONE},
+     {&quot;AcceptAll&quot;, SSL_TEST_VERIFY_ACCEPT_ALL},
++    {&quot;RetryOnce&quot;, SSL_TEST_VERIFY_RETRY_ONCE},
+     {&quot;RejectAll&quot;, SSL_TEST_VERIFY_REJECT_ALL},
+ };
+ 
+@@ -184,6 +185,7 @@ __owur static int parse_client_verify_callback(SSL_TEST_CLIENT_CONF *client_conf
+                                                const char *value)
+ {
+     int ret_value;
++
+     if (!parse_enum(ssl_verify_callbacks, OSSL_NELEM(ssl_verify_callbacks),
+                     &amp;ret_value, value)) {
+         return 0;
+diff --git a/test/helpers/ssl_test_ctx.h b/test/helpers/ssl_test_ctx.h
+index 4e8d3df4ac..1c9451b751 100644
+--- a/test/helpers/ssl_test_ctx.h
++++ b/test/helpers/ssl_test_ctx.h
+@@ -25,6 +25,7 @@ typedef enum {
+ typedef enum {
+     SSL_TEST_VERIFY_NONE = 0, /* Default */
+     SSL_TEST_VERIFY_ACCEPT_ALL,
++    SSL_TEST_VERIFY_RETRY_ONCE,
+     SSL_TEST_VERIFY_REJECT_ALL
+ } ssl_verify_callback_t;
+ 
+diff --git a/test/recipes/80-test_ssl_new.t b/test/recipes/80-test_ssl_new.t
+index e2b9349d04..6f404b5376 100644
+--- a/test/recipes/80-test_ssl_new.t
++++ b/test/recipes/80-test_ssl_new.t
+@@ -157,12 +157,12 @@ sub test_conf {
+            &quot;Getting output from generate_ssl_tests.pl.&quot;);
+ 
+     SKIP: {
+-        # Test 2. Compare against existing output in test/ssl_tests.cnf.
++        # Test 2. Compare against existing output in test/ssl-tests/
+         skip &quot;Skipping generated source test for $conf&quot;, 1
+           if !$check_source;
+ 
+         $run_test = is(cmp_text($output_file, $conf_file), 0,
+-                       &quot;Comparing generated sources.&quot;);
++                       &quot;Comparing generated $output_file with $conf_file.&quot;);
+       }
+ 
+       # Test 3. Run the test.
+diff --git a/test/ssl-tests/03-custom_verify.cnf b/test/ssl-tests/03-custom_verify.cnf
+index 8dca715e74..e107b93b5b 100644
+--- a/test/ssl-tests/03-custom_verify.cnf
++++ b/test/ssl-tests/03-custom_verify.cnf
+@@ -1,16 +1,17 @@
+ # Generated with generate_ssl_tests.pl
+ 
+-num_tests = 9
++num_tests = 10
+ 
+ test-0 = 0-verify-success
+ test-1 = 1-verify-custom-reject
+ test-2 = 2-verify-custom-allow
+-test-3 = 3-noverify-success
+-test-4 = 4-noverify-ignore-custom-reject
+-test-5 = 5-noverify-accept-custom-allow
+-test-6 = 6-verify-fail-no-root
+-test-7 = 7-verify-custom-success-no-root
+-test-8 = 8-verify-custom-fail-no-root
++test-3 = 3-verify-custom-retry
++test-4 = 4-noverify-success
++test-5 = 5-noverify-ignore-custom-reject
++test-6 = 6-noverify-accept-custom-allow
++test-7 = 7-verify-fail-no-root
++test-8 = 8-verify-custom-success-no-root
++test-9 = 9-verify-custom-fail-no-root
+ # ===========================================================
+ 
+ [0-verify-success]
+@@ -91,148 +92,175 @@ VerifyCallback = AcceptAll
+ 
+ # ===========================================================
+ 
+-[3-noverify-success]
+-ssl_conf = 3-noverify-success-ssl
++[3-verify-custom-retry]
++ssl_conf = 3-verify-custom-retry-ssl
+ 
+-[3-noverify-success-ssl]
+-server = 3-noverify-success-server
+-client = 3-noverify-success-client
++[3-verify-custom-retry-ssl]
++server = 3-verify-custom-retry-server
++client = 3-verify-custom-retry-client
+ 
+-[3-noverify-success-server]
++[3-verify-custom-retry-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[3-noverify-success-client]
++[3-verify-custom-retry-client]
+ CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
+ 
+ [test-3]
+ ExpectedResult = Success
++client = 3-verify-custom-retry-client-extra
++
++[3-verify-custom-retry-client-extra]
++VerifyCallback = RetryOnce
+ 
+ 
+ # ===========================================================
+ 
+-[4-noverify-ignore-custom-reject]
+-ssl_conf = 4-noverify-ignore-custom-reject-ssl
++[4-noverify-success]
++ssl_conf = 4-noverify-success-ssl
+ 
+-[4-noverify-ignore-custom-reject-ssl]
+-server = 4-noverify-ignore-custom-reject-server
+-client = 4-noverify-ignore-custom-reject-client
++[4-noverify-success-ssl]
++server = 4-noverify-success-server
++client = 4-noverify-success-client
+ 
+-[4-noverify-ignore-custom-reject-server]
++[4-noverify-success-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[4-noverify-ignore-custom-reject-client]
++[4-noverify-success-client]
+ CipherString = DEFAULT
+ 
+ [test-4]
+ ExpectedResult = Success
+-client = 4-noverify-ignore-custom-reject-client-extra
+ 
+-[4-noverify-ignore-custom-reject-client-extra]
++
++# ===========================================================
++
++[5-noverify-ignore-custom-reject]
++ssl_conf = 5-noverify-ignore-custom-reject-ssl
++
++[5-noverify-ignore-custom-reject-ssl]
++server = 5-noverify-ignore-custom-reject-server
++client = 5-noverify-ignore-custom-reject-client
++
++[5-noverify-ignore-custom-reject-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[5-noverify-ignore-custom-reject-client]
++CipherString = DEFAULT
++
++[test-5]
++ExpectedResult = Success
++client = 5-noverify-ignore-custom-reject-client-extra
++
++[5-noverify-ignore-custom-reject-client-extra]
+ VerifyCallback = RejectAll
+ 
+ 
+ # ===========================================================
+ 
+-[5-noverify-accept-custom-allow]
+-ssl_conf = 5-noverify-accept-custom-allow-ssl
++[6-noverify-accept-custom-allow]
++ssl_conf = 6-noverify-accept-custom-allow-ssl
+ 
+-[5-noverify-accept-custom-allow-ssl]
+-server = 5-noverify-accept-custom-allow-server
+-client = 5-noverify-accept-custom-allow-client
++[6-noverify-accept-custom-allow-ssl]
++server = 6-noverify-accept-custom-allow-server
++client = 6-noverify-accept-custom-allow-client
+ 
+-[5-noverify-accept-custom-allow-server]
++[6-noverify-accept-custom-allow-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[5-noverify-accept-custom-allow-client]
++[6-noverify-accept-custom-allow-client]
+ CipherString = DEFAULT
+ 
+-[test-5]
++[test-6]
+ ExpectedResult = Success
+-client = 5-noverify-accept-custom-allow-client-extra
++client = 6-noverify-accept-custom-allow-client-extra
+ 
+-[5-noverify-accept-custom-allow-client-extra]
++[6-noverify-accept-custom-allow-client-extra]
+ VerifyCallback = AcceptAll
+ 
+ 
+ # ===========================================================
+ 
+-[6-verify-fail-no-root]
+-ssl_conf = 6-verify-fail-no-root-ssl
++[7-verify-fail-no-root]
++ssl_conf = 7-verify-fail-no-root-ssl
+ 
+-[6-verify-fail-no-root-ssl]
+-server = 6-verify-fail-no-root-server
+-client = 6-verify-fail-no-root-client
++[7-verify-fail-no-root-ssl]
++server = 7-verify-fail-no-root-server
++client = 7-verify-fail-no-root-client
+ 
+-[6-verify-fail-no-root-server]
++[7-verify-fail-no-root-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[6-verify-fail-no-root-client]
++[7-verify-fail-no-root-client]
+ CipherString = DEFAULT
+ VerifyMode = Peer
+ 
+-[test-6]
++[test-7]
+ ExpectedClientAlert = UnknownCA
+ ExpectedResult = ClientFail
+ 
+ 
+ # ===========================================================
+ 
+-[7-verify-custom-success-no-root]
+-ssl_conf = 7-verify-custom-success-no-root-ssl
++[8-verify-custom-success-no-root]
++ssl_conf = 8-verify-custom-success-no-root-ssl
+ 
+-[7-verify-custom-success-no-root-ssl]
+-server = 7-verify-custom-success-no-root-server
+-client = 7-verify-custom-success-no-root-client
++[8-verify-custom-success-no-root-ssl]
++server = 8-verify-custom-success-no-root-server
++client = 8-verify-custom-success-no-root-client
+ 
+-[7-verify-custom-success-no-root-server]
++[8-verify-custom-success-no-root-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[7-verify-custom-success-no-root-client]
++[8-verify-custom-success-no-root-client]
+ CipherString = DEFAULT
+ VerifyMode = Peer
+ 
+-[test-7]
++[test-8]
+ ExpectedResult = Success
+-client = 7-verify-custom-success-no-root-client-extra
++client = 8-verify-custom-success-no-root-client-extra
+ 
+-[7-verify-custom-success-no-root-client-extra]
++[8-verify-custom-success-no-root-client-extra]
+ VerifyCallback = AcceptAll
+ 
+ 
+ # ===========================================================
+ 
+-[8-verify-custom-fail-no-root]
+-ssl_conf = 8-verify-custom-fail-no-root-ssl
++[9-verify-custom-fail-no-root]
++ssl_conf = 9-verify-custom-fail-no-root-ssl
+ 
+-[8-verify-custom-fail-no-root-ssl]
+-server = 8-verify-custom-fail-no-root-server
+-client = 8-verify-custom-fail-no-root-client
++[9-verify-custom-fail-no-root-ssl]
++server = 9-verify-custom-fail-no-root-server
++client = 9-verify-custom-fail-no-root-client
+ 
+-[8-verify-custom-fail-no-root-server]
++[9-verify-custom-fail-no-root-server]
+ Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
+ CipherString = DEFAULT
+ PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
+ 
+-[8-verify-custom-fail-no-root-client]
++[9-verify-custom-fail-no-root-client]
+ CipherString = DEFAULT
+ VerifyMode = Peer
+ 
+-[test-8]
++[test-9]
+ ExpectedClientAlert = HandshakeFailure
+ ExpectedResult = ClientFail
+-client = 8-verify-custom-fail-no-root-client-extra
++client = 9-verify-custom-fail-no-root-client-extra
+ 
+-[8-verify-custom-fail-no-root-client-extra]
++[9-verify-custom-fail-no-root-client-extra]
+ VerifyCallback = RejectAll
+ 
+ 
+diff --git a/test/ssl-tests/03-custom_verify.cnf.in b/test/ssl-tests/03-custom_verify.cnf.in
+index 28b57216a1..a6b33ba4ca 100644
+--- a/test/ssl-tests/03-custom_verify.cnf.in
++++ b/test/ssl-tests/03-custom_verify.cnf.in
+@@ -51,6 +51,20 @@ our @tests = (
+         },
+     },
+ 
++    # Same test as above but with a custom callback that requests retry once.
++    {
++        name =&gt; &quot;verify-custom-retry&quot;,
++        server =&gt; { },
++        client =&gt; {
++            extra =&gt; {
++                &quot;VerifyCallback&quot; =&gt; &quot;RetryOnce&quot;,
++            },
++        },
++        test   =&gt; {
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;,
++        },
++    },
++
+     # Sanity-check that verification indeed succeeds if peer verification
+     # is not requested.
+     {
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index c6520482f6..4f367f118a 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -549,6 +549,91 @@ end:
+ }
+ #endif
+ 
++static int verify_retry_cb(X509_STORE_CTX *ctx, void *arg)
++{
++    int res = X509_verify_cert(ctx);
++
++    if (res == 0 &amp;&amp; X509_STORE_CTX_get_error(ctx) ==
++        X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY)
++        return -1; /* indicate SSL_ERROR_WANT_RETRY_VERIFY */
++    return res;
++}
++
++static int test_client_cert_verify_cb(void)
++{
++    /* server key, cert, chain, and root */
++    char *skey = test_mk_file_path(certsdir, &quot;leaf.key&quot;);
++    char *leaf = test_mk_file_path(certsdir, &quot;leaf.pem&quot;);
++    char *int2 = test_mk_file_path(certsdir, &quot;subinterCA.pem&quot;);
++    char *int1 = test_mk_file_path(certsdir, &quot;interCA.pem&quot;);
++    char *root = test_mk_file_path(certsdir, &quot;rootCA.pem&quot;);
++    X509 *crt1 = NULL, *crt2 = NULL;
++    STACK_OF(X509) *server_chain;
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL;
++    int testresult = 0;
++
++    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
++                                       TLS_client_method(), TLS1_VERSION, 0,
++                                       &amp;sctx, &amp;cctx, NULL, NULL)))
++        goto end;
++    if (!TEST_int_eq(SSL_CTX_use_certificate_chain_file(sctx, leaf), 1)
++            || !TEST_int_eq(SSL_CTX_use_PrivateKey_file(sctx, skey,
++                                                        SSL_FILETYPE_PEM), 1)
++            || !TEST_int_eq(SSL_CTX_check_private_key(sctx), 1))
++        goto end;
++    if (!TEST_true(SSL_CTX_load_verify_locations(cctx, root, NULL)))
++        goto end;
++    SSL_CTX_set_verify(cctx, SSL_VERIFY_PEER, NULL);
++    SSL_CTX_set_cert_verify_callback(cctx, verify_retry_cb, NULL);
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &amp;serverssl,
++                                      &amp;clientssl, NULL, NULL)))
++        goto end;
++
++    /* attempt SSL_connect() with incomplete server chain */
++    if (!TEST_false(create_ssl_connection(serverssl, clientssl,
++                                          SSL_ERROR_WANT_RETRY_VERIFY)))
++        goto end;
++
++    /* application provides intermediate certs needed to verify server cert */
++    if (!TEST_ptr((crt1 = load_cert_pem(int1, libctx)))
++        || !TEST_ptr((crt2 = load_cert_pem(int2, libctx)))
++        || !TEST_ptr((server_chain = SSL_get_peer_cert_chain(clientssl))))
++        goto end;
++    /* add certs in reverse order to demonstrate real chain building */
++    if (!TEST_true(sk_X509_push(server_chain, crt1)))
++        goto end;
++    crt1 = NULL;
++    if (!TEST_true(sk_X509_push(server_chain, crt2)))
++        goto end;
++    crt2 = NULL;
++
++    /* continue SSL_connect(), must now succeed with completed server chain */
++    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
++                                         SSL_ERROR_NONE)))
++        goto end;
++
++    testresult = 1;
++
++end:
++    X509_free(crt1);
++    X509_free(crt2);
++    SSL_shutdown(clientssl);
++    SSL_shutdown(serverssl);
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++
++    OPENSSL_free(skey);
++    OPENSSL_free(leaf);
++    OPENSSL_free(int2);
++    OPENSSL_free(int1);
++    OPENSSL_free(root);
++
++    return testresult;
++}
++
+ #ifndef OPENSSL_NO_TLS1_2
+ static int full_client_hello_callback(SSL *s, int *al, void *arg)
+ {
+@@ -8618,6 +8703,7 @@ int setup_tests(void)
+ #ifndef OPENSSL_NO_TLS1_3
+     ADD_TEST(test_keylog_no_master_key);
+ #endif
++    ADD_TEST(test_client_cert_verify_cb);
+ #ifndef OPENSSL_NO_TLS1_2
+     ADD_TEST(test_client_hello_cb);
+     ADD_TEST(test_no_ems);
+diff --git a/util/other.syms b/util/other.syms
+index b6974b5f01..670ba78938 100644
+--- a/util/other.syms
++++ b/util/other.syms
+@@ -579,6 +579,7 @@ SSL_want_async_job                      define
+ SSL_want_client_hello_cb                define
+ SSL_want_nothing                        define
+ SSL_want_read                           define
++SSL_want_retry_verify                   define
+ SSL_want_write                          define
+ SSL_want_x509_lookup                    define
+ SSLv23_client_method                    define
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032911.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032918.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32912">[ date ]</a>
+              <a href="thread.html#32912">[ thread ]</a>
+              <a href="subject.html#32912">[ subject ]</a>
+              <a href="author.html#32912">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

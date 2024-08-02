@@ -1,0 +1,452 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1589879037.613514.21107.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028815.html">
+   <LINK REL="Next"  HREF="028818.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1589879037.613514.21107.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue May 19 09:03:57 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028815.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028818.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28816">[ date ]</a>
+              <a href="thread.html#28816">[ thread ]</a>
+              <a href="subject.html#28816">[ subject ]</a>
+              <a href="author.html#28816">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  5a29b6286f8ccafc2ed9a026b0e8d4bd6d0396e6 (commit)
+      from  c0ec5ce0bf97c358bea29c81d3d16047244a9a7e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 5a29b6286f8ccafc2ed9a026b0e8d4bd6d0396e6
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Fri May 15 15:56:05 2020 +0200
+
+    CORE: query for operations only once per provider (unless no_store is true)
+    
+    When a desired algorithm wasn't available, we didn't register anywhere
+    that an attempt had been made, with the result that next time the same
+    attempt was made, the whole process would be done again.
+    
+    To avoid this churn, we register a bit for each operation that has
+    been queried in the libcrypto provider object, and test it before
+    trying the same query and method construction loop again.
+    
+    If course, if the provider has told us not to cache, we don't register
+    this bit.
+    
+    Fixes #11814
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11842">https://github.com/openssl/openssl/pull/11842</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/core_algorithm.c                 | 48 +++++++++++++++++++++++++++++----
+ crypto/core_fetch.c                     | 41 +++++++++++++++++++++++++++-
+ crypto/evp/evp_fetch.c                  |  8 +++++-
+ crypto/provider_core.c                  | 46 +++++++++++++++++++++++++++++++
+ crypto/serializer/serializer_meth.c     |  9 +++++--
+ doc/internal/man3/ossl_provider_new.pod | 17 +++++++++++-
+ include/internal/core.h                 |  4 +++
+ include/internal/provider.h             |  5 ++++
+ 8 files changed, 168 insertions(+), 10 deletions(-)
+
+diff --git a/crypto/core_algorithm.c b/crypto/core_algorithm.c
+index 79625fdea6..5c019f0405 100644
+--- a/crypto/core_algorithm.c
++++ b/crypto/core_algorithm.c
+@@ -16,8 +16,11 @@
+ struct algorithm_data_st {
+     OPENSSL_CTX *libctx;
+     int operation_id;            /* May be zero for finding them all */
++    int (*pre)(OSSL_PROVIDER *, int operation_id, void *data, int *result);
+     void (*fn)(OSSL_PROVIDER *, const OSSL_ALGORITHM *, int no_store,
+                void *data);
++    int (*post)(OSSL_PROVIDER *, int operation_id, int no_store, void *data,
++                int *result);
+     void *data;
+ };
+ 
+@@ -36,19 +39,48 @@ static int algorithm_do_this(OSSL_PROVIDER *provider, void *cbdata)
+     for (cur_operation = first_operation;
+          cur_operation &lt;= last_operation;
+          cur_operation++) {
+-        const OSSL_ALGORITHM *map =
+-            ossl_provider_query_operation(provider, cur_operation,
+-                                          &amp;no_store);
++        const OSSL_ALGORITHM *map = NULL;
++        int ret;
+ 
++        /* Do we fulfill pre-conditions? */
++        if (data-&gt;pre == NULL) {
++            /* If there is no pre-condition function, assume &quot;yes&quot; */
++            ret = 1;
++        } else {
++            if (!data-&gt;pre(provider, cur_operation, data-&gt;data, &amp;ret))
++                /* Error, bail out! */
++                return 0;
++        }
++
++        /* If pre-condition not fulfilled, go to the next operation */
++        if (!ret)
++            continue;
++
++        map = ossl_provider_query_operation(provider, cur_operation,
++                                            &amp;no_store);
+         if (map == NULL)
+             continue;
+ 
+-        ok = 1;                  /* As long as we've found *something* */
+         while (map-&gt;algorithm_names != NULL) {
+             const OSSL_ALGORITHM *thismap = map++;
+ 
+             data-&gt;fn(provider, thismap, no_store, data-&gt;data);
+         }
++
++        /* Do we fulfill post-conditions? */
++        if (data-&gt;post == NULL) {
++            /* If there is no post-condition function, assume &quot;yes&quot; */
++            ret = 1;
++        } else {
++            if (!data-&gt;post(provider, cur_operation, no_store, data-&gt;data,
++                            &amp;ret))
++                /* Error, bail out! */
++                return 0;
++        }
++
++        /* If post-condition fulfilled, set general success */
++        if (ret)
++            ok = 1;
+     }
+ 
+     return ok;
+@@ -56,16 +88,22 @@ static int algorithm_do_this(OSSL_PROVIDER *provider, void *cbdata)
+ 
+ void ossl_algorithm_do_all(OPENSSL_CTX *libctx, int operation_id,
+                            OSSL_PROVIDER *provider,
++                           int (*pre)(OSSL_PROVIDER *, int operation_id,
++                                      void *data, int *result),
+                            void (*fn)(OSSL_PROVIDER *provider,
+                                       const OSSL_ALGORITHM *algo,
+                                       int no_store, void *data),
++                           int (*post)(OSSL_PROVIDER *, int operation_id,
++                                       int no_store, void *data, int *result),
+                            void *data)
+ {
+-    struct algorithm_data_st cbdata;
++    struct algorithm_data_st cbdata = { 0, };
+ 
+     cbdata.libctx = libctx;
+     cbdata.operation_id = operation_id;
++    cbdata.pre = pre;
+     cbdata.fn = fn;
++    cbdata.post = post;
+     cbdata.data = data;
+ 
+     if (provider == NULL)
+diff --git a/crypto/core_fetch.c b/crypto/core_fetch.c
+index 7f815a50ac..51ae4011dc 100644
+--- a/crypto/core_fetch.c
++++ b/crypto/core_fetch.c
+@@ -24,6 +24,42 @@ struct construct_data_st {
+     void *mcm_data;
+ };
+ 
++static int ossl_method_construct_precondition(OSSL_PROVIDER *provider,
++                                              int operation_id, void *cbdata,
++                                              int *result)
++{
++    if (!ossl_assert(result != NULL)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++
++    if (!ossl_provider_test_operation_bit(provider, operation_id, result))
++        return 0;
++
++    /*
++     * The result we get tells if methods have already been constructed.
++     * However, we want to tell whether construction should happen (true)
++     * or not (false), which is the opposite of what we got.
++     */
++    *result = !*result;
++
++    return 1;
++}
++
++static int ossl_method_construct_postcondition(OSSL_PROVIDER *provider,
++                                               int operation_id, int no_store,
++                                               void *cbdata, int *result)
++{
++    if (!ossl_assert(result != NULL)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++
++    *result = 1;
++    return no_store != 0
++        || ossl_provider_set_operation_bit(provider, operation_id);
++}
++
+ static void ossl_method_construct_this(OSSL_PROVIDER *provider,
+                                        const OSSL_ALGORITHM *algo,
+                                        int no_store, void *cbdata)
+@@ -86,7 +122,10 @@ void *ossl_method_construct(OPENSSL_CTX *libctx, int operation_id,
+         cbdata.mcm = mcm;
+         cbdata.mcm_data = mcm_data;
+         ossl_algorithm_do_all(libctx, operation_id, NULL,
+-                              ossl_method_construct_this, &amp;cbdata);
++                              ossl_method_construct_precondition,
++                              ossl_method_construct_this,
++                              ossl_method_construct_postcondition,
++                              &amp;cbdata);
+ 
+         method = mcm-&gt;get(libctx, cbdata.store, mcm_data);
+         mcm-&gt;dealloc_tmp_store(cbdata.store);
+diff --git a/crypto/evp/evp_fetch.c b/crypto/evp/evp_fetch.c
+index be5ab111aa..596f592535 100644
+--- a/crypto/evp/evp_fetch.c
++++ b/crypto/evp/evp_fetch.c
+@@ -444,7 +444,13 @@ void evp_generic_do_all(OPENSSL_CTX *libctx, int operation_id,
+     data.free_method = free_method;
+     data.user_fn = user_fn;
+     data.user_arg = user_arg;
+-    ossl_algorithm_do_all(libctx, operation_id, NULL, do_one, &amp;data);
++
++    /*
++     * No pre- or post-condition for this call, as this only creates methods
++     * temporarly and then promptly destroys them.
++     */
++    ossl_algorithm_do_all(libctx, operation_id, NULL, NULL, do_one, NULL,
++                          &amp;data);
+ }
+ 
+ const char *evp_first_name(const OSSL_PROVIDER *prov, int name_id)
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 662576cd7b..0c21660080 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -71,6 +71,13 @@ struct ossl_provider_st {
+     OSSL_provider_get_params_fn *get_params;
+     OSSL_provider_query_operation_fn *query_operation;
+ 
++    /*
++     * Cache of bit to indicate of query_operation() has been called on
++     * a specific operation or not.
++     */
++    unsigned char *operation_bits;
++    size_t operation_bits_sz;
++
+     /* Provider side data */
+     void *provctx;
+ };
+@@ -317,6 +324,9 @@ void ossl_provider_free(OSSL_PROVIDER *prov)
+             }
+ # endif
+ #endif
++            OPENSSL_free(prov-&gt;operation_bits);
++            prov-&gt;operation_bits = NULL;
++            prov-&gt;operation_bits_sz = 0;
+             prov-&gt;flag_initialized = 0;
+         }
+ 
+@@ -782,6 +792,42 @@ const OSSL_ALGORITHM *ossl_provider_query_operation(const OSSL_PROVIDER *prov,
+     return prov-&gt;query_operation(prov-&gt;provctx, operation_id, no_cache);
+ }
+ 
++int ossl_provider_set_operation_bit(OSSL_PROVIDER *provider, size_t bitnum)
++{
++    size_t byte = bitnum / 8;
++    unsigned char bit = (1 &lt;&lt; (bitnum % 8)) &amp; 0xFF;
++
++    if (provider-&gt;operation_bits_sz &lt;= byte) {
++        provider-&gt;operation_bits = OPENSSL_realloc(provider-&gt;operation_bits,
++                                                   byte + 1);
++        if (provider-&gt;operation_bits == NULL) {
++            ERR_raise(ERR_LIB_CRYPTO, ERR_R_MALLOC_FAILURE);
++            return 0;
++        }
++        memset(provider-&gt;operation_bits + provider-&gt;operation_bits_sz,
++               '\0', byte + 1 - provider-&gt;operation_bits_sz);
++    }
++    provider-&gt;operation_bits[byte] |= bit;
++    return 1;
++}
++
++int ossl_provider_test_operation_bit(OSSL_PROVIDER *provider, size_t bitnum,
++                                     int *result)
++{
++    size_t byte = bitnum / 8;
++    unsigned char bit = (1 &lt;&lt; (bitnum % 8)) &amp; 0xFF;
++
++    if (!ossl_assert(result != NULL)) {
++        ERR_raise(ERR_LIB_CRYPTO, ERR_R_PASSED_NULL_PARAMETER);
++        return 0;
++    }
++
++    *result = 0;
++    if (provider-&gt;operation_bits_sz &gt; byte)
++        *result = ((provider-&gt;operation_bits[byte] &amp; bit) != 0);
++    return 1;
++}
++
+ /*-
+  * Core functions for the provider
+  * ===============================
+diff --git a/crypto/serializer/serializer_meth.c b/crypto/serializer/serializer_meth.c
+index a098ffb07b..bc30c96bef 100644
+--- a/crypto/serializer/serializer_meth.c
++++ b/crypto/serializer/serializer_meth.c
+@@ -417,8 +417,13 @@ void OSSL_SERIALIZER_do_all_provided(OPENSSL_CTX *libctx,
+ 
+     data.user_fn = (void (*)(void *, void *))fn;
+     data.user_arg = arg;
+-    ossl_algorithm_do_all(libctx, OSSL_OP_SERIALIZER, NULL,
+-                          serializer_do_one, &amp;data);
++
++    /*
++     * No pre- or post-condition for this call, as this only creates methods
++     * temporarly and then promptly destroys them.
++     */
++    ossl_algorithm_do_all(libctx, OSSL_OP_SERIALIZER, NULL, NULL,
++                          serializer_do_one, NULL, &amp;data);
+ }
+ 
+ void OSSL_SERIALIZER_names_do_all(const OSSL_SERIALIZER *ser,
+diff --git a/doc/internal/man3/ossl_provider_new.pod b/doc/internal/man3/ossl_provider_new.pod
+index 36fe6301bf..d5d732d415 100644
+--- a/doc/internal/man3/ossl_provider_new.pod
++++ b/doc/internal/man3/ossl_provider_new.pod
+@@ -13,7 +13,8 @@ ossl_provider_name, ossl_provider_dso,
+ ossl_provider_module_name, ossl_provider_module_path,
+ ossl_provider_library_context,
+ ossl_provider_teardown, ossl_provider_gettable_params,
+-ossl_provider_get_params, ossl_provider_query_operation
++ossl_provider_get_params, ossl_provider_query_operation,
++ossl_provider_set_operation_bit, ossl_provider_test_operation_bit
+ - internal provider routines
+ 
+ =head1 SYNOPSIS
+@@ -63,6 +64,10 @@ ossl_provider_get_params, ossl_provider_query_operation
+                                                      int operation_id,
+                                                      int *no_cache);
+ 
++ int ossl_provider_set_operation_bit(OSSL_PROVIDER *provider, size_t bitnum);
++ int ossl_provider_test_operation_bit(OSSL_PROVIDER *provider, size_t bitnum,
++                                      int *result);
++
+ =head1 DESCRIPTION
+ 
+ I&lt;OSSL_PROVIDER&gt; is a type that holds all the necessary information
+@@ -208,6 +213,13 @@ I&lt;query_operation&gt; function, if the provider has one.
+ It should return an array of I&lt;OSSL_ALGORITHM&gt; for the given
+ I&lt;operation_id&gt;.
+ 
++ossl_provider_set_operation_bit() registers a 1 for operation I&lt;bitnum&gt;
++in a bitstring that's internal to I&lt;provider&gt;.
++
++ossl_provider_tests_operation_bit() checks if the bit operation I&lt;bitnum&gt;
++is set (1) or not (0) in the internal I&lt;provider&gt; bitstring, and sets
++I&lt;*result&gt; to 1 or 0 accorddingly. 
++
+ =head1 NOTES
+ 
+ Locating a provider module happens as follows:
+@@ -270,6 +282,9 @@ otherwise NULL.
+ ossl_provider_get_params() returns 1 on success, or 0 on error.
+ If this function isn't available in the provider, 0 is returned.
+ 
++ossl_provider_set_operation_bit() and ossl_provider_test_operation_bit()
++return 1 on success, or 0 on error.
++
+ =head1 SEE ALSO
+ 
+ L&lt;OSSL_PROVIDER(3)&gt;, L&lt;provider(7)&gt;, L&lt;openssl(1)&gt;
+diff --git a/include/internal/core.h b/include/internal/core.h
+index ca04333486..e2d2b28e8c 100644
+--- a/include/internal/core.h
++++ b/include/internal/core.h
+@@ -50,9 +50,13 @@ void *ossl_method_construct(OPENSSL_CTX *ctx, int operation_id,
+ 
+ void ossl_algorithm_do_all(OPENSSL_CTX *libctx, int operation_id,
+                            OSSL_PROVIDER *provider,
++                           int (*pre)(OSSL_PROVIDER *, int operation_id,
++                                      void *data, int *result),
+                            void (*fn)(OSSL_PROVIDER *provider,
+                                       const OSSL_ALGORITHM *algo,
+                                       int no_store, void *data),
++                           int (*post)(OSSL_PROVIDER *, int operation_id,
++                                       int no_store, void *data, int *result),
+                            void *data);
+ 
+ #endif
+diff --git a/include/internal/provider.h b/include/internal/provider.h
+index e39a5eae82..135b660f49 100644
+--- a/include/internal/provider.h
++++ b/include/internal/provider.h
+@@ -74,6 +74,11 @@ const OSSL_ALGORITHM *ossl_provider_query_operation(const OSSL_PROVIDER *prov,
+                                                     int operation_id,
+                                                     int *no_cache);
+ 
++/* Cache of bits to see if we already queried an operation */
++int ossl_provider_set_operation_bit(OSSL_PROVIDER *provider, size_t bitnum);
++int ossl_provider_test_operation_bit(OSSL_PROVIDER *provider, size_t bitnum,
++                                     int *result);
++
+ /* Configuration */
+ void ossl_provider_add_conf_module(void);
+ 
+</PRE>
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028815.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028818.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28816">[ date ]</a>
+              <a href="thread.html#28816">[ thread ]</a>
+              <a href="subject.html#28816">[ subject ]</a>
+              <a href="author.html#28816">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

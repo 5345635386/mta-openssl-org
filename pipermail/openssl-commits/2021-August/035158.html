@@ -1,0 +1,246 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1629986838.367601.18844.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035156.html">
+   <LINK REL="Next"  HREF="035159.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1629986838.367601.18844.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Thu Aug 26 14:07:18 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035156.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="035159.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35158">[ date ]</a>
+              <a href="thread.html#35158">[ thread ]</a>
+              <a href="subject.html#35158">[ subject ]</a>
+              <a href="author.html#35158">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  78539b250b05d0721da775bf4eddc096bde5ecaa (commit)
+      from  62bae84d4587ec9a56d0ce830e36e4a5b2fa8a33 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 78539b250b05d0721da775bf4eddc096bde5ecaa
+Author: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Date:   Wed Aug 25 13:50:40 2021 +0200
+
+    EVP_DigestSign/VerifyFinal: Duplicate the pctx to allow multiple calls
+    
+    The legacy implementation duplicates the pctx before creating/verifying
+    the signature unless EVP_MD_CTX_FLAG_FINALISE is set. We have to do the
+    same with provided implementations.
+    
+    Fixes #16321
+    
+    Reviewed-by: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16422">https://github.com/openssl/openssl/pull/16422</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/m_sigver.c | 35 +++++++++++++++++++++++++++--------
+ test/evp_extra_test.c | 33 +++++++++++++++++++++++++--------
+ 2 files changed, 52 insertions(+), 16 deletions(-)
+
+diff --git a/crypto/evp/m_sigver.c b/crypto/evp/m_sigver.c
+index f21865a8c3..806ef3224c 100644
+--- a/crypto/evp/m_sigver.c
++++ b/crypto/evp/m_sigver.c
+@@ -400,7 +400,7 @@ int EVP_DigestSignFinal(EVP_MD_CTX *ctx, unsigned char *sigret,
+                         size_t *siglen)
+ {
+     int sctx = 0, r = 0;
+-    EVP_PKEY_CTX *pctx = ctx-&gt;pctx;
++    EVP_PKEY_CTX *dctx, *pctx = ctx-&gt;pctx;
+ 
+     if (pctx == NULL
+             || pctx-&gt;operation != EVP_PKEY_OP_SIGNCTX
+@@ -408,8 +408,19 @@ int EVP_DigestSignFinal(EVP_MD_CTX *ctx, unsigned char *sigret,
+             || pctx-&gt;op.sig.signature == NULL)
+         goto legacy;
+ 
+-    return pctx-&gt;op.sig.signature-&gt;digest_sign_final(pctx-&gt;op.sig.algctx,
+-                                                     sigret, siglen, SIZE_MAX);
++    if (sigret == NULL || (ctx-&gt;flags &amp; EVP_MD_CTX_FLAG_FINALISE) != 0)
++        return pctx-&gt;op.sig.signature-&gt;digest_sign_final(pctx-&gt;op.sig.algctx,
++                                                         sigret, siglen,
++                                                         SIZE_MAX);
++    dctx = EVP_PKEY_CTX_dup(pctx);
++    if (dctx == NULL)
++        return 0;
++
++    r = dctx-&gt;op.sig.signature-&gt;digest_sign_final(dctx-&gt;op.sig.algctx,
++                                                  sigret, siglen,
++                                                  SIZE_MAX);
++    EVP_PKEY_CTX_free(dctx);
++    return r;
+ 
+  legacy:
+     if (pctx == NULL || pctx-&gt;pmeth == NULL) {
+@@ -429,8 +440,7 @@ int EVP_DigestSignFinal(EVP_MD_CTX *ctx, unsigned char *sigret,
+         if (ctx-&gt;flags &amp; EVP_MD_CTX_FLAG_FINALISE)
+             r = pctx-&gt;pmeth-&gt;signctx(pctx, sigret, siglen, ctx);
+         else {
+-            EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_dup(pctx);
+-
++            dctx = EVP_PKEY_CTX_dup(pctx);
+             if (dctx == NULL)
+                 return 0;
+             r = dctx-&gt;pmeth-&gt;signctx(dctx, sigret, siglen, ctx);
+@@ -516,7 +526,7 @@ int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig,
+     int r = 0;
+     unsigned int mdlen = 0;
+     int vctx = 0;
+-    EVP_PKEY_CTX *pctx = ctx-&gt;pctx;
++    EVP_PKEY_CTX *dctx, *pctx = ctx-&gt;pctx;
+ 
+     if (pctx == NULL
+             || pctx-&gt;operation != EVP_PKEY_OP_VERIFYCTX
+@@ -524,8 +534,17 @@ int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig,
+             || pctx-&gt;op.sig.signature == NULL)
+         goto legacy;
+ 
+-    return pctx-&gt;op.sig.signature-&gt;digest_verify_final(pctx-&gt;op.sig.algctx,
+-                                                       sig, siglen);
++    if ((ctx-&gt;flags &amp; EVP_MD_CTX_FLAG_FINALISE) != 0)
++        return pctx-&gt;op.sig.signature-&gt;digest_verify_final(pctx-&gt;op.sig.algctx,
++                                                           sig, siglen);
++    dctx = EVP_PKEY_CTX_dup(pctx);
++    if (dctx == NULL)
++        return 0;
++
++    r = dctx-&gt;op.sig.signature-&gt;digest_verify_final(dctx-&gt;op.sig.algctx,
++                                                    sig, siglen);
++    EVP_PKEY_CTX_free(dctx);
++    return r;
+ 
+  legacy:
+     if (pctx == NULL || pctx-&gt;pmeth == NULL) {
+diff --git a/test/evp_extra_test.c b/test/evp_extra_test.c
+index bc02cea95d..83f8902d24 100644
+--- a/test/evp_extra_test.c
++++ b/test/evp_extra_test.c
+@@ -1051,8 +1051,8 @@ static int test_EVP_DigestSignInit(int tst)
+ {
+     int ret = 0;
+     EVP_PKEY *pkey = NULL;
+-    unsigned char *sig = NULL;
+-    size_t sig_len = 0;
++    unsigned char *sig = NULL, *sig2 = NULL;
++    size_t sig_len = 0, sig2_len = 0;
+     EVP_MD_CTX *md_ctx = NULL, *md_ctx_verify = NULL;
+     EVP_MD_CTX *a_md_ctx = NULL, *a_md_ctx_verify = NULL;
+     BIO *mdbio = NULL, *membio = NULL;
+@@ -1115,17 +1115,17 @@ static int test_EVP_DigestSignInit(int tst)
+             || !TEST_true(EVP_DigestSignFinal(md_ctx, sig, &amp;sig_len)))
+         goto out;
+ 
+-    if (tst &gt;= 6) {
+-        if (!TEST_int_gt(BIO_reset(mdbio), 0)
+-                || !TEST_int_gt(BIO_get_md_ctx(mdbio, &amp;md_ctx_verify), 0))
+-            goto out;
+-    }
+-
+     /*
+      * Ensure that the signature round-trips (Verification isn't supported for
+      * HMAC via EVP_DigestVerify*)
+      */
+     if (tst != 2 &amp;&amp; tst != 5 &amp;&amp; tst != 8) {
++        if (tst &gt;= 6) {
++            if (!TEST_int_gt(BIO_reset(mdbio), 0)
++                || !TEST_int_gt(BIO_get_md_ctx(mdbio, &amp;md_ctx_verify), 0))
++                goto out;
++        }
++
+         if (!TEST_true(EVP_DigestVerifyInit(md_ctx_verify, NULL, md,
+                                             NULL, pkey)))
+             goto out;
+@@ -1140,6 +1140,22 @@ static int test_EVP_DigestSignInit(int tst)
+         }
+         if (!TEST_true(EVP_DigestVerifyFinal(md_ctx_verify, sig, sig_len)))
+             goto out;
++
++        /* Multiple calls to EVP_DigestVerifyFinal should work */
++        if (!TEST_true(EVP_DigestVerifyFinal(md_ctx_verify, sig, sig_len)))
++            goto out;
++    } else {
++        /*
++         * For HMAC a doubled call to DigestSignFinal should produce the same
++         * value as finalization should not happen.
++         */
++        if (!TEST_true(EVP_DigestSignFinal(md_ctx, NULL, &amp;sig2_len))
++            || !TEST_ptr(sig2 = OPENSSL_malloc(sig2_len))
++            || !TEST_true(EVP_DigestSignFinal(md_ctx, sig2, &amp;sig2_len)))
++            goto out;
++
++        if (!TEST_mem_eq(sig, sig_len, sig2, sig2_len))
++            goto out;
+     }
+ 
+     ret = 1;
+@@ -1151,6 +1167,7 @@ static int test_EVP_DigestSignInit(int tst)
+     EVP_MD_CTX_free(a_md_ctx_verify);
+     EVP_PKEY_free(pkey);
+     OPENSSL_free(sig);
++    OPENSSL_free(sig2);
+     EVP_MD_free(mdexp);
+ 
+     return ret;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035156.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="035159.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35158">[ date ]</a>
+              <a href="thread.html#35158">[ thread ]</a>
+              <a href="subject.html#35158">[ subject ]</a>
+              <a href="author.html#35158">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

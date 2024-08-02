@@ -1,0 +1,174 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1518582501.008237.4533.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018073.html">
+   <LINK REL="Next"  HREF="018089.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1518582501.008237.4533.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">viktor at openssl.org
+       </A><BR>
+    <I>Wed Feb 14 04:28:21 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018073.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018089.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18076">[ date ]</a>
+              <a href="thread.html#18076">[ thread ]</a>
+              <a href="subject.html#18076">[ subject ]</a>
+              <a href="author.html#18076">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  babab8e7c9060cd4e8e423a783853503982a5d27 (commit)
+      from  72960279562e9af53264155a46b4a0b6a40f9590 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit babab8e7c9060cd4e8e423a783853503982a5d27
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Tue Feb 13 22:43:15 2018 -0500
+
+    Avoid fragile aliasing of SHA224/384 update/final
+    
+    This is purported to save a few cycles, but makes the code less
+    obvious and more brittle, and in fact breaks on platforms where for
+    ABI continuity reasons there is a SHA2 implementation in libc, and
+    so EVP needs to call those to avoid conflicts.
+    
+    A sufficiently good optimizer could simply generate the same entry
+    points for:
+    
+            foo(...) { ... }
+        and
+            bar(...) { return foo(...); }
+    
+    but, even without that, the different is negligible, with the
+    &quot;winner&quot; varying from run to run (openssl speed -evp sha384):
+    
+        Old:
+        type             16 bytes     64 bytes    256 bytes   1024 bytes   8192 bytes 16384 bytes
+        sha384           28864.28k   117362.62k   266469.21k   483258.03k   635144.87k 649123.16k
+    
+        New:
+        type             16 bytes     64 bytes    256 bytes   1024 bytes   8192 bytes 16384 bytes
+        sha384           30055.18k   120725.98k   272057.26k   482847.40k   634585.09k 650308.27k
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/m_sha1.c | 33 ++++++++++++++++++++++++---------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/evp/m_sha1.c b/crypto/evp/m_sha1.c
+index d73e412..ac52417 100644
+--- a/crypto/evp/m_sha1.c
++++ b/crypto/evp/m_sha1.c
+@@ -116,16 +116,21 @@ static int init224(EVP_MD_CTX *ctx)
+     return SHA224_Init(EVP_MD_CTX_md_data(ctx));
+ }
+ 
++static int update224(EVP_MD_CTX *ctx, const void *data, size_t count)
++{
++    return SHA224_Update(EVP_MD_CTX_md_data(ctx), data, count);
++}
++
++static int final224(EVP_MD_CTX *ctx, unsigned char *md)
++{
++    return SHA224_Final(md, EVP_MD_CTX_md_data(ctx));
++}
++
+ static int init256(EVP_MD_CTX *ctx)
+ {
+     return SHA256_Init(EVP_MD_CTX_md_data(ctx));
+ }
+ 
+-/*
+- * Even though there're separate SHA224_[Update|Final], we call
+- * SHA256 functions even in SHA224 context. This is what happens
+- * there anyway, so we can spare few CPU cycles:-)
+- */
+ static int update256(EVP_MD_CTX *ctx, const void *data, size_t count)
+ {
+     return SHA256_Update(EVP_MD_CTX_md_data(ctx), data, count);
+@@ -142,8 +147,8 @@ static const EVP_MD sha224_md = {
+     SHA224_DIGEST_LENGTH,
+     EVP_MD_FLAG_DIGALGID_ABSENT,
+     init224,
+-    update256,
+-    final256,
++    update224,
++    final224,
+     NULL,
+     NULL,
+     SHA256_CBLOCK,
+@@ -189,6 +194,16 @@ static int init384(EVP_MD_CTX *ctx)
+     return SHA384_Init(EVP_MD_CTX_md_data(ctx));
+ }
+ 
++static int update384(EVP_MD_CTX *ctx, const void *data, size_t count)
++{
++    return SHA384_Update(EVP_MD_CTX_md_data(ctx), data, count);
++}
++
++static int final384(EVP_MD_CTX *ctx, unsigned char *md)
++{
++    return SHA384_Final(md, EVP_MD_CTX_md_data(ctx));
++}
++
+ static int init512(EVP_MD_CTX *ctx)
+ {
+     return SHA512_Init(EVP_MD_CTX_md_data(ctx));
+@@ -249,8 +264,8 @@ static const EVP_MD sha384_md = {
+     SHA384_DIGEST_LENGTH,
+     EVP_MD_FLAG_DIGALGID_ABSENT,
+     init384,
+-    update512,
+-    final512,
++    update384,
++    final384,
+     NULL,
+     NULL,
+     SHA512_CBLOCK,
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018073.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018089.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18076">[ date ]</a>
+              <a href="thread.html#18076">[ thread ]</a>
+              <a href="subject.html#18076">[ subject ]</a>
+              <a href="author.html#18076">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

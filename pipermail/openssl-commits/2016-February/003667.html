@@ -1,0 +1,637 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1454687694.675676.4048.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003610.html">
+   <LINK REL="Next"  HREF="003722.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Viktor Dukhovni</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1454687694.675676.4048.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">viktor at openssl.org
+       </A><BR>
+    <I>Fri Feb  5 15:54:54 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003610.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="003722.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3667">[ date ]</a>
+              <a href="thread.html#3667">[ thread ]</a>
+              <a href="subject.html#3667">[ subject ]</a>
+              <a href="author.html#3667">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  a3baa171053547488475709c7197592c66e427cf (commit)
+      from  093d20a8cb74e64d627fcd03532ba6b3150f1d1f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a3baa171053547488475709c7197592c66e427cf
+Author: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">openssl-users at dukhovni.org</A>&gt;
+Date:   Tue Feb 2 04:35:27 2016 -0500
+
+    Fix missing ok=0 with locally blacklisted CAs
+    
+    Also in X509_verify_cert() avoid using &quot;i&quot; not only as a loop
+    counter, but also as a trust outcome and as an error ordinal.
+    
+    Finally, make sure that all &quot;goto end&quot; jumps return an error, with
+    &quot;end&quot; renamed to &quot;err&quot; accordingly.
+    
+    [ The 1.1.0 version of X509_verify_cert() is major rewrite,
+      which addresses these issues in a more systemic way. ]
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x509_vfy.c | 70 ++++++++++++++++++++++++++++----------------------
+ 1 file changed, 40 insertions(+), 30 deletions(-)
+
+diff --git a/crypto/x509/x509_vfy.c b/crypto/x509/x509_vfy.c
+index 0429767..4d34dba 100644
+--- a/crypto/x509/x509_vfy.c
++++ b/crypto/x509/x509_vfy.c
+@@ -194,6 +194,9 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     int num, j, retry;
+     int (*cb) (int xok, X509_STORE_CTX *xctx);
+     STACK_OF(X509) *sktmp = NULL;
++    int trust = X509_TRUST_UNTRUSTED;
++    int err;
++
+     if (ctx-&gt;cert == NULL) {
+         X509err(X509_F_X509_VERIFY_CERT, X509_R_NO_CERT_SET_FOR_US_TO_VERIFY);
+         return -1;
+@@ -216,7 +219,8 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     if (((ctx-&gt;chain = sk_X509_new_null()) == NULL) ||
+         (!sk_X509_push(ctx-&gt;chain, ctx-&gt;cert))) {
+         X509err(X509_F_X509_VERIFY_CERT, ERR_R_MALLOC_FAILURE);
+-        goto end;
++        ok = -1;
++        goto err;
+     }
+     CRYPTO_add(&amp;ctx-&gt;cert-&gt;references, 1, CRYPTO_LOCK_X509);
+     ctx-&gt;last_untrusted = 1;
+@@ -225,7 +229,8 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     if (ctx-&gt;untrusted != NULL
+         &amp;&amp; (sktmp = sk_X509_dup(ctx-&gt;untrusted)) == NULL) {
+         X509err(X509_F_X509_VERIFY_CERT, ERR_R_MALLOC_FAILURE);
+-        goto end;
++        ok = -1;
++        goto err;
+     }
+ 
+     num = sk_X509_num(ctx-&gt;chain);
+@@ -249,7 +254,7 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+         if (ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_TRUSTED_FIRST) {
+             ok = ctx-&gt;get_issuer(&amp;xtmp, ctx, x);
+             if (ok &lt; 0)
+-                goto end;
++                goto err;
+             /*
+              * If successful for now free up cert so it will be picked up
+              * again later.
+@@ -266,7 +271,8 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+             if (xtmp != NULL) {
+                 if (!sk_X509_push(ctx-&gt;chain, xtmp)) {
+                     X509err(X509_F_X509_VERIFY_CERT, ERR_R_MALLOC_FAILURE);
+-                    goto end;
++                    ok = -1;
++                    goto err;
+                 }
+                 CRYPTO_add(&amp;xtmp-&gt;references, 1, CRYPTO_LOCK_X509);
+                 (void)sk_X509_delete_ptr(sktmp, xtmp);
+@@ -314,7 +320,7 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+                     bad_chain = 1;
+                     ok = cb(0, ctx);
+                     if (!ok)
+-                        goto end;
++                        goto err;
+                 } else {
+                     /*
+                      * We have a match: replace certificate with store
+@@ -347,25 +353,26 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+             ok = ctx-&gt;get_issuer(&amp;xtmp, ctx, x);
+ 
+             if (ok &lt; 0)
+-                goto end;
++                goto err;
+             if (ok == 0)
+                 break;
+             x = xtmp;
+             if (!sk_X509_push(ctx-&gt;chain, x)) {
+                 X509_free(xtmp);
+                 X509err(X509_F_X509_VERIFY_CERT, ERR_R_MALLOC_FAILURE);
+-                ok = 0;
+-                goto end;
++                ok = -1;
++                goto err;
+             }
+             num++;
+         }
+ 
+         /* we now have our chain, lets check it... */
+-        i = check_trust(ctx);
++        if ((trust = check_trust(ctx)) == X509_TRUST_REJECTED) {
++            /* Callback already issued */
++            ok = 0;
++            goto err;
++        }
+ 
+-        /* If explicitly rejected error */
+-        if (i == X509_TRUST_REJECTED)
+-            goto end;
+         /*
+          * If it's not explicitly trusted then check if there is an alternative
+          * chain that could be used. We only do this if we haven't already
+@@ -373,14 +380,14 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+          * chain checking
+          */
+         retry = 0;
+-        if (i != X509_TRUST_TRUSTED
++        if (trust != X509_TRUST_TRUSTED
+             &amp;&amp; !(ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_TRUSTED_FIRST)
+             &amp;&amp; !(ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_NO_ALT_CHAINS)) {
+             while (j-- &gt; 1) {
+                 xtmp2 = sk_X509_value(ctx-&gt;chain, j - 1);
+                 ok = ctx-&gt;get_issuer(&amp;xtmp, ctx, xtmp2);
+                 if (ok &lt; 0)
+-                    goto end;
++                    goto err;
+                 /* Check if we found an alternate chain */
+                 if (ok &gt; 0) {
+                     /*
+@@ -410,7 +417,7 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+      * self signed certificate in which case we've indicated an error already
+      * and set bad_chain == 1
+      */
+-    if (i != X509_TRUST_TRUSTED &amp;&amp; !bad_chain) {
++    if (trust != X509_TRUST_TRUSTED &amp;&amp; !bad_chain) {
+         if ((chain_ss == NULL) || !ctx-&gt;check_issued(ctx, x, chain_ss)) {
+             if (ctx-&gt;last_untrusted &gt;= num)
+                 ctx-&gt;error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY;
+@@ -431,26 +438,26 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+         bad_chain = 1;
+         ok = cb(0, ctx);
+         if (!ok)
+-            goto end;
++            goto err;
+     }
+ 
+     /* We have the chain complete: now we need to check its purpose */
+     ok = check_chain_extensions(ctx);
+ 
+     if (!ok)
+-        goto end;
++        goto err;
+ 
+     /* Check name constraints */
+ 
+     ok = check_name_constraints(ctx);
+ 
+     if (!ok)
+-        goto end;
++        goto err;
+ 
+     ok = check_id(ctx);
+ 
+     if (!ok)
+-        goto end;
++        goto err;
+ 
+     /* We may as well copy down any DSA parameters that are required */
+     X509_get_pubkey_parameters(NULL, ctx-&gt;chain);
+@@ -462,16 +469,16 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+ 
+     ok = ctx-&gt;check_revocation(ctx);
+     if (!ok)
+-        goto end;
++        goto err;
+ 
+-    i = X509_chain_check_suiteb(&amp;ctx-&gt;error_depth, NULL, ctx-&gt;chain,
+-                                ctx-&gt;param-&gt;flags);
+-    if (i != X509_V_OK) {
+-        ctx-&gt;error = i;
++    err = X509_chain_check_suiteb(&amp;ctx-&gt;error_depth, NULL, ctx-&gt;chain,
++                                  ctx-&gt;param-&gt;flags);
++    if (err != X509_V_OK) {
++        ctx-&gt;error = err;
+         ctx-&gt;current_cert = sk_X509_value(ctx-&gt;chain, ctx-&gt;error_depth);
+         ok = cb(0, ctx);
+         if (!ok)
+-            goto end;
++            goto err;
+     }
+ 
+     /* At this point, we have a chain and need to verify it */
+@@ -480,25 +487,28 @@ int X509_verify_cert(X509_STORE_CTX *ctx)
+     else
+         ok = internal_verify(ctx);
+     if (!ok)
+-        goto end;
++        goto err;
+ 
+ #ifndef OPENSSL_NO_RFC3779
+     /* RFC 3779 path validation, now that CRL check has been done */
+     ok = v3_asid_validate_path(ctx);
+     if (!ok)
+-        goto end;
++        goto err;
+     ok = v3_addr_validate_path(ctx);
+     if (!ok)
+-        goto end;
++        goto err;
+ #endif
+ 
+     /* If we get this far evaluate policies */
+     if (!bad_chain &amp;&amp; (ctx-&gt;param-&gt;flags &amp; X509_V_FLAG_POLICY_CHECK))
+         ok = ctx-&gt;check_policy(ctx);
+     if (!ok)
+-        goto end;
++        goto err;
+     if (0) {
+- end:
++ err:
++        /* Ensure we return an error */
++        if (ok &gt; 0)
++            ok = 0;
+         X509_get_pubkey_parameters(NULL, ctx-&gt;chain);
+     }
+     if (sktmp != NULL)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003610.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="003722.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3667">[ date ]</a>
+              <a href="thread.html#3667">[ thread ]</a>
+              <a href="subject.html#3667">[ subject ]</a>
+              <a href="author.html#3667">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

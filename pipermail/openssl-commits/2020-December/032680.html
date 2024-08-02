@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1608718342.920006.32746.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032673.html">
+   <LINK REL="Next"  HREF="032681.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>beldmit at gmail.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1608718342.920006.32746.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">beldmit at gmail.com
+       </A><BR>
+    <I>Wed Dec 23 10:12:22 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032673.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032681.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32680">[ date ]</a>
+              <a href="thread.html#32680">[ thread ]</a>
+              <a href="subject.html#32680">[ subject ]</a>
+              <a href="author.html#32680">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  128d25ba6a9e02481381d47e3a5aa915700b9a1e (commit)
+      from  c4b2c53fadb158bee34aef90d5a7d500aead1f70 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 128d25ba6a9e02481381d47e3a5aa915700b9a1e
+Author: Dmitry Belyavskiy &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">beldmit at gmail.com</A>&gt;
+Date:   Mon Dec 21 14:23:17 2020 +0100
+
+    Fetch provided algorithm once per benchmark
+    
+    Partially fixes #13578
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13721">https://github.com/openssl/openssl/pull/13721</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/speed.c | 50 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/apps/speed.c b/apps/speed.c
+index 5b944290fc..c8c4f65b47 100644
+--- a/apps/speed.c
++++ b/apps/speed.c
+@@ -1003,7 +1003,9 @@ static int EVP_Update_loop_aead(void *args)
+     return count;
+ }
+ 
+-static const EVP_MD *evp_md = NULL;
++static EVP_MD *evp_md = NULL;
++static int fetched_alg = 0;
++
+ static int EVP_Digest_loop(void *args)
+ {
+     loopargs_t *tempargs = *(loopargs_t **) args;
+@@ -1491,6 +1493,38 @@ static int run_benchmark(int async_jobs,
+     return error ? -1 : total_op_count;
+ }
+ 
++static EVP_MD *obtain_md(const char *name)
++{
++    EVP_MD *md = NULL;
++
++    /* Look through providers' digests */
++    ERR_set_mark();
++    md = EVP_MD_fetch(NULL, name, NULL);
++    ERR_pop_to_mark();
++    if (md != NULL) {
++        fetched_alg = 1;
++        return md;
++    }
++
++    return (EVP_MD *)EVP_get_digestbyname(name);
++}
++
++static EVP_CIPHER *obtain_cipher(const char *name)
++{
++    EVP_CIPHER *cipher = NULL;
++
++    /* Look through providers' ciphers */
++    ERR_set_mark();
++    cipher = EVP_CIPHER_fetch(NULL, name, NULL);
++    ERR_pop_to_mark();
++    if (cipher != NULL) {
++        fetched_alg = 1;
++        return cipher;
++    }
++
++    return (EVP_CIPHER *)EVP_get_cipherbyname(name);
++}
++
+ #define stop_it(do_it, test_num)\
+     memset(do_it + test_num, 0, OSSL_NELEM(do_it) - test_num);
+ 
+@@ -1500,7 +1534,7 @@ int speed_main(int argc, char **argv)
+     loopargs_t *loopargs = NULL;
+     const char *prog;
+     const char *engine_id = NULL;
+-    const EVP_CIPHER *evp_cipher = NULL;
++    EVP_CIPHER *evp_cipher = NULL;
+     double d = 0.0;
+     OPTION_CHOICE o;
+     int async_init = 0, multiblock = 0, pr_header = 0;
+@@ -1694,10 +1728,14 @@ int speed_main(int argc, char **argv)
+             usertime = 0;
+             break;
+         case OPT_EVP:
++            if (doit[D_EVP]) {
++                BIO_printf(bio_err, &quot;%s: -evp option cannot be used more than once\n&quot;, prog);
++                goto opterr;
++            }
+             evp_md = NULL;
+-            evp_cipher = EVP_get_cipherbyname(opt_arg());
++            evp_cipher = obtain_cipher(opt_arg());
+             if (evp_cipher == NULL)
+-                evp_md = EVP_get_digestbyname(opt_arg());
++                evp_md = obtain_md(opt_arg());
+             if (evp_cipher == NULL &amp;&amp; evp_md == NULL) {
+                 BIO_printf(bio_err,
+                            &quot;%s: %s is an unknown cipher or digest\n&quot;,
+@@ -4091,6 +4129,10 @@ int speed_main(int argc, char **argv)
+     }
+     OPENSSL_free(loopargs);
+     release_engine(e);
++    if (fetched_alg) {
++        EVP_MD_free(evp_md);
++        EVP_CIPHER_free(evp_cipher);
++    }
+     return ret;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032673.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032681.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32680">[ date ]</a>
+              <a href="thread.html#32680">[ thread ]</a>
+              <a href="subject.html#32680">[ subject ]</a>
+              <a href="author.html#32680">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

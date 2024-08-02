@@ -1,0 +1,455 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  OpenSSL_1_1_1-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-September/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1568106427.051429.19316.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024970.html">
+   <LINK REL="Next"  HREF="024982.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  OpenSSL_1_1_1-stable update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20OpenSSL_1_1_1-stable%20update&In-Reply-To=%3C1568106427.051429.19316.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  OpenSSL_1_1_1-stable update">matt at openssl.org
+       </A><BR>
+    <I>Tue Sep 10 09:07:07 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024970.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+        <LI>Next message: <A HREF="024982.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24979">[ date ]</a>
+              <a href="thread.html#24979">[ thread ]</a>
+              <a href="subject.html#24979">[ subject ]</a>
+              <a href="author.html#24979">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_1_1-stable has been updated
+       via  79f5e2f4b9d9886d1b0da09c2eb3e397bcf82876 (commit)
+       via  1d36536457c14c92a2e728e8499260f396bd4657 (commit)
+      from  63180182ecfe6474fbc50bc4021e558d11414e88 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 79f5e2f4b9d9886d1b0da09c2eb3e397bcf82876
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Fri Sep 6 21:54:13 2019 +0200
+
+    Fix a potential crash in rand_unix.c
+    
+    Due to the dynamic allocation that was added to rand_pool_add_begin
+    this function could now return a null pointer where it was previously
+    guaranteed to succeed. But the return value of this function does
+    not need to be checked by design.
+    
+    Move rand_pool_grow from rand_pool_add_begin to rand_pool_bytes_needed.
+    Make an allocation error persistent to avoid falling back to less secure
+    or blocking entropy sources.
+    
+    Fixes: a6a66e4511ee (&quot;Make rand_pool buffers more dynamic in their sizing.&quot;)
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9687">https://github.com/openssl/openssl/pull/9687</A>)
+    
+    (cherry picked from commit fa3eb248e29ca8031e6a14e8a2c6f3cd58b5450e)
+
+commit 1d36536457c14c92a2e728e8499260f396bd4657
+Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+Date:   Sat Aug 24 11:38:32 2019 +0200
+
+    Fix a strict warnings error in rand_pool_acquire_entropy
+    
+    There was a warning about unused variables in this config:
+    ./config --strict-warnings --with-rand-seed=rdcpu
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/9687">https://github.com/openssl/openssl/pull/9687</A>)
+    
+    (cherry picked from commit e301c147a763f67dcc5ba63eb7e2ae40d83a68aa)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/rand_lib.c  | 115 +++++++++++++++++++++++++++++++++++-------------
+ crypto/rand/rand_unix.c |  39 +++++++++-------
+ 2 files changed, 106 insertions(+), 48 deletions(-)
+
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 945ea1e795..91b2652311 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -611,6 +611,42 @@ size_t rand_pool_entropy_needed(RAND_POOL *pool)
+     return 0;
+ }
+ 
++/* Increase the allocation size -- not usable for an attached pool */
++static int rand_pool_grow(RAND_POOL *pool, size_t len)
++{
++    if (len &gt; pool-&gt;alloc_len - pool-&gt;len) {
++        unsigned char *p;
++        const size_t limit = pool-&gt;max_len / 2;
++        size_t newlen = pool-&gt;alloc_len;
++
++        if (pool-&gt;attached || len &gt; pool-&gt;max_len - pool-&gt;len) {
++            RANDerr(RAND_F_RAND_POOL_GROW, ERR_R_INTERNAL_ERROR);
++            return 0;
++        }
++
++        do
++            newlen = newlen &lt; limit ? newlen * 2 : pool-&gt;max_len;
++        while (len &gt; newlen - pool-&gt;len);
++
++        if (pool-&gt;secure)
++            p = OPENSSL_secure_zalloc(newlen);
++        else
++            p = OPENSSL_zalloc(newlen);
++        if (p == NULL) {
++            RANDerr(RAND_F_RAND_POOL_GROW, ERR_R_MALLOC_FAILURE);
++            return 0;
++        }
++        memcpy(p, pool-&gt;buffer, pool-&gt;len);
++        if (pool-&gt;secure)
++            OPENSSL_secure_clear_free(pool-&gt;buffer, pool-&gt;alloc_len);
++        else
++            OPENSSL_clear_free(pool-&gt;buffer, pool-&gt;alloc_len);
++        pool-&gt;buffer = p;
++        pool-&gt;alloc_len = newlen;
++    }
++    return 1;
++}
++
+ /*
+  * Returns the number of bytes needed to fill the pool, assuming
+  * the input has 1 / |entropy_factor| entropy bits per data bit.
+@@ -640,6 +676,24 @@ size_t rand_pool_bytes_needed(RAND_POOL *pool, unsigned int entropy_factor)
+         /* to meet the min_len requirement */
+         bytes_needed = pool-&gt;min_len - pool-&gt;len;
+ 
++    /*
++     * Make sure the buffer is large enough for the requested amount
++     * of data. This guarantees that existing code patterns where
++     * rand_pool_add_begin, rand_pool_add_end or rand_pool_add
++     * are used to collect entropy data without any error handling
++     * whatsoever, continue to be valid.
++     * Furthermore if the allocation here fails once, make sure that
++     * we don't fall back to a less secure or even blocking random source,
++     * as that could happen by the existing code patterns.
++     * This is not a concern for additional data, therefore that
++     * is not needed if rand_pool_grow fails in other places.
++     */
++    if (!rand_pool_grow(pool, bytes_needed)) {
++        /* persistent error for this pool */
++        pool-&gt;max_len = pool-&gt;len = 0;
++        return 0;
++    }
++
+     return bytes_needed;
+ }
+ 
+@@ -649,36 +703,6 @@ size_t rand_pool_bytes_remaining(RAND_POOL *pool)
+     return pool-&gt;max_len - pool-&gt;len;
+ }
+ 
+-static int rand_pool_grow(RAND_POOL *pool, size_t len)
+-{
+-    if (len &gt; pool-&gt;alloc_len - pool-&gt;len) {
+-        unsigned char *p;
+-        const size_t limit = pool-&gt;max_len / 2;
+-        size_t newlen = pool-&gt;alloc_len;
+-
+-        do
+-            newlen = newlen &lt; limit ? newlen * 2 : pool-&gt;max_len;
+-        while (len &gt; newlen - pool-&gt;len);
+-
+-        if (pool-&gt;secure)
+-            p = OPENSSL_secure_zalloc(newlen);
+-        else
+-            p = OPENSSL_zalloc(newlen);
+-        if (p == NULL) {
+-            RANDerr(RAND_F_RAND_POOL_GROW, ERR_R_MALLOC_FAILURE);
+-            return 0;
+-        }
+-        memcpy(p, pool-&gt;buffer, pool-&gt;len);
+-        if (pool-&gt;secure)
+-            OPENSSL_secure_clear_free(pool-&gt;buffer, pool-&gt;alloc_len);
+-        else
+-            OPENSSL_clear_free(pool-&gt;buffer, pool-&gt;alloc_len);
+-        pool-&gt;buffer = p;
+-        pool-&gt;alloc_len = newlen;
+-    }
+-    return 1;
+-}
+-
+ /*
+  * Add random bytes to the random pool.
+  *
+@@ -702,6 +726,25 @@ int rand_pool_add(RAND_POOL *pool,
+     }
+ 
+     if (len &gt; 0) {
++        /*
++         * This is to protect us from accidentally passing the buffer
++         * returned from rand_pool_add_begin.
++         * The check for alloc_len makes sure we do not compare the
++         * address of the end of the allocated memory to something
++         * different, since that comparison would have an
++         * indeterminate result.
++         */
++        if (pool-&gt;alloc_len &gt; pool-&gt;len &amp;&amp; pool-&gt;buffer + pool-&gt;len == buffer) {
++            RANDerr(RAND_F_RAND_POOL_ADD, ERR_R_INTERNAL_ERROR);
++            return 0;
++        }
++        /*
++         * We have that only for cases when a pool is used to collect
++         * additional data.
++         * For entropy data, as long as the allocation request stays within
++         * the limits given by rand_pool_bytes_needed this rand_pool_grow
++         * below is guaranteed to succeed, thus no allocation happens.
++         */
+         if (!rand_pool_grow(pool, len))
+             return 0;
+         memcpy(pool-&gt;buffer + pool-&gt;len, buffer, len);
+@@ -739,8 +782,18 @@ unsigned char *rand_pool_add_begin(RAND_POOL *pool, size_t len)
+         return NULL;
+     }
+ 
++    /*
++     * As long as the allocation request stays within the limits given
++     * by rand_pool_bytes_needed this rand_pool_grow below is guaranteed
++     * to succeed, thus no allocation happens.
++     * We have that only for cases when a pool is used to collect
++     * additional data. Then the buffer might need to grow here,
++     * and of course the caller is responsible to check the return
++     * value of this function.
++     */
+     if (!rand_pool_grow(pool, len))
+         return NULL;
++
+     return pool-&gt;buffer + pool-&gt;len;
+ }
+ 
+@@ -755,7 +808,7 @@ unsigned char *rand_pool_add_begin(RAND_POOL *pool, size_t len)
+  */
+ int rand_pool_add_end(RAND_POOL *pool, size_t len, size_t entropy)
+ {
+-    if (len &gt; pool-&gt;max_len - pool-&gt;len) {
++    if (len &gt; pool-&gt;alloc_len - pool-&gt;len) {
+         RANDerr(RAND_F_RAND_POOL_ADD_END, RAND_R_RANDOM_POOL_OVERFLOW);
+         return 0;
+     }
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index 0cfa4e0625..69efcdeed7 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -573,12 +573,12 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ #  if defined(OPENSSL_RAND_SEED_NONE)
+     return rand_pool_entropy_available(pool);
+ #  else
+-    size_t bytes_needed;
+-    size_t entropy_available = 0;
+-    unsigned char *buffer;
++    size_t entropy_available;
+ 
+ #   if defined(OPENSSL_RAND_SEED_GETRANDOM)
+     {
++        size_t bytes_needed;
++        unsigned char *buffer;
+         ssize_t bytes;
+         /* Maximum allowed number of consecutive unsuccessful attempts */
+         int attempts = 3;
+@@ -609,6 +609,8 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ 
+ #   if defined(OPENSSL_RAND_SEED_DEVRANDOM)
+     if (wait_random_seeded()) {
++        size_t bytes_needed;
++        unsigned char *buffer;
+         size_t i;
+ 
+         bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
+@@ -658,26 +660,29 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
+ #   endif
+ 
+ #   if defined(OPENSSL_RAND_SEED_EGD)
+-    bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
+-    if (bytes_needed &gt; 0) {
++    {
+         static const char *paths[] = { DEVRANDOM_EGD, NULL };
++        size_t bytes_needed;
++        unsigned char *buffer;
+         int i;
+ 
+-        for (i = 0; paths[i] != NULL; i++) {
++        bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
++        for (i = 0; bytes_needed &gt; 0 &amp;&amp; paths[i] != NULL; i++) {
++            size_t bytes = 0;
++            int num;
++
+             buffer = rand_pool_add_begin(pool, bytes_needed);
+-            if (buffer != NULL) {
+-                size_t bytes = 0;
+-                int num = RAND_query_egd_bytes(paths[i],
+-                                               buffer, (int)bytes_needed);
+-                if (num == (int)bytes_needed)
+-                    bytes = bytes_needed;
++            num = RAND_query_egd_bytes(paths[i],
++                                       buffer, (int)bytes_needed);
++            if (num == (int)bytes_needed)
++                bytes = bytes_needed;
+ 
+-                rand_pool_add_end(pool, bytes, 8 * bytes);
+-                entropy_available = rand_pool_entropy_available(pool);
+-            }
+-            if (entropy_available &gt; 0)
+-                return entropy_available;
++            rand_pool_add_end(pool, bytes, 8 * bytes);
++            bytes_needed = rand_pool_bytes_needed(pool, 1);
+         }
++        entropy_available = rand_pool_entropy_available(pool);
++        if (entropy_available &gt; 0)
++            return entropy_available;
+     }
+ #   endif
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024970.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+	<LI>Next message: <A HREF="024982.html">[openssl]  OpenSSL_1_1_1-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24979">[ date ]</a>
+              <a href="thread.html#24979">[ thread ]</a>
+              <a href="subject.html#24979">[ subject ]</a>
+              <a href="author.html#24979">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

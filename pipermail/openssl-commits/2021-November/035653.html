@@ -1,0 +1,400 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1636983643.444816.2263722.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035651.html">
+   <LINK REL="Next"  HREF="035656.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1636983643.444816.2263722.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Mon Nov 15 13:40:43 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035651.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="035656.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35653">[ date ]</a>
+              <a href="thread.html#35653">[ thread ]</a>
+              <a href="subject.html#35653">[ subject ]</a>
+              <a href="author.html#35653">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  7a9b09feaa07f79522f7affccbca4236da2443e5 (commit)
+      from  bef9b48e5071cdd2b41a4f486d1bcb5e14b2a5c3 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 7a9b09feaa07f79522f7affccbca4236da2443e5
+Author: Dr. David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">David.von.Oheimb at siemens.com</A>&gt;
+Date:   Fri Jul 9 00:31:21 2021 +0200
+
+    BIO_s_connect(): Enable BIO_gets()
+    
+    Fixes #16028
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/16030">https://github.com/openssl/openssl/pull/16030</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/bss_conn.c      |  53 ++++++++++++++++++++-
+ doc/man3/BIO_s_connect.pod |   4 +-
+ test/http_test.c           | 114 +++++++++++++++++++++++++++++++++++----------
+ 3 files changed, 144 insertions(+), 27 deletions(-)
+
+diff --git a/crypto/bio/bss_conn.c b/crypto/bio/bss_conn.c
+index d146c97b82..8bc53548ca 100644
+--- a/crypto/bio/bss_conn.c
++++ b/crypto/bio/bss_conn.c
+@@ -42,6 +42,7 @@ typedef struct bio_connect_st {
+ static int conn_write(BIO *h, const char *buf, int num);
+ static int conn_read(BIO *h, char *buf, int size);
+ static int conn_puts(BIO *h, const char *str);
++static int conn_gets(BIO *h, char *buf, int size);
+ static long conn_ctrl(BIO *h, int cmd, long arg1, void *arg2);
+ static int conn_new(BIO *h);
+ static int conn_free(BIO *data);
+@@ -68,7 +69,7 @@ static const BIO_METHOD methods_connectp = {
+     bread_conv,
+     conn_read,
+     conn_puts,
+-    NULL,                       /* conn_gets, */
++    conn_gets,
+     conn_ctrl,
+     conn_new,
+     conn_free,
+@@ -595,6 +596,56 @@ static int conn_puts(BIO *bp, const char *str)
+     return ret;
+ }
+ 
++int conn_gets(BIO *bio, char *buf, int size)
++{
++    BIO_CONNECT *data;
++    char *ptr = buf;
++    int ret = 0;
++
++    if (buf == NULL) {
++        ERR_raise(ERR_LIB_BIO, ERR_R_PASSED_NULL_PARAMETER);
++        return -1;
++    }
++    if (size &lt;= 0) {
++        ERR_raise(ERR_LIB_BIO, BIO_R_INVALID_ARGUMENT);
++        return -1;
++    }
++    *buf = '\0';
++
++    if (bio == NULL || bio-&gt;ptr == NULL) {
++        ERR_raise(ERR_LIB_BIO, ERR_R_PASSED_NULL_PARAMETER);
++        return -1;
++    }
++    data = (BIO_CONNECT *)bio-&gt;ptr;
++    if (data-&gt;state != BIO_CONN_S_OK) {
++        ret = conn_state(bio, data);
++        if (ret &lt;= 0)
++            return ret;
++    }
++
++    clear_socket_error();
++    while (size-- &gt; 1) {
++# ifndef OPENSSL_NO_KTLS
++        if (BIO_get_ktls_recv(bio))
++            ret = ktls_read_record(bio-&gt;num, ptr, 1);
++        else
++# endif
++            ret = readsocket(bio-&gt;num, ptr, 1);
++        BIO_clear_retry_flags(bio);
++        if (ret &lt;= 0) {
++            if (BIO_sock_should_retry(ret))
++                BIO_set_retry_read(bio);
++            else if (ret == 0)
++                bio-&gt;flags |= BIO_FLAGS_IN_EOF;
++            break;
++        }
++        if (*ptr++ == '\n')
++            break;
++    }
++    *ptr = '\0';
++    return ret &gt; 0 || (bio-&gt;flags &amp; BIO_FLAGS_IN_EOF) != 0 ? ptr - buf : ret;
++}
++
+ BIO *BIO_new_connect(const char *str)
+ {
+     BIO *ret;
+diff --git a/doc/man3/BIO_s_connect.pod b/doc/man3/BIO_s_connect.pod
+index 88450dffce..782e076a94 100644
+--- a/doc/man3/BIO_s_connect.pod
++++ b/doc/man3/BIO_s_connect.pod
+@@ -44,7 +44,7 @@ on the underlying connection. If no connection is established
+ and the port and hostname (see below) is set up properly then
+ a connection is established first.
+ 
+-Connect BIOs support BIO_puts() but not BIO_gets().
++Connect BIOs support BIO_puts() and BIO_gets().
+ 
+ If the close flag is set on a connect BIO then any active
+ connection is shutdown and the socket closed when the BIO
+@@ -199,6 +199,8 @@ BIO_set_conn_int_port(), BIO_get_conn_int_port(), BIO_set_conn_ip(), and BIO_get
+ were removed in OpenSSL 1.1.0.
+ Use BIO_set_conn_address() and BIO_get_conn_address() instead.
+ 
++Connect BIOs support BIO_gets() since OpenSSL 3.1.
++
+ =head1 COPYRIGHT
+ 
+ Copyright 2000-2021 The OpenSSL Project Authors. All Rights Reserved.
+diff --git a/test/http_test.c b/test/http_test.c
+index b9f7452744..edf995eb03 100644
+--- a/test/http_test.c
++++ b/test/http_test.c
+@@ -21,17 +21,21 @@ static X509 *x509 = NULL;
+ 
+ typedef struct {
+     BIO *out;
++    const char *content_type;
++    const char *txt;
+     char version;
+     int keep_alive;
+ } server_args;
+ 
+ /*-
+  * Pretty trivial HTTP mock server:
+- * For POST, copy request headers+body from mem BIO 'in' as response to 'out'.
+- * For GET, redirect to RPATH, else respond with 'rsp' of ASN1 type 'it'.
+- * Respond with HTTP version 1.'version' and 'keep_alive' (unless implicit).
++ * For POST, copy request headers+body from mem BIO |in| as response to |out|.
++ * For GET, redirect to RPATH unless already there, else use |content_type| and
++ * respond with |txt| if not NULL, else with |rsp| of ASN1 type |it|.
++ * Response hdr has HTTP version 1.|version| and |keep_alive| (unless implicit).
+  */
+ static int mock_http_server(BIO *in, BIO *out, char version, int keep_alive,
++                            const char *content_type, const char *txt,
+                             ASN1_VALUE *rsp, const ASN1_ITEM *it)
+ {
+     const char *req, *path;
+@@ -40,7 +44,7 @@ static int mock_http_server(BIO *in, BIO *out, char version, int keep_alive,
+     int is_get = count &gt;= 4 &amp;&amp; strncmp(hdr, &quot;GET &quot;, 4) == 0;
+     int len;
+ 
+-    /* first line should contain &quot;&lt;GET or POST&gt; &lt;path&gt; HTTP/1.x&quot; */
++    /* first line should contain &quot;(GET|POST) &lt;path&gt; HTTP/1.x&quot; */
+     if (is_get)
+         hdr += 4;
+     else if (TEST_true(count &gt;= 5 &amp;&amp; strncmp(hdr, &quot;POST &quot;, 5) == 0))
+@@ -79,11 +83,15 @@ static int mock_http_server(BIO *in, BIO *out, char version, int keep_alive,
+                        version == '0' ? &quot;keep-alive&quot; : &quot;close&quot;) &lt;= 0)
+             return 0;
+     if (is_get) { /* construct new header and body */
+-        if ((len = ASN1_item_i2d(rsp, NULL, it)) &lt;= 0)
++        if (txt != NULL)
++            len = strlen(txt);
++        else if ((len = ASN1_item_i2d(rsp, NULL, it)) &lt;= 0)
+             return 0;
+-        if (BIO_printf(out, &quot;Content-Type: application/x-x509-ca-cert\r\n&quot;
+-                       &quot;Content-Length: %d\r\n\r\n&quot;, len) &lt;= 0)
++        if (BIO_printf(out, &quot;Content-Type: %s\r\n&quot;
++                       &quot;Content-Length: %d\r\n\r\n&quot;, content_type, len) &lt;= 0)
+             return 0;
++        if (txt != NULL)
++            return BIO_puts(out, txt);
+         return ASN1_item_i2d_bio(it, out, rsp);
+     } else {
+         len = strlen(&quot;Connection: &quot;);
+@@ -106,47 +114,91 @@ static long http_bio_cb_ex(BIO *bio, int oper, const char *argp, size_t len,
+ 
+     if (oper == (BIO_CB_CTRL | BIO_CB_RETURN) &amp;&amp; cmd == BIO_CTRL_FLUSH)
+         ret = mock_http_server(bio, args-&gt;out, args-&gt;version, args-&gt;keep_alive,
++                               args-&gt;content_type, args-&gt;txt,
+                                (ASN1_VALUE *)x509, x509_it);
+     return ret;
+ }
+ 
+-static int test_http_x509(int do_get)
++#define text1 &quot;test\n&quot;
++#define text2 &quot;more\n&quot;
++#define REAL_SERVER_URL &quot;<A HREF="http://httpbin.org/">http://httpbin.org/</A>&quot;
++#define DOCTYPE_HTML &quot;&lt;!DOCTYPE html&gt;\n&quot;
++
++static int test_http_method(int do_get, int do_txt)
+ {
+-    X509 *rcert = NULL;
+     BIO *wbio = BIO_new(BIO_s_mem());
+     BIO *rbio = BIO_new(BIO_s_mem());
+-    server_args mock_args = { NULL, '0', 0 };
+-    BIO *rsp, *req = ASN1_item_i2d_mem_bio(x509_it, (ASN1_VALUE *)x509);
++    server_args mock_args = { NULL, NULL, NULL, '0', 0 };
++    BIO *req, *rsp;
+     STACK_OF(CONF_VALUE) *headers = NULL;
+-    const char content_type[] = &quot;application/x-x509-ca-cert&quot;;
++    const char *content_type;
+     int res = 0;
+-
++    int real_server = do_txt &amp;&amp; 0; /* remove &quot;&amp;&amp; 0&quot; for using real server */
++
++    if (do_txt) {
++        content_type = &quot;text/plain&quot;;
++        req = BIO_new(BIO_s_mem());
++        if (req == NULL
++                || BIO_puts(req, text1) != sizeof(text1) - 1
++                || BIO_puts(req, text2) != sizeof(text2) - 1) {
++            BIO_free(req);
++            req = NULL;
++        }
++        mock_args.txt = text1;
++    } else {
++        content_type = &quot;application/x-x509-ca-cert&quot;;
++        req = ASN1_item_i2d_mem_bio(x509_it, (ASN1_VALUE *)x509);
++        mock_args.txt = NULL;
++    }
+     if (wbio == NULL || rbio == NULL || req == NULL)
+         goto err;
++
+     mock_args.out = rbio;
++    mock_args.content_type = content_type;
+     BIO_set_callback_ex(wbio, http_bio_cb_ex);
+     BIO_set_callback_arg(wbio, (char *)&amp;mock_args);
+ 
+     rsp = do_get ?
+-        OSSL_HTTP_get(&quot;/will-be-redirected&quot;,
++        OSSL_HTTP_get(real_server ? REAL_SERVER_URL :
++                      do_txt ? RPATH : &quot;/will-be-redirected&quot;,
+                       NULL /* proxy */, NULL /* no_proxy */,
+-                      wbio, rbio, NULL /* bio_update_fn */, NULL /* arg */,
+-                      0 /* buf_size */, headers, content_type,
+-                      1 /* expect_asn1 */,
++                      real_server ? NULL : wbio,
++                      real_server ? NULL : rbio,
++                      NULL /* bio_update_fn */, NULL /* arg */,
++                      0 /* buf_size */, headers,
++                      real_server ? &quot;text/html; charset=utf-8&quot;:  content_type,
++                      !do_txt /* expect_asn1 */,
+                       OSSL_HTTP_DEFAULT_MAX_RESP_LEN, 0 /* timeout */)
+         : OSSL_HTTP_transfer(NULL, NULL /* host */, NULL /* port */, RPATH,
+                              0 /* use_ssl */,NULL /* proxy */, NULL /* no_pr */,
+                              wbio, rbio, NULL /* bio_fn */, NULL /* arg */,
+                              0 /* buf_size */, headers, content_type,
+-                             req, content_type, 1 /* expect_asn1 */,
++                             req, content_type, !do_txt /* expect_asn1 */,
+                              OSSL_HTTP_DEFAULT_MAX_RESP_LEN, 0 /* timeout */,
+                              0 /* keep_alive */);
+-    rcert = d2i_X509_bio(rsp, NULL);
+-    BIO_free(rsp);
+-    res = TEST_ptr(rcert) &amp;&amp; TEST_int_eq(X509_cmp(x509, rcert), 0);
++    if (rsp != NULL) {
++        if (do_get &amp;&amp; real_server) {
++            char rtext[sizeof(DOCTYPE_HTML)];
++
++            res = TEST_int_eq(BIO_gets(rsp, rtext, sizeof(rtext)),
++                              sizeof(DOCTYPE_HTML) - 1)
++                &amp;&amp; TEST_str_eq(rtext, DOCTYPE_HTML);
++        } else if (do_txt) {
++            char rtext[sizeof(text1) + 1 /* more space than needed */];
++
++            res = TEST_int_eq(BIO_gets(rsp, rtext, sizeof(rtext)),
++                              sizeof(text1) - 1)
++                &amp;&amp; TEST_str_eq(rtext, text1);
++        } else {
++            X509 *rcert = d2i_X509_bio(rsp, NULL);
++
++            res = TEST_ptr(rcert) &amp;&amp; TEST_int_eq(X509_cmp(x509, rcert), 0);
++            X509_free(rcert);
++        }
++        BIO_free(rsp);
++    }
+ 
+  err:
+-    X509_free(rcert);
+     BIO_free(req);
+     BIO_free(wbio);
+     BIO_free(rbio);
+@@ -159,8 +211,8 @@ static int test_http_keep_alive(char version, int keep_alive, int kept_alive)
+     BIO *wbio = BIO_new(BIO_s_mem());
+     BIO *rbio = BIO_new(BIO_s_mem());
+     BIO *rsp;
+-    server_args mock_args = { NULL, '0', 0 };
+     const char *const content_type = &quot;application/x-x509-ca-cert&quot;;
++    server_args mock_args = { NULL, content_type, NULL, '0', 0 };
+     OSSL_HTTP_REQ_CTX *rctx = NULL;
+     int i, res = 0;
+ 
+@@ -306,14 +358,24 @@ static int test_http_url_invalid_path(void)
+     return test_http_url_invalid(&quot;<A HREF="https://[FF01::101">https://[FF01::101</A>]pkix&quot;);
+ }
+ 
++static int test_http_get_txt(void)
++{
++    return test_http_method(1 /* GET */, 1);
++}
++
++static int test_http_post_txt(void)
++{
++    return test_http_method(0 /* POST */, 1);
++}
++
+ static int test_http_get_x509(void)
+ {
+-    return test_http_x509(1);
++    return test_http_method(1 /* GET */, 0); /* includes redirection */
+ }
+ 
+ static int test_http_post_x509(void)
+ {
+-    return test_http_x509(0);
++    return test_http_method(0 /* POST */, 0);
+ }
+ 
+ static int test_http_keep_alive_0_no_no(void)
+@@ -380,6 +442,8 @@ int setup_tests(void)
+     ADD_TEST(test_http_url_invalid_prefix);
+     ADD_TEST(test_http_url_invalid_port);
+     ADD_TEST(test_http_url_invalid_path);
++    ADD_TEST(test_http_get_txt);
++    ADD_TEST(test_http_post_txt);
+     ADD_TEST(test_http_get_x509);
+     ADD_TEST(test_http_post_x509);
+     ADD_TEST(test_http_keep_alive_0_no_no);
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035651.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="035656.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35653">[ date ]</a>
+              <a href="thread.html#35653">[ thread ]</a>
+              <a href="subject.html#35653">[ subject ]</a>
+              <a href="author.html#35653">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

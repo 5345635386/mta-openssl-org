@@ -1,0 +1,313 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619106126.198596.13546.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033962.html">
+   <LINK REL="Next"  HREF="033965.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tomas at openssl.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619106126.198596.13546.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tomas at openssl.org
+       </A><BR>
+    <I>Thu Apr 22 15:42:06 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033962.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033965.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33964">[ date ]</a>
+              <a href="thread.html#33964">[ thread ]</a>
+              <a href="subject.html#33964">[ subject ]</a>
+              <a href="author.html#33964">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  309c6fbaceb907e5b596a158f0891f42e6694bc2 (commit)
+      from  1fac27050176f7ed00da5649266024265678f70c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 309c6fbaceb907e5b596a158f0891f42e6694bc2
+Author: Todd Short &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tshort at akamai.com</A>&gt;
+Date:   Mon Apr 12 15:51:59 2021 -0400
+
+    Add RUN_ONCE support to zlib init
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14940">https://github.com/openssl/openssl/pull/14940</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/comp/c_zlib.c        | 91 ++++++++++++++++++++++-----------------------
+ crypto/init.c               | 24 +-----------
+ include/crypto/cryptlib.h   |  1 -
+ include/openssl/crypto.h.in |  2 +-
+ 4 files changed, 48 insertions(+), 70 deletions(-)
+
+diff --git a/crypto/comp/c_zlib.c b/crypto/comp/c_zlib.c
+index 4d81b5f53e..a27bbeacb1 100644
+--- a/crypto/comp/c_zlib.c
++++ b/crypto/comp/c_zlib.c
+@@ -15,6 +15,7 @@
+ #include &lt;openssl/err.h&gt;
+ #include &quot;crypto/cryptlib.h&quot;
+ #include &quot;internal/bio.h&quot;
++#include &quot;internal/thread_once.h&quot;
+ #include &quot;comp_local.h&quot;
+ 
+ COMP_METHOD *COMP_zlib(void);
+@@ -102,7 +103,6 @@ static deflate_ft p_deflate = NULL;
+ static deflateInit__ft p_deflateInit_ = NULL;
+ static zError__ft p_zError = NULL;
+ 
+-static int zlib_loaded = 0;     /* only attempt to init func pts once */
+ static DSO *zlib_dso = NULL;
+ 
+ #  define compress                p_compress
+@@ -204,61 +204,58 @@ static int zlib_stateful_expand_block(COMP_CTX *ctx, unsigned char *out,
+     return olen - state-&gt;istream.avail_out;
+ }
+ 
+-#endif
+-
+-COMP_METHOD *COMP_zlib(void)
++static CRYPTO_ONCE zlib_once = CRYPTO_ONCE_STATIC_INIT;
++DEFINE_RUN_ONCE_STATIC(ossl_comp_zlib_init)
+ {
+-    COMP_METHOD *meth = &amp;zlib_method_nozlib;
+-
+-#ifdef ZLIB_SHARED
++# ifdef ZLIB_SHARED
+     /* LIBZ may be externally defined, and we should respect that value */
+-# ifndef LIBZ
+-#  if defined(OPENSSL_SYS_WINDOWS) || defined(OPENSSL_SYS_WIN32)
+-#   define LIBZ &quot;ZLIB1&quot;
+-#  elif defined(OPENSSL_SYS_VMS)
+-#   define LIBZ &quot;LIBZ&quot;
+-#  else
+-#   define LIBZ &quot;z&quot;
++#  ifndef LIBZ
++#   if defined(OPENSSL_SYS_WINDOWS) || defined(OPENSSL_SYS_WIN32)
++#    define LIBZ &quot;ZLIB1&quot;
++#   elif defined(OPENSSL_SYS_VMS)
++#    define LIBZ &quot;LIBZ&quot;
++#   else
++#    define LIBZ &quot;z&quot;
++#   endif
+ #  endif
+-# endif
+ 
+-    if (!zlib_loaded) {
+-        zlib_dso = DSO_load(NULL, LIBZ, NULL, 0);
+-        if (zlib_dso != NULL) {
+-            p_compress = (compress_ft) DSO_bind_func(zlib_dso, &quot;compress&quot;);
+-            p_inflateEnd
+-                = (inflateEnd_ft) DSO_bind_func(zlib_dso, &quot;inflateEnd&quot;);
+-            p_inflate = (inflate_ft) DSO_bind_func(zlib_dso, &quot;inflate&quot;);
+-            p_inflateInit_
+-                = (inflateInit__ft) DSO_bind_func(zlib_dso, &quot;inflateInit_&quot;);
+-            p_deflateEnd
+-                = (deflateEnd_ft) DSO_bind_func(zlib_dso, &quot;deflateEnd&quot;);
+-            p_deflate = (deflate_ft) DSO_bind_func(zlib_dso, &quot;deflate&quot;);
+-            p_deflateInit_
+-                = (deflateInit__ft) DSO_bind_func(zlib_dso, &quot;deflateInit_&quot;);
+-            p_zError = (zError__ft) DSO_bind_func(zlib_dso, &quot;zError&quot;);
+-
+-            if (p_compress &amp;&amp; p_inflateEnd &amp;&amp; p_inflate
+-                &amp;&amp; p_inflateInit_ &amp;&amp; p_deflateEnd
+-                &amp;&amp; p_deflate &amp;&amp; p_deflateInit_ &amp;&amp; p_zError)
+-                zlib_loaded++;
+-
+-            if (!OPENSSL_init_crypto(OPENSSL_INIT_ZLIB, NULL)) {
+-                ossl_comp_zlib_cleanup();
+-                return meth;
+-            }
+-            if (zlib_loaded)
+-                meth = &amp;zlib_stateful_method;
++    zlib_dso = DSO_load(NULL, LIBZ, NULL, 0);
++    if (zlib_dso != NULL) {
++        p_compress = (compress_ft) DSO_bind_func(zlib_dso, &quot;compress&quot;);
++        p_inflateEnd = (inflateEnd_ft) DSO_bind_func(zlib_dso, &quot;inflateEnd&quot;);
++        p_inflate = (inflate_ft) DSO_bind_func(zlib_dso, &quot;inflate&quot;);
++        p_inflateInit_ = (inflateInit__ft) DSO_bind_func(zlib_dso, &quot;inflateInit_&quot;);
++        p_deflateEnd = (deflateEnd_ft) DSO_bind_func(zlib_dso, &quot;deflateEnd&quot;);
++        p_deflate = (deflate_ft) DSO_bind_func(zlib_dso, &quot;deflate&quot;);
++        p_deflateInit_ = (deflateInit__ft) DSO_bind_func(zlib_dso, &quot;deflateInit_&quot;);
++        p_zError = (zError__ft) DSO_bind_func(zlib_dso, &quot;zError&quot;);
++
++        if (p_compress == NULL || p_inflateEnd == NULL
++                || p_inflate == NULL || p_inflateInit_ == NULL
++                || p_deflateEnd == NULL || p_deflate == NULL
++                || p_deflateInit_ == NULL || p_zError == NULL) {
++            ossl_comp_zlib_cleanup();
++            return 0;
+         }
+     }
++# endif
++    return 1;
++}
+ #endif
+-#if defined(ZLIB)
+-    meth = &amp;zlib_stateful_method;
++
++COMP_METHOD *COMP_zlib(void)
++{
++    COMP_METHOD *meth = &amp;zlib_method_nozlib;
++
++#ifdef ZLIB
++    if (RUN_ONCE(&amp;zlib_once, ossl_comp_zlib_init))
++        meth = &amp;zlib_stateful_method;
+ #endif
+ 
+     return meth;
+ }
+ 
++/* Also called from OPENSSL_cleanup() */
+ void ossl_comp_zlib_cleanup(void)
+ {
+ #ifdef ZLIB_SHARED
+@@ -318,9 +315,9 @@ const BIO_METHOD *BIO_f_zlib(void)
+ static int bio_zlib_new(BIO *bi)
+ {
+     BIO_ZLIB_CTX *ctx;
++
+ # ifdef ZLIB_SHARED
+-    (void)COMP_zlib();
+-    if (!zlib_loaded) {
++    if (!RUN_ONCE(&amp;zlib_once, ossl_comp_zlib_init)) {
+         ERR_raise(ERR_LIB_COMP, COMP_R_ZLIB_NOT_SUPPORTED);
+         return 0;
+     }
+@@ -346,6 +343,7 @@ static int bio_zlib_new(BIO *bi)
+ static int bio_zlib_free(BIO *bi)
+ {
+     BIO_ZLIB_CTX *ctx;
++
+     if (!bi)
+         return 0;
+     ctx = BIO_get_data(bi);
+@@ -632,6 +630,7 @@ static long bio_zlib_ctrl(BIO *b, int cmd, long num, void *ptr)
+ static long bio_zlib_callback_ctrl(BIO *b, int cmd, BIO_info_cb *fp)
+ {
+     BIO *next = BIO_next(b);
++
+     if (next == NULL)
+         return 0;
+     return BIO_callback_ctrl(next, cmd, fp);
+diff --git a/crypto/init.c b/crypto/init.c
+index 788abe52e8..3170c60ac2 100644
+--- a/crypto/init.c
++++ b/crypto/init.c
+@@ -330,18 +330,6 @@ DEFINE_RUN_ONCE_STATIC(ossl_init_engine_afalg)
+ # endif
+ #endif
+ 
+-#ifndef OPENSSL_NO_COMP
+-static CRYPTO_ONCE zlib = CRYPTO_ONCE_STATIC_INIT;
+-
+-static int zlib_inited = 0;
+-DEFINE_RUN_ONCE_STATIC(ossl_init_zlib)
+-{
+-    /* Do nothing - we need to know about this for the later cleanup */
+-    zlib_inited = 1;
+-    return 1;
+-}
+-#endif
+-
+ void OPENSSL_cleanup(void)
+ {
+     OPENSSL_INIT_STOP *currhandler, *lasthandler;
+@@ -384,10 +372,8 @@ void OPENSSL_cleanup(void)
+      */
+ 
+ #ifndef OPENSSL_NO_COMP
+-    if (zlib_inited) {
+-        OSSL_TRACE(INIT, &quot;OPENSSL_cleanup: ossl_comp_zlib_cleanup()\n&quot;);
+-        ossl_comp_zlib_cleanup();
+-    }
++    OSSL_TRACE(INIT, &quot;OPENSSL_cleanup: ossl_comp_zlib_cleanup()\n&quot;);
++    ossl_comp_zlib_cleanup();
+ #endif
+ 
+     if (async_inited) {
+@@ -644,12 +630,6 @@ int OPENSSL_init_crypto(uint64_t opts, const OPENSSL_INIT_SETTINGS *settings)
+     }
+ #endif
+ 
+-#ifndef OPENSSL_NO_COMP
+-    if ((opts &amp; OPENSSL_INIT_ZLIB)
+-            &amp;&amp; !RUN_ONCE(&amp;zlib, ossl_init_zlib))
+-        return 0;
+-#endif
+-
+     if (!CRYPTO_atomic_or(&amp;optsdone, opts, &amp;tmp, init_lock))
+         return 0;
+ 
+diff --git a/include/crypto/cryptlib.h b/include/crypto/cryptlib.h
+index 2508801184..1e58663b4f 100644
+--- a/include/crypto/cryptlib.h
++++ b/include/crypto/cryptlib.h
+@@ -28,7 +28,6 @@ void ossl_ctx_thread_stop(void *arg);
+  * are those omitted from crypto.h because they are &quot;reserved for internal
+  * use&quot;.
+  */
+-# define OPENSSL_INIT_ZLIB                   0x00010000L
+ # define OPENSSL_INIT_BASE_ONLY              0x00040000L
+ 
+ void ossl_trace_cleanup(void);
+diff --git a/include/openssl/crypto.h.in b/include/openssl/crypto.h.in
+index f25b997e32..ec6f94d985 100644
+--- a/include/openssl/crypto.h.in
++++ b/include/openssl/crypto.h.in
+@@ -435,7 +435,7 @@ int CRYPTO_memcmp(const void * in_a, const void * in_b, size_t len);
+ # define OPENSSL_INIT_ENGINE_CAPI            0x00002000L
+ # define OPENSSL_INIT_ENGINE_PADLOCK         0x00004000L
+ # define OPENSSL_INIT_ENGINE_AFALG           0x00008000L
+-/* OPENSSL_INIT_ZLIB                         0x00010000L */
++/* FREE:                                     0x00010000L */
+ # define OPENSSL_INIT_ATFORK                 0x00020000L
+ /* OPENSSL_INIT_BASE_ONLY                    0x00040000L */
+ # define OPENSSL_INIT_NO_ATEXIT              0x00080000L
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033962.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033965.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33964">[ date ]</a>
+              <a href="thread.html#33964">[ thread ]</a>
+              <a href="subject.html#33964">[ subject ]</a>
+              <a href="author.html#33964">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

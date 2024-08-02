@@ -1,0 +1,492 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499375980.820228.8661.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015385.html">
+   <LINK REL="Next"  HREF="015387.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>paul.dale at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499375980.820228.8661.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">paul.dale at oracle.com
+       </A><BR>
+    <I>Thu Jul  6 21:19:40 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015385.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="015387.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15386">[ date ]</a>
+              <a href="thread.html#15386">[ thread ]</a>
+              <a href="subject.html#15386">[ subject ]</a>
+              <a href="author.html#15386">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  59e539e6429d9c3b5c4db07569f09ec6acc5a7e9 (commit)
+      from  9ee344f5cd5e935c60d3bf7c3ce9ee21895069db (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 59e539e6429d9c3b5c4db07569f09ec6acc5a7e9
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Thu Jul 6 14:11:27 2017 +1000
+
+    BIO range checking.
+    
+    Add length limits to avoid problems with sprintf, strcpy and strcat.  This replaces recently removed code but also guards some previously missing function calls (for DOS &amp; Windows).
+    
+    Reworked the BIO_dump_indent_cb code to reduce temporary storage.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3870">https://github.com/openssl/openssl/pull/3870</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bio/b_dump.c   | 74 ++++++++++++++++++++++++++++-----------------------
+ crypto/bio/bio_cb.c   | 51 ++++++++++++++++++-----------------
+ crypto/bio/bss_file.c | 46 ++++++++++++++++----------------
+ 3 files changed, 90 insertions(+), 81 deletions(-)
+
+diff --git a/crypto/bio/b_dump.c b/crypto/bio/b_dump.c
+index 491b973..f539140 100644
+--- a/crypto/bio/b_dump.c
++++ b/crypto/bio/b_dump.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -16,7 +16,9 @@
+ 
+ #define TRUNCATE
+ #define DUMP_WIDTH      16
+-#define DUMP_WIDTH_LESS_INDENT(i) (DUMP_WIDTH-((i-(i&gt;6?6:i)+3)/4))
++#define DUMP_WIDTH_LESS_INDENT(i) (DUMP_WIDTH - ((i - (i &gt; 6 ? 6 : i) + 3) / 4))
++
++#define SPACE(buf, pos, n)   (sizeof(buf) - (pos) &gt; (n))
+ 
+ int BIO_dump_cb(int (*cb) (const void *data, size_t len, void *u),
+                 void *u, const char *s, int len)
+@@ -28,8 +30,8 @@ int BIO_dump_indent_cb(int (*cb) (const void *data, size_t len, void *u),
+                        void *u, const char *s, int len, int indent)
+ {
+     int ret = 0;
+-    char buf[288 + 1], tmp[20], str[128 + 1];
+-    int i, j, rows, trc;
++    char buf[288 + 1];
++    int i, j, rows, trc, n;
+     unsigned char ch;
+     int dump_width;
+ 
+@@ -42,59 +44,65 @@ int BIO_dump_indent_cb(int (*cb) (const void *data, size_t len, void *u),
+ 
+     if (indent &lt; 0)
+         indent = 0;
+-    if (indent) {
+-        if (indent &gt; 128)
+-            indent = 128;
+-        memset(str, ' ', indent);
+-    }
+-    str[indent] = '\0';
++    else if (indent &gt; 128)
++        indent = 128;
+ 
+     dump_width = DUMP_WIDTH_LESS_INDENT(indent);
+-    rows = (len / dump_width);
++    rows = len / dump_width;
+     if ((rows * dump_width) &lt; len)
+         rows++;
+     for (i = 0; i &lt; rows; i++) {
+-        strcpy(buf, str);
+-        sprintf(tmp, &quot;%04x - &quot;, i * dump_width);
+-        strcat(buf, tmp);
++        n = BIO_snprintf(buf, sizeof(buf), &quot;%*s%04x - &quot;, indent, &quot;&quot;,
++                         i * dump_width);
+         for (j = 0; j &lt; dump_width; j++) {
+-            if (((i * dump_width) + j) &gt;= len) {
+-                strcat(buf, &quot;   &quot;);
+-            } else {
+-                ch = ((unsigned char)*(s + i * dump_width + j)) &amp; 0xff;
+-                sprintf(tmp, &quot;%02x%c&quot;, ch, j == 7 ? '-' : ' ');
+-                strcat(buf, tmp);
++            if (SPACE(buf, n, 3)) {
++                if (((i * dump_width) + j) &gt;= len) {
++                    strcpy(buf + n, &quot;   &quot;);
++                } else {
++                    ch = ((unsigned char)*(s + i * dump_width + j)) &amp; 0xff;
++                    BIO_snprintf(buf + n, 4, &quot;%02x%c&quot;, ch,
++                                 j == 7 ? '-' : ' ');
++                }
++                n += 3;
+             }
+         }
+-        strcat(buf, &quot;  &quot;);
++        if (SPACE(buf, n, 2)) {
++            strcpy(buf + n, &quot;  &quot;);
++            n += 2;
++        }
+         for (j = 0; j &lt; dump_width; j++) {
+             if (((i * dump_width) + j) &gt;= len)
+                 break;
+-            ch = ((unsigned char)*(s + i * dump_width + j)) &amp; 0xff;
++            if (SPACE(buf, n, 1)) {
++                ch = ((unsigned char)*(s + i * dump_width + j)) &amp; 0xff;
+ #ifndef CHARSET_EBCDIC
+-            sprintf(tmp, &quot;%c&quot;, ((ch &gt;= ' ') &amp;&amp; (ch &lt;= '~')) ? ch : '.');
++                buf[n++] = ((ch &gt;= ' ') &amp;&amp; (ch &lt;= '~')) ? ch : '.';
+ #else
+-            sprintf(tmp, &quot;%c&quot;,
+-                         ((ch &gt;= os_toascii[' ']) &amp;&amp; (ch &lt;= os_toascii['~']))
+-                         ? os_toebcdic[ch]
+-                         : '.');
++                buf[n++] = ((ch &gt;= os_toascii[' ']) &amp;&amp; (ch &lt;= os_toascii['~']))
++                           ? os_toebcdic[ch]
++                           : '.';
+ #endif
+-            strcat(buf, tmp);
++                buf[n] = '\0';
++            }
++        }
++        if (SPACE(buf, n, 1)) {
++            buf[n++] = '\n';
++            buf[n] = '\0';
+         }
+-        strcat(buf, &quot;\n&quot;);
+         /*
+          * if this is the last call then update the ddt_dump thing so that we
+          * will move the selection point in the debug window
+          */
+-        ret += cb((void *)buf, strlen(buf), u);
++        ret += cb((void *)buf, n, u);
+     }
+ #ifdef TRUNCATE
+     if (trc &gt; 0) {
+-        sprintf(buf, &quot;%s%04x - &lt;SPACES/NULS&gt;\n&quot;, str, len + trc);
+-        ret += cb((void *)buf, strlen(buf), u);
++        n = BIO_snprintf(buf, sizeof(buf), &quot;%*s%04x - &lt;SPACES/NULS&gt;\n&quot;,
++                         indent, &quot;&quot;, len + trc);
++        ret += cb((void *)buf, n, u);
+     }
+ #endif
+-    return (ret);
++    return ret;
+ }
+ 
+ #ifndef OPENSSL_NO_STDIO
+diff --git a/crypto/bio/bio_cb.c b/crypto/bio/bio_cb.c
+index 13368e8..1154c23 100644
+--- a/crypto/bio/bio_cb.c
++++ b/crypto/bio/bio_cb.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -21,68 +21,69 @@ long BIO_debug_callback(BIO *bio, int cmd, const char *argp,
+     char buf[256];
+     char *p;
+     long r = 1;
+-    int len;
++    int len, left;
+ 
+     if (BIO_CB_RETURN &amp; cmd)
+         r = ret;
+ 
+-    len = sprintf(buf, &quot;BIO[%p]: &quot;, (void *)bio);
++    len = BIO_snprintf(buf, sizeof(buf), &quot;BIO[%p]: &quot;, (void *)bio);
+ 
+     /* Ignore errors and continue printing the other information. */
+     if (len &lt; 0)
+         len = 0;
+     p = buf + len;
++    left = sizeof(buf) - len;
+ 
+     switch (cmd) {
+     case BIO_CB_FREE:
+-        sprintf(p, &quot;Free - %s\n&quot;, bio-&gt;method-&gt;name);
++        BIO_snprintf(p, left, &quot;Free - %s\n&quot;, bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_READ:
+         if (bio-&gt;method-&gt;type &amp; BIO_TYPE_DESCRIPTOR)
+-            sprintf(p, &quot;read(%d,%lu) - %s fd=%d\n&quot;,
+-                    bio-&gt;num, (unsigned long)argi,
+-                    bio-&gt;method-&gt;name, bio-&gt;num);
++            BIO_snprintf(p, left, &quot;read(%d,%lu) - %s fd=%d\n&quot;,
++                         bio-&gt;num, (unsigned long)argi,
++                         bio-&gt;method-&gt;name, bio-&gt;num);
+         else
+-            sprintf(p, &quot;read(%d,%lu) - %s\n&quot;,
++            BIO_snprintf(p, left, &quot;read(%d,%lu) - %s\n&quot;,
+                     bio-&gt;num, (unsigned long)argi, bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_WRITE:
+         if (bio-&gt;method-&gt;type &amp; BIO_TYPE_DESCRIPTOR)
+-            sprintf(p, &quot;write(%d,%lu) - %s fd=%d\n&quot;,
+-                    bio-&gt;num, (unsigned long)argi,
+-                    bio-&gt;method-&gt;name, bio-&gt;num);
++            BIO_snprintf(p, left, &quot;write(%d,%lu) - %s fd=%d\n&quot;,
++                         bio-&gt;num, (unsigned long)argi,
++                         bio-&gt;method-&gt;name, bio-&gt;num);
+         else
+-            sprintf(p, &quot;write(%d,%lu) - %s\n&quot;,
+-                    bio-&gt;num, (unsigned long)argi, bio-&gt;method-&gt;name);
++            BIO_snprintf(p, left, &quot;write(%d,%lu) - %s\n&quot;,
++                         bio-&gt;num, (unsigned long)argi, bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_PUTS:
+-        sprintf(p, &quot;puts() - %s\n&quot;, bio-&gt;method-&gt;name);
++        BIO_snprintf(p, left, &quot;puts() - %s\n&quot;, bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_GETS:
+-        sprintf(p, &quot;gets(%lu) - %s\n&quot;, (unsigned long)argi,
+-                bio-&gt;method-&gt;name);
++        BIO_snprintf(p, left, &quot;gets(%lu) - %s\n&quot;, (unsigned long)argi,
++                     bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_CTRL:
+-        sprintf(p, &quot;ctrl(%lu) - %s\n&quot;, (unsigned long)argi,
+-                bio-&gt;method-&gt;name);
++        BIO_snprintf(p, left, &quot;ctrl(%lu) - %s\n&quot;, (unsigned long)argi,
++                     bio-&gt;method-&gt;name);
+         break;
+     case BIO_CB_RETURN | BIO_CB_READ:
+-        sprintf(p, &quot;read return %ld\n&quot;, ret);
++        BIO_snprintf(p, left, &quot;read return %ld\n&quot;, ret);
+         break;
+     case BIO_CB_RETURN | BIO_CB_WRITE:
+-        sprintf(p, &quot;write return %ld\n&quot;, ret);
++        BIO_snprintf(p, left, &quot;write return %ld\n&quot;, ret);
+         break;
+     case BIO_CB_RETURN | BIO_CB_GETS:
+-        sprintf(p, &quot;gets return %ld\n&quot;, ret);
++        BIO_snprintf(p, left, &quot;gets return %ld\n&quot;, ret);
+         break;
+     case BIO_CB_RETURN | BIO_CB_PUTS:
+-        sprintf(p, &quot;puts return %ld\n&quot;, ret);
++        BIO_snprintf(p, left, &quot;puts return %ld\n&quot;, ret);
+         break;
+     case BIO_CB_RETURN | BIO_CB_CTRL:
+-        sprintf(p, &quot;ctrl return %ld\n&quot;, ret);
++        BIO_snprintf(p, left, &quot;ctrl return %ld\n&quot;, ret);
+         break;
+     default:
+-        sprintf(p, &quot;bio callback - unknown type (%d)\n&quot;, cmd);
++        BIO_snprintf(p, left, &quot;bio callback - unknown type (%d)\n&quot;, cmd);
+         break;
+     }
+ 
+@@ -93,5 +94,5 @@ long BIO_debug_callback(BIO *bio, int cmd, const char *argp,
+     else
+         fputs(buf, stderr);
+ #endif
+-    return (r);
++    return r;
+ }
+diff --git a/crypto/bio/bss_file.c b/crypto/bio/bss_file.c
+index 49d8f09..e7bbc31 100644
+--- a/crypto/bio/bss_file.c
++++ b/crypto/bio/bss_file.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -85,17 +85,17 @@ BIO *BIO_new_file(const char *filename, const char *mode)
+             BIOerr(BIO_F_BIO_NEW_FILE, BIO_R_NO_SUCH_FILE);
+         else
+             BIOerr(BIO_F_BIO_NEW_FILE, ERR_R_SYS_LIB);
+-        return (NULL);
++        return NULL;
+     }
+     if ((ret = BIO_new(BIO_s_file())) == NULL) {
+         fclose(file);
+-        return (NULL);
++        return NULL;
+     }
+ 
+     BIO_clear_flags(ret, BIO_FLAGS_UPLINK); /* we did fopen -&gt; we disengage
+                                              * UPLINK */
+     BIO_set_fp(ret, file, fp_flags);
+-    return (ret);
++    return ret;
+ }
+ 
+ BIO *BIO_new_fp(FILE *stream, int close_flag)
+@@ -103,17 +103,17 @@ BIO *BIO_new_fp(FILE *stream, int close_flag)
+     BIO *ret;
+ 
+     if ((ret = BIO_new(BIO_s_file())) == NULL)
+-        return (NULL);
++        return NULL;
+ 
+     /* redundant flag, left for documentation purposes */
+     BIO_set_flags(ret, BIO_FLAGS_UPLINK);
+     BIO_set_fp(ret, stream, close_flag);
+-    return (ret);
++    return ret;
+ }
+ 
+ const BIO_METHOD *BIO_s_file(void)
+ {
+-    return (&amp;methods_filep);
++    return &amp;methods_filep;
+ }
+ 
+ static int file_new(BIO *bi)
+@@ -122,13 +122,13 @@ static int file_new(BIO *bi)
+     bi-&gt;num = 0;
+     bi-&gt;ptr = NULL;
+     bi-&gt;flags = BIO_FLAGS_UPLINK; /* default to UPLINK */
+-    return (1);
++    return 1;
+ }
+ 
+ static int file_free(BIO *a)
+ {
+     if (a == NULL)
+-        return (0);
++        return 0;
+     if (a-&gt;shutdown) {
+         if ((a-&gt;init) &amp;&amp; (a-&gt;ptr != NULL)) {
+             if (a-&gt;flags &amp; BIO_FLAGS_UPLINK)
+@@ -140,7 +140,7 @@ static int file_free(BIO *a)
+         }
+         a-&gt;init = 0;
+     }
+-    return (1);
++    return 1;
+ }
+ 
+ static int file_read(BIO *b, char *out, int outl)
+@@ -160,7 +160,7 @@ static int file_read(BIO *b, char *out, int outl)
+             ret = -1;
+         }
+     }
+-    return (ret);
++    return ret;
+ }
+ 
+ static int file_write(BIO *b, const char *in, int inl)
+@@ -181,7 +181,7 @@ static int file_write(BIO *b, const char *in, int inl)
+          * implementations (VMS)
+          */
+     }
+-    return (ret);
++    return ret;
+ }
+ 
+ static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+@@ -271,15 +271,15 @@ static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+         b-&gt;shutdown = (int)num &amp; BIO_CLOSE;
+         if (num &amp; BIO_FP_APPEND) {
+             if (num &amp; BIO_FP_READ)
+-                strcpy(p, &quot;a+&quot;);
++                OPENSSL_strlcpy(p, &quot;a+&quot;, sizeof(p));
+             else
+-                strcpy(p, &quot;a&quot;);
++                OPENSSL_strlcpy(p, &quot;a&quot;, sizeof(p));
+         } else if ((num &amp; BIO_FP_READ) &amp;&amp; (num &amp; BIO_FP_WRITE))
+-            strcpy(p, &quot;r+&quot;);
++            OPENSSL_strlcpy(p, &quot;r+&quot;, sizeof(p));
+         else if (num &amp; BIO_FP_WRITE)
+-            strcpy(p, &quot;w&quot;);
++            OPENSSL_strlcpy(p, &quot;w&quot;, sizeof(p));
+         else if (num &amp; BIO_FP_READ)
+-            strcpy(p, &quot;r&quot;);
++            OPENSSL_strlcpy(p, &quot;r&quot;, sizeof(p));
+         else {
+             BIOerr(BIO_F_FILE_CTRL, BIO_R_BAD_FOPEN_MODE);
+             ret = 0;
+@@ -287,9 +287,9 @@ static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+         }
+ #  if defined(OPENSSL_SYS_MSDOS) || defined(OPENSSL_SYS_WINDOWS) || defined(OPENSSL_SYS_WIN32_CYGWIN)
+         if (!(num &amp; BIO_FP_TEXT))
+-            strcat(p, &quot;b&quot;);
++            OPENSSL_strlcat(p, &quot;b&quot;, sizeof(p));
+         else
+-            strcat(p, &quot;t&quot;);
++            OPENSSL_strlcat(p, &quot;t&quot;, sizeof(p));
+ #  endif
+         fp = openssl_fopen(ptr, p);
+         if (fp == NULL) {
+@@ -339,7 +339,7 @@ static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+         ret = 0;
+         break;
+     }
+-    return (ret);
++    return ret;
+ }
+ 
+ static int file_gets(BIO *bp, char *buf, int size)
+@@ -357,7 +357,7 @@ static int file_gets(BIO *bp, char *buf, int size)
+     if (buf[0] != '\0')
+         ret = strlen(buf);
+  err:
+-    return (ret);
++    return ret;
+ }
+ 
+ static int file_puts(BIO *bp, const char *str)
+@@ -366,7 +366,7 @@ static int file_puts(BIO *bp, const char *str)
+ 
+     n = strlen(str);
+     ret = file_write(bp, str, n);
+-    return (ret);
++    return ret;
+ }
+ 
+ #else
+@@ -419,7 +419,7 @@ static const BIO_METHOD methods_filep = {
+ 
+ const BIO_METHOD *BIO_s_file(void)
+ {
+-    return (&amp;methods_filep);
++    return &amp;methods_filep;
+ }
+ 
+ BIO *BIO_new_file(const char *filename, const char *mode)
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015385.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="015387.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15386">[ date ]</a>
+              <a href="thread.html#15386">[ thread ]</a>
+              <a href="subject.html#15386">[ subject ]</a>
+              <a href="author.html#15386">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

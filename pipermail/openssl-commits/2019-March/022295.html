@@ -1,0 +1,1168 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1552335755.359598.6324.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022292.html">
+   <LINK REL="Next"  HREF="022301.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1552335755.359598.6324.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Mon Mar 11 20:22:35 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="022292.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="022301.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22295">[ date ]</a>
+              <a href="thread.html#22295">[ thread ]</a>
+              <a href="subject.html#22295">[ subject ]</a>
+              <a href="author.html#22295">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  d1229190bfbb19439589557e4d65f9bccab09b2d (commit)
+      from  c453283421299b7f8e0db6d6069c68369294a9f7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit d1229190bfbb19439589557e4d65f9bccab09b2d
+Author: Patrick Steuer &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">patrick.steuer at de.ibm.com</A>&gt;
+Date:   Mon Feb 25 18:55:04 2019 +0100
+
+    s390x assembly pack: import chacha from cryptogams repo
+    
+    featuring 6x&quot;horizontal&quot; code path which is up to 25%
+    faster than present 4x&quot;vertical&quot; for larger blocks.
+    
+    Signed-off-by: Patrick Steuer &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">patrick.steuer at de.ibm.com</A>&gt;
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8287">https://github.com/openssl/openssl/pull/8287</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/chacha/asm/chacha-s390x.pl | 1006 ++++++++++++++++++++++++++-----------
+ 1 file changed, 719 insertions(+), 287 deletions(-)
+
+diff --git a/crypto/chacha/asm/chacha-s390x.pl b/crypto/chacha/asm/chacha-s390x.pl
+index abf7283..51efe64 100755
+--- a/crypto/chacha/asm/chacha-s390x.pl
++++ b/crypto/chacha/asm/chacha-s390x.pl
+@@ -23,11 +23,20 @@
+ #
+ # August 2018
+ #
+-# Add vx code path.
++# Add vx code path: 4x&quot;vertical&quot;.
+ #
+ # Copyright IBM Corp. 2018
+ # Author: Patrick Steuer &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">patrick.steuer at de.ibm.com</A>&gt;
+ 
++#
++# February 2019
++#
++# Add 6x&quot;horizontal&quot; VX implementation. It's ~25% faster than IBM's
++# 4x&quot;vertical&quot; submission [on z13] and &gt;3 faster than scalar code.
++# But to harness overheads revert to transliteration of VSX code path
++# from chacha-ppc module, which is also 4x&quot;vertical&quot;, to handle inputs
++# not longer than 256 bytes.
++
+ use strict;
+ use FindBin qw($Bin);
+ use lib &quot;$Bin/../..&quot;;
+@@ -50,11 +59,9 @@ while (($output=shift) &amp;&amp; ($output!~/\w[\w\-]*\.\w+$/)) {}
+ my $sp=&quot;%r15&quot;;
+ my $stdframe=16*$SIZE_T+4*8;
+ 
++sub ROUND {
+ my @x=map(&quot;%r$_&quot;,(0..7,&quot;x&quot;,&quot;x&quot;,&quot;x&quot;,&quot;x&quot;,(10..13)));
+ my @t=map(&quot;%r$_&quot;,(8,9));
+-my @v=map(&quot;%v$_&quot;,(16..31));
+-
+-sub ROUND {
+ my ($a0,$b0,$c0,$d0)=@_;
+ my ($a1,$b1,$c1,$d1)=map(($_&amp;~3)+(($_+1)&amp;3),($a0,$b0,$c0,$d0));
+ my ($a2,$b2,$c2,$d2)=map(($_&amp;~3)+(($_+1)&amp;3),($a1,$b1,$c1,$d1));
+@@ -143,63 +150,92 @@ my ($xc,$xc_)=map(&quot;$_&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at t</A>);
+ 	 rll	(@x[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3],7);
+ }
+ 
+-sub VX_ROUND {
++sub VX_lane_ROUND {
+ my ($a0,$b0,$c0,$d0)=@_;
+ my ($a1,$b1,$c1,$d1)=map(($_&amp;~3)+(($_+1)&amp;3),($a0,$b0,$c0,$d0));
+ my ($a2,$b2,$c2,$d2)=map(($_&amp;~3)+(($_+1)&amp;3),($a1,$b1,$c1,$d1));
+ my ($a3,$b3,$c3,$d3)=map(($_&amp;~3)+(($_+1)&amp;3),($a2,$b2,$c2,$d2));
++my @x=map(&quot;%v$_&quot;,(0..15));
++
++	vaf	(@x[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0]);	# Q1
++	vx	(@x[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a0]);
++	verllf	(@x[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0],16);
++	vaf	(@x[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1]);	# Q2
++	vx	(@x[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a1]);
++	verllf	(@x[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1],16);
++	vaf	(@x[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2]);	# Q3
++	vx	(@x[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a2]);
++	verllf	(@x[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2],16);
++	vaf	(@x[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3]);	# Q4
++	vx	(@x[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a3]);
++	verllf	(@x[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3],16);
++
++	vaf	(@x[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0]);
++	vx	(@x[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c0]);
++	verllf	(@x[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0],12);
++	vaf	(@x[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1]);
++	vx	(@x[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c1]);
++	verllf	(@x[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1],12);
++	vaf	(@x[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2]);
++	vx	(@x[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c2]);
++	verllf	(@x[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2],12);
++	vaf	(@x[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3]);
++	vx	(@x[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c3]);
++	verllf	(@x[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3],12);
++
++	vaf	(@x[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0]);
++	vx	(@x[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a0]);
++	verllf	(@x[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0],8);
++	vaf	(@x[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1]);
++	vx	(@x[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a1]);
++	verllf	(@x[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1],8);
++	vaf	(@x[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2]);
++	vx	(@x[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a2]);
++	verllf	(@x[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2],8);
++	vaf	(@x[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3]);
++	vx	(@x[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$a3]);
++	verllf	(@x[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3],8);
++
++	vaf	(@x[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d0]);
++	vx	(@x[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c0]);
++	verllf	(@x[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b0],7);
++	vaf	(@x[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d1]);
++	vx	(@x[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c1]);
++	verllf	(@x[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b1],7);
++	vaf	(@x[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d2]);
++	vx	(@x[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c2]);
++	verllf	(@x[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b2],7);
++	vaf	(@x[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$d3]);
++	vx	(@x[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$c3]);
++	verllf	(@x[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at x</A>[$b3],7);
++}
+ 
+-	vaf	(@v[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0]);
+-	vaf	(@v[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1]);
+-	vaf	(@v[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2]);
+-	vaf	(@v[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3]);
+-	vx	(@v[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a0]);
+-	vx	(@v[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a1]);
+-	vx	(@v[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a2]);
+-	vx	(@v[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a3]);
+-	verllf	(@v[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0],16);
+-	verllf	(@v[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1],16);
+-	verllf	(@v[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2],16);
+-	verllf	(@v[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3],16);
+-
+-	vaf	(@v[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0]);
+-	vaf	(@v[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1]);
+-	vaf	(@v[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2]);
+-	vaf	(@v[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3]);
+-	vx	(@v[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c0]);
+-	vx	(@v[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c1]);
+-	vx	(@v[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c2]);
+-	vx	(@v[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c3]);
+-	verllf	(@v[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0],12);
+-	verllf	(@v[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1],12);
+-	verllf	(@v[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2],12);
+-	verllf	(@v[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3],12);
+-
+-	vaf	(@v[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0]);
+-	vaf	(@v[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1]);
+-	vaf	(@v[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2]);
+-	vaf	(@v[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3]);
+-	vx	(@v[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a0]);
+-	vx	(@v[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a1]);
+-	vx	(@v[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a2]);
+-	vx	(@v[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$a3]);
+-	verllf	(@v[$d0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0],8);
+-	verllf	(@v[$d1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1],8);
+-	verllf	(@v[$d2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2],8);
+-	verllf	(@v[$d3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3],8);
+-
+-	vaf	(@v[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d0]);
+-	vaf	(@v[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d1]);
+-	vaf	(@v[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d2]);
+-	vaf	(@v[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$d3]);
+-	vx	(@v[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c0]);
+-	vx	(@v[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c1]);
+-	vx	(@v[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c2]);
+-	vx	(@v[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$c3]);
+-	verllf	(@v[$b0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b0],7);
+-	verllf	(@v[$b1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b1],7);
+-	verllf	(@v[$b2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b2],7);
+-	verllf	(@v[$b3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$b3],7);
++sub VX_ROUND {
++my @a=@_[0..5];
++my @b=@_[6..11];
++my @c=@_[12..17];
++my @d=@_[18..23];
++my $odd=@_[24];
++
++	vaf		(@a[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at a</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_]) for (0..5);
++	vx		(@d[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at a</A>[$_]) for (0..5);
++	verllf		(@d[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_],16) for (0..5);
++
++	vaf		(@c[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_]) for (0..5);
++	vx		(@b[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_]) for (0..5);
++	verllf		(@b[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_],12) for (0..5);
++
++	vaf		(@a[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at a</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_]) for (0..5);
++	vx		(@d[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at a</A>[$_]) for (0..5);
++	verllf		(@d[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_],8) for (0..5);
++
++	vaf		(@c[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_]) for (0..5);
++	vx		(@b[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_]) for (0..5);
++	verllf		(@b[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_],7) for (0..5);
++
++	vsldb		(@c[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at c</A>[$_],8) for (0..5);
++	vsldb		(@b[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at b</A>[$_],$odd?12:4) for (0..5);
++	vsldb		(@d[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at d</A>[$_],$odd?4:12) for (0..5);
+ }
+ 
+ PERLASM_BEGIN($output);
+@@ -210,13 +246,11 @@ TEXT	();
+ ################
+ # void ChaCha20_ctr32(unsigned char *out, const unsigned char *inp, size_t len,
+ #                     const unsigned int key[8], const unsigned int counter[4])
+-{
+ my ($out,$inp,$len,$key,$counter)=map(&quot;%r$_&quot;,(2..6));
+-
+-# VX CODE PATH
+ {
+-my $off=$z*8*16+8;	# offset(initial state)
+-my $frame=$stdframe+4*16+$off;
++my $frame=$stdframe+4*20;
++my @x=map(&quot;%r$_&quot;,(0..7,&quot;x&quot;,&quot;x&quot;,&quot;x&quot;,&quot;x&quot;,(10..13)));
++my @t=map(&quot;%r$_&quot;,(8,9));
+ 
+ GLOBL	(&quot;ChaCha20_ctr32&quot;);
+ TYPE	(&quot;ChaCha20_ctr32&quot;,&quot;\@function&quot;);
+@@ -225,230 +259,16 @@ LABEL	(&quot;ChaCha20_ctr32&quot;);
+ 	larl	(&quot;%r1&quot;,&quot;OPENSSL_s390xcap_P&quot;);
+ 
+ 	lghi	(&quot;%r0&quot;,64);
++&amp;{$z?	\&amp;ltgr:\&amp;ltr}	($len,$len);		# len==0?
++	bzr	(&quot;%r14&quot;);
++	lg	(&quot;%r1&quot;,&quot;S390X_STFLE+16(%r1)&quot;);
+ &amp;{$z?	\&amp;clgr:\&amp;clr}	($len,&quot;%r0&quot;);
+-	jle	(&quot;_s390x_chacha_novx&quot;);
+-
+-	lg	(&quot;%r0&quot;,&quot;S390X_STFLE+16(%r1)&quot;);
+-	tmhh	(&quot;%r0&quot;,0x4000);	# check for vector facility
+-	jz	(&quot;_s390x_chacha_novx&quot;);
+-
+-if (!$z) {
+-	llgfr   ($len,$len);
+-	std	(&quot;%f4&quot;,&quot;16*$SIZE_T+2*8($sp)&quot;);
+-	std	(&quot;%f6&quot;,&quot;16*$SIZE_T+3*8($sp)&quot;);
+-}
+-&amp;{$z?	\&amp;stmg:\&amp;stm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;6*$SIZE_T($sp)&quot;);
++	jle	(&quot;.Lshort&quot;);
+ 
+-	lghi	(&quot;%r1&quot;,-$frame);
+-	lgr	(&quot;%r0&quot;,$sp);
+-	la	($sp,&quot;0(%r1,$sp)&quot;);	# allocate stack frame
++	tmhh	(&quot;%r1&quot;,0x4000);			# check for vx bit
++	jnz	(&quot;.LChaCha20_ctr32_vx&quot;);
+ 
+-	larl	(&quot;%r7&quot;,&quot;.Lsigma&quot;);
+-&amp;{$z?	\&amp;stg:\&amp;st}	(&quot;%r0&quot;,&quot;0($sp)&quot;);	# backchain
+-
+-	vstm	(&quot;%v8&quot;,&quot;%v15&quot;,&quot;8($sp)&quot;) if ($z);
+-
+-	vlm	(&quot;%v1&quot;,&quot;%v2&quot;,&quot;0($key)&quot;);	# load key
+-	vl	(&quot;%v0&quot;,&quot;0(%r7)&quot;);	# load sigma constant
+-	vl	(&quot;%v3&quot;,&quot;0($counter)&quot;);	# load iv (counter||nonce)
+-	l	(&quot;%r0&quot;,&quot;0($counter)&quot;);	# load counter
+-	vstm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;$off($sp)&quot;);	# copy initial state to stack
+-
+-	srlg	(&quot;%r1&quot;,$len,8);
+-	ltgr	(&quot;%r1&quot;,&quot;%r1&quot;);
+-	jz	(&quot;.Lvx_4x_done&quot;);
+-
+-ALIGN	(16);	# process 4 64-byte blocks
+-LABEL	(&quot;.Lvx_4x&quot;);
+-	vlrepf	(&quot;%v$_&quot;,($_*4).&quot;+$off($sp)&quot;) for (0..15);	# load initial
+-								#  state
+-	vl	(&quot;%v31&quot;,&quot;16(%r7)&quot;);
+-	vaf	(&quot;%v12&quot;,&quot;%v12&quot;,&quot;%v31&quot;);	# increment counter
+-
+-	vlr	(@v[$_],&quot;%v$_&quot;) for (0..15);	# copy initial state
+-
+-	lhi	(&quot;%r6&quot;,10);
+-	j	(&quot;.Loop_vx_4x&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Loop_vx_4x&quot;);
+-	VX_ROUND( 0, 4, 8,12);	# column round
+-	VX_ROUND( 0, 5,10,15);	# diagonal round
+-	brct	(&quot;%r6&quot;,&quot;.Loop_vx_4x&quot;);
+-
+-	vaf	(@v[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_],&quot;%v$_&quot;) for (0..15);	# state += initial
+-							#  state (mod 32)
+-	vlm	(&quot;%v6&quot;,&quot;%v7&quot;,&quot;32(%r7)&quot;);	# load vperm operands
+-
+-for (0..3) {	# blocks 1,2
+-	vmrhf	(&quot;%v0&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+1]);	# ks = serialize(state)
+-	vmrhf	(&quot;%v1&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+3]);
+-	vperm	(&quot;%v&quot;.($_+ 8),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v6&quot;);
+-	vperm	(&quot;%v&quot;.($_+12),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v7&quot;);
+-}
+-	vlm	(&quot;%v0&quot;,&quot;%v7&quot;,&quot;0($inp)&quot;);	# load in
+-	vx	(&quot;%v$_&quot;,&quot;%v$_&quot;,&quot;%v&quot;.($_+8)) for (0..7);	# out = in ^ ks
+-	vstm	(&quot;%v0&quot;,&quot;%v7&quot;,&quot;0($out)&quot;);	# store out
+-
+-	vlm	(&quot;%v6&quot;,&quot;%v7&quot;,&quot;32(%r7)&quot;);	# restore vperm operands
+-
+-for (0..3) {	# blocks 2,3
+-	vmrlf	(&quot;%v0&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+1]);	# ks = serialize(state)
+-	vmrlf	(&quot;%v1&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+3]);
+-	vperm	(&quot;%v&quot;.($_+ 8),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v6&quot;);
+-	vperm	(&quot;%v&quot;.($_+12),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v7&quot;);
+-}
+-	vlm	(&quot;%v0&quot;,&quot;%v7&quot;,&quot;128($inp)&quot;);	# load in
+-	vx	(&quot;%v$_&quot;,&quot;%v$_&quot;,&quot;%v&quot;.($_+8)) for (0..7);	# out = in ^ ks
+-	vstm	(&quot;%v0&quot;,&quot;%v7&quot;,&quot;128($out)&quot;);	# store out
+-
+-	ahi	(&quot;%r0&quot;,4);
+-	st	(&quot;%r0&quot;,&quot;48+$off($sp)&quot;);	# update initial state
+-
+-	la	($inp,&quot;256($inp)&quot;);
+-	la	($out,&quot;256($out)&quot;);
+-	brctg	(&quot;%r1&quot;,&quot;.Lvx_4x&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Lvx_4x_done&quot;);
+-	lghi	(&quot;%r1&quot;,0xff);
+-	ngr	($len,&quot;%r1&quot;);
+-	jnz	(&quot;.Lvx_rem&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Lvx_done&quot;);
+-	vzero	(&quot;%v$_&quot;) for (16..31);	# wipe ks and key copy
+-	vstm	(&quot;%v16&quot;,&quot;%v17&quot;,&quot;16+$off($sp)&quot;);
+-	vlm	(&quot;%v8&quot;,&quot;%v15&quot;,&quot;8($sp)&quot;) if ($z);
+-
+-	la	($sp,&quot;$frame($sp)&quot;);
+-&amp;{$z?	\&amp;lmg:\&amp;lm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;6*$SIZE_T($sp)&quot;);
+-
+-if (!$z) {
+-	ld	(&quot;%f4&quot;,&quot;16*$SIZE_T+2*8($sp)&quot;);
+-	ld	(&quot;%f6&quot;,&quot;16*$SIZE_T+3*8($sp)&quot;);
+-	vzero	(&quot;%v$_&quot;) for (8..15);
+-}
+-	br	(&quot;%r14&quot;);
+-ALIGN	(16);
+-LABEL	(&quot;.Lvx_rem&quot;);
+-	lhi	(&quot;%r0&quot;,64);
+-
+-	sr	($len,&quot;%r0&quot;);
+-	brc	(2,&quot;.Lvx_rem_g64&quot;);	# cc==2?
+-
+-	lghi	(&quot;%r1&quot;,-$stdframe);
+-
+-	la	($counter,&quot;48+$off($sp)&quot;);	# load updated iv
+-	ar	($len,&quot;%r0&quot;);	# restore len
+-
+-	lgr	(&quot;%r7&quot;,$counter);
+-&amp;{$z?	\&amp;stg:\&amp;st}	(&quot;%r14&quot;,&quot;14*$SIZE_T+$frame($sp)&quot;);
+-	la	($sp,&quot;0(%r1,$sp)&quot;);
+-
+-	bras	(&quot;%r14&quot;,&quot;_s390x_chacha_novx&quot;);
+-
+-	la	($sp,&quot;$stdframe($sp)&quot;);
+-&amp;{$z?	\&amp;lg:\&amp;l}	(&quot;%r14&quot;,&quot;14*$SIZE_T+$frame($sp)&quot;);
+-	lgr	($counter,&quot;%r7&quot;);
+-	j	(&quot;.Lvx_done&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Lvx_rem_g64&quot;);
+-	vlrepf	(&quot;%v$_&quot;,($_*4).&quot;+$off($sp)&quot;) for (0..15);	# load initial
+-								#  state
+-	vl	(&quot;%v31&quot;,&quot;16(%r7)&quot;);
+-	vaf	(&quot;%v12&quot;,&quot;%v12&quot;,&quot;%v31&quot;);	# increment counter
+-
+-	vlr	(@v[$_],&quot;%v$_&quot;) for (0..15);	# state = initial state
+-
+-	lhi	(&quot;%r6&quot;,10);
+-	j	(&quot;.Loop_vx_rem&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Loop_vx_rem&quot;);
+-	VX_ROUND( 0, 4, 8,12);	# column round
+-	VX_ROUND( 0, 5,10,15);	# diagonal round
+-	brct	(&quot;%r6&quot;,&quot;.Loop_vx_rem&quot;);
+-
+-	vaf	(@v[$_]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_],&quot;%v$_&quot;) for (0..15);	# state += initial
+-							#  state (mod 32)
+-	vlm	(&quot;%v6&quot;,&quot;%v7&quot;,&quot;32(%r7)&quot;);	# load vperm operands
+-
+-for (0..3) {	# blocks 1,2
+-	vmrhf	(&quot;%v0&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+1]);	# ks = serialize(state)
+-	vmrhf	(&quot;%v1&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+3]);
+-	vperm	(&quot;%v&quot;.($_+8),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v6&quot;);
+-	vperm	(&quot;%v&quot;.($_+12),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v7&quot;);
+-}
+-	vlm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($inp)&quot;);	# load in
+-	vx	(&quot;%v$_&quot;,&quot;%v$_&quot;,&quot;%v&quot;.($_+8)) for (0..3);	# out = in ^ ks
+-	vstm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($out)&quot;);	# store out
+-
+-	la	($inp,&quot;64($inp)&quot;);
+-	la	($out,&quot;64($out)&quot;);
+-
+-	sr	($len,&quot;%r0&quot;);
+-	brc	(4,&quot;.Lvx_tail&quot;);	# cc==4?
+-
+-	vlm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($inp)&quot;);	# load in
+-	vx	(&quot;%v$_&quot;,&quot;%v$_&quot;,&quot;%v&quot;.($_+12)) for (0..3);	# out = in ^ ks
+-	vstm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($out)&quot;);	# store out
+-	jz	(&quot;.Lvx_done&quot;);
+-
+-for (0..3) {	# blocks 3,4
+-	vmrlf	(&quot;%v0&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+1]);	# ks = serialize(state)
+-	vmrlf	(&quot;%v1&quot;<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at v</A>[$_*4+3]);
+-	vperm	(&quot;%v&quot;.($_+12),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v6&quot;);
+-	vperm	(&quot;%v&quot;.($_+8),&quot;%v0&quot;,&quot;%v1&quot;,&quot;%v7&quot;);
+-}
+-	la	($inp,&quot;64($inp)&quot;);
+-	la	($out,&quot;64($out)&quot;);
+-
+-	sr	($len,&quot;%r0&quot;);
+-	brc	(4,&quot;.Lvx_tail&quot;);	# cc==4?
+-
+-	vlm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($inp)&quot;);	# load in
+-	vx	(&quot;%v$_&quot;,&quot;%v$_&quot;,&quot;%v&quot;.($_+12)) for (0..3);	# out = in ^ ks
+-	vstm	(&quot;%v0&quot;,&quot;%v3&quot;,&quot;0($out)&quot;);	# store out
+-	jz	(&quot;.Lvx_done&quot;);
+-
+-	la	($inp,&quot;64($inp)&quot;);
+-	la	($out,&quot;64($out)&quot;);
+-
+-	sr	($len,&quot;%r0&quot;);
+-	vlr	(&quot;%v&quot;.($_+4),&quot;%v$_&quot;) for (8..11);
+-	j	(&quot;.Lvx_tail&quot;);
+-
+-ALIGN	(16);
+-LABEL	(&quot;.Lvx_tail&quot;);
+-	ar	($len,&quot;%r0&quot;);	# restore $len
+-	ahi	($len,-1);
+-
+-	lhi	(&quot;%r0&quot;,16);
+-for (0..2) {
+-	vll	(&quot;%v0&quot;,$len,($_*16).&quot;($inp)&quot;);
+-	vx	(&quot;%v0&quot;,&quot;%v0&quot;,&quot;%v&quot;.($_+12));
+-	vstl	(&quot;%v0&quot;,$len,($_*16).&quot;($out)&quot;);
+-	sr	($len,&quot;%r0&quot;);
+-	brc	(4,&quot;.Lvx_done&quot;);	# cc==4?
+-}
+-	vll	(&quot;%v0&quot;,$len,&quot;3*16($inp)&quot;);
+-	vx	(&quot;%v0&quot;,&quot;%v0&quot;,&quot;%v15&quot;);
+-	vstl	(&quot;%v0&quot;,$len,&quot;3*16($out)&quot;);
+-	j	(&quot;.Lvx_done&quot;);
+-SIZE	(&quot;ChaCha20_ctr32&quot;,&quot;.-ChaCha20_ctr32&quot;);
+-}
+-
+-# NOVX CODE PATH
+-{
+-my $frame=$stdframe+4*20;
+-
+-TYPE	(&quot;_s390x_chacha_novx&quot;,&quot;\@function&quot;);
+-ALIGN	(32);
+-LABEL	(&quot;_s390x_chacha_novx&quot;);
+-&amp;{$z?	\&amp;ltgr:\&amp;ltr}	($len,$len);	# $len==0?
+-	bzr	(&quot;%r14&quot;);
++LABEL	(&quot;.Lshort&quot;);
+ &amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-64);
+ &amp;{$z?	\&amp;lghi:\&amp;lhi}	(&quot;%r1&quot;,-$frame);
+ &amp;{$z?	\&amp;stmg:\&amp;stm}	(&quot;%r6&quot;,&quot;%r15&quot;,&quot;6*$SIZE_T($sp)&quot;);
+@@ -607,17 +427,629 @@ LABEL	(&quot;.Loop_tail&quot;);
+ 	brct	(@t[1],&quot;.Loop_tail&quot;);
+ 
+ 	j	(&quot;.Ldone&quot;);
+-SIZE	(&quot;_s390x_chacha_novx&quot;,&quot;.-_s390x_chacha_novx&quot;);
++SIZE	(&quot;ChaCha20_ctr32&quot;,&quot;.-ChaCha20_ctr32&quot;);
++}
++
++########################################################################
++# 4x&quot;vertical&quot; layout minimizes amount of instructions, but pipeline
++# runs underutilized [because of vector instructions' high latency].
++# On the other hand minimum amount of data it takes to fully utilize
++# the pipeline is higher, so that effectively, short inputs would be
++# processed slower. Hence this code path targeting &lt;=256 bytes lengths.
++#
++{
++my ($xa0,$xa1,$xa2,$xa3, $xb0,$xb1,$xb2,$xb3,
++    $xc0,$xc1,$xc2,$xc3, $xd0,$xd1,$xd2,$xd3)=map(&quot;%v$_&quot;,(0..15));
++my @K=map(&quot;%v$_&quot;,(16..19));
++my $CTR=&quot;%v26&quot;;
++my ($xt0,$xt1,$xt2,$xt3)=map(&quot;%v$_&quot;,(27..30));
++my $beperm=&quot;%v31&quot;;
++my ($x00,$x10,$x20,$x30)=(0,map(&quot;r$_&quot;,(8..10)));
++my $FRAME=$stdframe+4*16;
++
++ALIGN	(32);
++LABEL	(&quot;ChaCha20_ctr32_4x&quot;);
++LABEL	(&quot;.LChaCha20_ctr32_4x&quot;);
++&amp;{$z?	\&amp;stmg:\&amp;stm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;6*$SIZE_T($sp)&quot;);
++if (!$z) {
++	std	(&quot;%f4&quot;,&quot;16*$SIZE_T+2*8($sp)&quot;);
++	std	(&quot;%f6&quot;,&quot;16*$SIZE_T+3*8($sp)&quot;);
++}
++&amp;{$z?	\&amp;lghi:\&amp;lhi}	(&quot;%r1&quot;,-$FRAME);
++	lgr	(&quot;%r0&quot;,$sp);
++	la	($sp,&quot;0(%r1,$sp)&quot;);
++&amp;{$z?	\&amp;stg:\&amp;st}	(&quot;%r0&quot;,&quot;0($sp)&quot;);	# back-chain
++if ($z) {
++	std	(&quot;%f8&quot;,&quot;$stdframe+8*0($sp)&quot;);
++	std	(&quot;%f9&quot;,&quot;$stdframe+8*1($sp)&quot;);
++	std	(&quot;%f10&quot;,&quot;$stdframe+8*2($sp)&quot;);
++	std	(&quot;%f11&quot;,&quot;$stdframe+8*3($sp)&quot;);
++	std	(&quot;%f12&quot;,&quot;$stdframe+8*4($sp)&quot;);
++	std	(&quot;%f13&quot;,&quot;$stdframe+8*5($sp)&quot;);
++	std	(&quot;%f14&quot;,&quot;$stdframe+8*6($sp)&quot;);
++	std	(&quot;%f15&quot;,&quot;$stdframe+8*7($sp)&quot;);
++}
++	larl	(&quot;%r7&quot;,&quot;.Lsigma&quot;);
++	lhi	(&quot;%r0&quot;,10);
++	lhi	(&quot;%r1&quot;,0);
++
++	vl	(@K[0],&quot;0(%r7)&quot;);		# load sigma
++	vl	(@K[1],&quot;0($key)&quot;);		# load key
++	vl	(@K[2],&quot;16($key)&quot;);
++	vl	(@K[3],&quot;0($counter)&quot;);		# load counter
++
++	vl	($beperm,&quot;0x40(%r7)&quot;);
++	vl	($xt1,&quot;0x50(%r7)&quot;);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">CTR, at K</A>[3],0);
++	vlvgf	(@K[3],&quot;%r1&quot;,0);		# clear @K[3].word[0]
++	vaf	($CTR,$CTR,$xt1);
++
++#LABEL	(&quot;.Loop_outer_4x&quot;);
++	vlm	($xa0,$xa3,&quot;0x60(%r7)&quot;);	# load [smashed] sigma
++
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xb0, at K</A>[1],0);			# smash the key
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xb1, at K</A>[1],1);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xb2, at K</A>[1],2);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xb3, at K</A>[1],3);
++
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xc0, at K</A>[2],0);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xc1, at K</A>[2],1);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xc2, at K</A>[2],2);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xc3, at K</A>[2],3);
++
++	vlr	($xd0,$CTR);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xd1, at K</A>[3],1);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xd2, at K</A>[3],2);
++	vrepf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">xd3, at K</A>[3],3);
++
++LABEL	(&quot;.Loop_4x&quot;);
++	VX_lane_ROUND(0, 4, 8,12);
++	VX_lane_ROUND(0, 5,10,15);
++	brct	(&quot;%r0&quot;,&quot;.Loop_4x&quot;);
++
++	vaf	($xd0,$xd0,$CTR);
++
++	vmrhf	($xt0,$xa0,$xa1);		# transpose data
++	vmrhf	($xt1,$xa2,$xa3);
++	vmrlf	($xt2,$xa0,$xa1);
++	vmrlf	($xt3,$xa2,$xa3);
++	vpdi	($xa0,$xt0,$xt1,0b0000);
++	vpdi	($xa1,$xt0,$xt1,0b0101);
++	vpdi	($xa2,$xt2,$xt3,0b0000);
++	vpdi	($xa3,$xt2,$xt3,0b0101);
++
++	vmrhf	($xt0,$xb0,$xb1);
++	vmrhf	($xt1,$xb2,$xb3);
++	vmrlf	($xt2,$xb0,$xb1);
++	vmrlf	($xt3,$xb2,$xb3);
++	vpdi	($xb0,$xt0,$xt1,0b0000);
++	vpdi	($xb1,$xt0,$xt1,0b0101);
++	vpdi	($xb2,$xt2,$xt3,0b0000);
++	vpdi	($xb3,$xt2,$xt3,0b0101);
++
++	vmrhf	($xt0,$xc0,$xc1);
++	vmrhf	($xt1,$xc2,$xc3);
++	vmrlf	($xt2,$xc0,$xc1);
++	vmrlf	($xt3,$xc2,$xc3);
++	vpdi	($xc0,$xt0,$xt1,0b0000);
++	vpdi	($xc1,$xt0,$xt1,0b0101);
++	vpdi	($xc2,$xt2,$xt3,0b0000);
++	vpdi	($xc3,$xt2,$xt3,0b0101);
++
++	vmrhf	($xt0,$xd0,$xd1);
++	vmrhf	($xt1,$xd2,$xd3);
++	vmrlf	($xt2,$xd0,$xd1);
++	vmrlf	($xt3,$xd2,$xd3);
++	vpdi	($xd0,$xt0,$xt1,0b0000);
++	vpdi	($xd1,$xt0,$xt1,0b0101);
++	vpdi	($xd2,$xt2,$xt3,0b0000);
++	vpdi	($xd3,$xt2,$xt3,0b0101);
++
++	#vrepif	($xt0,4);
++	#vaf	($CTR,$CTR,$xt0);		# next counter value
++
++	vaf	($xa0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xa0, at K</A>[0]);
++	vaf	($xb0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xb0, at K</A>[1]);
++	vaf	($xc0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xc0, at K</A>[2]);
++	vaf	($xd0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xd0, at K</A>[3]);
++
++	vperm	($xa0,$xa0,$xa0,$beperm);
++	vperm	($xb0,$xb0,$xb0,$beperm);
++	vperm	($xc0,$xc0,$xc0,$beperm);
++	vperm	($xd0,$xd0,$xd0,$beperm);
++
++	#&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	#jl	(&quot;.Ltail_4x&quot;);
++
++	vlm	($xt0,$xt3,&quot;0($inp)&quot;);
++
++	vx	($xt0,$xt0,$xa0);
++	vx	($xt1,$xt1,$xb0);
++	vx	($xt2,$xt2,$xc0);
++	vx	($xt3,$xt3,$xd0);
++
++	vstm	($xt0,$xt3,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	#je	(&quot;.Ldone_4x&quot;);
++
++	vaf	($xa0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xa1, at K</A>[0]);
++	vaf	($xb0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xb1, at K</A>[1]);
++	vaf	($xc0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xc1, at K</A>[2]);
++	vaf	($xd0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xd1, at K</A>[3]);
++
++	vperm	($xa0,$xa0,$xa0,$beperm);
++	vperm	($xb0,$xb0,$xb0,$beperm);
++	vperm	($xc0,$xc0,$xc0,$beperm);
++	vperm	($xd0,$xd0,$xd0,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	jl	(&quot;.Ltail_4x&quot;);
++
++	vlm	($xt0,$xt3,&quot;0($inp)&quot;);
++
++	vx	($xt0,$xt0,$xa0);
++	vx	($xt1,$xt1,$xb0);
++	vx	($xt2,$xt2,$xc0);
++	vx	($xt3,$xt3,$xd0);
++
++	vstm	($xt0,$xt3,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_4x&quot;);
++
++	vaf	($xa0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xa2, at K</A>[0]);
++	vaf	($xb0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xb2, at K</A>[1]);
++	vaf	($xc0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xc2, at K</A>[2]);
++	vaf	($xd0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xd2, at K</A>[3]);
++
++	vperm	($xa0,$xa0,$xa0,$beperm);
++	vperm	($xb0,$xb0,$xb0,$beperm);
++	vperm	($xc0,$xc0,$xc0,$beperm);
++	vperm	($xd0,$xd0,$xd0,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	jl	(&quot;.Ltail_4x&quot;);
++
++	vlm	($xt0,$xt3,&quot;0($inp)&quot;);
++
++	vx	($xt0,$xt0,$xa0);
++	vx	($xt1,$xt1,$xb0);
++	vx	($xt2,$xt2,$xc0);
++	vx	($xt3,$xt3,$xd0);
++
++	vstm	($xt0,$xt3,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_4x&quot;);
++
++	vaf	($xa0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xa3, at K</A>[0]);
++	vaf	($xb0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xb3, at K</A>[1]);
++	vaf	($xc0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xc3, at K</A>[2]);
++	vaf	($xd0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">xd3, at K</A>[3]);
++
++	vperm	($xa0,$xa0,$xa0,$beperm);
++	vperm	($xb0,$xb0,$xb0,$beperm);
++	vperm	($xc0,$xc0,$xc0,$beperm);
++	vperm	($xd0,$xd0,$xd0,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	jl	(&quot;.Ltail_4x&quot;);
++
++	vlm	($xt0,$xt3,&quot;0($inp)&quot;);
++
++	vx	($xt0,$xt0,$xa0);
++	vx	($xt1,$xt1,$xb0);
++	vx	($xt2,$xt2,$xc0);
++	vx	($xt3,$xt3,$xd0);
++
++	vstm	($xt0,$xt3,&quot;0($out)&quot;);
++
++	#la	$inp,0x40($inp));
++	#la	$out,0x40($out));
++	#lhi	%r0,10);
++	#&amp;{$z?	\&amp;aghi:\&amp;ahi}	$len,-0x40);
++	#jne	.Loop_outer_4x);
++
++LABEL	(&quot;.Ldone_4x&quot;);
++if (!$z) {
++	ld	(&quot;%f4&quot;,&quot;$FRAME+16*$SIZE_T+2*8($sp)&quot;);
++	ld	(&quot;%f6&quot;,&quot;$FRAME+16*$SIZE_T+3*8($sp)&quot;);
++} else {
++	ld	(&quot;%f8&quot;,&quot;$stdframe+8*0($sp)&quot;);
++	ld	(&quot;%f9&quot;,&quot;$stdframe+8*1($sp)&quot;);
++	ld	(&quot;%f10&quot;,&quot;$stdframe+8*2($sp)&quot;);
++	ld	(&quot;%f11&quot;,&quot;$stdframe+8*3($sp)&quot;);
++	ld	(&quot;%f12&quot;,&quot;$stdframe+8*4($sp)&quot;);
++	ld	(&quot;%f13&quot;,&quot;$stdframe+8*5($sp)&quot;);
++	ld	(&quot;%f14&quot;,&quot;$stdframe+8*6($sp)&quot;);
++	ld	(&quot;%f15&quot;,&quot;$stdframe+8*7($sp)&quot;);
++}
++&amp;{$z?	\&amp;lmg:\&amp;lm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;$FRAME+6*$SIZE_T($sp)&quot;);
++	la	($sp,&quot;$FRAME($sp)&quot;);
++	br	(&quot;%r14&quot;);
++
++ALIGN	(16);
++LABEL	(&quot;.Ltail_4x&quot;);
++if (!$z) {
++	vlr	($xt0,$xb0);
++	ld	(&quot;%f4&quot;,&quot;$FRAME+16*$SIZE_T+2*8($sp)&quot;);
++	ld	(&quot;%f6&quot;,&quot;$FRAME+16*$SIZE_T+3*8($sp)&quot;);
++
++	vst	($xa0,&quot;$stdframe+0x00($sp)&quot;);
++	vst	($xt0,&quot;$stdframe+0x10($sp)&quot;);
++	vst	($xc0,&quot;$stdframe+0x20($sp)&quot;);
++	vst	($xd0,&quot;$stdframe+0x30($sp)&quot;);
++} else {
++	vlr	($xt0,$xc0);
++	ld	(&quot;%f8&quot;,&quot;$stdframe+8*0($sp)&quot;);
++	ld	(&quot;%f9&quot;,&quot;$stdframe+8*1($sp)&quot;);
++	ld	(&quot;%f10&quot;,&quot;$stdframe+8*2($sp)&quot;);
++	ld	(&quot;%f11&quot;,&quot;$stdframe+8*3($sp)&quot;);
++	vlr	($xt1,$xd0);
++	ld	(&quot;%f12&quot;,&quot;$stdframe+8*4($sp)&quot;);
++	ld	(&quot;%f13&quot;,&quot;$stdframe+8*5($sp)&quot;);
++	ld	(&quot;%f14&quot;,&quot;$stdframe+8*6($sp)&quot;);
++	ld	(&quot;%f15&quot;,&quot;$stdframe+8*7($sp)&quot;);
++
++	vst	($xa0,&quot;$stdframe+0x00($sp)&quot;);
++	vst	($xb0,&quot;$stdframe+0x10($sp)&quot;);
++	vst	($xt0,&quot;$stdframe+0x20($sp)&quot;);
++	vst	($xt1,&quot;$stdframe+0x30($sp)&quot;);
+ }
++	lghi	(&quot;%r1&quot;,0);
++
++LABEL	(&quot;.Loop_tail_4x&quot;);
++	llgc	(&quot;%r5&quot;,&quot;0(%r1,$inp)&quot;);
++	llgc	(&quot;%r6&quot;,&quot;$stdframe(%r1,$sp)&quot;);
++	xr	(&quot;%r6&quot;,&quot;%r5&quot;);
++	stc	(&quot;%r6&quot;,&quot;0(%r1,$out)&quot;);
++	la	(&quot;%r1&quot;,&quot;1(%r1)&quot;);
++	brct	($len,&quot;.Loop_tail_4x&quot;);
++
++&amp;{$z?	\&amp;lmg:\&amp;lm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;$FRAME+6*$SIZE_T($sp)&quot;);
++	la	($sp,&quot;$FRAME($sp)&quot;);
++	br	(&quot;%r14&quot;);
++SIZE	(&quot;ChaCha20_ctr32_4x&quot;,&quot;.-ChaCha20_ctr32_4x&quot;);
++}
++
++########################################################################
++# 6x&quot;horizontal&quot; layout is optimal fit for the platform in its current
++# shape, more specifically for given vector instructions' latency. Well,
++# computational part of 8x&quot;vertical&quot; would be faster, but it consumes
++# all registers and dealing with that will diminish the return...
++#
++{
++my ($a0,$b0,$c0,$d0, $a1,$b1,$c1,$d1,
++    $a2,$b2,$c2,$d2, $a3,$b3,$c3,$d3,
++    $a4,$b4,$c4,$d4, $a5,$b5,$c5,$d5)=map(&quot;%v$_&quot;,(0..23));
++my @K=map(&quot;%v$_&quot;,(27,24..26));
++my ($t0,$t1,$t2,$t3)=map(&quot;%v$_&quot;,27..30);
++my $beperm=&quot;%v31&quot;;
++my $FRAME=$stdframe + 4*16;
++
++GLOBL	(&quot;ChaCha20_ctr32_vx&quot;);
++ALIGN	(32);
++LABEL	(&quot;ChaCha20_ctr32_vx&quot;);
++LABEL	(&quot;.LChaCha20_ctr32_vx&quot;);
++&amp;{$z?	\&amp;clgfi:\&amp;clfi}	($len,256);
++	jle	(&quot;.LChaCha20_ctr32_4x&quot;);
++&amp;{$z?	\&amp;stmg:\&amp;stm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;6*$SIZE_T($sp)&quot;);
++if (!$z) {
++	std	(&quot;%f4&quot;,&quot;16*$SIZE_T+2*8($sp)&quot;);
++	std	(&quot;%f6&quot;,&quot;16*$SIZE_T+3*8($sp)&quot;);
++}
++&amp;{$z?	\&amp;lghi:\&amp;lhi}	(&quot;%r1&quot;,-$FRAME);
++	lgr	(&quot;%r0&quot;,$sp);
++	la	($sp,&quot;0(%r1,$sp)&quot;);
++&amp;{$z?	\&amp;stg:\&amp;st}	(&quot;%r0&quot;,&quot;0($sp)&quot;);	# back-chain
++if ($z) {
++	std	(&quot;%f8&quot;,&quot;$FRAME-8*8($sp)&quot;);
++	std	(&quot;%f9&quot;,&quot;$FRAME-8*7($sp)&quot;);
++	std	(&quot;%f10&quot;,&quot;$FRAME-8*6($sp)&quot;);
++	std	(&quot;%f11&quot;,&quot;$FRAME-8*5($sp)&quot;);
++	std	(&quot;%f12&quot;,&quot;$FRAME-8*4($sp)&quot;);
++	std	(&quot;%f13&quot;,&quot;$FRAME-8*3($sp)&quot;);
++	std	(&quot;%f14&quot;,&quot;$FRAME-8*2($sp)&quot;);
++	std	(&quot;%f15&quot;,&quot;$FRAME-8*1($sp)&quot;);
++}
++	larl	(&quot;%r7&quot;,&quot;.Lsigma&quot;);
++	lhi	(&quot;%r0&quot;,10);
++
++	vlm	(@K[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at K</A>[2],&quot;0($key)&quot;);	# load key
++	vl	(@K[3],&quot;0($counter)&quot;);		# load counter
++
++	vlm	(@K[0],&quot;$beperm&quot;,&quot;0(%r7)&quot;);	# load sigma, increments, ...
++
++LABEL	(&quot;.Loop_outer_vx&quot;);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a0, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b0, at K</A>[1]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a1, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b1, at K</A>[1]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a2, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b2, at K</A>[1]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a3, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b3, at K</A>[1]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a4, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b4, at K</A>[1]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">a5, at K</A>[0]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">b5, at K</A>[1]);
++
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">d0, at K</A>[3]);
++	vaf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">d1, at K</A>[3],$t1);		# K[3]+1
++	vaf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">d2, at K</A>[3],$t2);		# K[3]+2
++	vaf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">d3, at K</A>[3],$t3);		# K[3]+3
++	vaf	($d4,$d2,$t2);			# K[3]+4
++	vaf	($d5,$d2,$t3);			# K[3]+5
++
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c0, at K</A>[2]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c1, at K</A>[2]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c2, at K</A>[2]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c3, at K</A>[2]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c4, at K</A>[2]);
++	vlr	($<A HREF="../../../mailman/listinfo/openssl-commits.html">c5, at K</A>[2]);
++
++	vlr	($t1,$d1);
++	vlr	($t2,$d2);
++	vlr	($t3,$d3);
++
++ALIGN	(4);
++LABEL	(&quot;.Loop_vx&quot;);
++
++	VX_ROUND($a0,$a1,$a2,$a3,$a4,$a5,
++		 $b0,$b1,$b2,$b3,$b4,$b5,
++		 $c0,$c1,$c2,$c3,$c4,$c5,
++		 $d0,$d1,$d2,$d3,$d4,$d5,
++		 0);
++
++	VX_ROUND($a0,$a1,$a2,$a3,$a4,$a5,
++		 $b0,$b1,$b2,$b3,$b4,$b5,
++		 $c0,$c1,$c2,$c3,$c4,$c5,
++		 $d0,$d1,$d2,$d3,$d4,$d5,
++		 1);
++
++	brct	(&quot;%r0&quot;,&quot;.Loop_vx&quot;);
++
++	vaf	($a0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a0, at K</A>[0]);
++	vaf	($b0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b0, at K</A>[1]);
++	vaf	($c0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c0, at K</A>[2]);
++	vaf	($d0,$<A HREF="../../../mailman/listinfo/openssl-commits.html">d0, at K</A>[3]);
++	vaf	($a1,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a1, at K</A>[0]);
++	vaf	($d1,$d1,$t1);			# +K[3]+1
++
++	vperm	($a0,$a0,$a0,$beperm);
++	vperm	($b0,$b0,$b0,$beperm);
++	vperm	($c0,$c0,$c0,$beperm);
++	vperm	($d0,$d0,$d0,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi}	($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vaf	($d2,$d2,$t2);			# +K[3]+2
++	vaf	($d3,$d3,$t3);			# +K[3]+3
++	vlm	($t0,$t3,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$t0);
++	vx	($b0,$b0,$t1);
++	vx	($c0,$c0,$t2);
++	vx	($d0,$d0,$t3);
++
++	vlm	(@K[0],$t3,&quot;0(%r7)&quot;);		# re-load sigma and increments
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_vx&quot;);
++
++	vaf	($b1,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b1, at K</A>[1]);
++	vaf	($c1,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c1, at K</A>[2]);
++
++	vperm	($a0,$a1,$a1,$beperm);
++	vperm	($b0,$b1,$b1,$beperm);
++	vperm	($c0,$c1,$c1,$beperm);
++	vperm	($d0,$d1,$d1,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vlm	($a1,$d1,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$a1);
++	vx	($b0,$b0,$b1);
++	vx	($c0,$c0,$c1);
++	vx	($d0,$d0,$d1);
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_vx&quot;);
++
++	vaf	($a2,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a2, at K</A>[0]);
++	vaf	($b2,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b2, at K</A>[1]);
++	vaf	($c2,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c2, at K</A>[2]);
++
++	vperm	($a0,$a2,$a2,$beperm);
++	vperm	($b0,$b2,$b2,$beperm);
++	vperm	($c0,$c2,$c2,$beperm);
++	vperm	($d0,$d2,$d2,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi}	($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vlm	($a1,$d1,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$a1);
++	vx	($b0,$b0,$b1);
++	vx	($c0,$c0,$c1);
++	vx	($d0,$d0,$d1);
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_vx&quot;);
++
++	vaf	($a3,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a3, at K</A>[0]);
++	vaf	($b3,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b3, at K</A>[1]);
++	vaf	($c3,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c3, at K</A>[2]);
++	vaf	($<A HREF="../../../mailman/listinfo/openssl-commits.html">d2, at K</A>[3],$t3);		# K[3]+3
++
++	vperm	($a0,$a3,$a3,$beperm);
++	vperm	($b0,$b3,$b3,$beperm);
++	vperm	($c0,$c3,$c3,$beperm);
++	vperm	($d0,$d3,$d3,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi}	($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vaf	($d3,$d2,$t1);			# K[3]+4
++	vlm	($a1,$d1,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$a1);
++	vx	($b0,$b0,$b1);
++	vx	($c0,$c0,$c1);
++	vx	($d0,$d0,$d1);
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_vx&quot;);
++
++	vaf	($a4,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a4, at K</A>[0]);
++	vaf	($b4,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b4, at K</A>[1]);
++	vaf	($c4,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c4, at K</A>[2]);
++	vaf	($d4,$d4,$d3);			# +K[3]+4
++	vaf	($d3,$d3,$t1);			# K[3]+5
++	vaf	(@K[3],$d2,$t3);		# K[3]+=6
++
++	vperm	($a0,$a4,$a4,$beperm);
++	vperm	($b0,$b4,$b4,$beperm);
++	vperm	($c0,$c4,$c4,$beperm);
++	vperm	($d0,$d4,$d4,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi}	($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vlm	($a1,$d1,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$a1);
++	vx	($b0,$b0,$b1);
++	vx	($c0,$c0,$c1);
++	vx	($d0,$d0,$d1);
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	je	(&quot;.Ldone_vx&quot;);
++
++	vaf	($a5,$<A HREF="../../../mailman/listinfo/openssl-commits.html">a5, at K</A>[0]);
++	vaf	($b5,$<A HREF="../../../mailman/listinfo/openssl-commits.html">b5, at K</A>[1]);
++	vaf	($c5,$<A HREF="../../../mailman/listinfo/openssl-commits.html">c5, at K</A>[2]);
++	vaf	($d5,$d5,$d3);			# +K[3]+5
++
++	vperm	($a0,$a5,$a5,$beperm);
++	vperm	($b0,$b5,$b5,$beperm);
++	vperm	($c0,$c5,$c5,$beperm);
++	vperm	($d0,$d5,$d5,$beperm);
++
++&amp;{$z?	\&amp;clgfi:\&amp;clfi} ($len,0x40);
++	jl	(&quot;.Ltail_vx&quot;);
++
++	vlm	($a1,$d1,&quot;0($inp)&quot;);
++
++	vx	($a0,$a0,$a1);
++	vx	($b0,$b0,$b1);
++	vx	($c0,$c0,$c1);
++	vx	($d0,$d0,$d1);
++
++	vstm	($a0,$d0,&quot;0($out)&quot;);
++
++	la	($inp,&quot;0x40($inp)&quot;);
++	la	($out,&quot;0x40($out)&quot;);
++	lhi	(&quot;%r0&quot;,10);
++&amp;{$z?	\&amp;aghi:\&amp;ahi}	($len,-0x40);
++	jne	(&quot;.Loop_outer_vx&quot;);
++
++LABEL	(&quot;.Ldone_vx&quot;);
++if (!$z) {
++	ld	(&quot;%f4&quot;,&quot;$FRAME+16*$SIZE_T+2*8($sp)&quot;);
++	ld	(&quot;%f6&quot;,&quot;$FRAME+16*$SIZE_T+3*8($sp)&quot;);
++} else {
++	ld	(&quot;%f8&quot;,&quot;$FRAME-8*8($sp)&quot;);
++	ld	(&quot;%f9&quot;,&quot;$FRAME-8*7($sp)&quot;);
++	ld	(&quot;%f10&quot;,&quot;$FRAME-8*6($sp)&quot;);
++	ld	(&quot;%f11&quot;,&quot;$FRAME-8*5($sp)&quot;);
++	ld	(&quot;%f12&quot;,&quot;$FRAME-8*4($sp)&quot;);
++	ld	(&quot;%f13&quot;,&quot;$FRAME-8*3($sp)&quot;);
++	ld	(&quot;%f14&quot;,&quot;$FRAME-8*2($sp)&quot;);
++	ld	(&quot;%f15&quot;,&quot;$FRAME-8*1($sp)&quot;);
++}
++&amp;{$z?	\&amp;lmg:\&amp;lm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;$FRAME+6*$SIZE_T($sp)&quot;);
++	la	($sp,&quot;$FRAME($sp)&quot;);
++	br	(&quot;%r14&quot;);
++
++ALIGN	(16);
++LABEL	(&quot;.Ltail_vx&quot;);
++if (!$z) {
++	ld	(&quot;%f4&quot;,&quot;$FRAME+16*$SIZE_T+2*8($sp)&quot;);
++	ld	(&quot;%f6&quot;,&quot;$FRAME+16*$SIZE_T+3*8($sp)&quot;);
++} else {
++	ld	(&quot;%f8&quot;,&quot;$FRAME-8*8($sp)&quot;);
++	ld	(&quot;%f9&quot;,&quot;$FRAME-8*7($sp)&quot;);
++	ld	(&quot;%f10&quot;,&quot;$FRAME-8*6($sp)&quot;);
++	ld	(&quot;%f11&quot;,&quot;$FRAME-8*5($sp)&quot;);
++	ld	(&quot;%f12&quot;,&quot;$FRAME-8*4($sp)&quot;);
++	ld	(&quot;%f13&quot;,&quot;$FRAME-8*3($sp)&quot;);
++	ld	(&quot;%f14&quot;,&quot;$FRAME-8*2($sp)&quot;);
++	ld	(&quot;%f15&quot;,&quot;$FRAME-8*1($sp)&quot;);
++}
++	vstm	($a0,$d0,&quot;$stdframe($sp)&quot;);
++	lghi	(&quot;%r1&quot;,0);
++
++LABEL	(&quot;.Loop_tail_vx&quot;);
++	llgc	(&quot;%r5&quot;,&quot;0(%r1,$inp)&quot;);
++	llgc	(&quot;%r6&quot;,&quot;$stdframe(%r1,$sp)&quot;);
++	xr	(&quot;%r6&quot;,&quot;%r5&quot;);
++	stc	(&quot;%r6&quot;,&quot;0(%r1,$out)&quot;);
++	la	(&quot;%r1&quot;,&quot;1(%r1)&quot;);
++	brct	($len,&quot;.Loop_tail_vx&quot;);
++
++&amp;{$z?	\&amp;lmg:\&amp;lm}	(&quot;%r6&quot;,&quot;%r7&quot;,&quot;$FRAME+6*$SIZE_T($sp)&quot;);
++	la	($sp,&quot;$FRAME($sp)&quot;);
++	br	(&quot;%r14&quot;);
++SIZE	(&quot;ChaCha20_ctr32_vx&quot;,&quot;.-ChaCha20_ctr32_vx&quot;);
+ }
+ ################
+ 
+-ALIGN	(64);
++ALIGN	(32);
+ LABEL	(&quot;.Lsigma&quot;);
+ LONG	(0x61707865,0x3320646e,0x79622d32,0x6b206574);	# endian-neutral sigma
+-LONG	(0x00000000,0x00000001,0x00000002,0x00000003);	# vaf counter increment
+-LONG	(0x03020100,0x07060504,0x13121110,0x17161514);	# vperm serialization
+-LONG	(0x0b0a0908,0x0f0e0d0c,0x1b1a1918,0x1f1e1d1c);	# vperm serialization
++LONG	(1,0,0,0);
++LONG	(2,0,0,0);
++LONG	(3,0,0,0);
++LONG	(0x03020100,0x07060504,0x0b0a0908,0x0f0e0d0c);	# byte swap
++
++LONG	(0,1,2,3);
++LONG	(0x61707865,0x61707865,0x61707865,0x61707865);	# smashed sigma
++LONG	(0x3320646e,0x3320646e,0x3320646e,0x3320646e);
++LONG	(0x79622d32,0x79622d32,0x79622d32,0x79622d32);
++LONG	(0x6b206574,0x6b206574,0x6b206574,0x6b206574);
++
+ ASCIZ	(&quot;\&quot;ChaCha20 for s390x, CRYPTOGAMS by &lt;appro\@openssl.org&gt;\&quot;&quot;);
+ ALIGN	(4);
+ 
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="022292.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="022301.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22295">[ date ]</a>
+              <a href="thread.html#22295">[ thread ]</a>
+              <a href="subject.html#22295">[ subject ]</a>
+              <a href="author.html#22295">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

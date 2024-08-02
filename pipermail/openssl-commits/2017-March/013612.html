@@ -1,0 +1,749 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1489500526.041194.14887.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013609.html">
+   <LINK REL="Next"  HREF="013613.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1489500526.041194.14887.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Tue Mar 14 14:08:46 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013609.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="013613.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13612">[ date ]</a>
+              <a href="thread.html#13612">[ thread ]</a>
+              <a href="subject.html#13612">[ subject ]</a>
+              <a href="author.html#13612">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ea1ecd9831cfe8de9dbeafdfec344b8c944c9b84 (commit)
+      from  4b5f7e7555340db28b285452cfd0cafe1854de2a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ea1ecd9831cfe8de9dbeafdfec344b8c944c9b84
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Tue Mar 14 13:48:54 2017 +0100
+
+    Port SRP tests to the new test framework
+    
+    Also add negative tests for password mismatch.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/README.ssltest.md         |   3 +
+ test/handshake_helper.c        |  52 +++++++++++++++
+ test/recipes/80-test_ssl_new.t |   4 +-
+ test/recipes/80-test_ssl_old.t |  28 +-------
+ test/ssl-tests/23-srp.conf     | 144 +++++++++++++++++++++++++++++++++++++++++
+ test/ssl-tests/23-srp.conf.in  | 103 +++++++++++++++++++++++++++++
+ test/ssl_test_ctx.c            |  16 +++++
+ test/ssl_test_ctx.h            |   6 ++
+ test/ssltest_old.c             |  89 -------------------------
+ 9 files changed, 330 insertions(+), 115 deletions(-)
+ create mode 100644 test/ssl-tests/23-srp.conf
+ create mode 100644 test/ssl-tests/23-srp.conf.in
+
+diff --git a/test/README.ssltest.md b/test/README.ssltest.md
+index 3d0fe91..a326967 100644
+--- a/test/README.ssltest.md
++++ b/test/README.ssltest.md
+@@ -179,6 +179,9 @@ client =&gt; {
+   protocols can be specified as a comma-separated list, and a callback with the
+   recommended behaviour will be installed automatically.
+ 
++* SRPUser, SRPPassword - SRP settings. For client, this is the SRP user to
++  connect as; for server, this is a known SRP user.
++
+ ### Default server and client configurations
+ 
+ The default server certificate and CA files are added to the configurations
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index 99b6ad1..30fd479 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -12,6 +12,9 @@
+ #include &lt;openssl/bio.h&gt;
+ #include &lt;openssl/x509_vfy.h&gt;
+ #include &lt;openssl/ssl.h&gt;
++#ifndef OPENSSL_NO_SRP
++#include &lt;openssl/srp.h&gt;
++#endif
+ 
+ #include &quot;handshake_helper.h&quot;
+ #include &quot;testutil.h&quot;
+@@ -52,6 +55,8 @@ typedef struct ctx_data_st {
+     size_t npn_protocols_len;
+     unsigned char *alpn_protocols;
+     size_t alpn_protocols_len;
++    char *srp_user;
++    char *srp_password;
+ } CTX_DATA;
+ 
+ /* |ctx_data| itself is stack-allocated. */
+@@ -61,6 +66,10 @@ static void ctx_data_free_data(CTX_DATA *ctx_data)
+     ctx_data-&gt;npn_protocols = NULL;
+     OPENSSL_free(ctx_data-&gt;alpn_protocols);
+     ctx_data-&gt;alpn_protocols = NULL;
++    OPENSSL_free(ctx_data-&gt;srp_user);
++    ctx_data-&gt;srp_user = NULL;
++    OPENSSL_free(ctx_data-&gt;srp_password);
++    ctx_data-&gt;srp_password = NULL;
+ }
+ 
+ static int ex_data_idx;
+@@ -405,6 +414,28 @@ static int server_alpn_cb(SSL *s, const unsigned char **out,
+         : SSL_TLSEXT_ERR_NOACK;
+ }
+ 
++#ifndef OPENSSL_NO_SRP
++static char *client_srp_cb(SSL *s, void *arg)
++{
++    CTX_DATA *ctx_data = (CTX_DATA*)(arg);
++    return OPENSSL_strdup(ctx_data-&gt;srp_password);
++}
++
++static int server_srp_cb(SSL *s, int *ad, void *arg)
++{
++    CTX_DATA *ctx_data = (CTX_DATA*)(arg);
++    if (strcmp(ctx_data-&gt;srp_user, SSL_get_srp_username(s)) != 0)
++        return SSL3_AL_FATAL;
++    if (SSL_set_srp_server_param_pw(s, ctx_data-&gt;srp_user,
++                                    ctx_data-&gt;srp_password,
++                                    &quot;2048&quot; /* known group */) &lt; 0) {
++        *ad = SSL_AD_INTERNAL_ERROR;
++        return SSL3_AL_FATAL;
++    }
++    return SSL_ERROR_NONE;
++}
++#endif  /* !OPENSSL_NO_SRP */
++
+ /*
+  * Configure callbacks and other properties that can't be set directly
+  * in the server/client CONF.
+@@ -562,6 +593,27 @@ static void configure_handshake_ctx(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+         break;
+     }
+ #endif
++#ifndef OPENSSL_NO_SRP
++    if (extra-&gt;server.srp_user != NULL) {
++        SSL_CTX_set_srp_username_callback(server_ctx, server_srp_cb);
++        server_ctx_data-&gt;srp_user = OPENSSL_strdup(extra-&gt;server.srp_user);
++        server_ctx_data-&gt;srp_password = OPENSSL_strdup(extra-&gt;server.srp_password);
++        SSL_CTX_set_srp_cb_arg(server_ctx, server_ctx_data);
++    }
++    if (extra-&gt;server2.srp_user != NULL) {
++        TEST_check(server2_ctx != NULL);
++        SSL_CTX_set_srp_username_callback(server2_ctx, server_srp_cb);
++        server2_ctx_data-&gt;srp_user = OPENSSL_strdup(extra-&gt;server2.srp_user);
++        server2_ctx_data-&gt;srp_password = OPENSSL_strdup(extra-&gt;server2.srp_password);
++        SSL_CTX_set_srp_cb_arg(server2_ctx, server2_ctx_data);
++    }
++    if (extra-&gt;client.srp_user != NULL) {
++        TEST_check(SSL_CTX_set_srp_username(client_ctx, extra-&gt;client.srp_user));
++        SSL_CTX_set_srp_client_pwd_callback(client_ctx, client_srp_cb);
++        client_ctx_data-&gt;srp_password = OPENSSL_strdup(extra-&gt;client.srp_password);
++        SSL_CTX_set_srp_cb_arg(client_ctx, client_ctx_data);
++    }
++#endif  /* !OPENSSL_NO_SRP */
+ }
+ 
+ /* Configure per-SSL callbacks and other properties. */
+diff --git a/test/recipes/80-test_ssl_new.t b/test/recipes/80-test_ssl_new.t
+index 4173157..903dc91 100644
+--- a/test/recipes/80-test_ssl_new.t
++++ b/test/recipes/80-test_ssl_new.t
+@@ -29,7 +29,7 @@ map { s/\^// } @conf_files if $^O eq &quot;VMS&quot;;
+ 
+ # We hard-code the number of tests to double-check that the globbing above
+ # finds all files as expected.
+-plan tests =&gt; 22;  # = scalar @conf_srcs
++plan tests =&gt; 23;  # = scalar @conf_srcs
+ 
+ # Some test results depend on the configuration of enabled protocols. We only
+ # verify generated sources in the default configuration.
+@@ -90,6 +90,8 @@ my %skip = (
+   &quot;20-cert-select.conf&quot; =&gt; disabled(&quot;tls1_2&quot;) || $no_ec,
+   &quot;21-key-update.conf&quot; =&gt; disabled(&quot;tls1_3&quot;),
+   &quot;22-compression.conf&quot; =&gt; disabled(&quot;zlib&quot;) || $no_tls,
++  &quot;23-srp.conf&quot; =&gt; (disabled(&quot;tls1&quot;) &amp;&amp; disabled (&quot;tls1_1&quot;)
++                    &amp;&amp; disabled(&quot;tls1_2&quot;)) || disabled(&quot;srp&quot;),
+ );
+ 
+ foreach my $conf (@conf_files) {
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index ec09bb8..05cc794 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -20,10 +20,10 @@ setup(&quot;test_ssl&quot;);
+ 
+ $ENV{CTLOG_FILE} = srctop_file(&quot;test&quot;, &quot;ct&quot;, &quot;log_list.conf&quot;);
+ 
+-my ($no_rsa, $no_dsa, $no_dh, $no_ec, $no_srp, $no_psk,
++my ($no_rsa, $no_dsa, $no_dh, $no_ec, $no_psk,
+     $no_ssl3, $no_tls1, $no_tls1_1, $no_tls1_2, $no_tls1_3,
+     $no_dtls, $no_dtls1, $no_dtls1_2, $no_ct) =
+-    anydisabled qw/rsa dsa dh ec srp psk
++    anydisabled qw/rsa dsa dh ec psk
+                    ssl3 tls1 tls1_1 tls1_2 tls1_3
+                    dtls dtls1 dtls1_2 ct/;
+ my $no_anytls = alldisabled(available_protocols(&quot;tls&quot;));
+@@ -79,7 +79,7 @@ my $client_sess=&quot;client.ss&quot;;
+ # new format in ssl_test.c and add recipes to 80-test_ssl_new.t instead.
+ plan tests =&gt;
+     1				# For testss
+-    +6  			# For the first testssl
++    +5  			# For the first testssl
+     ;
+ 
+ subtest 'test_ss' =&gt; sub {
+@@ -568,28 +568,6 @@ sub testssl {
+ 	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-tls1&quot;, &quot;-custom_ext&quot;, &quot;-serverinfo_file&quot;, $serverinfo, &quot;-serverinfo_sct&quot;, &quot;-serverinfo_tack&quot;])));
+ 	}
+     };
+-
+-    subtest 'SRP tests' =&gt; sub {
+-
+-	plan tests =&gt; 4;
+-
+-      SKIP: {
+-	  skip &quot;skipping SRP tests&quot;, 4
+-	      if $no_srp || alldisabled(grep !/^ssl3/, available_protocols(&quot;tls&quot;));
+-
+-	  ok(run(test([@ssltest, &quot;-tls1&quot;, &quot;-cipher&quot;, &quot;SRP&quot;, &quot;-srpuser&quot;, &quot;test&quot;, &quot;-srppass&quot;, &quot;abc123&quot;])),
+-	     'test tls1 with SRP');
+-
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-tls1&quot;, &quot;-cipher&quot;, &quot;SRP&quot;, &quot;-srpuser&quot;, &quot;test&quot;, &quot;-srppass&quot;, &quot;abc123&quot;])),
+-	     'test tls1 with SRP via BIO pair');
+-
+-	  ok(run(test([@ssltest, &quot;-tls1&quot;, &quot;-cipher&quot;, &quot;aSRP&quot;, &quot;-srpuser&quot;, &quot;test&quot;, &quot;-srppass&quot;, &quot;abc123&quot;])),
+-	     'test tls1 with SRP auth');
+-
+-	  ok(run(test([@ssltest, &quot;-bio_pair&quot;, &quot;-tls1&quot;, &quot;-cipher&quot;, &quot;aSRP&quot;, &quot;-srpuser&quot;, &quot;test&quot;, &quot;-srppass&quot;, &quot;abc123&quot;])),
+-	     'test tls1 with SRP auth via BIO pair');
+-	}
+-    };
+ }
+ 
+ unlink $CAkey;
+diff --git a/test/ssl-tests/23-srp.conf b/test/ssl-tests/23-srp.conf
+new file mode 100644
+index 0000000..6ae49e6
+--- /dev/null
++++ b/test/ssl-tests/23-srp.conf
+@@ -0,0 +1,144 @@
++# Generated with generate_ssl_tests.pl
++
++num_tests = 4
++
++test-0 = 0-srp
++test-1 = 1-srp-bad-password
++test-2 = 2-srp-auth
++test-3 = 3-srp-auth-bad-password
++# ===========================================================
++
++[0-srp]
++ssl_conf = 0-srp-ssl
++
++[0-srp-ssl]
++server = 0-srp-server
++client = 0-srp-client
++
++[0-srp-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = SRP
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[0-srp-client]
++CipherString = SRP
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-0]
++ExpectedResult = Success
++server = 0-srp-server-extra
++client = 0-srp-client-extra
++
++[0-srp-server-extra]
++SRPPassword = password
++SRPUser = user
++
++[0-srp-client-extra]
++SRPPassword = password
++SRPUser = user
++
++
++# ===========================================================
++
++[1-srp-bad-password]
++ssl_conf = 1-srp-bad-password-ssl
++
++[1-srp-bad-password-ssl]
++server = 1-srp-bad-password-server
++client = 1-srp-bad-password-client
++
++[1-srp-bad-password-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = SRP
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[1-srp-bad-password-client]
++CipherString = SRP
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-1]
++ExpectedResult = ServerFail
++server = 1-srp-bad-password-server-extra
++client = 1-srp-bad-password-client-extra
++
++[1-srp-bad-password-server-extra]
++SRPPassword = password
++SRPUser = user
++
++[1-srp-bad-password-client-extra]
++SRPPassword = passw0rd
++SRPUser = user
++
++
++# ===========================================================
++
++[2-srp-auth]
++ssl_conf = 2-srp-auth-ssl
++
++[2-srp-auth-ssl]
++server = 2-srp-auth-server
++client = 2-srp-auth-client
++
++[2-srp-auth-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = aSRP
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[2-srp-auth-client]
++CipherString = aSRP
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-2]
++ExpectedResult = Success
++server = 2-srp-auth-server-extra
++client = 2-srp-auth-client-extra
++
++[2-srp-auth-server-extra]
++SRPPassword = password
++SRPUser = user
++
++[2-srp-auth-client-extra]
++SRPPassword = password
++SRPUser = user
++
++
++# ===========================================================
++
++[3-srp-auth-bad-password]
++ssl_conf = 3-srp-auth-bad-password-ssl
++
++[3-srp-auth-bad-password-ssl]
++server = 3-srp-auth-bad-password-server
++client = 3-srp-auth-bad-password-client
++
++[3-srp-auth-bad-password-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = aSRP
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++[3-srp-auth-bad-password-client]
++CipherString = aSRP
++MaxProtocol = TLSv1.2
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++[test-3]
++ExpectedResult = ServerFail
++server = 3-srp-auth-bad-password-server-extra
++client = 3-srp-auth-bad-password-client-extra
++
++[3-srp-auth-bad-password-server-extra]
++SRPPassword = password
++SRPUser = user
++
++[3-srp-auth-bad-password-client-extra]
++SRPPassword = passw0rd
++SRPUser = user
++
++
+diff --git a/test/ssl-tests/23-srp.conf.in b/test/ssl-tests/23-srp.conf.in
+new file mode 100644
+index 0000000..b7601fc
+--- /dev/null
++++ b/test/ssl-tests/23-srp.conf.in
+@@ -0,0 +1,103 @@
++# -*- mode: perl; -*-
++# Copyright 2017 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++use strict;
++use warnings;
++
++package ssltests;
++
++# SRP is only supported up to TLSv1.2
++
++our @tests = (
++    {
++	name =&gt; &quot;srp&quot;,
++	server =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;SRP&quot;,
++	    extra =&gt; {
++	       	&quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++        },
++	client =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;SRP&quot;,
++	    &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++	    extra =&gt; {
++	        &quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++	},
++	test =&gt; {
++	    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;
++	},
++    },
++    {
++	name =&gt; &quot;srp-bad-password&quot;,
++	server =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;SRP&quot;,
++	    extra =&gt; {
++	       	&quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++        },
++	client =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;SRP&quot;,
++	    &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++	    extra =&gt; {
++	        &quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;passw0rd&quot;,
++	    },
++	},
++	test =&gt; {
++	    # Server fails first with bad client Finished.
++	    &quot;ExpectedResult&quot; =&gt; &quot;ServerFail&quot;
++	},
++    },
++    {
++	name =&gt; &quot;srp-auth&quot;,
++	server =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;aSRP&quot;,
++	    extra =&gt; {
++	       	&quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++        },
++	client =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;aSRP&quot;,
++	    &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++	    extra =&gt; {
++	        &quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++	},
++	test =&gt; {
++	    &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;
++	},
++    },
++    {
++	name =&gt; &quot;srp-auth-bad-password&quot;,
++	server =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;aSRP&quot;,
++	    extra =&gt; {
++	       	&quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;password&quot;,
++	    },
++        },
++	client =&gt; {
++	    &quot;CipherString&quot; =&gt; &quot;aSRP&quot;,
++	    &quot;MaxProtocol&quot; =&gt; &quot;TLSv1.2&quot;,
++	    extra =&gt; {
++	        &quot;SRPUser&quot; =&gt; &quot;user&quot;,
++		&quot;SRPPassword&quot; =&gt; &quot;passw0rd&quot;,
++	    },
++	},
++	test =&gt; {
++	    # Server fails first with bad client Finished.
++	    &quot;ExpectedResult&quot; =&gt; &quot;ServerFail&quot;
++	},
++    },
++);
+\ No newline at end of file
+diff --git a/test/ssl_test_ctx.c b/test/ssl_test_ctx.c
+index d668f51..3e3be9e 100644
+--- a/test/ssl_test_ctx.c
++++ b/test/ssl_test_ctx.c
+@@ -322,6 +322,12 @@ IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, alpn_protocols)
+ IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, alpn_protocols)
+ IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CTX, test, expected_alpn_protocol)
+ 
++/* SRP options */
++IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, srp_user)
++IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, srp_user)
++IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_CLIENT_CONF, client, srp_password)
++IMPLEMENT_SSL_TEST_STRING_OPTION(SSL_TEST_SERVER_CONF, server, srp_password)
++
+ /* Handshake mode */
+ 
+ static const test_enum ssl_handshake_modes[] = {
+@@ -576,6 +582,8 @@ static const ssl_test_client_option ssl_test_client_options[] = {
+     { &quot;ALPNProtocols&quot;, &amp;parse_client_alpn_protocols },
+     { &quot;CTValidation&quot;, &amp;parse_ct_validation },
+     { &quot;RenegotiateCiphers&quot;, &amp;parse_client_reneg_ciphers},
++    { &quot;SRPUser&quot;, &amp;parse_client_srp_user },
++    { &quot;SRPPassword&quot;, &amp;parse_client_srp_password },
+ };
+ 
+ /* Nested server options. */
+@@ -590,6 +598,8 @@ static const ssl_test_server_option ssl_test_server_options[] = {
+     { &quot;ALPNProtocols&quot;, &amp;parse_server_alpn_protocols },
+     { &quot;BrokenSessionTicket&quot;, &amp;parse_server_broken_session_ticket },
+     { &quot;CertStatus&quot;, &amp;parse_certstatus },
++    { &quot;SRPUser&quot;, &amp;parse_server_srp_user },
++    { &quot;SRPPassword&quot;, &amp;parse_server_srp_password },
+ };
+ 
+ /*
+@@ -615,6 +625,12 @@ static void ssl_test_extra_conf_free_data(SSL_TEST_EXTRA_CONF *conf)
+     OPENSSL_free(conf-&gt;server.alpn_protocols);
+     OPENSSL_free(conf-&gt;server2.alpn_protocols);
+     OPENSSL_free(conf-&gt;client.reneg_ciphers);
++    OPENSSL_free(conf-&gt;server.srp_user);
++    OPENSSL_free(conf-&gt;server.srp_password);
++    OPENSSL_free(conf-&gt;server2.srp_user);
++    OPENSSL_free(conf-&gt;server2.srp_password);
++    OPENSSL_free(conf-&gt;client.srp_user);
++    OPENSSL_free(conf-&gt;client.srp_password);
+ }
+ 
+ static void ssl_test_ctx_free_extra_data(SSL_TEST_CTX *ctx)
+diff --git a/test/ssl_test_ctx.h b/test/ssl_test_ctx.h
+index 300a557..3d8f72b 100644
+--- a/test/ssl_test_ctx.h
++++ b/test/ssl_test_ctx.h
+@@ -81,6 +81,7 @@ typedef enum {
+     SSL_TEST_CERT_STATUS_GOOD_RESPONSE,
+     SSL_TEST_CERT_STATUS_BAD_RESPONSE
+ } ssl_cert_status_t;
++
+ /*
+  * Server/client settings that aren't supported by the SSL CONF library,
+  * such as callbacks.
+@@ -96,6 +97,8 @@ typedef struct {
+     ssl_ct_validation_t ct_validation;
+     /* Ciphersuites to set on a renegotiation */
+     char *reneg_ciphers;
++    char *srp_user;
++    char *srp_password;
+ } SSL_TEST_CLIENT_CONF;
+ 
+ typedef struct {
+@@ -108,6 +111,9 @@ typedef struct {
+     int broken_session_ticket;
+     /* Should we send a CertStatus message? */
+     ssl_cert_status_t cert_status;
++    /* An SRP user known to the server. */
++    char *srp_user;
++    char *srp_password;
+ } SSL_TEST_SERVER_CONF;
+ 
+ typedef struct {
+diff --git a/test/ssltest_old.c b/test/ssltest_old.c
+index 055014b..00fb1a8 100644
+--- a/test/ssltest_old.c
++++ b/test/ssltest_old.c
+@@ -84,9 +84,6 @@
+ #ifndef OPENSSL_NO_DH
+ # include &lt;openssl/dh.h&gt;
+ #endif
+-#ifndef OPENSSL_NO_SRP
+-# include &lt;openssl/srp.h&gt;
+-#endif
+ #include &lt;openssl/bn.h&gt;
+ #ifndef OPENSSL_NO_CT
+ # include &lt;openssl/ct.h&gt;
+@@ -141,45 +138,6 @@ static unsigned int psk_server_callback(SSL *ssl, const char *identity,
+                                         unsigned int max_psk_len);
+ #endif
+ 
+-#ifndef OPENSSL_NO_SRP
+-/* SRP client */
+-/* This is a context that we pass to all callbacks */
+-typedef struct srp_client_arg_st {
+-    char *srppassin;
+-    char *srplogin;
+-} SRP_CLIENT_ARG;
+-
+-# define PWD_STRLEN 1024
+-
+-static char *ssl_give_srp_client_pwd_cb(SSL *s, void *arg)
+-{
+-    SRP_CLIENT_ARG *srp_client_arg = (SRP_CLIENT_ARG *)arg;
+-    return OPENSSL_strdup((char *)srp_client_arg-&gt;srppassin);
+-}
+-
+-/* SRP server */
+-/* This is a context that we pass to SRP server callbacks */
+-typedef struct srp_server_arg_st {
+-    char *expected_user;
+-    char *pass;
+-} SRP_SERVER_ARG;
+-
+-static int ssl_srp_server_param_cb(SSL *s, int *ad, void *arg)
+-{
+-    SRP_SERVER_ARG *p = (SRP_SERVER_ARG *)arg;
+-
+-    if (strcmp(p-&gt;expected_user, SSL_get_srp_username(s)) != 0) {
+-        fprintf(stderr, &quot;User %s doesn't exist\n&quot;, SSL_get_srp_username(s));
+-        return SSL3_AL_FATAL;
+-    }
+-    if (SSL_set_srp_server_param_pw(s, p-&gt;expected_user, p-&gt;pass, &quot;1024&quot;) &lt; 0) {
+-        *ad = SSL_AD_INTERNAL_ERROR;
+-        return SSL3_AL_FATAL;
+-    }
+-    return SSL_ERROR_NONE;
+-}
+-#endif
+-
+ static BIO *bio_err = NULL;
+ static BIO *bio_stdout = NULL;
+ 
+@@ -722,10 +680,6 @@ static void sv_usage(void)
+ #ifndef OPENSSL_NO_PSK
+     fprintf(stderr, &quot; -psk arg      - PSK in hex (without 0x)\n&quot;);
+ #endif
+-#ifndef OPENSSL_NO_SRP
+-    fprintf(stderr, &quot; -srpuser user - SRP username to use\n&quot;);
+-    fprintf(stderr, &quot; -srppass arg  - password for 'user'\n&quot;);
+-#endif
+ #ifndef OPENSSL_NO_SSL3
+     fprintf(stderr, &quot; -ssl3         - use SSLv3\n&quot;);
+ #endif
+@@ -971,12 +925,6 @@ int main(int argc, char *argv[])
+     DH *dh;
+     int dhe512 = 0, dhe1024dsa = 0;
+ #endif
+-#ifndef OPENSSL_NO_SRP
+-    /* client */
+-    SRP_CLIENT_ARG srp_client_arg = { NULL, NULL };
+-    /* server */
+-    SRP_SERVER_ARG srp_server_arg = { NULL, NULL };
+-#endif
+     int no_dhe = 0;
+     int no_psk = 0;
+     int print_time = 0;
+@@ -1098,20 +1046,6 @@ int main(int argc, char *argv[])
+             no_psk = 1;
+ #endif
+         }
+-#ifndef OPENSSL_NO_SRP
+-        else if (strcmp(*argv, &quot;-srpuser&quot;) == 0) {
+-            if (--argc &lt; 1)
+-                goto bad;
+-            srp_server_arg.expected_user = srp_client_arg.srplogin =
+-                *(++argv);
+-            min_version = TLS1_VERSION;
+-        } else if (strcmp(*argv, &quot;-srppass&quot;) == 0) {
+-            if (--argc &lt; 1)
+-                goto bad;
+-            srp_server_arg.pass = srp_client_arg.srppassin = *(++argv);
+-            min_version = TLS1_VERSION;
+-        }
+-#endif
+         else if (strcmp(*argv, &quot;-tls1_2&quot;) == 0) {
+             tls1_2 = 1;
+         } else if (strcmp(*argv, &quot;-tls1&quot;) == 0) {
+@@ -1605,29 +1539,6 @@ int main(int argc, char *argv[])
+         }
+ #endif
+     }
+-#ifndef OPENSSL_NO_SRP
+-    if (srp_client_arg.srplogin) {
+-        if (!SSL_CTX_set_srp_username(c_ctx, srp_client_arg.srplogin)) {
+-            BIO_printf(bio_err, &quot;Unable to set SRP username\n&quot;);
+-            goto end;
+-        }
+-        SSL_CTX_set_srp_cb_arg(c_ctx, &amp;srp_client_arg);
+-        SSL_CTX_set_srp_client_pwd_callback(c_ctx,
+-                                            ssl_give_srp_client_pwd_cb);
+-        /*
+-         * SSL_CTX_set_srp_strength(c_ctx, srp_client_arg.strength);
+-         */
+-    }
+-
+-    if (srp_server_arg.expected_user != NULL) {
+-        SSL_CTX_set_verify(s_ctx, SSL_VERIFY_NONE, verify_callback);
+-        SSL_CTX_set_verify(s_ctx2, SSL_VERIFY_NONE, verify_callback);
+-        SSL_CTX_set_srp_cb_arg(s_ctx, &amp;srp_server_arg);
+-        SSL_CTX_set_srp_cb_arg(s_ctx2, &amp;srp_server_arg);
+-        SSL_CTX_set_srp_username_callback(s_ctx, ssl_srp_server_param_cb);
+-        SSL_CTX_set_srp_username_callback(s_ctx2, ssl_srp_server_param_cb);
+-    }
+-#endif
+ 
+ #ifndef OPENSSL_NO_NEXTPROTONEG
+     if (npn_client) {
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013609.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="013613.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13612">[ date ]</a>
+              <a href="thread.html#13612">[ thread ]</a>
+              <a href="subject.html#13612">[ subject ]</a>
+              <a href="author.html#13612">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

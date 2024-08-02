@@ -1,0 +1,156 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1581686311.748396.15526.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027521.html">
+   <LINK REL="Next"  HREF="027525.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1581686311.748396.15526.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Feb 14 13:18:31 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027521.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027525.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27522">[ date ]</a>
+              <a href="thread.html#27522">[ thread ]</a>
+              <a href="subject.html#27522">[ subject ]</a>
+              <a href="author.html#27522">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cdb16632636c4a1a439449d110f94cad15d2e9fe (commit)
+      from  3e686afd04a99e64b70a7c2ef488459ed10ad392 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cdb16632636c4a1a439449d110f94cad15d2e9fe
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 12 18:58:15 2020 +0100
+
+    Adapt i2d_PUBKEY for provider only keys
+    
+    It uses EVP_PKEY serializers to get the desired results.
+    
+    Reviewed-by: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11078">https://github.com/openssl/openssl/pull/11078</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/x509/x_pubkey.c | 53 +++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index f74c156652..f79a57cb7d 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -253,21 +253,52 @@ EVP_PKEY *d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length)
+ 
+ int i2d_PUBKEY(const EVP_PKEY *a, unsigned char **pp)
+ {
+-    X509_PUBKEY *xpk = NULL;
+     int ret = -1;
+ 
+     if (a == NULL)
+         return 0;
+-    if ((xpk = X509_PUBKEY_new()) == NULL)
+-        return -1;
+-    if (a-&gt;ameth != NULL &amp;&amp; a-&gt;ameth-&gt;pub_encode != NULL
+-        &amp;&amp; !a-&gt;ameth-&gt;pub_encode(xpk, a))
+-        goto error;
+-    xpk-&gt;pkey = (EVP_PKEY *)a;
+-    ret = i2d_X509_PUBKEY(xpk, pp);
+-    xpk-&gt;pkey = NULL;
+- error:
+-    X509_PUBKEY_free(xpk);
++    if (a-&gt;ameth != NULL) {
++        X509_PUBKEY *xpk = NULL;
++
++        if ((xpk = X509_PUBKEY_new()) == NULL)
++            return -1;
++
++        /* pub_encode() only encode parameters, not the key itself */
++        if (a-&gt;ameth-&gt;pub_encode != NULL &amp;&amp; a-&gt;ameth-&gt;pub_encode(xpk, a)) {
++            xpk-&gt;pkey = (EVP_PKEY *)a;
++            ret = i2d_X509_PUBKEY(xpk, pp);
++            xpk-&gt;pkey = NULL;
++        }
++        X509_PUBKEY_free(xpk);
++    } else if (a-&gt;pkeys[0].keymgmt != NULL) {
++        const char *serprop = OSSL_SERIALIZER_PUBKEY_TO_DER_PQ;
++        OSSL_SERIALIZER_CTX *ctx =
++            OSSL_SERIALIZER_CTX_new_by_EVP_PKEY(a, serprop);
++        BIO *out = BIO_new(BIO_s_mem());
++        BUF_MEM *buf = NULL;
++
++        if (ctx != NULL
++            &amp;&amp; out != NULL
++            &amp;&amp; OSSL_SERIALIZER_CTX_get_serializer(ctx) != NULL
++            &amp;&amp; OSSL_SERIALIZER_to_bio(ctx, out)
++            &amp;&amp; BIO_get_mem_ptr(out, &amp;buf) &gt; 0) {
++            ret = buf-&gt;length;
++
++            if (pp != NULL) {
++                if (*pp == NULL) {
++                    *pp = (unsigned char *)buf-&gt;data;
++                    buf-&gt;length = 0;
++                    buf-&gt;data = NULL;
++                } else {
++                    memcpy(*pp, buf-&gt;data, ret);
++                    *pp += ret;
++                }
++            }
++        }
++        BIO_free(out);
++        OSSL_SERIALIZER_CTX_free(ctx);
++    }
++
+     return ret;
+ }
+ 
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027521.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027525.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27522">[ date ]</a>
+              <a href="thread.html#27522">[ thread ]</a>
+              <a href="subject.html#27522">[ subject ]</a>
+              <a href="author.html#27522">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

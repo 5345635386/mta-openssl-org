@@ -1,0 +1,710 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471338123.902717.10409.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009717.html">
+   <LINK REL="Next"  HREF="009720.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1471338123.902717.10409.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Tue Aug 16 09:02:03 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009717.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009720.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9718">[ date ]</a>
+              <a href="thread.html#9718">[ thread ]</a>
+              <a href="subject.html#9718">[ subject ]</a>
+              <a href="author.html#9718">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e0421bd8b203b8c4e460c99740b5684600a503da (commit)
+      from  ffb261ff192b1af83726305aee17d025ff8fe352 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e0421bd8b203b8c4e460c99740b5684600a503da
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Thu Aug 11 20:51:57 2016 +0200
+
+    SSL tests: send some application data
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/handshake_helper.c     | 284 +++++++++++++++++++++++++++++++++++---------
+ test/ssl_test_ctx.c         |  75 +++++++-----
+ test/ssl_test_ctx.h         |   5 +
+ test/ssl_test_ctx_test.c    |   6 +
+ test/ssl_test_ctx_test.conf |   1 +
+ 5 files changed, 284 insertions(+), 87 deletions(-)
+
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index ee87512..07615ad 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -39,14 +39,14 @@ void HANDSHAKE_RESULT_free(HANDSHAKE_RESULT *result)
+  * from the SSL object directly, we use the info callback and stash
+  * the result in ex_data.
+  */
+-typedef struct handshake_ex_data {
++typedef struct handshake_ex_data_st {
+     int alert_sent;
+     int alert_received;
+     int session_ticket_do_not_call;
+     ssl_servername_t servername;
+ } HANDSHAKE_EX_DATA;
+ 
+-typedef struct ctx_data {
++typedef struct ctx_data_st {
+     unsigned char *npn_protocols;
+     size_t npn_protocols_len;
+     unsigned char *alpn_protocols;
+@@ -401,13 +401,132 @@ static void configure_handshake_ssl(SSL *server, SSL *client,
+                                  ssl_servername_name(extra-&gt;client.servername));
+ }
+ 
+-
++/* The status for each connection phase. */
+ typedef enum {
+     PEER_SUCCESS,
+     PEER_RETRY,
+     PEER_ERROR
+ } peer_status_t;
+ 
++/* An SSL object and associated read-write buffers. */
++typedef struct peer_st {
++    SSL *ssl;
++    /* Buffer lengths are int to match the SSL read/write API. */
++    unsigned char *write_buf;
++    int write_buf_len;
++    unsigned char *read_buf;
++    int read_buf_len;
++    int bytes_to_write;
++    int bytes_to_read;
++    peer_status_t status;
++} PEER;
++
++static void create_peer(PEER *peer, SSL_CTX *ctx)
++{
++    static const int peer_buffer_size = 64 * 1024;
++
++    peer-&gt;ssl = SSL_new(ctx);
++    TEST_check(peer-&gt;ssl != NULL);
++    peer-&gt;write_buf = OPENSSL_zalloc(peer_buffer_size);
++    TEST_check(peer-&gt;write_buf != NULL);
++    peer-&gt;read_buf = OPENSSL_zalloc(peer_buffer_size);
++    TEST_check(peer-&gt;read_buf != NULL);
++    peer-&gt;write_buf_len = peer-&gt;read_buf_len = peer_buffer_size;
++}
++
++static void peer_free_data(PEER *peer)
++{
++    SSL_free(peer-&gt;ssl);
++    OPENSSL_free(peer-&gt;write_buf);
++    OPENSSL_free(peer-&gt;read_buf);
++}
++
++/*
++ * Note that we could do the handshake transparently under an SSL_write,
++ * but separating the steps is more helpful for debugging test failures.
++ */
++static void do_handshake_step(PEER *peer)
++{
++    int ret;
++
++    TEST_check(peer-&gt;status == PEER_RETRY);
++    ret = SSL_do_handshake(peer-&gt;ssl);
++
++    if (ret == 1) {
++        peer-&gt;status = PEER_SUCCESS;
++    } else if (ret == 0) {
++        peer-&gt;status = PEER_ERROR;
++    } else {
++        int error = SSL_get_error(peer-&gt;ssl, ret);
++        /* Memory bios should never block with SSL_ERROR_WANT_WRITE. */
++        if (error != SSL_ERROR_WANT_READ)
++            peer-&gt;status = PEER_ERROR;
++    }
++}
++
++/*-
++ * Send/receive some application data. The read-write sequence is
++ * Peer A: (R) W - first read will yield no data
++ * Peer B:  R  W
++ * ...
++ * Peer A:  R  W
++ * Peer B:  R  W
++ * Peer A:  R
++ */
++static void do_app_data_step(PEER *peer)
++{
++    int ret = 1, write_bytes;
++
++    TEST_check(peer-&gt;status == PEER_RETRY);
++
++    /* We read everything available... */
++    while (ret &gt; 0 &amp;&amp; peer-&gt;bytes_to_read) {
++        ret = SSL_read(peer-&gt;ssl, peer-&gt;read_buf, peer-&gt;read_buf_len);
++        if (ret &gt; 0) {
++            TEST_check(ret &lt;= peer-&gt;bytes_to_read);
++            peer-&gt;bytes_to_read -= ret;
++        } else if (ret == 0) {
++            peer-&gt;status = PEER_ERROR;
++            return;
++        } else {
++            int error = SSL_get_error(peer-&gt;ssl, ret);
++            if (error != SSL_ERROR_WANT_READ) {
++                peer-&gt;status = PEER_ERROR;
++                return;
++            } /* Else continue with write. */
++        }
++    }
++
++    /* ... but we only write one write-buffer-full of data. */
++    write_bytes = peer-&gt;bytes_to_write &lt; peer-&gt;write_buf_len ? peer-&gt;bytes_to_write :
++        peer-&gt;write_buf_len;
++    if (write_bytes) {
++        ret = SSL_write(peer-&gt;ssl, peer-&gt;write_buf, write_bytes);
++        if (ret &gt; 0) {
++            /* SSL_write will only succeed with a complete write. */
++            TEST_check(ret == write_bytes);
++            peer-&gt;bytes_to_write -= ret;
++        } else {
++            /*
++             * We should perhaps check for SSL_ERROR_WANT_READ/WRITE here
++             * but this doesn't yet occur with current app data sizes.
++             */
++            peer-&gt;status = PEER_ERROR;
++            return;
++        }
++    }
++
++    /*
++     * We could simply finish when there was nothing to read, and we have
++     * nothing left to write. But keeping track of the expected number of bytes
++     * to read gives us somewhat better guarantees that all data sent is in fact
++     * received.
++     */
++    if (!peer-&gt;bytes_to_write &amp;&amp; !peer-&gt;bytes_to_read) {
++        peer-&gt;status = PEER_SUCCESS;
++    }
++}
++
+ /*
+  * RFC 5246 says:
+  *
+@@ -423,23 +542,58 @@ typedef enum {
+  * can compare sent and received close_notify alerts and get some test coverage
+  * for SSL_shutdown as a bonus.
+  */
+-static peer_status_t do_handshake_step(SSL *ssl, int shutdown)
++static void do_shutdown_step(PEER *peer)
+ {
+     int ret;
+ 
+-    ret = shutdown ? SSL_shutdown(ssl) : SSL_do_handshake(ssl);
++    TEST_check(peer-&gt;status == PEER_RETRY);
++    ret = SSL_shutdown(peer-&gt;ssl);
+ 
+     if (ret == 1) {
+-        return PEER_SUCCESS;
+-    } else if (ret == 0) {
+-        return shutdown ? PEER_RETRY : PEER_ERROR;
+-    } else {
+-        int error = SSL_get_error(ssl, ret);
++        peer-&gt;status = PEER_SUCCESS;
++    } else if (ret &lt; 0) { /* On 0, we retry. */
++        int error = SSL_get_error(peer-&gt;ssl, ret);
+         /* Memory bios should never block with SSL_ERROR_WANT_WRITE. */
+-        if (error == SSL_ERROR_WANT_READ)
+-            return PEER_RETRY;
+-        else
+-            return PEER_ERROR;
++        if (error != SSL_ERROR_WANT_READ)
++            peer-&gt;status = PEER_ERROR;
++    }
++}
++
++typedef enum {
++    HANDSHAKE,
++    APPLICATION_DATA,
++    SHUTDOWN,
++    CONNECTION_DONE
++} connect_phase_t;
++
++static connect_phase_t next_phase(connect_phase_t phase)
++{
++    switch (phase) {
++    case HANDSHAKE:
++        return APPLICATION_DATA;
++    case APPLICATION_DATA:
++        return SHUTDOWN;
++    case SHUTDOWN:
++        return CONNECTION_DONE;
++    default:
++        TEST_check(0); /* Should never call next_phase when done. */
++    }
++}
++
++static void do_connect_step(PEER *peer, connect_phase_t phase)
++{
++    switch (phase) {
++    case HANDSHAKE:
++        do_handshake_step(peer);
++        break;
++    case APPLICATION_DATA:
++        do_app_data_step(peer);
++        break;
++    case SHUTDOWN:
++        do_shutdown_step(peer);
++        break;
++    default:
++        TEST_check(0);
+     }
+ }
+ 
+@@ -502,6 +656,7 @@ static handshake_status_t handshake_status(peer_status_t last_status,
+              * TODO(emilia): we should be able to continue here (with some
+              * application data?) to ensure the first peer receives the
+              * alert / close_notify.
++             * (No tests currently exercise this branch.)
+              */
+             return client_spoke_last ? CLIENT_ERROR : SERVER_ERROR;
+         case PEER_RETRY:
+@@ -533,16 +688,16 @@ static char *dup_str(const unsigned char *in, size_t len)
+ 
+ static HANDSHAKE_RESULT *do_handshake_internal(
+     SSL_CTX *server_ctx, SSL_CTX *server2_ctx, SSL_CTX *client_ctx,
+-    const SSL_TEST_EXTRA_CONF *extra, SSL_SESSION *session_in,
+-    SSL_SESSION **session_out)
++    const SSL_TEST_EXTRA_CONF *extra, int app_data_size,
++    SSL_SESSION *session_in, SSL_SESSION **session_out)
+ {
+-    SSL *server, *client;
++    PEER server, client;
+     BIO *client_to_server, *server_to_client;
+     HANDSHAKE_EX_DATA server_ex_data, client_ex_data;
+     CTX_DATA client_ctx_data, server_ctx_data, server2_ctx_data;
+     HANDSHAKE_RESULT *ret = HANDSHAKE_RESULT_new();
+-    int client_turn = 1, shutdown = 0;
+-    peer_status_t client_status = PEER_RETRY, server_status = PEER_RETRY;
++    int client_turn = 1;
++    connect_phase_t phase = HANDSHAKE;
+     handshake_status_t status = HANDSHAKE_RETRY;
+     unsigned char* tick = NULL;
+     size_t tick_len = 0;
+@@ -554,20 +709,24 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     memset(&amp;server_ctx_data, 0, sizeof(server_ctx_data));
+     memset(&amp;server2_ctx_data, 0, sizeof(server2_ctx_data));
+     memset(&amp;client_ctx_data, 0, sizeof(client_ctx_data));
++    memset(&amp;server, 0, sizeof(server));
++    memset(&amp;client, 0, sizeof(client));
+ 
+     configure_handshake_ctx(server_ctx, server2_ctx, client_ctx, extra,
+                             &amp;server_ctx_data, &amp;server2_ctx_data, &amp;client_ctx_data);
+ 
+-    server = SSL_new(server_ctx);
+-    client = SSL_new(client_ctx);
+-    TEST_check(server != NULL);
+-    TEST_check(client != NULL);
++    /* Setup SSL and buffers; additional configuration happens below. */
++    create_peer(&amp;server, server_ctx);
++    create_peer(&amp;client, client_ctx);
+ 
+-    configure_handshake_ssl(server, client, extra);
++    server.bytes_to_write = client.bytes_to_read = app_data_size;
++    client.bytes_to_write = server.bytes_to_read = app_data_size;
++
++    configure_handshake_ssl(server.ssl, client.ssl, extra);
+     if (session_in != NULL) {
+         /* In case we're testing resumption without tickets. */
+         TEST_check(SSL_CTX_add_session(server_ctx, session_in));
+-        TEST_check(SSL_set_session(client, session_in));
++        TEST_check(SSL_set_session(client.ssl, session_in));
+     }
+ 
+     memset(&amp;server_ex_data, 0, sizeof(server_ex_data));
+@@ -578,31 +737,32 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     client_to_server = BIO_new(BIO_s_mem());
+     server_to_client = BIO_new(BIO_s_mem());
+ 
+-    TEST_check(client_to_server != NULL &amp;&amp; server_to_client != NULL);
++    TEST_check(client_to_server != NULL);
++    TEST_check(server_to_client != NULL);
+ 
+     /* Non-blocking bio. */
+     BIO_set_nbio(client_to_server, 1);
+     BIO_set_nbio(server_to_client, 1);
+ 
+-    SSL_set_connect_state(client);
+-    SSL_set_accept_state(server);
++    SSL_set_connect_state(client.ssl);
++    SSL_set_accept_state(server.ssl);
+ 
+     /* The bios are now owned by the SSL object. */
+-    SSL_set_bio(client, server_to_client, client_to_server);
++    SSL_set_bio(client.ssl, server_to_client, client_to_server);
+     TEST_check(BIO_up_ref(server_to_client) &gt; 0);
+     TEST_check(BIO_up_ref(client_to_server) &gt; 0);
+-    SSL_set_bio(server, client_to_server, server_to_client);
++    SSL_set_bio(server.ssl, client_to_server, server_to_client);
+ 
+     ex_data_idx = SSL_get_ex_new_index(0, &quot;ex data&quot;, NULL, NULL, NULL);
+     TEST_check(ex_data_idx &gt;= 0);
+ 
+-    TEST_check(SSL_set_ex_data(server, ex_data_idx,
+-                                   &amp;server_ex_data) == 1);
+-    TEST_check(SSL_set_ex_data(client, ex_data_idx,
+-                                   &amp;client_ex_data) == 1);
++    TEST_check(SSL_set_ex_data(server.ssl, ex_data_idx, &amp;server_ex_data) == 1);
++    TEST_check(SSL_set_ex_data(client.ssl, ex_data_idx, &amp;client_ex_data) == 1);
++
++    SSL_set_info_callback(server.ssl, &amp;info_cb);
++    SSL_set_info_callback(client.ssl, &amp;info_cb);
+ 
+-    SSL_set_info_callback(server, &amp;info_cb);
+-    SSL_set_info_callback(client, &amp;info_cb);
++    client.status = server.status = PEER_RETRY;
+ 
+     /*
+      * Half-duplex handshake loop.
+@@ -614,23 +774,29 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+      */
+     for(;;) {
+         if (client_turn) {
+-            client_status = do_handshake_step(client, shutdown);
+-            status = handshake_status(client_status, server_status,
++            do_connect_step(&amp;client, phase);
++            status = handshake_status(client.status, server.status,
+                                       1 /* client went last */);
+         } else {
+-            server_status = do_handshake_step(server, shutdown);
+-            status = handshake_status(server_status, client_status,
++            do_connect_step(&amp;server, phase);
++            status = handshake_status(server.status, client.status,
+                                       0 /* server went last */);
+         }
+ 
+         switch (status) {
+         case HANDSHAKE_SUCCESS:
+-            if (shutdown) {
++            phase = next_phase(phase);
++            if (phase == CONNECTION_DONE) {
+                 ret-&gt;result = SSL_TEST_SUCCESS;
+                 goto err;
+             } else {
+-                client_status = server_status = PEER_RETRY;
+-                shutdown = 1;
++                client.status = server.status = PEER_RETRY;
++                /*
++                 * For now, client starts each phase. Since each phase is
++                 * started separately, we can later control this more
++                 * precisely, for example, to test client-initiated and
++                 * server-initiated shutdown.
++                 */
+                 client_turn = 1;
+                 break;
+             }
+@@ -654,10 +820,10 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     ret-&gt;server_alert_received = client_ex_data.alert_received;
+     ret-&gt;client_alert_sent = client_ex_data.alert_sent;
+     ret-&gt;client_alert_received = server_ex_data.alert_received;
+-    ret-&gt;server_protocol = SSL_version(server);
+-    ret-&gt;client_protocol = SSL_version(client);
++    ret-&gt;server_protocol = SSL_version(server.ssl);
++    ret-&gt;client_protocol = SSL_version(client.ssl);
+     ret-&gt;servername = server_ex_data.servername;
+-    if ((sess = SSL_get0_session(client)) != NULL)
++    if ((sess = SSL_get0_session(client.ssl)) != NULL)
+         SSL_SESSION_get0_ticket(sess, &amp;tick, &amp;tick_len);
+     if (tick == NULL || tick_len == 0)
+         ret-&gt;session_ticket = SSL_TEST_SESSION_TICKET_NO;
+@@ -666,31 +832,31 @@ static HANDSHAKE_RESULT *do_handshake_internal(
+     ret-&gt;session_ticket_do_not_call = server_ex_data.session_ticket_do_not_call;
+ 
+ #ifndef OPENSSL_NO_NEXTPROTONEG
+-    SSL_get0_next_proto_negotiated(client, &amp;proto, &amp;proto_len);
++    SSL_get0_next_proto_negotiated(client.ssl, &amp;proto, &amp;proto_len);
+     ret-&gt;client_npn_negotiated = dup_str(proto, proto_len);
+ 
+-    SSL_get0_next_proto_negotiated(server, &amp;proto, &amp;proto_len);
++    SSL_get0_next_proto_negotiated(server.ssl, &amp;proto, &amp;proto_len);
+     ret-&gt;server_npn_negotiated = dup_str(proto, proto_len);
+ #endif
+ 
+-    SSL_get0_alpn_selected(client, &amp;proto, &amp;proto_len);
++    SSL_get0_alpn_selected(client.ssl, &amp;proto, &amp;proto_len);
+     ret-&gt;client_alpn_negotiated = dup_str(proto, proto_len);
+ 
+-    SSL_get0_alpn_selected(server, &amp;proto, &amp;proto_len);
++    SSL_get0_alpn_selected(server.ssl, &amp;proto, &amp;proto_len);
+     ret-&gt;server_alpn_negotiated = dup_str(proto, proto_len);
+ 
+-    ret-&gt;client_resumed = SSL_session_reused(client);
+-    ret-&gt;server_resumed = SSL_session_reused(server);
++    ret-&gt;client_resumed = SSL_session_reused(client.ssl);
++    ret-&gt;server_resumed = SSL_session_reused(server.ssl);
+ 
+     if (session_out != NULL)
+-        *session_out = SSL_get1_session(client);
++        *session_out = SSL_get1_session(client.ssl);
+ 
+     ctx_data_free_data(&amp;server_ctx_data);
+     ctx_data_free_data(&amp;server2_ctx_data);
+     ctx_data_free_data(&amp;client_ctx_data);
+ 
+-    SSL_free(server);
+-    SSL_free(client);
++    peer_free_data(&amp;server);
++    peer_free_data(&amp;client);
+     return ret;
+ }
+ 
+@@ -703,7 +869,8 @@ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+     SSL_SESSION *session = NULL;
+ 
+     result = do_handshake_internal(server_ctx, server2_ctx, client_ctx,
+-                                   &amp;test_ctx-&gt;extra, NULL, &amp;session);
++                                   &amp;test_ctx-&gt;extra, test_ctx-&gt;app_data_size,
++                                   NULL, &amp;session);
+     if (test_ctx-&gt;handshake_mode == SSL_TEST_HANDSHAKE_SIMPLE)
+         goto end;
+ 
+@@ -711,13 +878,14 @@ HANDSHAKE_RESULT *do_handshake(SSL_CTX *server_ctx, SSL_CTX *server2_ctx,
+ 
+     if (result-&gt;result != SSL_TEST_SUCCESS) {
+         result-&gt;result = SSL_TEST_FIRST_HANDSHAKE_FAILED;
+-        return result;
++        goto end;
+     }
+ 
+     HANDSHAKE_RESULT_free(result);
+     /* We don't support SNI on second handshake yet, so server2_ctx is NULL. */
+     result = do_handshake_internal(resume_server_ctx, NULL, resume_client_ctx,
+-                                   &amp;test_ctx-&gt;resume_extra, session, NULL);
++                                   &amp;test_ctx-&gt;resume_extra, test_ctx-&gt;app_data_size,
++                                   session, NULL);
+  end:
+     SSL_SESSION_free(session);
+     return result;
+diff --git a/test/ssl_test_ctx.c b/test/ssl_test_ctx.c
+index 3913e9f..8c953a3 100644
+--- a/test/ssl_test_ctx.c
++++ b/test/ssl_test_ctx.c
+@@ -16,6 +16,43 @@
+ #include &quot;ssl_test_ctx.h&quot;
+ #include &quot;testutil.h&quot;
+ 
++static const int default_app_data_size = 256;
++
++static int parse_boolean(const char *value, int *result)
++{
++    if (strcasecmp(value, &quot;Yes&quot;) == 0) {
++        *result = 1;
++        return 1;
++    }
++    else if (strcasecmp(value, &quot;No&quot;) == 0) {
++        *result = 0;
++        return 1;
++    }
++    return 0;
++}
++
++#define IMPLEMENT_SSL_TEST_BOOL_OPTION(struct_type, name, field)        \
++    static int parse_##name##_##field(struct_type *ctx, const char *value) \
++    {                                                                   \
++        return parse_boolean(value, &amp;ctx-&gt;field);                       \
++    }
++
++#define IMPLEMENT_SSL_TEST_STRING_OPTION(struct_type, name, field)      \
++    static int parse_##name##_##field(struct_type *ctx, const char *value) \
++    {                                                                   \
++        OPENSSL_free(ctx-&gt;field);                                       \
++        ctx-&gt;field = OPENSSL_strdup(value);                             \
++        TEST_check(ctx-&gt;field != NULL);                                 \
++        return 1;                                                       \
++    }
++
++#define IMPLEMENT_SSL_TEST_INT_OPTION(struct_type, name, field)        \
++    static int parse_##name##_##field(struct_type *ctx, const char *value) \
++    {                                                                   \
++        ctx-&gt;field = atoi(value);                                       \
++        return 1;                                                       \
++    }
++
+ /* True enums and other test configuration values that map to an int. */
+ typedef struct {
+     const char *name;
+@@ -133,7 +170,7 @@ const char *ssl_protocol_name(int protocol)
+ }
+ 
+ /***********************/
+-/* VerifyCallback. */
++/* VerifyCallback.     */
+ /***********************/
+ 
+ static const test_enum ssl_verify_callbacks[] = {
+@@ -282,15 +319,6 @@ const char *ssl_test_method_name(ssl_test_method_t method)
+     return enum_name(ssl_test_methods, OSSL_NELEM(ssl_test_methods), method);
+ }
+ 
+-#define IMPLEMENT_SSL_TEST_STRING_OPTION(struct_type, name, field)      \
+-    static int parse_##name##_##field(struct_type *ctx, const char *value) \
+-    {                                                                   \
+-        OPENSSL_free(ctx-&gt;field);                                       \
+-        ctx-&gt;field = OPENSSL_strdup(value);                             \
+-        TEST_check(ctx-&gt;field != NULL);                                 \
+-        return 1;                                                       \
+-    }
+-
+ /************************************/
+ /* NPN and ALPN options             */
+ /************************************/
+@@ -357,28 +385,15 @@ const char *ssl_ct_validation_name(ssl_ct_validation_t mode)
+                      mode);
+ }
+ 
+-static int parse_boolean(const char *value, int *result)
+-{
+-    if (strcasecmp(value, &quot;Yes&quot;) == 0) {
+-        *result = 1;
+-        return 1;
+-    }
+-    else if (strcasecmp(value, &quot;No&quot;) == 0) {
+-        *result = 0;
+-        return 1;
+-    }
+-    return 0;
+-}
+-
+-#define IMPLEMENT_SSL_TEST_BOOL_OPTION(struct_type, name, field)        \
+-    static int parse_##name##_##field(struct_type *ctx, const char *value) \
+-    {                                                                   \
+-        return parse_boolean(value, &amp;ctx-&gt;field);                       \
+-    }
+-
+ IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_CTX, test, resumption_expected)
+ IMPLEMENT_SSL_TEST_BOOL_OPTION(SSL_TEST_SERVER_CONF, server, broken_session_ticket)
+ 
++/***********************/
++/* Applicationdata     */
++/***********************/
++
++IMPLEMENT_SSL_TEST_INT_OPTION(SSL_TEST_CTX, test, app_data_size)
++
+ /*************************************************************/
+ /* Known test options and their corresponding parse methods. */
+ /*************************************************************/
+@@ -401,6 +416,7 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
+     { &quot;ExpectedALPNProtocol&quot;, &amp;parse_test_expected_alpn_protocol },
+     { &quot;HandshakeMode&quot;, &amp;parse_handshake_mode },
+     { &quot;ResumptionExpected&quot;, &amp;parse_test_resumption_expected },
++    { &quot;ApplicationData&quot;, &amp;parse_test_app_data_size },
+ };
+ 
+ /* Nested client options. */
+@@ -439,6 +455,7 @@ SSL_TEST_CTX *SSL_TEST_CTX_new()
+     SSL_TEST_CTX *ret;
+     ret = OPENSSL_zalloc(sizeof(*ret));
+     TEST_check(ret != NULL);
++    ret-&gt;app_data_size = default_app_data_size;
+     return ret;
+ }
+ 
+diff --git a/test/ssl_test_ctx.h b/test/ssl_test_ctx.h
+index 916b31a..1074f8e 100644
+--- a/test/ssl_test_ctx.h
++++ b/test/ssl_test_ctx.h
+@@ -104,6 +104,11 @@ typedef struct {
+     ssl_test_method_t method;
+     /* Whether to test a resumed/renegotiated handshake. */
+     ssl_handshake_mode_t handshake_mode;
++    /*
++     * How much application data to exchange (default is 256 bytes).
++     * Both peers will send |app_data_size| bytes interleaved.
++     */
++    int app_data_size;
+ 
+     /*
+      * Extra server/client configurations. Per-handshake.
+diff --git a/test/ssl_test_ctx_test.c b/test/ssl_test_ctx_test.c
+index 60bd573..f110bd1 100644
+--- a/test/ssl_test_ctx_test.c
++++ b/test/ssl_test_ctx_test.c
+@@ -109,6 +109,11 @@ static int SSL_TEST_CTX_equal(SSL_TEST_CTX *ctx, SSL_TEST_CTX *ctx2)
+                 ssl_handshake_mode_name(ctx2-&gt;handshake_mode));
+         return 0;
+     }
++    if (ctx-&gt;app_data_size != ctx2-&gt;app_data_size) {
++        fprintf(stderr, &quot;ApplicationData mismatch: %d vs %d.\n&quot;,
++                ctx-&gt;app_data_size, ctx2-&gt;app_data_size);
++        return 0;
++    }
+ 
+     if (!SSL_TEST_EXTRA_CONF_equal(&amp;ctx-&gt;extra, &amp;ctx2-&gt;extra)) {
+         fprintf(stderr, &quot;Extra conf mismatch.\n&quot;);
+@@ -240,6 +245,7 @@ static int test_good_configuration()
+     fixture.test_section = &quot;ssltest_good&quot;;
+     fixture.expected_ctx-&gt;method = SSL_TEST_METHOD_DTLS;
+     fixture.expected_ctx-&gt;handshake_mode = SSL_TEST_HANDSHAKE_RESUME;
++    fixture.expected_ctx-&gt;app_data_size = 1024;
+ 
+     fixture.expected_ctx-&gt;expected_result = SSL_TEST_SERVER_FAIL;
+     fixture.expected_ctx-&gt;expected_client_alert = SSL_AD_UNKNOWN_CA;
+diff --git a/test/ssl_test_ctx_test.conf b/test/ssl_test_ctx_test.conf
+index 3c46d96..d1dbd22 100644
+--- a/test/ssl_test_ctx_test.conf
++++ b/test/ssl_test_ctx_test.conf
+@@ -8,6 +8,7 @@ resume-client = ssltest_good_resume_client_extra
+ 
+ Method = DTLS
+ HandshakeMode = Resume
++ApplicationData = 1024
+ 
+ ExpectedResult = ServerFail
+ ExpectedClientAlert = UnknownCA
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009717.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009720.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9718">[ date ]</a>
+              <a href="thread.html#9718">[ thread ]</a>
+              <a href="subject.html#9718">[ subject ]</a>
+              <a href="author.html#9718">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

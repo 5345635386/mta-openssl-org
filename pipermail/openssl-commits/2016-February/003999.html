@@ -1,0 +1,393 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1455310834.688989.22617.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003979.html">
+   <LINK REL="Next"  HREF="004029.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20OpenSSL_1_0_2-stable%20update&In-Reply-To=%3C1455310834.688989.22617.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update">appro at openssl.org
+       </A><BR>
+    <I>Fri Feb 12 21:00:34 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003979.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+        <LI>Next message: <A HREF="004029.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3999">[ date ]</a>
+              <a href="thread.html#3999">[ thread ]</a>
+              <a href="subject.html#3999">[ subject ]</a>
+              <a href="author.html#3999">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch OpenSSL_1_0_2-stable has been updated
+       via  6533a0b8d1ed12aa5f7dfd7a429eec67c5486bb5 (commit)
+      from  b4b23d05d3282b0c155a1ab8435379306be43315 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6533a0b8d1ed12aa5f7dfd7a429eec67c5486bb5
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Fri Feb 12 14:07:27 2016 +0100
+
+    modes/ctr128.c: pay attention to ecount_buf alignment in CRYPTO_ctr128_encrypt.
+    
+    It's never problem if CRYPTO_ctr128_encrypt is called from EVP, because
+    buffer in question is always aligned within EVP_CIPHER_CTX structure.
+    
+    RT#4218
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (cherry picked from commit 5e4bbeb49fb6522d858703201b5adee9611e7b7b)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/modes/ctr128.c | 41 +++++++++++++++++------------------------
+ 1 file changed, 17 insertions(+), 24 deletions(-)
+
+diff --git a/crypto/modes/ctr128.c b/crypto/modes/ctr128.c
+index f3bbcbf..bcafd6b 100644
+--- a/crypto/modes/ctr128.c
++++ b/crypto/modes/ctr128.c
+@@ -67,23 +67,20 @@
+ /* increment counter (128-bit int) by 1 */
+ static void ctr128_inc(unsigned char *counter)
+ {
+-    u32 n = 16;
+-    u8 c;
++    u32 n = 16, c = 1;
+ 
+     do {
+         --n;
+-        c = counter[n];
+-        ++c;
+-        counter[n] = c;
+-        if (c)
+-            return;
++        c += counter[n];
++        counter[n] = (u8)c;
++        c &gt;&gt;= 8;
+     } while (n);
+ }
+ 
+ #if !defined(OPENSSL_SMALL_FOOTPRINT)
+ static void ctr128_inc_aligned(unsigned char *counter)
+ {
+-    size_t *data, c, n;
++    size_t *data, c, d, n;
+     const union {
+         long one;
+         char little;
+@@ -91,20 +88,19 @@ static void ctr128_inc_aligned(unsigned char *counter)
+         1
+     };
+ 
+-    if (is_endian.little) {
++    if (is_endian.little || ((size_t)counter % sizeof(size_t)) != 0) {
+         ctr128_inc(counter);
+         return;
+     }
+ 
+     data = (size_t *)counter;
++    c = 1;
+     n = 16 / sizeof(size_t);
+     do {
+         --n;
+-        c = data[n];
+-        ++c;
+-        data[n] = c;
+-        if (c)
+-            return;
++        d = data[n] += c;
++        /* did addition carry? */
++        c = ((d - c) ^ d) &gt;&gt; (sizeof(size_t) * 8 - 1);
+     } while (n);
+ }
+ #endif
+@@ -144,14 +140,14 @@ void CRYPTO_ctr128_encrypt(const unsigned char *in, unsigned char *out,
+             }
+ 
+ # if defined(STRICT_ALIGNMENT)
+-            if (((size_t)in | (size_t)out | (size_t)ivec) % sizeof(size_t) !=
+-                0)
++            if (((size_t)in | (size_t)out | (size_t)ecount_buf)
++                % sizeof(size_t) != 0)
+                 break;
+ # endif
+             while (len &gt;= 16) {
+                 (*block) (ivec, ecount_buf, key);
+                 ctr128_inc_aligned(ivec);
+-                for (; n &lt; 16; n += sizeof(size_t))
++                for (n = 0; n &lt; 16; n += sizeof(size_t))
+                     *(size_t *)(out + n) =
+                         *(size_t *)(in + n) ^ *(size_t *)(ecount_buf + n);
+                 len -= 16;
+@@ -189,16 +185,13 @@ void CRYPTO_ctr128_encrypt(const unsigned char *in, unsigned char *out,
+ /* increment upper 96 bits of 128-bit counter by 1 */
+ static void ctr96_inc(unsigned char *counter)
+ {
+-    u32 n = 12;
+-    u8 c;
++    u32 n = 12, c = 1;
+ 
+     do {
+         --n;
+-        c = counter[n];
+-        ++c;
+-        counter[n] = c;
+-        if (c)
+-            return;
++        c += counter[n];
++        counter[n] = (u8)c;
++        c &gt;&gt;= 8;
+     } while (n);
+ }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003979.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+	<LI>Next message: <A HREF="004029.html">[openssl-commits] [openssl]  OpenSSL_1_0_2-stable update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3999">[ date ]</a>
+              <a href="thread.html#3999">[ thread ]</a>
+              <a href="subject.html#3999">[ subject ]</a>
+              <a href="author.html#3999">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

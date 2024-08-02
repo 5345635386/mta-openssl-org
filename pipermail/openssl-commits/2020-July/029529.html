@@ -1,0 +1,495 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1593919141.460897.3225.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029527.html">
+   <LINK REL="Next"  HREF="029530.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1593919141.460897.3225.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Sun Jul  5 03:19:01 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029527.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029530.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29529">[ date ]</a>
+              <a href="thread.html#29529">[ thread ]</a>
+              <a href="subject.html#29529">[ subject ]</a>
+              <a href="author.html#29529">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  22f7f42433fe9deb409703d76a0c4383371e6983 (commit)
+       via  7dc38bea94bcb71258eb2abaf48607a610cd576f (commit)
+       via  132abb21f977c31477387c0585a4384e99f45b5c (commit)
+      from  8c1cbc72105ffd493b48e65f8f5fd3657dedb28c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 22f7f42433fe9deb409703d76a0c4383371e6983
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Thu Jul 2 10:45:23 2020 +1000
+
+    rand: avoid caching RNG parameters.
+    
+    The strength and max_length DRBG parameters were being cached in the EVP_RAND
+    layer.  This commit removes the caching.
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12321">https://github.com/openssl/openssl/pull/12321</A>)
+
+commit 7dc38bea94bcb71258eb2abaf48607a610cd576f
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Wed Jul 1 10:57:03 2020 +1000
+
+    Refactor the EVP_RAND code to make locking issues less likely
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12321">https://github.com/openssl/openssl/pull/12321</A>)
+
+commit 132abb21f977c31477387c0585a4384e99f45b5c
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Tue Jun 30 09:36:47 2020 +1000
+
+    rand: fix recursive locking issue.
+    
+    The calls to query the DRBG strength, state and maximum output size all used
+    nested locks.  This removes the nesting.
+    
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12321">https://github.com/openssl/openssl/pull/12321</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_local.h |   5 -
+ crypto/evp/evp_rand.c  | 243 +++++++++++++++++++++++++++++++------------------
+ 2 files changed, 154 insertions(+), 94 deletions(-)
+
+diff --git a/crypto/evp/evp_local.h b/crypto/evp/evp_local.h
+index aeb4cca266..4aae702d6f 100644
+--- a/crypto/evp/evp_local.h
++++ b/crypto/evp/evp_local.h
+@@ -69,11 +69,6 @@ struct evp_kdf_ctx_st {
+ struct evp_rand_ctx_st {
+     EVP_RAND *meth;             /* Method structure */
+     void *data;                 /* Algorithm-specific data */
+-    size_t max_request;         /*
+-                                 * Cached: maximum number of bytes generated 
+-                                 * in a single call to the generate function
+-                                 */
+-    unsigned int strength;      /* Cached: bit strength of generator */
+ } /* EVP_RAND_CTX */ ;
+ 
+ struct evp_rand_st {
+diff --git a/crypto/evp/evp_rand.c b/crypto/evp/evp_rand.c
+index 6e3541481a..9273fd9c19 100644
+--- a/crypto/evp/evp_rand.c
++++ b/crypto/evp/evp_rand.c
+@@ -194,6 +194,7 @@ static void *evp_rand_from_dispatch(int name_id,
+             if (rand-&gt;get_ctx_params != NULL)
+                 break;
+             rand-&gt;get_ctx_params = OSSL_FUNC_rand_get_ctx_params(fns);
++            fnctxcnt++;
+             break;
+         case OSSL_FUNC_RAND_SET_CTX_PARAMS:
+             if (rand-&gt;set_ctx_params != NULL)
+@@ -220,7 +221,7 @@ static void *evp_rand_from_dispatch(int name_id,
+      * locking functions.
+      */
+     if (fnrandcnt != 3
+-            || fnctxcnt != 2
++            || fnctxcnt != 3
+             || (fnlockcnt != 0 &amp;&amp; fnlockcnt != 3)
+ #ifdef FIPS_MODULE
+             || fnzeroizecnt != 1
+@@ -338,32 +339,39 @@ EVP_RAND *EVP_RAND_CTX_rand(EVP_RAND_CTX *ctx)
+     return ctx-&gt;meth;
+ }
+ 
++static int evp_rand_get_ctx_params_locked(EVP_RAND_CTX *ctx,
++                                          OSSL_PARAM params[])
++{
++    return ctx-&gt;meth-&gt;get_ctx_params(ctx-&gt;data, params);
++}
++
+ int EVP_RAND_get_ctx_params(EVP_RAND_CTX *ctx, OSSL_PARAM params[])
+ {
+-    int res = 1;
++    int res;
+ 
+-    if (ctx-&gt;meth-&gt;get_ctx_params != NULL) {
+-        if (!evp_rand_lock(ctx))
+-            return 0;
+-        res = ctx-&gt;meth-&gt;get_ctx_params(ctx-&gt;data, params);
+-        evp_rand_unlock(ctx);
+-    }
++    if (!evp_rand_lock(ctx))
++        return 0;
++    res = evp_rand_get_ctx_params_locked(ctx, params);
++    evp_rand_unlock(ctx);
+     return res;
+ }
+ 
++static int evp_rand_set_ctx_params_locked(EVP_RAND_CTX *ctx,
++                                          const OSSL_PARAM params[])
++{
++    if (ctx-&gt;meth-&gt;set_ctx_params != NULL)
++        return ctx-&gt;meth-&gt;set_ctx_params(ctx-&gt;data, params);
++    return 1;
++}
++
+ int EVP_RAND_set_ctx_params(EVP_RAND_CTX *ctx, const OSSL_PARAM params[])
+ {
+-    int res = 1;
++    int res;
+ 
+-    if (ctx-&gt;meth-&gt;set_ctx_params != NULL) {
+-        if (!evp_rand_lock(ctx))
+-            return 0;
+-        res = ctx-&gt;meth-&gt;set_ctx_params(ctx-&gt;data, params);
+-        evp_rand_unlock(ctx);
+-        /* Clear out the cache state because the values can change on a set */
+-        ctx-&gt;strength = 0;
+-        ctx-&gt;max_request = 0;
+-    }
++    if (!evp_rand_lock(ctx))
++        return 0;
++    res = evp_rand_set_ctx_params_locked(ctx, params);
++    evp_rand_unlock(ctx);
+     return res;
+ }
+ 
+@@ -381,7 +389,7 @@ const OSSL_PARAM *EVP_RAND_gettable_ctx_params(const EVP_RAND *rand)
+ const OSSL_PARAM *EVP_RAND_settable_ctx_params(const EVP_RAND *rand)
+ {
+     return rand-&gt;settable_ctx_params == NULL ? NULL
+-                                             :rand-&gt;settable_ctx_params();
++                                             : rand-&gt;settable_ctx_params();
+ }
+ 
+ void EVP_RAND_do_all_provided(OPENSSL_CTX *libctx,
+@@ -401,6 +409,14 @@ void EVP_RAND_names_do_all(const EVP_RAND *rand,
+         evp_names_do_all(rand-&gt;prov, rand-&gt;name_id, fn, data);
+ }
+ 
++static int evp_rand_instantiate_locked
++    (EVP_RAND_CTX *ctx, unsigned int strength, int prediction_resistance,
++     const unsigned char *pstr, size_t pstr_len)
++{
++    return ctx-&gt;meth-&gt;instantiate(ctx-&gt;data, strength, prediction_resistance,
++                                  pstr, pstr_len);
++}
++
+ int EVP_RAND_instantiate(EVP_RAND_CTX *ctx, unsigned int strength,
+                          int prediction_resistance,
+                          const unsigned char *pstr, size_t pstr_len)
+@@ -409,49 +425,50 @@ int EVP_RAND_instantiate(EVP_RAND_CTX *ctx, unsigned int strength,
+ 
+     if (!evp_rand_lock(ctx))
+         return 0;
+-    res = ctx-&gt;meth-&gt;instantiate(ctx-&gt;data, strength, prediction_resistance,
+-                                 pstr, pstr_len);
++    res = evp_rand_instantiate_locked(ctx, strength, prediction_resistance,
++                                      pstr, pstr_len);
+     evp_rand_unlock(ctx);
+     return res;
+ }
+ 
++static int evp_rand_uninstantiate_locked(EVP_RAND_CTX *ctx)
++{
++    return ctx-&gt;meth-&gt;uninstantiate(ctx-&gt;data);
++}
++
+ int EVP_RAND_uninstantiate(EVP_RAND_CTX *ctx)
+ {
+     int res;
+ 
+     if (!evp_rand_lock(ctx))
+         return 0;
+-    res = ctx-&gt;meth-&gt;uninstantiate(ctx-&gt;data);
++    res = evp_rand_uninstantiate_locked(ctx);
+     evp_rand_unlock(ctx);
+     return res;
+ }
+ 
+-int EVP_RAND_generate(EVP_RAND_CTX *ctx, unsigned char *out, size_t outlen,
+-                      unsigned int strength, int prediction_resistance,
+-                      const unsigned char *addin, size_t addin_len)
++static int evp_rand_generate_locked(EVP_RAND_CTX *ctx, unsigned char *out,
++                                    size_t outlen, unsigned int strength,
++                                    int prediction_resistance,
++                                    const unsigned char *addin,
++                                    size_t addin_len)
+ {
+-    size_t chunk;
+-    OSSL_PARAM params[2];
+-    int res = 0;
++    size_t chunk, max_request = 0;
++    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
+ 
+-    if (!evp_rand_lock(ctx))
++    params[0] = OSSL_PARAM_construct_size_t(OSSL_DRBG_PARAM_MAX_REQUEST,
++                                            &amp;max_request);
++    if (!evp_rand_get_ctx_params_locked(ctx, params)
++            || max_request == 0) {
++        EVPerr(0, EVP_R_UNABLE_TO_GET_MAXIMUM_REQUEST_SIZE);
+         return 0;
+-    if (ctx-&gt;max_request == 0) {
+-        params[0] = OSSL_PARAM_construct_size_t(OSSL_DRBG_PARAM_MAX_REQUEST,
+-                                                &amp;chunk);
+-        params[1] = OSSL_PARAM_construct_end();
+-        if (!EVP_RAND_get_ctx_params(ctx, params) || chunk == 0) {
+-            EVPerr(0, EVP_R_UNABLE_TO_GET_MAXIMUM_REQUEST_SIZE);
+-            goto err;
+-        }
+-        ctx-&gt;max_request = chunk;
+     }
+     for (; outlen &gt; 0; outlen -= chunk, out += chunk) {
+-        chunk = outlen &gt; ctx-&gt;max_request ? ctx-&gt;max_request : outlen;
++        chunk = outlen &gt; max_request ? max_request : outlen;
+         if (!ctx-&gt;meth-&gt;generate(ctx-&gt;data, out, chunk, strength,
+                                  prediction_resistance, addin, addin_len)) {
+             EVPerr(0, EVP_R_GENERATE_ERROR);
+-            goto err;
++            return 0;
+         }
+         /*
+          * Prediction resistance is only relevant the first time around,
+@@ -459,82 +476,109 @@ int EVP_RAND_generate(EVP_RAND_CTX *ctx, unsigned char *out, size_t outlen,
+          */
+         prediction_resistance = 0;
+     }
+-    res = 1;
+-err:
++    return 1;
++}
++
++int EVP_RAND_generate(EVP_RAND_CTX *ctx, unsigned char *out, size_t outlen,
++                      unsigned int strength, int prediction_resistance,
++                      const unsigned char *addin, size_t addin_len)
++{
++    int res;
++
++    if (!evp_rand_lock(ctx))
++        return 0;
++    res = evp_rand_generate_locked(ctx, out, outlen, strength,
++                                   prediction_resistance, addin, addin_len);
+     evp_rand_unlock(ctx);
+     return res;
+ }
+ 
++static int evp_rand_reseed_locked(EVP_RAND_CTX *ctx, int prediction_resistance,
++                                  const unsigned char *ent, size_t ent_len,
++                                  const unsigned char *addin, size_t addin_len)
++{
++    if (ctx-&gt;meth-&gt;reseed != NULL)
++        return ctx-&gt;meth-&gt;reseed(ctx-&gt;data, prediction_resistance,
++                                 ent, ent_len, addin, addin_len);
++    return 1;
++}
++
+ int EVP_RAND_reseed(EVP_RAND_CTX *ctx, int prediction_resistance,
+                     const unsigned char *ent, size_t ent_len,
+                     const unsigned char *addin, size_t addin_len)
+ {
+-    int res = 1;
++    int res;
+ 
+     if (!evp_rand_lock(ctx))
+         return 0;
+-    if (ctx-&gt;meth-&gt;reseed != NULL)
+-        res = ctx-&gt;meth-&gt;reseed(ctx-&gt;data, prediction_resistance,
+-                                ent, ent_len, addin, addin_len);
++    res = evp_rand_reseed_locked(ctx, prediction_resistance,
++                                 ent, ent_len, addin, addin_len);
+     evp_rand_unlock(ctx);
+     return res;
+ }
+ 
+-int EVP_RAND_nonce(EVP_RAND_CTX *ctx, unsigned char *out, size_t outlen)
++static unsigned int evp_rand_strength_locked(EVP_RAND_CTX *ctx)
+ {
+-    int res = 1;
+-    unsigned int str = EVP_RAND_strength(ctx);
++    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
++    unsigned int strength = 0;
++
++    params[0] = OSSL_PARAM_construct_uint(OSSL_RAND_PARAM_STRENGTH, &amp;strength);
++    if (!evp_rand_get_ctx_params_locked(ctx, params))
++        return 0;
++    return strength;
++}
++
++unsigned int EVP_RAND_strength(EVP_RAND_CTX *ctx)
++{
++    unsigned int res;
+ 
+     if (!evp_rand_lock(ctx))
+         return 0;
+-    if (ctx-&gt;meth-&gt;nonce == NULL
+-            || !ctx-&gt;meth-&gt;nonce(ctx-&gt;data, out, str, outlen, outlen))
+-        res = ctx-&gt;meth-&gt;generate(ctx-&gt;data, out, outlen, str, 0, NULL, 0);
++    res = evp_rand_strength_locked(ctx);
+     evp_rand_unlock(ctx);
+     return res;
+ }
+ 
+-unsigned int EVP_RAND_strength(EVP_RAND_CTX *ctx)
++static int evp_rand_nonce_locked(EVP_RAND_CTX *ctx, unsigned char *out,
++                                 size_t outlen)
+ {
+-    OSSL_PARAM params[2];
+-    unsigned int t;
+-    int res;
++    unsigned int str = evp_rand_strength_locked(ctx);
+ 
+-    if (ctx-&gt;strength == 0) {
+-        params[0] = OSSL_PARAM_construct_uint(OSSL_RAND_PARAM_STRENGTH, &amp;t);
+-        params[1] = OSSL_PARAM_construct_end();
+-        if (!evp_rand_lock(ctx))
+-            return 0;
+-        res = EVP_RAND_get_ctx_params(ctx, params);
+-        evp_rand_unlock(ctx);
+-        if (!res)
+-            return 0;
+-        ctx-&gt;strength = t;
+-    }
+-    return ctx-&gt;strength;
++    if (ctx-&gt;meth-&gt;nonce == NULL)
++        return 0;
++    if (ctx-&gt;meth-&gt;nonce(ctx-&gt;data, out, str, outlen, outlen))
++        return 1;
++    return evp_rand_generate_locked(ctx, out, outlen, str, 0, NULL, 0);
+ }
+ 
+-int EVP_RAND_state(EVP_RAND_CTX *ctx)
++int EVP_RAND_nonce(EVP_RAND_CTX *ctx, unsigned char *out, size_t outlen)
+ {
+-    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
+-    int status, res;
++    int res;
+ 
+-    params[0] = OSSL_PARAM_construct_int(OSSL_RAND_PARAM_STATE,
+-                                         &amp;status);
+     if (!evp_rand_lock(ctx))
+         return 0;
+-    res = EVP_RAND_get_ctx_params(ctx, params);
++    res = evp_rand_nonce_locked(ctx, out, outlen);
+     evp_rand_unlock(ctx);
+-    if (!res)
+-        status = EVP_RAND_STATE_ERROR;
+-    return status;
++    return res;
+ }
+ 
+-int EVP_RAND_set_callbacks(EVP_RAND_CTX *ctx,
+-                           OSSL_INOUT_CALLBACK *get_entropy,
+-                           OSSL_CALLBACK *cleanup_entropy,
+-                           OSSL_INOUT_CALLBACK *get_nonce,
+-                           OSSL_CALLBACK *cleanup_nonce, void *arg)
++int EVP_RAND_state(EVP_RAND_CTX *ctx)
++{
++    OSSL_PARAM params[2] = { OSSL_PARAM_END, OSSL_PARAM_END };
++    int state;
++
++    params[0] = OSSL_PARAM_construct_int(OSSL_RAND_PARAM_STATE, &amp;state);
++    if (!EVP_RAND_get_ctx_params(ctx, params))
++        state = EVP_RAND_STATE_ERROR;
++    return state;
++}
++
++static int evp_rand_set_callbacks_locked(EVP_RAND_CTX *ctx,
++                                         OSSL_INOUT_CALLBACK *get_entropy,
++                                         OSSL_CALLBACK *cleanup_entropy,
++                                         OSSL_INOUT_CALLBACK *get_nonce,
++                                         OSSL_CALLBACK *cleanup_nonce,
++                                         void *arg)
+ {
+     if (ctx-&gt;meth-&gt;set_callbacks == NULL) {
+         EVPerr(0, EVP_R_UNABLE_TO_SET_CALLBACKS);
+@@ -545,15 +589,36 @@ int EVP_RAND_set_callbacks(EVP_RAND_CTX *ctx,
+     return 1;
+ }
+ 
++int EVP_RAND_set_callbacks(EVP_RAND_CTX *ctx,
++                           OSSL_INOUT_CALLBACK *get_entropy,
++                           OSSL_CALLBACK *cleanup_entropy,
++                           OSSL_INOUT_CALLBACK *get_nonce,
++                           OSSL_CALLBACK *cleanup_nonce, void *arg)
++{
++    int res;
++
++    if (!evp_rand_lock(ctx))
++        return 0;
++    res = evp_rand_set_callbacks_locked(ctx, get_entropy, cleanup_entropy,
++                                        get_nonce, cleanup_nonce, arg);
++    evp_rand_unlock(ctx);
++    return res;
++}
++
++static int evp_rand_verify_zeroization_locked(EVP_RAND_CTX *ctx)
++{
++    if (ctx-&gt;meth-&gt;verify_zeroization != NULL)
++        return ctx-&gt;meth-&gt;verify_zeroization(ctx-&gt;data);
++    return 0;
++}
++
+ int EVP_RAND_verify_zeroization(EVP_RAND_CTX *ctx)
+ {
+-    int res = 0;
++    int res;
+ 
+-    if (ctx-&gt;meth-&gt;verify_zeroization != NULL) {
+-        if (!evp_rand_lock(ctx))
+-            return 0;
+-        res = ctx-&gt;meth-&gt;verify_zeroization(ctx-&gt;data);
+-        evp_rand_unlock(ctx);
+-    }
++    if (!evp_rand_lock(ctx))
++        return 0;
++    res = evp_rand_verify_zeroization_locked(ctx);
++    evp_rand_unlock(ctx);
+     return res;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029527.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029530.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29529">[ date ]</a>
+              <a href="thread.html#29529">[ thread ]</a>
+              <a href="subject.html#29529">[ subject ]</a>
+              <a href="author.html#29529">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

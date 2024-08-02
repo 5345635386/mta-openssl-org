@@ -1,0 +1,246 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1491533720.091047.24860.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013978.html">
+   <LINK REL="Next"  HREF="013991.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1491533720.091047.24860.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Apr  7 02:55:20 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013978.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="013991.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13985">[ date ]</a>
+              <a href="thread.html#13985">[ thread ]</a>
+              <a href="subject.html#13985">[ subject ]</a>
+              <a href="author.html#13985">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  789a2b6250d5e05dfde6ce259e79ef8c172c9f3f (commit)
+       via  87975cfa91c3f06a52f2550ed2ef632644be6dde (commit)
+      from  005f6766284155645fa760cf764f85031e209f6c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 789a2b6250d5e05dfde6ce259e79ef8c172c9f3f
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Apr 6 15:58:38 2017 +0200
+
+    Don't try to clean up RAND from ENGINE
+    
+    This is especially harmful since OPENSSL_cleanup() has already called
+    the RAND cleanup function
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3137">https://github.com/openssl/openssl/pull/3137</A>)
+
+commit 87975cfa91c3f06a52f2550ed2ef632644be6dde
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Thu Apr 6 11:30:03 2017 +0200
+
+    Make getting and setting the RAND default method thread safe
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3137">https://github.com/openssl/openssl/pull/3137</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/engine/eng_lib.c |  5 -----
+ crypto/rand/rand_lib.c  | 37 +++++++++++++++++++++++++++++++++++--
+ 2 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/crypto/engine/eng_lib.c b/crypto/engine/eng_lib.c
+index 385af54..6f422bd 100644
+--- a/crypto/engine/eng_lib.c
++++ b/crypto/engine/eng_lib.c
+@@ -166,11 +166,6 @@ void engine_cleanup_int(void)
+                                         engine_cleanup_cb_free);
+         cleanup_stack = NULL;
+     }
+-    /*
+-     * FIXME: This should be handled (somehow) through RAND, eg. by it
+-     * registering a cleanup callback.
+-     */
+-    RAND_set_rand_method(NULL);
+     CRYPTO_THREAD_lock_free(global_engine_lock);
+ }
+ 
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index ad45250..dc62902 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -12,27 +12,50 @@
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/opensslconf.h&gt;
+ #include &quot;internal/rand.h&quot;
+-
+ #include &lt;openssl/engine.h&gt;
++#include &quot;internal/thread_once.h&quot;
+ 
+ #ifndef OPENSSL_NO_ENGINE
+ /* non-NULL if default_RAND_meth is ENGINE-provided */
+ static ENGINE *funct_ref = NULL;
++static CRYPTO_RWLOCK *rand_engine_lock = NULL;
+ #endif
+ static const RAND_METHOD *default_RAND_meth = NULL;
++static CRYPTO_RWLOCK *rand_meth_lock = NULL;
++static CRYPTO_ONCE rand_lock_init = CRYPTO_ONCE_STATIC_INIT;
++
++DEFINE_RUN_ONCE_STATIC(do_rand_lock_init)
++{
++#ifndef OPENSSL_NO_ENGINE
++    rand_engine_lock = CRYPTO_THREAD_lock_new();
++#endif
++    rand_meth_lock = CRYPTO_THREAD_lock_new();
++    return rand_engine_lock != NULL &amp;&amp; rand_meth_lock != NULL;
++}
+ 
+ int RAND_set_rand_method(const RAND_METHOD *meth)
+ {
++    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++        return 0;
++
++    CRYPTO_THREAD_write_lock(rand_meth_lock);
+ #ifndef OPENSSL_NO_ENGINE
+     ENGINE_finish(funct_ref);
+     funct_ref = NULL;
+ #endif
+     default_RAND_meth = meth;
++    CRYPTO_THREAD_unlock(rand_meth_lock);
+     return 1;
+ }
+ 
+ const RAND_METHOD *RAND_get_rand_method(void)
+ {
++    const RAND_METHOD *tmp_meth = NULL;
++
++    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++        return NULL;
++
++    CRYPTO_THREAD_write_lock(rand_meth_lock);
+     if (!default_RAND_meth) {
+ #ifndef OPENSSL_NO_ENGINE
+         ENGINE *e = ENGINE_get_default_RAND();
+@@ -49,13 +72,19 @@ const RAND_METHOD *RAND_get_rand_method(void)
+ #endif
+             default_RAND_meth = RAND_OpenSSL();
+     }
+-    return default_RAND_meth;
++    tmp_meth = default_RAND_meth;
++    CRYPTO_THREAD_unlock(rand_meth_lock);
++    return tmp_meth;
+ }
+ 
+ #ifndef OPENSSL_NO_ENGINE
+ int RAND_set_rand_engine(ENGINE *engine)
+ {
+     const RAND_METHOD *tmp_meth = NULL;
++
++    if (!RUN_ONCE(&amp;rand_lock_init, do_rand_lock_init))
++        return 0;
++
+     if (engine) {
+         if (!ENGINE_init(engine))
+             return 0;
+@@ -65,9 +94,11 @@ int RAND_set_rand_engine(ENGINE *engine)
+             return 0;
+         }
+     }
++    CRYPTO_THREAD_write_lock(rand_engine_lock);
+     /* This function releases any prior ENGINE so call it first */
+     RAND_set_rand_method(tmp_meth);
+     funct_ref = engine;
++    CRYPTO_THREAD_unlock(rand_engine_lock);
+     return 1;
+ }
+ #endif
+@@ -78,6 +109,8 @@ void rand_cleanup_int(void)
+     if (meth &amp;&amp; meth-&gt;cleanup)
+         meth-&gt;cleanup();
+     RAND_set_rand_method(NULL);
++    CRYPTO_THREAD_lock_free(rand_meth_lock);
++    CRYPTO_THREAD_lock_free(rand_engine_lock);
+ }
+ 
+ void RAND_seed(const void *buf, int num)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013978.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="013991.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13985">[ date ]</a>
+              <a href="thread.html#13985">[ thread ]</a>
+              <a href="subject.html#13985">[ subject ]</a>
+              <a href="author.html#13985">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1415 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1463073963.350645.17955.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007171.html">
+   <LINK REL="Next"  HREF="007177.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Emilia Kasper</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1463073963.350645.17955.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">emilia at openssl.org
+       </A><BR>
+    <I>Thu May 12 17:26:03 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007171.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="007177.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7172">[ date ]</a>
+              <a href="thread.html#7172">[ thread ]</a>
+              <a href="subject.html#7172">[ subject ]</a>
+              <a href="author.html#7172">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a263f320ebdb32ccc058ef02a617edbfe4a63e7f (commit)
+      from  d82c27589b5f9e9128f1ae9fce89fadd03c1c229 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a263f320ebdb32ccc058ef02a617edbfe4a63e7f
+Author: Emilia Kasper &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">emilia at openssl.org</A>&gt;
+Date:   Thu Apr 7 19:07:50 2016 +0200
+
+    Remove proxy tests. Add verify callback tests.
+    
+    The old proxy tests test the implementation of an application proxy
+    policy callback defined in the test itself, which is not particularly
+    useful.
+    
+    It is, however, useful to test cert verify overrides in
+    general. Therefore, replace these tests with tests for cert verify
+    callback behaviour.
+    
+    Also glob the ssl test inputs on the .in files to catch missing
+    generated files.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ test/README.ssltest.md                  |   5 +
+ test/handshake_helper.c                 |  37 ++-
+ test/handshake_helper.h                 |   3 +-
+ test/recipes/80-test_ssl_new.t          |   7 +-
+ test/recipes/80-test_ssl_old.t          |  83 -------
+ test/ssl-tests/03-custom_verify.conf    | 238 ++++++++++++++++++
+ test/ssl-tests/03-custom_verify.conf.in | 127 ++++++++++
+ test/ssl_test.c                         |   6 +-
+ test/ssl_test_ctx.c                     |  33 ++-
+ test/ssl_test_ctx.h                     |  13 +-
+ test/ssl_test_ctx_test.c                |  24 +-
+ test/ssl_test_ctx_test.conf             |   4 +
+ test/ssltest_old.c                      | 418 +-------------------------------
+ 13 files changed, 479 insertions(+), 519 deletions(-)
+ create mode 100644 test/ssl-tests/03-custom_verify.conf
+ create mode 100644 test/ssl-tests/03-custom_verify.conf.in
+
+diff --git a/test/README.ssltest.md b/test/README.ssltest.md
+index b65a0d7..2957d85 100644
+--- a/test/README.ssltest.md
++++ b/test/README.ssltest.md
+@@ -59,6 +59,11 @@ The test section supports the following options:
+ * Protocol - expected negotiated protocol. One of
+   SSLv3, TLSv1, TLSv1.1, TLSv1.2.
+ 
++* ClientVerifyCallback - the client's custom certificate verify callback.
++  Used to test callback behaviour. One of
++  - AcceptAll - accepts all certificates.
++  - RejectAll - rejects all certificates.
++
+ ## Configuring the client and server
+ 
+ The client and server configurations can be any valid `SSL_CTX`
+diff --git a/test/handshake_helper.c b/test/handshake_helper.c
+index 4682d45..0a27324 100644
+--- a/test/handshake_helper.c
++++ b/test/handshake_helper.c
+@@ -11,6 +11,7 @@
+ #include &lt;string.h&gt;
+ 
+ #include &lt;openssl/bio.h&gt;
++#include &lt;openssl/x509_vfy.h&gt;
+ #include &lt;openssl/ssl.h&gt;
+ 
+ #include &quot;handshake_helper.h&quot;
+@@ -40,6 +41,37 @@ static void info_callback(const SSL *s, int where, int ret)
+     }
+ }
+ 
++static int verify_reject_callback(X509_STORE_CTX *ctx, void *arg) {
++    X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
++    return 0;
++}
++
++static int verify_accept_callback(X509_STORE_CTX *ctx, void *arg) {
++    return 1;
++}
++
++/*
++ * Configure callbacks and other properties that can't be set directly
++ * in the server/client CONF.
++ */
++static void configure_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx,
++                                const SSL_TEST_CTX *test_ctx)
++{
++    switch (test_ctx-&gt;client_verify_callback) {
++    case SSL_TEST_VERIFY_ACCEPT_ALL:
++        SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_accept_callback,
++                                         NULL);
++        break;
++    case SSL_TEST_VERIFY_REJECT_ALL:
++        SSL_CTX_set_cert_verify_callback(client_ctx, &amp;verify_reject_callback,
++                                         NULL);
++        break;
++    default:
++        break;
++    }
++}
++
++
+ typedef enum {
+     PEER_SUCCESS,
+     PEER_RETRY,
+@@ -139,7 +171,8 @@ static handshake_status_t handshake_status(peer_status_t last_status,
+     return INTERNAL_ERROR;
+ }
+ 
+-HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx)
++HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx,
++                              const SSL_TEST_CTX *test_ctx)
+ {
+     SSL *server, *client;
+     BIO *client_to_server, *server_to_client;
+@@ -149,6 +182,8 @@ HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx)
+     peer_status_t client_status = PEER_RETRY, server_status = PEER_RETRY;
+     handshake_status_t status = HANDSHAKE_RETRY;
+ 
++    configure_handshake(server_ctx, client_ctx, test_ctx);
++
+     server = SSL_new(server_ctx);
+     client = SSL_new(client_ctx);
+     OPENSSL_assert(server != NULL &amp;&amp; client != NULL);
+diff --git a/test/handshake_helper.h b/test/handshake_helper.h
+index 56dfb19..5f1ca04 100644
+--- a/test/handshake_helper.h
++++ b/test/handshake_helper.h
+@@ -30,6 +30,7 @@ typedef struct handshake_result {
+ } HANDSHAKE_RESULT;
+ 
+ /* Do a handshake and report some information about the result. */
+-HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx);
++HANDSHAKE_RESULT do_handshake(SSL_CTX *server_ctx, SSL_CTX *client_ctx,
++                              const SSL_TEST_CTX *test_ctx);
+ 
+ #endif  /* HEADER_HANDSHAKE_HELPER_H */
+diff --git a/test/recipes/80-test_ssl_new.t b/test/recipes/80-test_ssl_new.t
+index a018358..57def45 100644
+--- a/test/recipes/80-test_ssl_new.t
++++ b/test/recipes/80-test_ssl_new.t
+@@ -20,8 +20,9 @@ setup(&quot;test_ssl_new&quot;);
+ 
+ $ENV{TEST_CERTS_DIR} = srctop_dir(&quot;test&quot;, &quot;certs&quot;);
+ 
+-my @conf_srcs =  glob(srctop_file(&quot;test&quot;, &quot;ssl-tests&quot;, &quot;*.conf&quot;));
+-my @conf_files = map {basename($_)} @conf_srcs;
++my @conf_srcs =  glob(srctop_file(&quot;test&quot;, &quot;ssl-tests&quot;, &quot;*.conf.in&quot;));
++my @conf_files = map { basename($_) } @conf_srcs;
++map { s/\.in// } @conf_files;
+ 
+ # 02-protocol-version.conf test results depend on the configuration of enabled
+ # protocols. We only verify generated sources in the default configuration.
+@@ -39,7 +40,7 @@ foreach my $conf (@conf_files) {
+ 
+ # We hard-code the number of tests to double-check that the globbing above
+ # finds all files as expected.
+-plan tests =&gt; 2;  # = scalar @conf_files
++plan tests =&gt; 3;  # = scalar @conf_srcs
+ 
+ sub test_conf {
+     plan tests =&gt; 3;
+diff --git a/test/recipes/80-test_ssl_old.t b/test/recipes/80-test_ssl_old.t
+index 61fc423..3763530 100644
+--- a/test/recipes/80-test_ssl_old.t
++++ b/test/recipes/80-test_ssl_old.t
+@@ -79,8 +79,6 @@ my $client_sess=&quot;client.ss&quot;;
+ plan tests =&gt;
+     1				# For testss
+     + 14			# For the first testssl
+-    + 16			# For the first testsslproxy
+-    + 16			# For the second testsslproxy
+     ;
+ 
+ subtest 'test_ss' =&gt; sub {
+@@ -98,13 +96,6 @@ subtest 'test_ss' =&gt; sub {
+ note('test_ssl -- key U');
+ testssl(&quot;keyU.ss&quot;, $Ucert, $CAcert);
+ 
+-note('test_ssl -- key P1');
+-testsslproxy(&quot;keyP1.ss&quot;, &quot;certP1.ss&quot;, &quot;intP1.ss&quot;, &quot;AB&quot;);
+-
+-note('test_ssl -- key P2');
+-testsslproxy(&quot;keyP2.ss&quot;, &quot;certP2.ss&quot;, &quot;intP2.ss&quot;, &quot;BC&quot;);
+-
+-
+ # -----------
+ # subtest functions
+ sub testss {
+@@ -832,77 +823,3 @@ sub testssl {
+         }
+     };
+ }
+-
+-sub testsslproxy {
+-    my $key = shift || srctop_file(&quot;apps&quot;,&quot;server.pem&quot;);
+-    my $cert = shift || srctop_file(&quot;apps&quot;,&quot;server.pem&quot;);
+-    my $CAtmp = shift;
+-    my @CA = $CAtmp ? (&quot;-CAfile&quot;, $CAtmp) : (&quot;-CApath&quot;, bldtop_dir(&quot;certs&quot;));
+-    my @extra = @_;
+-
+-    my @ssltest = (&quot;ssltest_old&quot;,
+-		   &quot;-s_key&quot;, $key, &quot;-s_cert&quot;, $cert,
+-		   &quot;-c_key&quot;, $key, &quot;-c_cert&quot;, $cert);
+-
+-    # plan tests =&gt; 16;
+-
+-    note('Testing a lot of proxy conditions.');
+-
+-    # We happen to know that certP1.ss has policy letters &quot;AB&quot; and
+-    # certP2.ss has policy letters &quot;BC&quot;.  However, because certP2.ss
+-    # has certP1.ss as issuer, when it's used, both their policy
+-    # letters get combined into just &quot;B&quot;.
+-    # The policy letter(s) then get filtered with the given auth letter
+-    # in the table below, and the result gets tested with the given
+-    # condition.  For details, read ssltest_old.c
+-    #
+-    # certfilename =&gt; [ [ auth, cond, expected result ] ... ]
+-    my %expected = ( &quot;certP1.ss&quot; =&gt; [ [ [ 'A',  'A'      ], 1 ],
+-                                      [ [ 'A',  'B'      ], 0 ],
+-                                      [ [ 'A',  'C'      ], 0 ],
+-                                      [ [ 'A',  'A|B&amp;!C' ], 1 ],
+-                                      [ [ 'B',  'A'      ], 0 ],
+-                                      [ [ 'B',  'B'      ], 1 ],
+-                                      [ [ 'B',  'C'      ], 0 ],
+-                                      [ [ 'B',  'A|B&amp;!C' ], 1 ],
+-                                      [ [ 'C',  'A'      ], 0 ],
+-                                      [ [ 'C',  'B'      ], 0 ],
+-                                      [ [ 'C',  'C'      ], 0 ],
+-                                      [ [ 'C',  'A|B&amp;!C' ], 0 ],
+-                                      [ [ 'BC', 'A'      ], 0 ],
+-                                      [ [ 'BC', 'B'      ], 1 ],
+-                                      [ [ 'BC', 'C'      ], 0 ],
+-                                      [ [ 'BC', 'A|B&amp;!C' ], 1 ] ],
+-                     &quot;certP2.ss&quot; =&gt; [ [ [ 'A',  'A'      ], 0 ],
+-                                      [ [ 'A',  'B'      ], 0 ],
+-                                      [ [ 'A',  'C'      ], 0 ],
+-                                      [ [ 'A',  'A|B&amp;!C' ], 0 ],
+-                                      [ [ 'B',  'A'      ], 0 ],
+-                                      [ [ 'B',  'B'      ], 1 ],
+-                                      [ [ 'B',  'C'      ], 0 ],
+-                                      [ [ 'B',  'A|B&amp;!C' ], 1 ],
+-                                      [ [ 'C',  'A'      ], 0 ],
+-                                      [ [ 'C',  'B'      ], 0 ],
+-                                      [ [ 'C',  'C'      ], 0 ],
+-                                      [ [ 'C',  'A|B&amp;!C' ], 0 ],
+-                                      [ [ 'BC', 'A'      ], 0 ],
+-                                      [ [ 'BC', 'B'      ], 1 ],
+-                                      [ [ 'BC', 'C'      ], 0 ],
+-                                      [ [ 'BC', 'A|B&amp;!C' ], 1 ] ] );
+-
+-  SKIP: {
+-      skip &quot;Neither SSLv3 nor any TLS version are supported by this OpenSSL build&quot;, scalar(@{$expected{$cert}})
+-	  if $no_anytls;
+-
+-      foreach (@{$expected{$cert}}) {
+-	  my $auth = $_-&gt;[0]-&gt;[0];
+-	  my $cond = $_-&gt;[0]-&gt;[1];
+-	  my $res  = $_-&gt;[1];
+-	  is(run(test([@ssltest, &quot;-server_auth&quot;, @CA,
+-		       &quot;-proxy&quot;, &quot;-proxy_auth&quot;, $auth,
+-		       &quot;-proxy_cond&quot;, $cond])), $res,
+-	     &quot;test tlsv1, server auth, proxy auth $auth and cond $cond (expect &quot;
+-	     .($res ? &quot;success&quot; : &quot;failure&quot;).&quot;)&quot;);
+-      }
+-    }
+-}
+diff --git a/test/ssl-tests/03-custom_verify.conf b/test/ssl-tests/03-custom_verify.conf
+new file mode 100644
+index 0000000..182a95d
+--- /dev/null
++++ b/test/ssl-tests/03-custom_verify.conf
+@@ -0,0 +1,238 @@
++# Generated with generate_ssl_tests.pl
++
++num_tests = 9
++
++test-0 = 0-verify-success
++test-1 = 1-verify-custom-reject
++test-2 = 2-verify-custom-allow
++test-3 = 3-noverify-success
++test-4 = 4-noverify-ignore-custom-reject
++test-5 = 5-noverify-accept-custom-allow
++test-6 = 6-verify-fail-no-root
++test-7 = 7-verify-custom-success-no-root
++test-8 = 8-verify-custom-fail-no-root
++# ===========================================================
++
++[0-verify-success]
++ssl_conf = 0-verify-success-ssl
++
++[0-verify-success-ssl]
++server = 0-verify-success-server
++client = 0-verify-success-client
++
++[0-verify-success-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[0-verify-success-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++
++[test-0]
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[1-verify-custom-reject]
++ssl_conf = 1-verify-custom-reject-ssl
++
++[1-verify-custom-reject-ssl]
++server = 1-verify-custom-reject-server
++client = 1-verify-custom-reject-client
++
++[1-verify-custom-reject-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[1-verify-custom-reject-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++
++[test-1]
++ClientAlert = HandshakeFailure
++ClientVerifyCallback = RejectAll
++ExpectedResult = ClientFail
++
++
++# ===========================================================
++
++[2-verify-custom-allow]
++ssl_conf = 2-verify-custom-allow-ssl
++
++[2-verify-custom-allow-ssl]
++server = 2-verify-custom-allow-server
++client = 2-verify-custom-allow-client
++
++[2-verify-custom-allow-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[2-verify-custom-allow-client]
++CipherString = DEFAULT
++VerifyCAFile = ${ENV::TEST_CERTS_DIR}/rootcert.pem
++VerifyMode = Peer
++
++
++[test-2]
++ClientVerifyCallback = AcceptAll
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[3-noverify-success]
++ssl_conf = 3-noverify-success-ssl
++
++[3-noverify-success-ssl]
++server = 3-noverify-success-server
++client = 3-noverify-success-client
++
++[3-noverify-success-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[3-noverify-success-client]
++CipherString = DEFAULT
++
++
++[test-3]
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[4-noverify-ignore-custom-reject]
++ssl_conf = 4-noverify-ignore-custom-reject-ssl
++
++[4-noverify-ignore-custom-reject-ssl]
++server = 4-noverify-ignore-custom-reject-server
++client = 4-noverify-ignore-custom-reject-client
++
++[4-noverify-ignore-custom-reject-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[4-noverify-ignore-custom-reject-client]
++CipherString = DEFAULT
++
++
++[test-4]
++ClientVerifyCallback = RejectAll
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[5-noverify-accept-custom-allow]
++ssl_conf = 5-noverify-accept-custom-allow-ssl
++
++[5-noverify-accept-custom-allow-ssl]
++server = 5-noverify-accept-custom-allow-server
++client = 5-noverify-accept-custom-allow-client
++
++[5-noverify-accept-custom-allow-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[5-noverify-accept-custom-allow-client]
++CipherString = DEFAULT
++
++
++[test-5]
++ClientVerifyCallback = AcceptAll
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[6-verify-fail-no-root]
++ssl_conf = 6-verify-fail-no-root-ssl
++
++[6-verify-fail-no-root-ssl]
++server = 6-verify-fail-no-root-server
++client = 6-verify-fail-no-root-client
++
++[6-verify-fail-no-root-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[6-verify-fail-no-root-client]
++CipherString = DEFAULT
++VerifyMode = Peer
++
++
++[test-6]
++ClientAlert = UnknownCA
++ExpectedResult = ClientFail
++
++
++# ===========================================================
++
++[7-verify-custom-success-no-root]
++ssl_conf = 7-verify-custom-success-no-root-ssl
++
++[7-verify-custom-success-no-root-ssl]
++server = 7-verify-custom-success-no-root-server
++client = 7-verify-custom-success-no-root-client
++
++[7-verify-custom-success-no-root-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[7-verify-custom-success-no-root-client]
++CipherString = DEFAULT
++VerifyMode = Peer
++
++
++[test-7]
++ClientVerifyCallback = AcceptAll
++ExpectedResult = Success
++
++
++# ===========================================================
++
++[8-verify-custom-fail-no-root]
++ssl_conf = 8-verify-custom-fail-no-root-ssl
++
++[8-verify-custom-fail-no-root-ssl]
++server = 8-verify-custom-fail-no-root-server
++client = 8-verify-custom-fail-no-root-client
++
++[8-verify-custom-fail-no-root-server]
++Certificate = ${ENV::TEST_CERTS_DIR}/servercert.pem
++CipherString = DEFAULT
++PrivateKey = ${ENV::TEST_CERTS_DIR}/serverkey.pem
++
++
++[8-verify-custom-fail-no-root-client]
++CipherString = DEFAULT
++VerifyMode = Peer
++
++
++[test-8]
++ClientAlert = HandshakeFailure
++ClientVerifyCallback = RejectAll
++ExpectedResult = ClientFail
++
++
+diff --git a/test/ssl-tests/03-custom_verify.conf.in b/test/ssl-tests/03-custom_verify.conf.in
+new file mode 100644
+index 0000000..e2f9dc7
+--- /dev/null
++++ b/test/ssl-tests/03-custom_verify.conf.in
+@@ -0,0 +1,127 @@
++# -*- mode: perl; -*-
++
++## SSL test configurations
++
++package ssltests;
++
++our @tests = (
++
++    # Sanity-check that verification indeed succeeds without the
++    # restrictive callback.
++    {
++        name =&gt; &quot;verify-success&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test   =&gt; { &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++
++    # Same test as above but with a custom callback that always fails.
++    {
++        name =&gt; &quot;verify-custom-reject&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;RejectAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;ClientFail&quot;,
++            &quot;ClientAlert&quot; =&gt; &quot;HandshakeFailure&quot;,
++        },
++    },
++
++    # Same test as above but with a custom callback that always succeeds.
++    {
++        name =&gt; &quot;verify-custom-allow&quot;,
++        server =&gt; { },
++        client =&gt; { },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;AcceptAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;,
++        },
++    },
++
++    # Sanity-check that verification indeed succeeds if peer verification
++    # is not requested.
++    {
++        name =&gt; &quot;noverify-success&quot;,
++        server =&gt; { },
++        client =&gt; {
++            &quot;VerifyMode&quot; =&gt; undef,
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; { &quot;ExpectedResult&quot; =&gt; &quot;Success&quot; },
++    },
++
++    # Same test as above but with a custom callback that always fails.
++    # The callback return has no impact on handshake success in this mode.
++    {
++        name =&gt; &quot;noverify-ignore-custom-reject&quot;,
++        server =&gt; { },
++        client =&gt; {
++            &quot;VerifyMode&quot; =&gt; undef,
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;RejectAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;,
++        },
++    },
++
++    # Same test as above but with a custom callback that always succeeds.
++    # The callback return has no impact on handshake success in this mode.
++    {
++        name =&gt; &quot;noverify-accept-custom-allow&quot;,
++        server =&gt; { },
++        client =&gt; {
++            &quot;VerifyMode&quot; =&gt; undef,
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;AcceptAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;,
++        },
++    },
++
++    # Sanity-check that verification indeed fails without the
++    # permissive callback.
++    {
++        name =&gt; &quot;verify-fail-no-root&quot;,
++        server =&gt; { },
++        client =&gt; {
++            # Don't set up the client root file.
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; {
++          &quot;ExpectedResult&quot; =&gt; &quot;ClientFail&quot;,
++          &quot;ClientAlert&quot; =&gt; &quot;UnknownCA&quot;,
++        },
++    },
++
++    # Same test as above but with a custom callback that always succeeds.
++    {
++        name =&gt; &quot;verify-custom-success-no-root&quot;,
++        server =&gt; { },
++        client =&gt; {
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;AcceptAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;Success&quot;
++        },
++    },
++
++    # Same test as above but with a custom callback that always fails.
++    {
++        name =&gt; &quot;verify-custom-fail-no-root&quot;,
++        server =&gt; { },
++        client =&gt; {
++            &quot;VerifyCAFile&quot; =&gt; undef,
++        },
++        test   =&gt; {
++            &quot;ClientVerifyCallback&quot; =&gt; &quot;RejectAll&quot;,
++            &quot;ExpectedResult&quot; =&gt; &quot;ClientFail&quot;,
++            &quot;ClientAlert&quot; =&gt; &quot;HandshakeFailure&quot;,
++        },
++    },
++
++
++
++);
+diff --git a/test/ssl_test.c b/test/ssl_test.c
+index dfe71cb..b3faffc 100644
+--- a/test/ssl_test.c
++++ b/test/ssl_test.c
+@@ -44,8 +44,8 @@ static int check_result(HANDSHAKE_RESULT result, SSL_TEST_CTX *test_ctx)
+ {
+     if (result.result != test_ctx-&gt;expected_result) {
+         fprintf(stderr, &quot;ExpectedResult mismatch: expected %s, got %s.\n&quot;,
+-                ssl_test_result_t_name(test_ctx-&gt;expected_result),
+-                ssl_test_result_t_name(result.result));
++                ssl_test_result_name(test_ctx-&gt;expected_result),
++                ssl_test_result_name(result.result));
+         return 0;
+     }
+     return 1;
+@@ -160,7 +160,7 @@ static int execute_test(SSL_TEST_FIXTURE fixture)
+     if (test_ctx == NULL)
+         goto err;
+ 
+-    result = do_handshake(server_ctx, client_ctx);
++    result = do_handshake(server_ctx, client_ctx, test_ctx);
+ 
+     ret = check_test(result, test_ctx);
+ 
+diff --git a/test/ssl_test_ctx.c b/test/ssl_test_ctx.c
+index 0c1bbbd..5db7bd4 100644
+--- a/test/ssl_test_ctx.c
++++ b/test/ssl_test_ctx.c
+@@ -71,7 +71,7 @@ __owur static int parse_expected_result(SSL_TEST_CTX *test_ctx, const char *valu
+     return 1;
+ }
+ 
+-const char *ssl_test_result_t_name(ssl_test_result_t result)
++const char *ssl_test_result_name(ssl_test_result_t result)
+ {
+     return enum_name(ssl_test_results, OSSL_NELEM(ssl_test_results), result);
+ }
+@@ -82,6 +82,7 @@ const char *ssl_test_result_t_name(ssl_test_result_t result)
+ 
+ static const test_enum ssl_alerts[] = {
+     {&quot;UnknownCA&quot;, SSL_AD_UNKNOWN_CA},
++    {&quot;HandshakeFailure&quot;, SSL_AD_HANDSHAKE_FAILURE},
+ };
+ 
+ __owur static int parse_alert(int *alert, const char *value)
+@@ -126,6 +127,34 @@ const char *ssl_protocol_name(int protocol)
+     return enum_name(ssl_protocols, OSSL_NELEM(ssl_protocols), protocol);
+ }
+ 
++/***********************/
++/* CertVerifyCallback. */
++/***********************/
++
++static const test_enum ssl_verify_callbacks[] = {
++    {&quot;None&quot;, SSL_TEST_VERIFY_NONE},
++    {&quot;AcceptAll&quot;, SSL_TEST_VERIFY_ACCEPT_ALL},
++    {&quot;RejectAll&quot;, SSL_TEST_VERIFY_REJECT_ALL},
++};
++
++__owur static int parse_client_verify_callback(SSL_TEST_CTX *test_ctx,
++                                              const char *value)
++{
++    int ret_value;
++    if (!parse_enum(ssl_verify_callbacks, OSSL_NELEM(ssl_verify_callbacks),
++                    &amp;ret_value, value)) {
++        return 0;
++    }
++    test_ctx-&gt;client_verify_callback = ret_value;
++    return 1;
++}
++
++const char *ssl_verify_callback_name(ssl_verify_callback_t callback)
++{
++    return enum_name(ssl_verify_callbacks, OSSL_NELEM(ssl_verify_callbacks),
++                     callback);
++}
++
+ 
+ /*************************************************************/
+ /* Known test options and their corresponding parse methods. */
+@@ -141,6 +170,7 @@ static const ssl_test_ctx_option ssl_test_ctx_options[] = {
+     { &quot;ClientAlert&quot;, &amp;parse_client_alert },
+     { &quot;ServerAlert&quot;, &amp;parse_server_alert },
+     { &quot;Protocol&quot;, &amp;parse_protocol },
++    { &quot;ClientVerifyCallback&quot;, &amp;parse_client_verify_callback },
+ };
+ 
+ 
+@@ -153,7 +183,6 @@ SSL_TEST_CTX *SSL_TEST_CTX_new()
+     SSL_TEST_CTX *ret;
+     ret = OPENSSL_zalloc(sizeof(*ret));
+     OPENSSL_assert(ret != NULL);
+-    ret-&gt;expected_result = SSL_TEST_SUCCESS;
+     return ret;
+ }
+ 
+diff --git a/test/ssl_test_ctx.h b/test/ssl_test_ctx.h
+index a183272..9aaa4ce 100644
+--- a/test/ssl_test_ctx.h
++++ b/test/ssl_test_ctx.h
+@@ -15,12 +15,18 @@
+ #include &lt;openssl/ssl.h&gt;
+ 
+ typedef enum {
+-    SSL_TEST_SUCCESS,  /* Default */
++    SSL_TEST_SUCCESS = 0,  /* Default */
+     SSL_TEST_SERVER_FAIL,
+     SSL_TEST_CLIENT_FAIL,
+     SSL_TEST_INTERNAL_ERROR
+ } ssl_test_result_t;
+ 
++typedef enum {
++    SSL_TEST_VERIFY_NONE = 0, /* Default */
++    SSL_TEST_VERIFY_ACCEPT_ALL,
++    SSL_TEST_VERIFY_REJECT_ALL
++} ssl_verify_callback_t;
++
+ typedef struct ssl_test_ctx {
+     /* Test expectations. */
+     /* Defaults to SUCCESS. */
+@@ -34,11 +40,14 @@ typedef struct ssl_test_ctx {
+     /* Negotiated protocol version. 0 if no expectation. */
+     /* See ssl.h for protocol versions. */
+     int protocol;
++    /* One of a number of predefined custom callbacks. */
++    ssl_verify_callback_t client_verify_callback;
+ } SSL_TEST_CTX;
+ 
+-const char *ssl_test_result_t_name(ssl_test_result_t result);
++const char *ssl_test_result_name(ssl_test_result_t result);
+ const char *ssl_alert_name(int alert);
+ const char *ssl_protocol_name(int protocol);
++const char *ssl_verify_callback_name(ssl_verify_callback_t verify_callback);
+ 
+ /*
+  * Load the test case context from |conf|.
+diff --git a/test/ssl_test_ctx_test.c b/test/ssl_test_ctx_test.c
+index 3c6fa71..792f5e8 100644
+--- a/test/ssl_test_ctx_test.c
++++ b/test/ssl_test_ctx_test.c
+@@ -37,26 +37,32 @@ static int SSL_TEST_CTX_equal(SSL_TEST_CTX *ctx, SSL_TEST_CTX *ctx2)
+ {
+     if (ctx-&gt;expected_result != ctx2-&gt;expected_result) {
+         fprintf(stderr, &quot;ExpectedResult mismatch: %s vs %s.\n&quot;,
+-                ssl_test_result_t_name(ctx-&gt;expected_result),
+-                ssl_test_result_t_name(ctx2-&gt;expected_result));
++                ssl_test_result_name(ctx-&gt;expected_result),
++                ssl_test_result_name(ctx2-&gt;expected_result));
+         return 0;
+     }
+     if (ctx-&gt;client_alert != ctx2-&gt;client_alert) {
+         fprintf(stderr, &quot;ClientAlert mismatch: %s vs %s.\n&quot;,
+-                ssl_alert_name(ctx-&gt;expected_result),
+-                ssl_alert_name(ctx2-&gt;expected_result));
++                ssl_alert_name(ctx-&gt;client_alert),
++                ssl_alert_name(ctx2-&gt;client_alert));
+         return 0;
+     }
+     if (ctx-&gt;server_alert != ctx2-&gt;server_alert) {
+         fprintf(stderr, &quot;ServerAlert mismatch: %s vs %s.\n&quot;,
+-                ssl_alert_name(ctx-&gt;expected_result),
+-                ssl_alert_name(ctx2-&gt;expected_result));
++                ssl_alert_name(ctx-&gt;server_alert),
++                ssl_alert_name(ctx2-&gt;server_alert));
+         return 0;
+     }
+     if (ctx-&gt;protocol != ctx2-&gt;protocol) {
+         fprintf(stderr, &quot;ClientAlert mismatch: %s vs %s.\n&quot;,
+-                ssl_protocol_name(ctx-&gt;expected_result),
+-                ssl_protocol_name(ctx2-&gt;expected_result));
++                ssl_protocol_name(ctx-&gt;protocol),
++                ssl_protocol_name(ctx2-&gt;protocol));
++        return 0;
++    }
++    if (ctx-&gt;client_verify_callback != ctx2-&gt;client_verify_callback) {
++        fprintf(stderr, &quot;ClientVerifyCallback mismatch: %s vs %s.\n&quot;,
++                ssl_verify_callback_name(ctx-&gt;client_verify_callback),
++                ssl_verify_callback_name(ctx2-&gt;client_verify_callback));
+         return 0;
+     }
+ 
+@@ -136,6 +142,7 @@ static int test_good_configuration()
+     fixture.expected_ctx-&gt;client_alert = SSL_AD_UNKNOWN_CA;
+     fixture.expected_ctx-&gt;server_alert = 0;  /* No alert. */
+     fixture.expected_ctx-&gt;protocol = TLS1_1_VERSION;
++    fixture.expected_ctx-&gt;client_verify_callback = SSL_TEST_VERIFY_REJECT_ALL,
+     EXECUTE_SSL_TEST_CTX_TEST();
+ }
+ 
+@@ -144,6 +151,7 @@ static const char *bad_configurations[] = {
+     &quot;ssltest_unknown_expected_result&quot;,
+     &quot;ssltest_unknown_alert&quot;,
+     &quot;ssltest_unknown_protocol&quot;,
++    &quot;ssltest_unknown_verify_callback&quot;,
+ };
+ 
+ static int test_bad_configuration(int idx)
+diff --git a/test/ssl_test_ctx_test.conf b/test/ssl_test_ctx_test.conf
+index 2e6800e..3b14605 100644
+--- a/test/ssl_test_ctx_test.conf
++++ b/test/ssl_test_ctx_test.conf
+@@ -4,6 +4,7 @@
+ ExpectedResult = ServerFail
+ ClientAlert = UnknownCA
+ Protocol = TLSv1.1
++ClientVerifyCallback = RejectAll
+ 
+ [ssltest_unknown_option]
+ UnknownOption = Foo
+@@ -16,3 +17,6 @@ ServerAlert = Foo
+ 
+ [ssltest_unknown_protocol]
+ Protocol = Foo
++
++[ssltest_unknown_verify_callback]
++ClientVerifyCallback = Foo
+diff --git a/test/ssltest_old.c b/test/ssltest_old.c
+index c7f3e18..eb35c1d 100644
+--- a/test/ssltest_old.c
++++ b/test/ssltest_old.c
+@@ -223,9 +223,6 @@ static int app_verify_callback(X509_STORE_CTX *ctx, void *arg);
+ struct app_verify_arg {
+     char *string;
+     int app_verify;
+-    int allow_proxy_certs;
+-    char *proxy_auth;
+-    char *proxy_cond;
+ };
+ 
+ #ifndef OPENSSL_NO_DH
+@@ -809,10 +806,6 @@ static void sv_usage(void)
+ #endif
+     fprintf(stderr, &quot; -server_auth  - check server certificate\n&quot;);
+     fprintf(stderr, &quot; -client_auth  - do client authentication\n&quot;);
+-    fprintf(stderr, &quot; -proxy        - allow proxy certificates\n&quot;);
+-    fprintf(stderr, &quot; -proxy_auth &lt;val&gt; - set proxy policy rights\n&quot;);
+-    fprintf(stderr,
+-            &quot; -proxy_cond &lt;val&gt; - expression to test proxy policy rights\n&quot;);
+     fprintf(stderr, &quot; -v            - more output\n&quot;);
+     fprintf(stderr, &quot; -d            - debug output\n&quot;);
+     fprintf(stderr, &quot; -reuse        - use session-id reuse\n&quot;);
+@@ -1069,7 +1062,7 @@ int main(int argc, char *argv[])
+     int client_auth = 0;
+     int server_auth = 0, i;
+     struct app_verify_arg app_verify_arg =
+-        { APP_CALLBACK_STRING, 0, 0, NULL, NULL };
++        { APP_CALLBACK_STRING, 0 };
+     char *p;
+     SSL_CTX *c_ctx = NULL;
+     const SSL_METHOD *meth = NULL;
+@@ -1179,15 +1172,7 @@ int main(int argc, char *argv[])
+             server_auth = 1;
+         else if (strcmp(*argv, &quot;-client_auth&quot;) == 0)
+             client_auth = 1;
+-        else if (strcmp(*argv, &quot;-proxy_auth&quot;) == 0) {
+-            if (--argc &lt; 1)
+-                goto bad;
+-            app_verify_arg.proxy_auth = *(++argv);
+-        } else if (strcmp(*argv, &quot;-proxy_cond&quot;) == 0) {
+-            if (--argc &lt; 1)
+-                goto bad;
+-            app_verify_arg.proxy_cond = *(++argv);
+-        } else if (strcmp(*argv, &quot;-v&quot;) == 0)
++        else if (strcmp(*argv, &quot;-v&quot;) == 0)
+             verbose = 1;
+         else if (strcmp(*argv, &quot;-d&quot;) == 0)
+             debug = 1;
+@@ -1307,8 +1292,6 @@ int main(int argc, char *argv[])
+ #endif
+         else if (strcmp(*argv, &quot;-app_verify&quot;) == 0) {
+             app_verify_arg.app_verify = 1;
+-        } else if (strcmp(*argv, &quot;-proxy&quot;) == 0) {
+-            app_verify_arg.allow_proxy_certs = 1;
+         }
+ #ifndef OPENSSL_NO_NEXTPROTONEG
+           else if (strcmp(*argv, &quot;-npn_client&quot;) == 0) {
+@@ -3027,23 +3010,6 @@ int doit(SSL *s_ssl, SSL *c_ssl, long count)
+     return (ret);
+ }
+ 
+-static CRYPTO_ONCE proxy_auth_ex_data_once = CRYPTO_ONCE_STATIC_INIT;
+-static volatile int proxy_auth_ex_data_idx = -1;
+-
+-static void do_get_proxy_auth_ex_data_idx(void)
+-{
+-    proxy_auth_ex_data_idx = X509_STORE_CTX_get_ex_new_index(0,
+-                                                &quot;SSLtest for verify callback&quot;,
+-                                                NULL, NULL, NULL);
+-}
+-
+-static int get_proxy_auth_ex_data_idx(void)
+-{
+-    CRYPTO_THREAD_run_once(&amp;proxy_auth_ex_data_once,
+-                           do_get_proxy_auth_ex_data_idx);
+-    return proxy_auth_ex_data_idx;
+-}
+-
+ static int verify_callback(int ok, X509_STORE_CTX *ctx)
+ {
+     char *s, buf[256];
+@@ -3076,341 +3042,13 @@ static int verify_callback(int ok, X509_STORE_CTX *ctx)
+         }
+     }
+ 
+-    if (ok == 1) {
+-        X509 *xs = X509_STORE_CTX_get_current_cert(ctx);
+-        if (X509_get_extension_flags(xs) &amp; EXFLAG_PROXY) {
+-            unsigned int *letters = X509_STORE_CTX_get_ex_data(ctx,
+-                                                               get_proxy_auth_ex_data_idx
+-                                                               ());
+-
+-            if (letters) {
+-                int found_any = 0;
+-                int i;
+-                PROXY_CERT_INFO_EXTENSION *pci =
+-                    X509_get_ext_d2i(xs, NID_proxyCertInfo,
+-                                     NULL, NULL);
+-
+-                switch (OBJ_obj2nid(pci-&gt;proxyPolicy-&gt;policyLanguage)) {
+-                case NID_Independent:
+-                    /*
+-                     * Completely meaningless in this program, as there's no
+-                     * way to grant explicit rights to a specific PrC.
+-                     * Basically, using id-ppl-Independent is the perfect way
+-                     * to grant no rights at all.
+-                     */
+-                    fprintf(stderr, &quot;  Independent proxy certificate&quot;);
+-                    for (i = 0; i &lt; 26; i++)
+-                        letters[i] = 0;
+-                    break;
+-                case NID_id_ppl_inheritAll:
+-                    /*
+-                     * This is basically a NOP, we simply let the current
+-                     * rights stand as they are.
+-                     */
+-                    fprintf(stderr, &quot;  Proxy certificate inherits all&quot;);
+-                    break;
+-                default:
+-                    s = (char *)
+-                        pci-&gt;proxyPolicy-&gt;policy-&gt;data;
+-                    i = pci-&gt;proxyPolicy-&gt;policy-&gt;length;
+-
+-                    /*
+-                     * The algorithm works as follows: it is assumed that
+-                     * previous iterations or the initial granted rights has
+-                     * already set some elements of `letters'.  What we need
+-                     * to do is to clear those that weren't granted by the
+-                     * current PrC as well.  The easiest way to do this is to
+-                     * add 1 to all the elements whose letters are given with
+-                     * the current policy. That way, all elements that are
+-                     * set by the current policy and were already set by
+-                     * earlier policies and through the original grant of
+-                     * rights will get the value 2 or higher. The last thing
+-                     * to do is to sweep through `letters' and keep the
+-                     * elements having the value 2 as set, and clear all the
+-                     * others.
+-                     */
+-
+-                    printf(&quot;  Certificate proxy rights = %*.*s&quot;, i,
+-                            i, s);
+-                    while (i-- &gt; 0) {
+-                        int c = *s++;
+-                        if (isascii(c) &amp;&amp; isalpha(c)) {
+-                            if (islower(c))
+-                                c = toupper(c);
+-                            letters[c - 'A']++;
+-                        }
+-                    }
+-                    for (i = 0; i &lt; 26; i++)
+-                        if (letters[i] &lt; 2)
+-                            letters[i] = 0;
+-                        else
+-                            letters[i] = 1;
+-                }
+-
+-                found_any = 0;
+-                printf(&quot;, resulting proxy rights = &quot;);
+-                for (i = 0; i &lt; 26; i++)
+-                    if (letters[i]) {
+-                        printf(&quot;%c&quot;, i + 'A');
+-                        found_any = 1;
+-                    }
+-                if (!found_any)
+-                    printf(&quot;none&quot;);
+-                printf(&quot;\n&quot;);
+-
+-                PROXY_CERT_INFO_EXTENSION_free(pci);
+-            }
+-        }
+-    }
+-
+     return (ok);
+ }
+ 
+-static void process_proxy_debug(int indent, const char *format, ...)
+-{
+-    /* That's 80 &gt; */
+-    static const char indentation[] =
+-        &quot;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&quot;
+-        &quot;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&quot;;
+-    char my_format[256];
+-    va_list args;
+-
+-    BIO_snprintf(my_format, sizeof(my_format), &quot;%*.*s %s&quot;,
+-                 indent, indent, indentation, format);
+-
+-    va_start(args, format);
+-    vfprintf(stderr, my_format, args);
+-    va_end(args);
+-}
+-
+-/*-
+- * Priority levels:
+- *  0   [!]var, ()
+- *  1   &amp; ^
+- *  2   |
+- */
+-static int process_proxy_cond_adders(unsigned int letters[26],
+-                                     const char *cond, const char **cond_end,
+-                                     int *pos, int indent);
+-static int process_proxy_cond_val(unsigned int letters[26], const char *cond,
+-                                  const char **cond_end, int *pos, int indent)
+-{
+-    int c;
+-    int ok = 1;
+-    int negate = 0;
+-
+-    while (isspace((int)*cond)) {
+-        cond++;
+-        (*pos)++;
+-    }
+-    c = *cond;
+-
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;Start process_proxy_cond_val at position %d: %s\n&quot;,
+-                            *pos, cond);
+-
+-    while (c == '!') {
+-        negate = !negate;
+-        cond++;
+-        (*pos)++;
+-        while (isspace((int)*cond)) {
+-            cond++;
+-            (*pos)++;
+-        }
+-        c = *cond;
+-    }
+-
+-    if (c == '(') {
+-        cond++;
+-        (*pos)++;
+-        ok = process_proxy_cond_adders(letters, cond, cond_end, pos,
+-                                       indent + 1);
+-        cond = *cond_end;
+-        if (ok &lt; 0)
+-            goto end;
+-        while (isspace((int)*cond)) {
+-            cond++;
+-            (*pos)++;
+-        }
+-        c = *cond;
+-        if (c != ')') {
+-            fprintf(stderr,
+-                    &quot;Weird condition character in position %d: &quot;
+-                    &quot;%c\n&quot;, *pos, c);
+-            ok = -1;
+-            goto end;
+-        }
+-        cond++;
+-        (*pos)++;
+-    } else if (isascii(c) &amp;&amp; isalpha(c)) {
+-        if (islower(c))
+-            c = toupper(c);
+-        ok = letters[c - 'A'];
+-        cond++;
+-        (*pos)++;
+-    } else {
+-        fprintf(stderr,
+-                &quot;Weird condition character in position %d: &quot; &quot;%c\n&quot;, *pos, c);
+-        ok = -1;
+-        goto end;
+-    }
+- end:
+-    *cond_end = cond;
+-    if (ok &gt;= 0 &amp;&amp; negate)
+-        ok = !ok;
+-
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;End process_proxy_cond_val at position %d: %s, returning %d\n&quot;,
+-                            *pos, cond, ok);
+-
+-    return ok;
+-}
+-
+-static int process_proxy_cond_multipliers(unsigned int letters[26],
+-                                          const char *cond,
+-                                          const char **cond_end, int *pos,
+-                                          int indent)
+-{
+-    int ok;
+-    char c;
+-
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;Start process_proxy_cond_multipliers at position %d: %s\n&quot;,
+-                            *pos, cond);
+-
+-    ok = process_proxy_cond_val(letters, cond, cond_end, pos, indent + 1);
+-    cond = *cond_end;
+-    if (ok &lt; 0)
+-        goto end;
+-
+-    while (ok &gt;= 0) {
+-        while (isspace((int)*cond)) {
+-            cond++;
+-            (*pos)++;
+-        }
+-        c = *cond;
+-
+-        switch (c) {
+-        case '&amp;':
+-        case '^':
+-            {
+-                int save_ok = ok;
+-
+-                cond++;
+-                (*pos)++;
+-                ok = process_proxy_cond_val(letters,
+-                                            cond, cond_end, pos, indent + 1);
+-                cond = *cond_end;
+-                if (ok &lt; 0)
+-                    break;
+-
+-                switch (c) {
+-                case '&amp;':
+-                    ok &amp;= save_ok;
+-                    break;
+-                case '^':
+-                    ok ^= save_ok;
+-                    break;
+-                default:
+-                    fprintf(stderr, &quot;SOMETHING IS SERIOUSLY WRONG!&quot;
+-                            &quot; STOPPING\n&quot;);
+-                    EXIT(1);
+-                }
+-            }
+-            break;
+-        default:
+-            goto end;
+-        }
+-    }
+- end:
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;End process_proxy_cond_multipliers at position %d: %s, returning %d\n&quot;,
+-                            *pos, cond, ok);
+-
+-    *cond_end = cond;
+-    return ok;
+-}
+-
+-static int process_proxy_cond_adders(unsigned int letters[26],
+-                                     const char *cond, const char **cond_end,
+-                                     int *pos, int indent)
+-{
+-    int ok;
+-    char c;
+-
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;Start process_proxy_cond_adders at position %d: %s\n&quot;,
+-                            *pos, cond);
+-
+-    ok = process_proxy_cond_multipliers(letters, cond, cond_end, pos,
+-                                        indent + 1);
+-    cond = *cond_end;
+-    if (ok &lt; 0)
+-        goto end;
+-
+-    while (ok &gt;= 0) {
+-        while (isspace((int)*cond)) {
+-            cond++;
+-            (*pos)++;
+-        }
+-        c = *cond;
+-
+-        switch (c) {
+-        case '|':
+-            {
+-                int save_ok = ok;
+-
+-                cond++;
+-                (*pos)++;
+-                ok = process_proxy_cond_multipliers(letters,
+-                                                    cond, cond_end, pos,
+-                                                    indent + 1);
+-                cond = *cond_end;
+-                if (ok &lt; 0)
+-                    break;
+-
+-                switch (c) {
+-                case '|':
+-                    ok |= save_ok;
+-                    break;
+-                default:
+-                    fprintf(stderr, &quot;SOMETHING IS SERIOUSLY WRONG!&quot;
+-                            &quot; STOPPING\n&quot;);
+-                    EXIT(1);
+-                }
+-            }
+-            break;
+-        default:
+-            goto end;
+-        }
+-    }
+- end:
+-    if (debug)
+-        process_proxy_debug(indent,
+-                            &quot;End process_proxy_cond_adders at position %d: %s, returning %d\n&quot;,
+-                            *pos, cond, ok);
+-
+-    *cond_end = cond;
+-    return ok;
+-}
+-
+-static int process_proxy_cond(unsigned int letters[26],
+-                              const char *cond, const char **cond_end)
+-{
+-    int pos = 1;
+-    return process_proxy_cond_adders(letters, cond, cond_end, &amp;pos, 1);
+-}
+-
+ static int app_verify_callback(X509_STORE_CTX *ctx, void *arg)
+ {
+     int ok = 1;
+     struct app_verify_arg *cb_arg = arg;
+-    unsigned int letters[26];   /* only used with proxy_auth */
+ 
+     if (cb_arg-&gt;app_verify) {
+         char *s = NULL, buf[256];
+@@ -3428,61 +3066,9 @@ static int app_verify_callback(X509_STORE_CTX *ctx, void *arg)
+         }
+         return (1);
+     }
+-    if (cb_arg-&gt;proxy_auth) {
+-        int found_any = 0, i;
+-        char *sp;
+-
+-        for (i = 0; i &lt; 26; i++)
+-            letters[i] = 0;
+-        for (sp = cb_arg-&gt;proxy_auth; *sp; sp++) {
+-            int c = *sp;
+-            if (isascii(c) &amp;&amp; isalpha(c)) {
+-                if (islower(c))
+-                    c = toupper(c);
+-                letters[c - 'A'] = 1;
+-            }
+-        }
+ 
+-        printf(&quot;  Initial proxy rights = &quot;);
+-        for (i = 0; i &lt; 26; i++)
+-            if (letters[i]) {
+-                printf(&quot;%c&quot;, i + 'A');
+-                found_any = 1;
+-            }
+-        if (!found_any)
+-            printf(&quot;none&quot;);
+-        printf(&quot;\n&quot;);
+-
+-        X509_STORE_CTX_set_ex_data(ctx,
+-                                   get_proxy_auth_ex_data_idx(), letters);
+-    }
+-    if (cb_arg-&gt;allow_proxy_certs) {
+-        X509_STORE_CTX_set_flags(ctx, X509_V_FLAG_ALLOW_PROXY_CERTS);
+-    }
+     ok = X509_verify_cert(ctx);
+ 
+-    if (cb_arg-&gt;proxy_auth) {
+-        if (ok &gt; 0) {
+-            const char *cond_end = NULL;
+-
+-            ok = process_proxy_cond(letters, cb_arg-&gt;proxy_cond, &amp;cond_end);
+-
+-            if (ok &lt; 0)
+-                EXIT(3);
+-            if (*cond_end) {
+-                fprintf(stderr,
+-                        &quot;Stopped processing condition before it's end.\n&quot;);
+-                ok = 0;
+-            }
+-            if (!ok)
+-                fprintf(stderr,
+-                        &quot;Proxy rights check with condition '%s' invalid\n&quot;,
+-                        cb_arg-&gt;proxy_cond);
+-            else
+-                printf(&quot;Proxy rights check with condition '%s' ok\n&quot;,
+-                        cb_arg-&gt;proxy_cond);
+-        }
+-    }
+     return (ok);
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007171.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="007177.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7172">[ date ]</a>
+              <a href="thread.html#7172">[ thread ]</a>
+              <a href="subject.html#7172">[ subject ]</a>
+              <a href="author.html#7172">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

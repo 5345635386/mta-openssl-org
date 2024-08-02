@@ -1,0 +1,451 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-November/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1572988881.354456.27553.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025990.html">
+   <LINK REL="Next"  HREF="025997.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1572988881.354456.27553.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Nov  5 21:21:21 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025990.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="025997.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25996">[ date ]</a>
+              <a href="thread.html#25996">[ thread ]</a>
+              <a href="subject.html#25996">[ subject ]</a>
+              <a href="author.html#25996">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  c0e0984f125ee30820520829c4c112b1e166f871 (commit)
+      from  677c4a012a7e72b5f2dd239639034f01fad850bf (commit)
+
+
+- Log -----------------------------------------------------------------
+commit c0e0984f125ee30820520829c4c112b1e166f871
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Oct 30 18:03:07 2019 +0100
+
+    EVP: Make the KEYEXCH implementation leaner
+    
+    Because the algorithm to use is decided already when creating an
+    EVP_PKEY_CTX regardless of how it was created, it turns out that it's
+    unnecessary to provide the KEYEXCH method explicitly, and rather
+    always have it be fetched implicitly.
+    
+    This means fewer changes for applications that want to use new key
+    exchange algorithms / implementations.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/10305">https://github.com/openssl/openssl/pull/10305</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/evp_local.h       |   2 -
+ crypto/evp/exchange.c        | 110 ++++++++++++++++---------------------------
+ crypto/evp/pmeth_lib.c       |   1 +
+ doc/man3/EVP_PKEY_derive.pod |  39 ++++++---------
+ include/crypto/evp.h         |   3 ++
+ include/openssl/evp.h        |   1 -
+ util/libcrypto.num           |   2 +-
+ 7 files changed, 60 insertions(+), 98 deletions(-)
+
+diff --git a/crypto/evp/evp_local.h b/crypto/evp/evp_local.h
+index 9b208190fb..5795dcbe51 100644
+--- a/crypto/evp/evp_local.h
++++ b/crypto/evp/evp_local.h
+@@ -102,8 +102,6 @@ struct evp_keyexch_st {
+     CRYPTO_REF_COUNT refcnt;
+     CRYPTO_RWLOCK *lock;
+ 
+-    EVP_KEYMGMT *keymgmt;
+-
+     OSSL_OP_keyexch_newctx_fn *newctx;
+     OSSL_OP_keyexch_init_fn *init;
+     OSSL_OP_keyexch_set_peer_fn *set_peer;
+diff --git a/crypto/evp/exchange.c b/crypto/evp/exchange.c
+index dfc309ecd7..6e1372e042 100644
+--- a/crypto/evp/exchange.c
++++ b/crypto/evp/exchange.c
+@@ -35,37 +35,17 @@ static EVP_KEYEXCH *evp_keyexch_new(OSSL_PROVIDER *prov)
+ static void *evp_keyexch_from_dispatch(int name_id,
+                                        const OSSL_DISPATCH *fns,
+                                        OSSL_PROVIDER *prov,
+-                                       void *vkeymgmt_data)
++                                       void *unused)
+ {
+-    /*
+-     * Key exchange cannot work without a key, and key management
+-     * from the same provider to manage its keys.  We therefore fetch
+-     * a key management method using the same algorithm and properties
+-     * and pass that down to evp_generic_fetch to be passed on to our
+-     * evp_keyexch_from_dispatch, which will attach the key management
+-     * method to the newly created key exchange method as long as the
+-     * provider matches.
+-     */
+-    struct keymgmt_data_st *keymgmt_data = vkeymgmt_data;
+-    EVP_KEYMGMT *keymgmt =
+-        evp_keymgmt_fetch_by_number(keymgmt_data-&gt;ctx, name_id,
+-                                    keymgmt_data-&gt;properties);
+     EVP_KEYEXCH *exchange = NULL;
+     int fncnt = 0, paramfncnt = 0;
+ 
+-    if (keymgmt == NULL || EVP_KEYMGMT_provider(keymgmt) != prov) {
+-        ERR_raise(ERR_LIB_EVP, EVP_R_NO_KEYMGMT_AVAILABLE);
+-        goto err;
+-    }
+-
+     if ((exchange = evp_keyexch_new(prov)) == NULL) {
+         ERR_raise(ERR_LIB_EVP, ERR_R_MALLOC_FAILURE);
+         goto err;
+     }
+ 
+     exchange-&gt;name_id = name_id;
+-    exchange-&gt;keymgmt = keymgmt;
+-    keymgmt = NULL;              /* avoid double free on failure below */
+ 
+     for (; fns-&gt;function_id != 0; fns++) {
+         switch (fns-&gt;function_id) {
+@@ -135,7 +115,6 @@ static void *evp_keyexch_from_dispatch(int name_id,
+ 
+  err:
+     EVP_KEYEXCH_free(exchange);
+-    EVP_KEYMGMT_free(keymgmt);
+     return NULL;
+ }
+ 
+@@ -147,7 +126,6 @@ void EVP_KEYEXCH_free(EVP_KEYEXCH *exchange)
+         CRYPTO_DOWN_REF(&amp;exchange-&gt;refcnt, &amp;i, exchange-&gt;lock);
+         if (i &gt; 0)
+             return;
+-        EVP_KEYMGMT_free(exchange-&gt;keymgmt);
+         ossl_provider_free(exchange-&gt;prov);
+         CRYPTO_THREAD_lock_free(exchange-&gt;lock);
+         OPENSSL_free(exchange);
+@@ -171,70 +149,73 @@ EVP_KEYEXCH *EVP_KEYEXCH_fetch(OPENSSL_CTX *ctx, const char *algorithm,
+                                const char *properties)
+ {
+     EVP_KEYEXCH *keyexch = NULL;
+-    struct keymgmt_data_st keymgmt_data;
+ 
+-    keymgmt_data.ctx = ctx;
+-    keymgmt_data.properties = properties;
+     keyexch = evp_generic_fetch(ctx, OSSL_OP_KEYEXCH, algorithm, properties,
+-                                evp_keyexch_from_dispatch, &amp;keymgmt_data,
++                                evp_keyexch_from_dispatch, NULL,
+                                 (int (*)(void *))EVP_KEYEXCH_up_ref,
+                                 (void (*)(void *))EVP_KEYEXCH_free);
+ 
+     return keyexch;
+ }
+ 
+-int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange)
++int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+ {
+     int ret;
+     void *provkey = NULL;
++    EVP_KEYEXCH *exchange = NULL;
++
++    if (ctx == NULL) {
++        EVPerr(0, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++        return -2;
++    }
+ 
+     evp_pkey_ctx_free_old_ops(ctx);
+     ctx-&gt;operation = EVP_PKEY_OP_DERIVE;
+ 
+-    if (ctx-&gt;engine != NULL)
++    if (ctx-&gt;engine != NULL || ctx-&gt;algorithm == NULL)
+         goto legacy;
+ 
+-    if (exchange != NULL) {
+-        if (!EVP_KEYEXCH_up_ref(exchange))
+-            goto err;
+-    } else {
+-        int nid = ctx-&gt;pkey != NULL ? ctx-&gt;pkey-&gt;type : ctx-&gt;pmeth-&gt;pkey_id;
++    /*
++     * Because we cleared out old ops, we shouldn't need to worry about
++     * checking if exchange is already there.  Keymgmt is a different
++     * matter, as it isn't tied to a specific EVP_PKEY op.
++     */
++    exchange = EVP_KEYEXCH_fetch(ctx-&gt;libctx, ctx-&gt;algorithm, ctx-&gt;propquery);
++    if (exchange != NULL &amp;&amp; ctx-&gt;keymgmt == NULL) {
++        int name_id = EVP_KEYEXCH_number(exchange);
+ 
++        ctx-&gt;keymgmt =
++            evp_keymgmt_fetch_by_number(ctx-&gt;libctx, name_id, ctx-&gt;propquery);
++    }
++
++    if (ctx-&gt;keymgmt == NULL
++        || exchange == NULL
++        || (EVP_KEYMGMT_provider(ctx-&gt;keymgmt)
++            != EVP_KEYEXCH_provider(exchange))) {
+         /*
+-         * TODO(3.0): Check for legacy handling. Remove this once all all
+-         * algorithms are moved to providers.
++         * We don't have the full support we need with provided methods,
++         * let's go see if legacy does.  Also, we don't need to free
++         * ctx-&gt;keymgmt here, as it's not necessarily tied to this
++         * operation.  It will be freed by EVP_PKEY_CTX_free().
+          */
+-        if (ctx-&gt;pkey != NULL) {
+-            switch (ctx-&gt;pkey-&gt;type) {
+-            case EVP_PKEY_DH:
+-                break;
+-            default:
+-                goto legacy;
+-            }
+-            exchange = EVP_KEYEXCH_fetch(NULL, OBJ_nid2sn(nid), NULL);
+-        } else {
+-            goto legacy;
+-        }
+-
+-        if (exchange == NULL) {
+-            EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX, EVP_R_INITIALIZATION_ERROR);
+-            goto err;
+-        }
++        EVP_KEYEXCH_free(exchange);
++        goto legacy;
+     }
+ 
++
+     ctx-&gt;op.kex.exchange = exchange;
++
+     if (ctx-&gt;pkey != NULL) {
+-        provkey =
+-            evp_keymgmt_export_to_provider(ctx-&gt;pkey, exchange-&gt;keymgmt, 0);
++        provkey = evp_keymgmt_export_to_provider(ctx-&gt;pkey, ctx-&gt;keymgmt, 0);
+         if (provkey == NULL) {
+-            EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX, EVP_R_INITIALIZATION_ERROR);
++            EVPerr(0, EVP_R_INITIALIZATION_ERROR);
+             goto err;
+         }
+     }
+     ctx-&gt;op.kex.exchprovctx = exchange-&gt;newctx(ossl_provider_ctx(exchange-&gt;prov));
+     if (ctx-&gt;op.kex.exchprovctx == NULL) {
+         /* The provider key can stay in the cache */
+-        EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX, EVP_R_INITIALIZATION_ERROR);
++        EVPerr(0, EVP_R_INITIALIZATION_ERROR);
+         goto err;
+     }
+     ret = exchange-&gt;init(ctx-&gt;op.kex.exchprovctx, provkey);
+@@ -246,8 +227,7 @@ int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange)
+ 
+  legacy:
+     if (ctx == NULL || ctx-&gt;pmeth == NULL || ctx-&gt;pmeth-&gt;derive == NULL) {
+-        EVPerr(EVP_F_EVP_PKEY_DERIVE_INIT_EX,
+-               EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
++        EVPerr(0, EVP_R_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE);
+         return -2;
+     }
+ 
+@@ -259,11 +239,6 @@ int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange)
+     return ret;
+ }
+ 
+-int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+-{
+-    return EVP_PKEY_derive_init_ex(ctx, NULL);
+-}
+-
+ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+ {
+     int ret;
+@@ -284,8 +259,7 @@ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+         return -2;
+     }
+ 
+-    provkey =
+-        evp_keymgmt_export_to_provider(peer, ctx-&gt;op.kex.exchange-&gt;keymgmt, 0);
++    provkey = evp_keymgmt_export_to_provider(peer, ctx-&gt;keymgmt, 0);
+     if (provkey == NULL) {
+         EVPerr(EVP_F_EVP_PKEY_DERIVE_SET_PEER, ERR_R_INTERNAL_ERROR);
+         return 0;
+@@ -402,13 +376,9 @@ void EVP_KEYEXCH_do_all_provided(OPENSSL_CTX *libctx,
+                                  void (*fn)(EVP_KEYEXCH *keyexch, void *arg),
+                                  void *arg)
+ {
+-    struct keymgmt_data_st keymgmt_data;
+-
+-    keymgmt_data.ctx = libctx;
+-    keymgmt_data.properties = NULL;
+     evp_generic_do_all(libctx, OSSL_OP_KEYEXCH,
+                        (void (*)(void *, void *))fn, arg,
+-                       evp_keyexch_from_dispatch, &amp;keymgmt_data,
++                       evp_keyexch_from_dispatch, NULL,
+                        (void (*)(void *))EVP_KEYEXCH_free);
+ }
+ 
+diff --git a/crypto/evp/pmeth_lib.c b/crypto/evp/pmeth_lib.c
+index d547e5a69d..cc0707e052 100644
+--- a/crypto/evp/pmeth_lib.c
++++ b/crypto/evp/pmeth_lib.c
+@@ -482,6 +482,7 @@ void EVP_PKEY_CTX_free(EVP_PKEY_CTX *ctx)
+         ctx-&gt;pmeth-&gt;cleanup(ctx);
+ 
+     evp_pkey_ctx_free_old_ops(ctx);
++    EVP_KEYMGMT_free(ctx-&gt;keymgmt);
+ 
+     EVP_PKEY_free(ctx-&gt;pkey);
+     EVP_PKEY_free(ctx-&gt;peerkey);
+diff --git a/doc/man3/EVP_PKEY_derive.pod b/doc/man3/EVP_PKEY_derive.pod
+index 832498ba76..954a3501e8 100644
+--- a/doc/man3/EVP_PKEY_derive.pod
++++ b/doc/man3/EVP_PKEY_derive.pod
+@@ -2,43 +2,34 @@
+ 
+ =head1 NAME
+ 
+-EVP_PKEY_derive_init, EVP_PKEY_derive_init_ex, EVP_PKEY_derive_set_peer,
+-EVP_PKEY_derive - derive public key algorithm shared secret
++EVP_PKEY_derive_init, EVP_PKEY_derive_set_peer, EVP_PKEY_derive
++- derive public key algorithm shared secret
+ 
+ =head1 SYNOPSIS
+ 
+  #include &lt;openssl/evp.h&gt;
+ 
+- int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange);
+  int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx);
+  int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer);
+  int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen);
+ 
+ =head1 DESCRIPTION
+ 
+-The EVP_PKEY_derive_init_ex() function initializes a public key algorithm
+-context for shared secret derivation using the key exchange algorithm
+-B&lt;exchange&gt;.
+-The key exchange algorithm B&lt;exchange&gt; should be fetched using a call to
+-L&lt;EVP_KEYEXCH_fetch(3)&gt;.
+-The EVP_PKEY object associated with B&lt;ctx&gt; must be compatible with that
+-algorithm.
+-B&lt;exchange&gt; may be NULL in which case the EVP_KEYEXCH algorithm is fetched
+-implicitly based on the type of EVP_PKEY associated with B&lt;ctx&gt;.
+-See L&lt;provider(7)/Implicit fetch&gt; for more information about implict fetches.
+-
+-The EVP_PKEY_derive_init() function is the same as EVP_PKEY_derive_init_ex()
+-except that the EVP_KEYEXCH algorithm is always implicitly fetched.
+-
+-The EVP_PKEY_derive_set_peer() function sets the peer key: this will normally
++EVP_PKEY_derive_init() initializes a public key algorithm context I&lt;ctx&gt; for
++shared secret derivation using the algorithm given when the context was created
++using L&lt;EVP_PKEY_CTX_new(3)&gt; or variants thereof.  The algorithm is used to
++fetch a B&lt;EVP_KEYEXCH&gt; method implicitly, see L&lt;provider(7)/Implicit fetch&gt; for
++more information about implict fetches.
++
++EVP_PKEY_derive_set_peer() sets the peer key: this will normally
+ be a public key.
+ 
+-The EVP_PKEY_derive() derives a shared secret using B&lt;ctx&gt;.
+-If B&lt;key&gt; is B&lt;NULL&gt; then the maximum size of the output buffer is written to
+-the B&lt;keylen&gt; parameter. If B&lt;key&gt; is not B&lt;NULL&gt; then before the call the
+-B&lt;keylen&gt; parameter should contain the length of the B&lt;key&gt; buffer, if the call
+-is successful the shared secret is written to B&lt;key&gt; and the amount of data
+-written to B&lt;keylen&gt;.
++EVP_PKEY_derive() derives a shared secret using I&lt;ctx&gt;.
++If I&lt;key&gt; is NULL then the maximum size of the output buffer is written to the
++I&lt;keylen&gt; parameter. If I&lt;key&gt; is not NULL then before the call the I&lt;keylen&gt;
++parameter should contain the length of the I&lt;key&gt; buffer, if the call is
++successful the shared secret is written to I&lt;key&gt; and the amount of data
++written to I&lt;keylen&gt;.
+ 
+ =head1 NOTES
+ 
+diff --git a/include/crypto/evp.h b/include/crypto/evp.h
+index 32ae121eea..dfbcf149de 100644
+--- a/include/crypto/evp.h
++++ b/include/crypto/evp.h
+@@ -29,6 +29,9 @@ struct evp_pkey_ctx_st {
+     const char *algorithm;
+     const char *propquery;
+ 
++    /* cached key manager */
++    EVP_KEYMGMT *keymgmt;
++
+     union {
+         struct {
+             EVP_KEYEXCH *exchange;
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index baa1ce8c6c..5de6f8b08e 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -1550,7 +1550,6 @@ int EVP_PKEY_decrypt(EVP_PKEY_CTX *ctx,
+                      unsigned char *out, size_t *outlen,
+                      const unsigned char *in, size_t inlen);
+ 
+-int EVP_PKEY_derive_init_ex(EVP_PKEY_CTX *ctx, EVP_KEYEXCH *exchange);
+ int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx);
+ int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer);
+ int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index 8a88b6e8bd..737a2aba98 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -4666,7 +4666,7 @@ BN_priv_rand_ex                         4782	3_0_0	EXIST::FUNCTION:
+ BN_rand_range_ex                        4783	3_0_0	EXIST::FUNCTION:
+ BN_priv_rand_range_ex                   4784	3_0_0	EXIST::FUNCTION:
+ BN_generate_prime_ex2                   4785	3_0_0	EXIST::FUNCTION:
+-EVP_PKEY_derive_init_ex                 4786	3_0_0	EXIST::FUNCTION:
++EVP_PKEY_derive_init_ex                 4786	3_0_0	NOEXIST::FUNCTION:
+ EVP_KEYEXCH_free                        4787	3_0_0	EXIST::FUNCTION:
+ EVP_KEYEXCH_up_ref                      4788	3_0_0	EXIST::FUNCTION:
+ EVP_KEYEXCH_fetch                       4789	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025990.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="025997.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25996">[ date ]</a>
+              <a href="thread.html#25996">[ thread ]</a>
+              <a href="subject.html#25996">[ subject ]</a>
+              <a href="author.html#25996">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

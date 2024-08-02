@@ -1,0 +1,587 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607480465.042135.10115.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032569.html">
+   <LINK REL="Next"  HREF="032580.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1607480465.042135.10115.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Wed Dec  9 02:21:05 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032569.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032580.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32575">[ date ]</a>
+              <a href="thread.html#32575">[ thread ]</a>
+              <a href="subject.html#32575">[ subject ]</a>
+              <a href="author.html#32575">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  81aef6ba720971c09ad68f89d418c8d3d3f904f7 (commit)
+      from  d8975dec0c3f41a491345f8a3c02612eaf8b30f7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 81aef6ba720971c09ad68f89d418c8d3d3f904f7
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Fri Nov 20 08:45:34 2020 +1000
+
+    rand: add a provider side seed source.
+    
+    This allows the operating system sources that OpenSSL supports to be
+    used directly as RNGs.  It also allows DRBG seeding to be explicitly
+    specified rather than being left to a fall back case.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13455">https://github.com/openssl/openssl/pull/13455</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/err/openssl.txt                             |   2 +
+ crypto/rand/rand_lib.c                             |  53 +++++-
+ doc/man5/config.pod                                |  10 ++
+ doc/man7/EVP_RAND-SEED-SRC.pod                     |  87 ++++++++++
+ providers/common/include/prov/providercommonerr.h  |   1 +
+ providers/common/provider_err.c                    |   2 +
+ providers/defltprov.c                              |   1 +
+ .../implementations/include/prov/implementations.h |   1 +
+ providers/implementations/rands/build.info         |   2 +-
+ providers/implementations/rands/seed_src.c         | 192 +++++++++++++++++++++
+ 10 files changed, 348 insertions(+), 3 deletions(-)
+ create mode 100644 doc/man7/EVP_RAND-SEED-SRC.pod
+ create mode 100644 providers/implementations/rands/seed_src.c
+
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 491f3a7cdb..73f551a3e5 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -2933,6 +2933,8 @@ PROV_R_REQUIRE_CTR_MODE_CIPHER:206:require ctr mode cipher
+ PROV_R_RESEED_ERROR:197:reseed error
+ PROV_R_SEARCH_ONLY_SUPPORTED_FOR_DIRECTORIES:222:\
+ 	search only supported for directories
++PROV_R_SEED_SOURCES_MUST_NOT_HAVE_A_PARENT:200:\
++	seed sources must not have a parent
+ PROV_R_SELF_TEST_KAT_FAILURE:215:self test kat failure
+ PROV_R_SELF_TEST_POST_FAILURE:216:self test post failure
+ PROV_R_TAG_NOTSET:119:tag notset
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 73d509a8dc..2ad3cf776f 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -325,6 +325,8 @@ typedef struct rand_global_st {
+      */
+     CRYPTO_RWLOCK *lock;
+ 
++    EVP_RAND_CTX *seed;
++
+     /*
+      * The &lt;primary&gt; DRBG
+      *
+@@ -363,6 +365,10 @@ typedef struct rand_global_st {
+     char *rng_cipher;
+     char *rng_digest;
+     char *rng_propq;
++
++    /* Allow the randomness source to be changed */
++    char *seed_name;
++    char *seed_propq;
+ } RAND_GLOBAL;
+ 
+ /*
+@@ -412,13 +418,16 @@ static void rand_ossl_ctx_free(void *vdgbl)
+         return;
+ 
+     CRYPTO_THREAD_lock_free(dgbl-&gt;lock);
+-    EVP_RAND_CTX_free(dgbl-&gt;primary);
+     CRYPTO_THREAD_cleanup_local(&amp;dgbl-&gt;private);
+     CRYPTO_THREAD_cleanup_local(&amp;dgbl-&gt;public);
++    EVP_RAND_CTX_free(dgbl-&gt;primary);
++    EVP_RAND_CTX_free(dgbl-&gt;seed);
+     OPENSSL_free(dgbl-&gt;rng_name);
+     OPENSSL_free(dgbl-&gt;rng_cipher);
+     OPENSSL_free(dgbl-&gt;rng_digest);
+     OPENSSL_free(dgbl-&gt;rng_propq);
++    OPENSSL_free(dgbl-&gt;seed_name);
++    OPENSSL_free(dgbl-&gt;seed_propq);
+ 
+     OPENSSL_free(dgbl);
+ }
+@@ -452,6 +461,35 @@ static void rand_delete_thread_state(void *arg)
+     EVP_RAND_CTX_free(rand);
+ }
+ 
++#ifndef FIPS_MODULE
++static EVP_RAND_CTX *rand_new_seed(OSSL_LIB_CTX *libctx)
++{
++    EVP_RAND *rand;
++    RAND_GLOBAL *dgbl = rand_get_global(libctx);
++    EVP_RAND_CTX *ctx;
++    char *name;
++
++    name = dgbl-&gt;seed_name != NULL ? dgbl-&gt;seed_name : &quot;SEED-SRC&quot;;
++    rand = EVP_RAND_fetch(libctx, name, dgbl-&gt;seed_propq);
++    if (rand == NULL) {
++        ERR_raise(ERR_LIB_RAND, RAND_R_UNABLE_TO_FETCH_DRBG);
++        return NULL;
++    }
++    ctx = EVP_RAND_CTX_new(rand, NULL);
++    EVP_RAND_free(rand);
++    if (ctx == NULL) {
++        ERR_raise(ERR_LIB_RAND, RAND_R_UNABLE_TO_CREATE_DRBG);
++        return NULL;
++    }
++    if (!EVP_RAND_instantiate(ctx, 0, 0, NULL, 0)) {
++        ERR_raise(ERR_LIB_RAND, RAND_R_ERROR_INSTANTIATING_DRBG);
++        EVP_RAND_CTX_free(ctx);
++        return NULL;
++    }
++    return ctx;
++}
++#endif
++
+ static EVP_RAND_CTX *rand_new_drbg(OSSL_LIB_CTX *libctx, EVP_RAND_CTX *parent,
+                                    unsigned int reseed_interval,
+                                    time_t reseed_time_interval)
+@@ -522,8 +560,13 @@ EVP_RAND_CTX *RAND_get0_primary(OSSL_LIB_CTX *ctx)
+     if (dgbl-&gt;primary == NULL) {
+         if (!CRYPTO_THREAD_write_lock(dgbl-&gt;lock))
+             return NULL;
++#ifndef FIPS_MODULE
++        if (dgbl-&gt;seed == NULL)
++            dgbl-&gt;seed = rand_new_seed(ctx);
++#endif
+         if (dgbl-&gt;primary == NULL)
+-            dgbl-&gt;primary = rand_new_drbg(ctx, NULL, PRIMARY_RESEED_INTERVAL,
++            dgbl-&gt;primary = rand_new_drbg(ctx, dgbl-&gt;seed,
++                                          PRIMARY_RESEED_INTERVAL,
+                                           PRIMARY_RESEED_TIME_INTERVAL);
+         CRYPTO_THREAD_unlock(dgbl-&gt;lock);
+     }
+@@ -644,6 +687,12 @@ static int random_conf_init(CONF_IMODULE *md, const CONF *cnf)
+         } else if (strcasecmp(cval-&gt;name, &quot;properties&quot;) == 0) {
+             if (!random_set_string(&amp;dgbl-&gt;rng_propq, cval-&gt;value))
+                 return 0;
++        } else if (strcasecmp(cval-&gt;name, &quot;seed&quot;) == 0) {
++            if (!random_set_string(&amp;dgbl-&gt;seed_name, cval-&gt;value))
++                return 0;
++        } else if (strcasecmp(cval-&gt;name, &quot;seed_properties&quot;) == 0) {
++            if (!random_set_string(&amp;dgbl-&gt;seed_propq, cval-&gt;value))
++                return 0;
+         } else {
+             ERR_raise_data(ERR_LIB_CRYPTO,
+                            CRYPTO_R_UNKNOWN_NAME_IN_RANDOM_SECTION,
+diff --git a/doc/man5/config.pod b/doc/man5/config.pod
+index 0a28f4ea4b..45165f20ec 100644
+--- a/doc/man5/config.pod
++++ b/doc/man5/config.pod
+@@ -438,6 +438,16 @@ generators will use.  Other random bit generators ignore this name.
+ This sets the property query used when fetching the random bit generator and
+ any underlying algorithms.
+ 
++=item B&lt;seed&gt;
++
++This sets the randomness source that should be used.  By default B&lt;SEED-SRC&gt;
++will be used outside of the FIPS provider.  The FIPS provider uses call backs
++to access the same randomness sources from outside the validated boundary.
++
++=item B&lt;seed_properties&gt;
++
++This sets the property query used when fetching the randomness source.
++
+ =back
+ 
+ =head1 EXAMPLES
+diff --git a/doc/man7/EVP_RAND-SEED-SRC.pod b/doc/man7/EVP_RAND-SEED-SRC.pod
+new file mode 100644
+index 0000000000..f301ed25f9
+--- /dev/null
++++ b/doc/man7/EVP_RAND-SEED-SRC.pod
+@@ -0,0 +1,87 @@
++=pod
++
++=head1 NAME
++
++EVP_RAND-SEED-SRC - The randomness seed source EVP_RAND implementation
++
++=head1 DESCRIPTION
++
++Support for deterministic random number generator seeding through the
++B&lt;EVP_RAND&gt; API.
++
++The seed sources used are specified at the time OpenSSL is configured for
++building using the B&lt;--with-rand-seed=&gt; option.  By default, operating system
++randomness sources are used.
++
++=head2 Identity
++
++&quot;SEED-SRC&quot; is the name for this implementation; it can be used with the
++EVP_RAND_fetch() function.
++
++=head2 Supported parameters
++
++The supported parameters are:
++
++=over 4
++
++=item &quot;state&quot; (B&lt;OSSL_RAND_PARAM_STATE&gt;) &lt;integer&gt;
++
++=item &quot;strength&quot; (B&lt;OSSL_RAND_PARAM_STRENGTH&gt;) &lt;unsigned integer&gt;
++
++=item &quot;max_request&quot; (B&lt;OSSL_RAND_PARAM_MAX_REQUEST&gt;) &lt;unsigned integer&gt;
++
++These parameters work as described in L&lt;EVP_RAND(3)/PARAMETERS&gt;.
++
++=back
++
++=head1 NOTES
++
++A context for the seed source can be obtained by calling:
++
++ EVP_RAND *rand = EVP_RAND_fetch(NULL, &quot;SEED-SRC&quot;, NULL);
++ EVP_RAND_CTX *rctx = EVP_RAND_CTX_new(rand);
++
++=head1 EXAMPLES
++
++ EVP_RAND *rand;
++ EVP_RAND_CTX *seed, *rctx;
++ unsigned char bytes[100];
++ OSSL_PARAM params[2], *p = params;
++ unsigned int strength = 128;
++
++ /* Create a seed source */
++ rand = EVP_RAND_fetch(NULL, &quot;SEED-SRC&quot;, NULL);
++ seed = EVP_RAND_CTX_new(rand, NULL);
++ EVP_RAND_free(rand);
++
++ /* Feed this into a DRBG */
++ rand = EVP_RAND_fetch(NULL, &quot;CTR-DRBG&quot;, NULL);
++ rctx = EVP_RAND_CTX_new(rand, seed);
++ EVP_RAND_free(rand);
++
++ /* Configure the DRBG */
++ *p++ = OSSL_PARAM_construct_utf8_string(OSSL_DRBG_PARAM_CIPHER,
++                                         SN_aes_256_ctr, 0);
++ *p = OSSL_PARAM_construct_end();
++ EVP_RAND_set_ctx_params(rctx, params);
++
++ EVP_RAND_generate(rctx, bytes, sizeof(bytes), strength, 0, NULL, 0);
++
++ EVP_RAND_CTX_free(rctx);
++ EVP_RAND_CTX_free(seed);
++
++=head1 SEE ALSO
++
++L&lt;EVP_RAND(3)&gt;,
++L&lt;EVP_RAND(3)/PARAMETERS&gt;
++
++=head1 COPYRIGHT
++
++Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++
++Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++this file except in compliance with the License.  You can obtain a copy
++in the file LICENSE in the source distribution or at
++L&lt;<A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>&gt;.
++
++=cut
+diff --git a/providers/common/include/prov/providercommonerr.h b/providers/common/include/prov/providercommonerr.h
+index ad1bd20c53..f044e7b7c7 100644
+--- a/providers/common/include/prov/providercommonerr.h
++++ b/providers/common/include/prov/providercommonerr.h
+@@ -154,6 +154,7 @@ int err_load_PROV_strings_int(void);
+ # define PROV_R_REQUIRE_CTR_MODE_CIPHER                   206
+ # define PROV_R_RESEED_ERROR                              197
+ # define PROV_R_SEARCH_ONLY_SUPPORTED_FOR_DIRECTORIES     222
++# define PROV_R_SEED_SOURCES_MUST_NOT_HAVE_A_PARENT       200
+ # define PROV_R_SELF_TEST_KAT_FAILURE                     215
+ # define PROV_R_SELF_TEST_POST_FAILURE                    216
+ # define PROV_R_TAG_NOTSET                                119
+diff --git a/providers/common/provider_err.c b/providers/common/provider_err.c
+index fed6018387..3a28eaaa2d 100644
+--- a/providers/common/provider_err.c
++++ b/providers/common/provider_err.c
+@@ -175,6 +175,8 @@ static const ERR_STRING_DATA PROV_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_RESEED_ERROR), &quot;reseed error&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SEARCH_ONLY_SUPPORTED_FOR_DIRECTORIES),
+     &quot;search only supported for directories&quot;},
++    {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SEED_SOURCES_MUST_NOT_HAVE_A_PARENT),
++    &quot;seed sources must not have a parent&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SELF_TEST_KAT_FAILURE),
+     &quot;self test kat failure&quot;},
+     {ERR_PACK(ERR_LIB_PROV, 0, PROV_R_SELF_TEST_POST_FAILURE),
+diff --git a/providers/defltprov.c b/providers/defltprov.c
+index 9a662738d8..3cd7dffee8 100644
+--- a/providers/defltprov.c
++++ b/providers/defltprov.c
+@@ -362,6 +362,7 @@ static const OSSL_ALGORITHM deflt_rands[] = {
+     { &quot;CTR-DRBG&quot;, &quot;provider=default&quot;, ossl_drbg_ctr_functions },
+     { &quot;HASH-DRBG&quot;, &quot;provider=default&quot;, ossl_drbg_hash_functions },
+     { &quot;HMAC-DRBG&quot;, &quot;provider=default&quot;, ossl_drbg_ossl_hmac_functions },
++    { &quot;SEED-SRC&quot;, &quot;provider=default&quot;, ossl_seed_src_functions },
+     { &quot;TEST-RAND&quot;, &quot;provider=default&quot;, ossl_test_rng_functions },
+     { NULL, NULL, NULL }
+ };
+diff --git a/providers/implementations/include/prov/implementations.h b/providers/implementations/include/prov/implementations.h
+index 00178d4ceb..5b6f913131 100644
+--- a/providers/implementations/include/prov/implementations.h
++++ b/providers/implementations/include/prov/implementations.h
+@@ -265,6 +265,7 @@ extern const OSSL_DISPATCH ossl_kdf_krb5kdf_functions[];
+ 
+ /* RNGs */
+ extern const OSSL_DISPATCH ossl_test_rng_functions[];
++extern const OSSL_DISPATCH ossl_seed_src_functions[];
+ extern const OSSL_DISPATCH ossl_drbg_hash_functions[];
+ extern const OSSL_DISPATCH ossl_drbg_ossl_hmac_functions[];
+ extern const OSSL_DISPATCH ossl_drbg_ctr_functions[];
+diff --git a/providers/implementations/rands/build.info b/providers/implementations/rands/build.info
+index 2ca0cdadc7..b44c1caa8a 100644
+--- a/providers/implementations/rands/build.info
++++ b/providers/implementations/rands/build.info
+@@ -3,4 +3,4 @@ SUBDIRS=seeding
+ $COMMON=drbg.c test_rng.c drbg_ctr.c drbg_hash.c drbg_hmac.c crngt.c
+ 
+ SOURCE[../../libfips.a]=$COMMON
+-SOURCE[../../libnonfips.a]=$COMMON
++SOURCE[../../libnonfips.a]=$COMMON seed_src.c
+diff --git a/providers/implementations/rands/seed_src.c b/providers/implementations/rands/seed_src.c
+new file mode 100644
+index 0000000000..7080e95fbf
+--- /dev/null
++++ b/providers/implementations/rands/seed_src.c
+@@ -0,0 +1,192 @@
++/*
++ * Copyright 2020 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;string.h&gt;
++#include &lt;openssl/rand.h&gt;
++#include &lt;openssl/core_dispatch.h&gt;
++#include &lt;openssl/e_os2.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/evp.h&gt;
++#include &lt;openssl/err.h&gt;
++#include &lt;openssl/randerr.h&gt;
++#include &quot;prov/implementations.h&quot;
++#include &quot;prov/provider_ctx.h&quot;
++#include &quot;prov/providercommonerr.h&quot;
++#include &quot;crypto/rand.h&quot;
++#include &quot;crypto/rand_pool.h&quot;
++
++static OSSL_FUNC_rand_newctx_fn seed_src_new;
++static OSSL_FUNC_rand_freectx_fn seed_src_free;
++static OSSL_FUNC_rand_instantiate_fn seed_src_instantiate;
++static OSSL_FUNC_rand_uninstantiate_fn seed_src_uninstantiate;
++static OSSL_FUNC_rand_generate_fn seed_src_generate;
++static OSSL_FUNC_rand_reseed_fn seed_src_reseed;
++static OSSL_FUNC_rand_gettable_ctx_params_fn seed_src_gettable_ctx_params;
++static OSSL_FUNC_rand_get_ctx_params_fn seed_src_get_ctx_params;
++static OSSL_FUNC_rand_verify_zeroization_fn seed_src_verify_zeroization;
++static OSSL_FUNC_rand_enable_locking_fn seed_src_enable_locking;
++
++typedef struct {
++    void *provctx;
++    int state;
++} PROV_SEED_SRC;
++
++static void *seed_src_new(void *provctx, void *parent,
++                          const OSSL_DISPATCH *parent_dispatch)
++{
++    PROV_SEED_SRC *s;
++
++    if (parent != NULL) {
++        ERR_raise(ERR_LIB_PROV, PROV_R_SEED_SOURCES_MUST_NOT_HAVE_A_PARENT);
++        return NULL;
++    }
++
++    s = OPENSSL_zalloc(sizeof(*s));
++    if (s == NULL) {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return NULL;
++    }
++
++    s-&gt;provctx = provctx;
++    s-&gt;state = EVP_RAND_STATE_UNINITIALISED;
++    return s;
++}
++
++static void seed_src_free(void *vseed)
++{
++    OPENSSL_free(vseed);
++}
++
++static int seed_src_instantiate(void *vseed, unsigned int strength,
++                                int prediction_resistance,
++                                const unsigned char *pstr, size_t pstr_len)
++{
++    PROV_SEED_SRC *s = (PROV_SEED_SRC *)vseed;
++
++    s-&gt;state = EVP_RAND_STATE_READY;
++    return 1;
++}
++
++static int seed_src_uninstantiate(void *vseed)
++{
++    PROV_SEED_SRC *s = (PROV_SEED_SRC *)vseed;
++
++    s-&gt;state = EVP_RAND_STATE_UNINITIALISED;
++    return 1;
++}
++
++static int seed_src_generate(void *vseed, unsigned char *out, size_t outlen,
++                             unsigned int strength,
++                             ossl_unused int prediction_resistance,
++                             ossl_unused const unsigned char *adin,
++                             ossl_unused size_t adin_len)
++{
++    PROV_SEED_SRC *s = (PROV_SEED_SRC *)vseed;
++    size_t entropy_available;
++    RAND_POOL *pool;
++
++    if (s-&gt;state != EVP_RAND_STATE_READY) {
++        ERR_raise(ERR_LIB_PROV,
++                  s-&gt;state == EVP_RAND_STATE_ERROR ? PROV_R_IN_ERROR_STATE
++                                                   : PROV_R_NOT_INSTANTIATED);
++        return 0;
++    }
++
++    pool = rand_pool_new(strength, 1, outlen, outlen);
++    if (pool == NULL) {
++        ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
++        return 0;
++    }
++
++    /* Get entropy by polling system entropy sources. */
++    entropy_available = ossl_pool_acquire_entropy(pool);
++
++    if (entropy_available &gt; 0)
++        memcpy(out, rand_pool_detach(pool), rand_pool_length(pool));
++
++    rand_pool_free(pool);
++    return entropy_available &gt; 0;
++}
++
++static int seed_src_reseed(void *vseed,
++                           ossl_unused int prediction_resistance,
++                           ossl_unused const unsigned char *ent,
++                           ossl_unused size_t ent_len,
++                           ossl_unused const unsigned char *adin,
++                           ossl_unused size_t adin_len)
++{
++    PROV_SEED_SRC *s = (PROV_SEED_SRC *)vseed;
++
++    if (s-&gt;state != EVP_RAND_STATE_READY) {
++        ERR_raise(ERR_LIB_PROV,
++                  s-&gt;state == EVP_RAND_STATE_ERROR ? PROV_R_IN_ERROR_STATE
++                                                   : PROV_R_NOT_INSTANTIATED);
++        return 0;
++    }
++    return 1;
++}
++
++static int seed_src_get_ctx_params(void *vseed, OSSL_PARAM params[])
++{
++    PROV_SEED_SRC *s = (PROV_SEED_SRC *)vseed;
++    OSSL_PARAM *p;
++
++    p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_STATE);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_int(p, s-&gt;state))
++        return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_STRENGTH);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_int(p, 1024))
++        return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_MAX_REQUEST);
++    if (p != NULL &amp;&amp; !OSSL_PARAM_set_size_t(p, 128))
++        return 0;
++    return 1;
++}
++
++static const OSSL_PARAM *seed_src_gettable_ctx_params(ossl_unused void *provctx)
++{
++    static const OSSL_PARAM known_gettable_ctx_params[] = {
++        OSSL_PARAM_int(OSSL_RAND_PARAM_STATE, NULL),
++        OSSL_PARAM_uint(OSSL_RAND_PARAM_STRENGTH, NULL),
++        OSSL_PARAM_size_t(OSSL_RAND_PARAM_MAX_REQUEST, NULL),
++        OSSL_PARAM_END
++    };
++    return known_gettable_ctx_params;
++}
++
++static int seed_src_verify_zeroization(ossl_unused void *vseed)
++{
++    return 1;
++}
++
++static int seed_src_enable_locking(ossl_unused void *vseed)
++{
++    return 1;
++}
++
++const OSSL_DISPATCH ossl_seed_src_functions[] = {
++    { OSSL_FUNC_RAND_NEWCTX, (void(*)(void))seed_src_new },
++    { OSSL_FUNC_RAND_FREECTX, (void(*)(void))seed_src_free },
++    { OSSL_FUNC_RAND_INSTANTIATE,
++      (void(*)(void))seed_src_instantiate },
++    { OSSL_FUNC_RAND_UNINSTANTIATE,
++      (void(*)(void))seed_src_uninstantiate },
++    { OSSL_FUNC_RAND_GENERATE, (void(*)(void))seed_src_generate },
++    { OSSL_FUNC_RAND_RESEED, (void(*)(void))seed_src_reseed },
++    { OSSL_FUNC_RAND_ENABLE_LOCKING, (void(*)(void))seed_src_enable_locking },
++    { OSSL_FUNC_RAND_GETTABLE_CTX_PARAMS,
++      (void(*)(void))seed_src_gettable_ctx_params },
++    { OSSL_FUNC_RAND_GET_CTX_PARAMS, (void(*)(void))seed_src_get_ctx_params },
++    { OSSL_FUNC_RAND_VERIFY_ZEROIZATION,
++      (void(*)(void))seed_src_verify_zeroization },
++    { 0, NULL }
++};
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032569.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032580.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32575">[ date ]</a>
+              <a href="thread.html#32575">[ thread ]</a>
+              <a href="subject.html#32575">[ subject ]</a>
+              <a href="author.html#32575">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

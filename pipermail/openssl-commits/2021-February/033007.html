@@ -1,0 +1,207 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1612531010.724336.26207.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033006.html">
+   <LINK REL="Next"  HREF="033008.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1612531010.724336.26207.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Fri Feb  5 13:16:50 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033006.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="033008.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33007">[ date ]</a>
+              <a href="thread.html#33007">[ thread ]</a>
+              <a href="subject.html#33007">[ subject ]</a>
+              <a href="author.html#33007">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  93d6132a79d85127dffa1ce4e62b264cf38c296d (commit)
+      from  93bae03abfdb1cb8047c2bef85e48b60891ecf54 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 93d6132a79d85127dffa1ce4e62b264cf38c296d
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Sat Nov 7 11:31:35 2020 +0100
+
+    EVP: use evp_pkey_copy_downgraded() in EVP_PKEY_copy_parameters()
+    
+    We used evp_pkey_downgrade() on 'from', which permanently converts 'from'
+    to have a legacy internal key.  Now that we have evp_pkey_copy_downgraded(),
+    it's better to use that (and thereby restore the constness contract).
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13341">https://github.com/openssl/openssl/pull/13341</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/evp/p_lib.c | 53 +++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 31 insertions(+), 22 deletions(-)
+
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 106830bfbb..95cc15e9d7 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -117,13 +117,18 @@ int EVP_PKEY_copy_parameters(EVP_PKEY *to, const EVP_PKEY *from)
+      * Clean up legacy stuff from this function when legacy support is gone.
+      */
+ 
++    EVP_PKEY *downgraded_from = NULL;
++    int ok = 0;
++
+     /*
+-     * If |to| is a legacy key and |from| isn't, we must downgrade |from|.
+-     * If that fails, this function fails.
++     * If |to| is a legacy key and |from| isn't, we must make a downgraded
++     * copy of |from|.  If that fails, this function fails.
+      */
+-    if (evp_pkey_is_legacy(to) &amp;&amp; evp_pkey_is_provided(from))
+-        if (!evp_pkey_downgrade((EVP_PKEY *)from))
+-            return 0;
++    if (evp_pkey_is_legacy(to) &amp;&amp; evp_pkey_is_provided(from)) {
++        if (!evp_pkey_copy_downgraded(&amp;downgraded_from, from))
++            goto end;
++        from = downgraded_from;
++    }
+ 
+     /*
+      * Make sure |to| is typed.  Content is less important at this early
+@@ -140,33 +145,36 @@ int EVP_PKEY_copy_parameters(EVP_PKEY *to, const EVP_PKEY *from)
+     if (evp_pkey_is_blank(to)) {
+         if (evp_pkey_is_legacy(from)) {
+             if (EVP_PKEY_set_type(to, from-&gt;type) == 0)
+-                return 0;
++                goto end;
+         } else {
+             if (EVP_PKEY_set_type_by_keymgmt(to, from-&gt;keymgmt) == 0)
+-                return 0;
++                goto end;
+         }
+     } else if (evp_pkey_is_legacy(to)) {
+         if (to-&gt;type != from-&gt;type) {
+             ERR_raise(ERR_LIB_EVP, EVP_R_DIFFERENT_KEY_TYPES);
+-            goto err;
++            goto end;
+         }
+     }
+ 
+     if (EVP_PKEY_missing_parameters(from)) {
+         ERR_raise(ERR_LIB_EVP, EVP_R_MISSING_PARAMETERS);
+-        goto err;
++        goto end;
+     }
+ 
+     if (!EVP_PKEY_missing_parameters(to)) {
+         if (EVP_PKEY_parameters_eq(to, from) == 1)
+-            return 1;
+-        ERR_raise(ERR_LIB_EVP, EVP_R_DIFFERENT_PARAMETERS);
+-        return 0;
++            ok = 1;
++        else
++            ERR_raise(ERR_LIB_EVP, EVP_R_DIFFERENT_PARAMETERS);
++        goto end;
+     }
+ 
+     /* For purely provided keys, we just call the keymgmt utility */
+-    if (to-&gt;keymgmt != NULL &amp;&amp; from-&gt;keymgmt != NULL)
+-        return evp_keymgmt_util_copy(to, (EVP_PKEY *)from, SELECT_PARAMETERS);
++    if (to-&gt;keymgmt != NULL &amp;&amp; from-&gt;keymgmt != NULL) {
++        ok = evp_keymgmt_util_copy(to, (EVP_PKEY *)from, SELECT_PARAMETERS);
++        goto end;
++    }
+ 
+     /*
+      * If |to| is provided, we know that |from| is legacy at this point.
+@@ -183,19 +191,20 @@ int EVP_PKEY_copy_parameters(EVP_PKEY *to, const EVP_PKEY *from)
+          * If we get a NULL, it could be an internal error, or it could be
+          * that there's a key mismatch.  We're pretending the latter...
+          */
+-        if (from_keydata == NULL) {
++        if (from_keydata == NULL)
+             ERR_raise(ERR_LIB_EVP, EVP_R_DIFFERENT_KEY_TYPES);
+-            return 0;
+-        }
+-        return evp_keymgmt_copy(to-&gt;keymgmt, to-&gt;keydata, from_keydata,
+-                                SELECT_PARAMETERS);
++        else
++            ok = evp_keymgmt_copy(to-&gt;keymgmt, to-&gt;keydata, from_keydata,
++                                  SELECT_PARAMETERS);
++        goto end;
+     }
+ 
+     /* Both keys are legacy */
+     if (from-&gt;ameth != NULL &amp;&amp; from-&gt;ameth-&gt;param_copy != NULL)
+-        return from-&gt;ameth-&gt;param_copy(to, from);
+- err:
+-    return 0;
++        ok = from-&gt;ameth-&gt;param_copy(to, from);
++ end:
++    EVP_PKEY_free(downgraded_from);
++    return ok;
+ }
+ 
+ int EVP_PKEY_missing_parameters(const EVP_PKEY *pkey)
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033006.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="033008.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33007">[ date ]</a>
+              <a href="thread.html#33007">[ thread ]</a>
+              <a href="subject.html#33007">[ subject ]</a>
+              <a href="author.html#33007">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

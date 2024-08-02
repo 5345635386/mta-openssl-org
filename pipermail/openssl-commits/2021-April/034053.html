@@ -1,0 +1,365 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619624204.978357.27740.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034052.html">
+   <LINK REL="Next"  HREF="034054.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1619624204.978357.27740.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Apr 28 15:36:44 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034052.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034054.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34053">[ date ]</a>
+              <a href="thread.html#34053">[ thread ]</a>
+              <a href="subject.html#34053">[ subject ]</a>
+              <a href="author.html#34053">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e9b30d9f50a356b3b0a9d60e6fc877e08f68a40e (commit)
+       via  f42e68dc473081393835b0ae7dad19d393ee589d (commit)
+      from  460d2fbcd75bef492638b54c17aa5f5bca7eec2a (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e9b30d9f50a356b3b0a9d60e6fc877e08f68a40e
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Apr 19 16:46:30 2021 +0100
+
+    Test a Finished message at the wrong time results in unexpected message
+    
+    We test that sending a Finished message instead of a ClientHello results
+    in an unexpected message error.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14930">https://github.com/openssl/openssl/pull/14930</A>)
+
+commit f42e68dc473081393835b0ae7dad19d393ee589d
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Apr 19 15:21:54 2021 +0100
+
+    Defer Finished MAC handling until after state transition
+    
+    In TLS we process received messages like this:
+    
+    1) Read Message Header
+    2) Validate and transition state based on received message type
+    3) Read Message Body
+    4) Process Message
+    
+    In DTLS we read messages like this:
+    
+    1) Read Message Header and Body
+    2) Validate and transition state based on received message type
+    3) Process Message
+    
+    The difference is because of the stream vs datagram semantics of the
+    underlying transport.
+    
+    In both TLS and DTLS we were doing finished MAC processing as part of
+    reading the message body. This means that in DTLS this was occurring
+    *before* the state transition has been validated. A crash was occurring
+    in DTLS if a Finished message was sent in an invalid state due to
+    assumptions in the code that certain variables would have been setup by
+    the time a Finished message arrives.
+    
+    To avoid this problem we shift the finished MAC processing to be after
+    the state transition in DTLS.
+    
+    Thanks to github user @bathooman for reporting this issue.
+    
+    Fixes #14906
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/14930">https://github.com/openssl/openssl/pull/14930</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem.c       | 19 +++++++-----
+ ssl/statem/statem_dtls.c  | 51 ++++++++++++++++++++++----------
+ ssl/statem/statem_local.h |  3 +-
+ test/dtlstest.c           | 74 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 124 insertions(+), 23 deletions(-)
+
+diff --git a/ssl/statem/statem.c b/ssl/statem/statem.c
+index 3b6e78e3f8..4c463974ea 100644
+--- a/ssl/statem/statem.c
++++ b/ssl/statem/statem.c
+@@ -582,7 +582,7 @@ static SUB_STATE_RETURN read_state_machine(SSL *s)
+                 /*
+                  * In DTLS we get the whole message in one go - header and body
+                  */
+-                ret = dtls_get_message(s, &amp;mt, &amp;len);
++                ret = dtls_get_message(s, &amp;mt);
+             } else {
+                 ret = tls_get_message_header(s, &amp;mt);
+             }
+@@ -625,13 +625,18 @@ static SUB_STATE_RETURN read_state_machine(SSL *s)
+             /* Fall through */
+ 
+         case READ_STATE_BODY:
+-            if (!SSL_IS_DTLS(s)) {
+-                /* We already got this above for DTLS */
++            if (SSL_IS_DTLS(s)) {
++                /*
++                 * Actually we already have the body, but we give DTLS the
++                 * opportunity to do any further processing.
++                 */
++                ret = dtls_get_message_body(s, &amp;len);
++            } else {
+                 ret = tls_get_message_body(s, &amp;len);
+-                if (ret == 0) {
+-                    /* Could be non-blocking IO */
+-                    return SUB_STATE_ERROR;
+-                }
++            }
++            if (ret == 0) {
++                /* Could be non-blocking IO */
++                return SUB_STATE_ERROR;
+             }
+ 
+             s-&gt;first_packet = 0;
+diff --git a/ssl/statem/statem_dtls.c b/ssl/statem/statem_dtls.c
+index c4bed3d3ee..1fcd064ea6 100644
+--- a/ssl/statem/statem_dtls.c
++++ b/ssl/statem/statem_dtls.c
+@@ -328,7 +328,7 @@ int dtls1_do_write(SSL *s, int type)
+     return 0;
+ }
+ 
+-int dtls_get_message(SSL *s, int *mt, size_t *len)
++int dtls_get_message(SSL *s, int *mt)
+ {
+     struct hm_header_st *msg_hdr;
+     unsigned char *p;
+@@ -352,7 +352,6 @@ int dtls_get_message(SSL *s, int *mt, size_t *len)
+     *mt = s-&gt;s3.tmp.message_type;
+ 
+     p = (unsigned char *)s-&gt;init_buf-&gt;data;
+-    *len = s-&gt;init_num;
+ 
+     if (*mt == SSL3_MT_CHANGE_CIPHER_SPEC) {
+         if (s-&gt;msg_callback) {
+@@ -373,32 +372,54 @@ int dtls_get_message(SSL *s, int *mt, size_t *len)
+     s2n(msg_hdr-&gt;seq, p);
+     l2n3(0, p);
+     l2n3(msg_len, p);
+-    if (s-&gt;version != DTLS1_BAD_VER) {
+-        p -= DTLS1_HM_HEADER_LENGTH;
+-        msg_len += DTLS1_HM_HEADER_LENGTH;
+-    }
+ 
++    memset(msg_hdr, 0, sizeof(*msg_hdr));
++
++    s-&gt;d1-&gt;handshake_read_seq++;
++
++    s-&gt;init_msg = s-&gt;init_buf-&gt;data + DTLS1_HM_HEADER_LENGTH;
++
++    return 1;
++}
++
++/*
++ * Actually we already have the message body - but this is an opportunity for
++ * DTLS to do any further processing it wants at the same point that TLS would
++ * be asked for the message body.
++ */
++int dtls_get_message_body(SSL *s, size_t *len)
++{
++    unsigned char *msg = (unsigned char *)s-&gt;init_buf-&gt;data;
++    size_t msg_len = s-&gt;init_num + DTLS1_HM_HEADER_LENGTH;
++
++    if (s-&gt;s3.tmp.message_type == SSL3_MT_CHANGE_CIPHER_SPEC) {
++        /* Nothing to be done */
++        goto end;
++    }
+     /*
+      * If receiving Finished, record MAC of prior handshake messages for
+      * Finished verification.
+      */
+-    if (*mt == SSL3_MT_FINISHED &amp;&amp; !ssl3_take_mac(s)) {
++    if (*(s-&gt;init_buf-&gt;data) == SSL3_MT_FINISHED &amp;&amp; !ssl3_take_mac(s)) {
+         /* SSLfatal() already called */
+         return 0;
+     }
+ 
+-    if (!ssl3_finish_mac(s, p, msg_len))
++    if (s-&gt;version == DTLS1_BAD_VER) {
++        msg += DTLS1_HM_HEADER_LENGTH;
++        msg_len -= DTLS1_HM_HEADER_LENGTH;
++    }
++
++    if (!ssl3_finish_mac(s, msg, msg_len))
+         return 0;
++
+     if (s-&gt;msg_callback)
+         s-&gt;msg_callback(0, s-&gt;version, SSL3_RT_HANDSHAKE,
+-                        p, msg_len, s, s-&gt;msg_callback_arg);
+-
+-    memset(msg_hdr, 0, sizeof(*msg_hdr));
+-
+-    s-&gt;d1-&gt;handshake_read_seq++;
+-
+-    s-&gt;init_msg = s-&gt;init_buf-&gt;data + DTLS1_HM_HEADER_LENGTH;
++                        s-&gt;init_buf-&gt;data, s-&gt;init_num + DTLS1_HM_HEADER_LENGTH,
++                        s, s-&gt;msg_callback_arg);
+ 
++ end:
++    *len = s-&gt;init_num;
+     return 1;
+ }
+ 
+diff --git a/ssl/statem/statem_local.h b/ssl/statem/statem_local.h
+index 61de225584..25bfdffc6c 100644
+--- a/ssl/statem/statem_local.h
++++ b/ssl/statem/statem_local.h
+@@ -95,7 +95,8 @@ WORK_STATE ossl_statem_server_post_process_message(SSL *s, WORK_STATE wst);
+ /* Functions for getting new message data */
+ __owur int tls_get_message_header(SSL *s, int *mt);
+ __owur int tls_get_message_body(SSL *s, size_t *len);
+-__owur int dtls_get_message(SSL *s, int *mt, size_t *len);
++__owur int dtls_get_message(SSL *s, int *mt);
++__owur int dtls_get_message_body(SSL *s, size_t *len);
+ 
+ /* Message construction and processing functions */
+ __owur int tls_process_initial_server_flight(SSL *s);
+diff --git a/test/dtlstest.c b/test/dtlstest.c
+index 2d8aaf4709..4f0f9d549d 100644
+--- a/test/dtlstest.c
++++ b/test/dtlstest.c
+@@ -337,6 +337,79 @@ static int test_dtls_duplicate_records(void)
+     return testresult;
+ }
+ 
++/*
++ * Test just sending a Finished message as the first message. Should fail due
++ * to an unexpected message.
++ */
++static int test_just_finished(void)
++{
++    int testresult = 0, ret;
++    SSL_CTX *sctx = NULL;
++    SSL *serverssl = NULL;
++    BIO *rbio = NULL, *wbio = NULL, *sbio = NULL;
++    unsigned char buf[] = {
++        /* Record header */
++        SSL3_RT_HANDSHAKE, /* content type */
++        (DTLS1_2_VERSION &gt;&gt; 8) &amp; 0xff, /* protocol version hi byte */
++        DTLS1_2_VERSION &amp; 0xff, /* protocol version lo byte */
++        0, 0, /* epoch */
++        0, 0, 0, 0, 0, 0, /* record sequence */
++        0, DTLS1_HM_HEADER_LENGTH + SHA_DIGEST_LENGTH, /* record length */
++
++        /* Message header */
++        SSL3_MT_FINISHED, /* message type */
++        0, 0, SHA_DIGEST_LENGTH, /* message length */
++        0, 0, /* message sequence */
++        0, 0, 0, /* fragment offset */
++        0, 0, SHA_DIGEST_LENGTH, /* fragment length */
++
++        /* Message body */
++        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++    };
++
++
++    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
++                                       NULL, 0, 0,
++                                       &amp;sctx, NULL, cert, privkey)))
++        return 0;
++
++    serverssl = SSL_new(sctx);
++    rbio = BIO_new(BIO_s_mem());
++    wbio = BIO_new(BIO_s_mem());
++
++    if (!TEST_ptr(serverssl) || !TEST_ptr(rbio) || !TEST_ptr(wbio))
++        goto end;
++
++    sbio = rbio;
++    SSL_set0_rbio(serverssl, rbio);
++    SSL_set0_wbio(serverssl, wbio);
++    rbio = wbio = NULL;
++    DTLS_set_timer_cb(serverssl, timer_cb);
++
++    if (!TEST_int_eq(BIO_write(sbio, buf, sizeof(buf)), sizeof(buf)))
++        goto end;
++
++    /* We expect the attempt to process the message to fail */
++    if (!TEST_int_le(ret = SSL_accept(serverssl), 0))
++        goto end;
++
++    /* Check that we got the error we were expecting */
++    if (!TEST_int_eq(SSL_get_error(serverssl, ret), SSL_ERROR_SSL))
++        goto end;
++
++    if (!TEST_int_eq(ERR_GET_REASON(ERR_get_error()), SSL_R_UNEXPECTED_MESSAGE))
++        goto end;
++
++    testresult = 1;
++ end:
++    BIO_free(rbio);
++    BIO_free(wbio);
++    SSL_free(serverssl);
++    SSL_CTX_free(sctx);
++
++    return testresult;
++}
++
+ OPT_TEST_DECLARE_USAGE(&quot;certfile privkeyfile\n&quot;)
+ 
+ int setup_tests(void)
+@@ -356,6 +429,7 @@ int setup_tests(void)
+ #endif
+     ADD_TEST(test_cookie);
+     ADD_TEST(test_dtls_duplicate_records);
++    ADD_TEST(test_just_finished);
+ 
+     return 1;
+ }
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034052.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034054.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34053">[ date ]</a>
+              <a href="thread.html#34053">[ thread ]</a>
+              <a href="subject.html#34053">[ subject ]</a>
+              <a href="author.html#34053">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,409 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1597196860.516234.9320.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030113.html">
+   <LINK REL="Next"  HREF="030118.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1597196860.516234.9320.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Wed Aug 12 01:47:40 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030113.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030118.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30117">[ date ]</a>
+              <a href="thread.html#30117">[ thread ]</a>
+              <a href="subject.html#30117">[ subject ]</a>
+              <a href="author.html#30117">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  af88e64a98a6402dabd41ac2de194444dd285b49 (commit)
+       via  7c9a7cf12715ac3e906b8d55466f19285fc59e78 (commit)
+      from  1017ab21e478b18dd2d9266955dee7e418932a3c (commit)
+
+
+- Log -----------------------------------------------------------------
+commit af88e64a98a6402dabd41ac2de194444dd285b49
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Mon Aug 10 10:16:26 2020 +1000
+
+    Fix serializer_EVP_PKEY_to_bio so that that the key is exported if the serializer provider does not match the key provider.
+    
+    RSA keys in the 'base' provider are different from a fips provider RSA key (since they have different object structures).
+    To use a fips provider key in the base serializer the key needs to be exported.
+    The fix was suggested by @levitte.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12162">https://github.com/openssl/openssl/pull/12162</A>)
+
+commit 7c9a7cf12715ac3e906b8d55466f19285fc59e78
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Tue Jun 16 13:04:57 2020 +1000
+
+    Add fix for RSA keygen in FIPS using keysizes 2048 &lt; bits &lt; 3072
+    
+    Fixes #11863
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12162">https://github.com/openssl/openssl/pull/12162</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/dgst.c                         |  2 +-
+ apps/genpkey.c                      | 57 ++++++++++++++++++++++++-------------
+ apps/genrsa.c                       |  2 +-
+ apps/include/apps.h                 |  3 +-
+ crypto/bn/bn_rsa_fips186_4.c        |  4 +--
+ crypto/serializer/serializer_pkey.c |  3 +-
+ doc/man1/openssl-genpkey.pod.in     |  3 ++
+ test/recipes/15-test_genrsa.t       | 40 ++++++++++++++++++++++++--
+ 8 files changed, 86 insertions(+), 28 deletions(-)
+
+diff --git a/apps/dgst.c b/apps/dgst.c
+index da162e6ed6..0654d4c8b9 100644
+--- a/apps/dgst.c
++++ b/apps/dgst.c
+@@ -293,7 +293,7 @@ int dgst_main(int argc, char **argv)
+     if (mac_name != NULL) {
+         EVP_PKEY_CTX *mac_ctx = NULL;
+         int r = 0;
+-        if (!init_gen_str(&amp;mac_ctx, mac_name, impl, 0))
++        if (!init_gen_str(&amp;mac_ctx, mac_name, impl, 0, NULL, NULL))
+             goto mac_end;
+         if (macopts != NULL) {
+             char *macopt;
+diff --git a/apps/genpkey.c b/apps/genpkey.c
+index 389f0e620c..9da5b556e8 100644
+--- a/apps/genpkey.c
++++ b/apps/genpkey.c
+@@ -21,13 +21,15 @@
+ # include &lt;openssl/engine.h&gt;
+ #endif
+ 
+-static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e);
++static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e,
++                            OPENSSL_CTX *libctx, const char *propq);
+ static int genpkey_cb(EVP_PKEY_CTX *ctx);
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+     OPT_ENGINE, OPT_OUTFORM, OPT_OUT, OPT_PASS, OPT_PARAMFILE,
+     OPT_ALGORITHM, OPT_PKEYOPT, OPT_GENPARAM, OPT_TEXT, OPT_CIPHER,
++    OPT_CONFIG,
+     OPT_PROV_ENUM
+ } OPTION_CHOICE;
+ 
+@@ -41,6 +43,7 @@ const OPTIONS genpkey_options[] = {
+     {&quot;algorithm&quot;, OPT_ALGORITHM, 's', &quot;The public key algorithm&quot;},
+     {&quot;pkeyopt&quot;, OPT_PKEYOPT, 's',
+      &quot;Set the public key algorithm option as opt:value&quot;},
++     OPT_CONFIG_OPTION,
+ 
+     OPT_SECTION(&quot;Output&quot;),
+     {&quot;out&quot;, OPT_OUT, '&gt;', &quot;Output file&quot;},
+@@ -60,6 +63,7 @@ const OPTIONS genpkey_options[] = {
+ 
+ int genpkey_main(int argc, char **argv)
+ {
++    CONF *conf = NULL;
+     BIO *in = NULL, *out = NULL;
+     ENGINE *e = NULL;
+     EVP_PKEY *pkey = NULL;
+@@ -69,6 +73,8 @@ int genpkey_main(int argc, char **argv)
+     OPTION_CHOICE o;
+     int outformat = FORMAT_PEM, text = 0, ret = 1, rv, do_param = 0;
+     int private = 0;
++    OPENSSL_CTX *libctx = app_get0_libctx();
++    const char *propq = app_get0_propq();
+ 
+     prog = opt_init(argc, argv, genpkey_options);
+     while ((o = opt_next()) != OPT_EOF) {
+@@ -98,11 +104,11 @@ int genpkey_main(int argc, char **argv)
+         case OPT_PARAMFILE:
+             if (do_param == 1)
+                 goto opthelp;
+-            if (!init_keygen_file(&amp;ctx, opt_arg(), e))
++            if (!init_keygen_file(&amp;ctx, opt_arg(), e, libctx, propq))
+                 goto end;
+             break;
+         case OPT_ALGORITHM:
+-            if (!init_gen_str(&amp;ctx, opt_arg(), e, do_param))
++            if (!init_gen_str(&amp;ctx, opt_arg(), e, do_param, libctx, propq))
+                 goto end;
+             break;
+         case OPT_PKEYOPT:
+@@ -138,6 +144,11 @@ int genpkey_main(int argc, char **argv)
+                 goto end;
+             }
+             break;
++        case OPT_CONFIG:
++            conf = app_load_config_modules(opt_arg());
++            if (conf == NULL)
++                goto end;
++            break;
+         case OPT_PROV_CASES:
+             if (!opt_provider(o))
+                 goto end;
+@@ -220,10 +231,12 @@ int genpkey_main(int argc, char **argv)
+     BIO_free(in);
+     release_engine(e);
+     OPENSSL_free(pass);
++    NCONF_free(conf);
+     return ret;
+ }
+ 
+-static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e)
++static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e,
++                            OPENSSL_CTX *libctx, const char *propq)
+ {
+     BIO *pbio;
+     EVP_PKEY *pkey = NULL;
+@@ -247,7 +260,10 @@ static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e)
+         return 0;
+     }
+ 
+-    ctx = EVP_PKEY_CTX_new(pkey, e);
++    if (e != NULL)
++        ctx = EVP_PKEY_CTX_new(pkey, e);
++    else
++        ctx = EVP_PKEY_CTX_new_from_pkey(libctx, pkey, propq);
+     if (ctx == NULL)
+         goto err;
+     if (EVP_PKEY_keygen_init(ctx) &lt;= 0)
+@@ -266,7 +282,8 @@ static int init_keygen_file(EVP_PKEY_CTX **pctx, const char *file, ENGINE *e)
+ }
+ 
+ int init_gen_str(EVP_PKEY_CTX **pctx,
+-                 const char *algname, ENGINE *e, int do_param)
++                 const char *algname, ENGINE *e, int do_param,
++                 OPENSSL_CTX *libctx, const char *propq)
+ {
+     EVP_PKEY_CTX *ctx = NULL;
+     const EVP_PKEY_ASN1_METHOD *ameth;
+@@ -278,25 +295,27 @@ int init_gen_str(EVP_PKEY_CTX **pctx,
+         return 0;
+     }
+ 
+-    ameth = EVP_PKEY_asn1_find_str(&amp;tmpeng, algname, -1);
++    if (libctx == NULL || e != NULL) {
++        ameth = EVP_PKEY_asn1_find_str(&amp;tmpeng, algname, -1);
+ 
+ #if !defined(OPENSSL_NO_ENGINE) &amp;&amp; !defined(OPENSSL_NO_DEPRECATED_3_0)
+-    if (!ameth &amp;&amp; e)
+-        ameth = ENGINE_get_pkey_asn1_meth_str(e, algname, -1);
++        if (ameth == NULL &amp;&amp; e != NULL)
++            ameth = ENGINE_get_pkey_asn1_meth_str(e, algname, -1);
+ #endif
++        if (ameth == NULL) {
++            BIO_printf(bio_err, &quot;Algorithm %s not found\n&quot;, algname);
++            return 0;
++        }
++        ERR_clear_error();
+ 
+-    if (!ameth) {
+-        BIO_printf(bio_err, &quot;Algorithm %s not found\n&quot;, algname);
+-        return 0;
+-    }
+-
+-    ERR_clear_error();
+-
+-    EVP_PKEY_asn1_get0_info(&amp;pkey_id, NULL, NULL, NULL, NULL, ameth);
++        EVP_PKEY_asn1_get0_info(&amp;pkey_id, NULL, NULL, NULL, NULL, ameth);
+ #if !defined(OPENSSL_NO_ENGINE) &amp;&amp; !defined(OPENSSL_NO_DEPRECATED_3_0)
+-    ENGINE_finish(tmpeng);
++        ENGINE_finish(tmpeng);
+ #endif
+-    ctx = EVP_PKEY_CTX_new_id(pkey_id, e);
++        ctx = EVP_PKEY_CTX_new_id(pkey_id, e);
++    } else {
++        ctx = EVP_PKEY_CTX_new_from_name(libctx, algname, propq);
++    }
+ 
+     if (!ctx)
+         goto err;
+diff --git a/apps/genrsa.c b/apps/genrsa.c
+index 9a9130125e..4f589e98c1 100644
+--- a/apps/genrsa.c
++++ b/apps/genrsa.c
+@@ -169,7 +169,7 @@ opthelp:
+     if (out == NULL)
+         goto end;
+ 
+-    if (!init_gen_str(&amp;ctx, &quot;RSA&quot;, eng, 0))
++    if (!init_gen_str(&amp;ctx, &quot;RSA&quot;, eng, 0, NULL, NULL))
+         goto end;
+ 
+     EVP_PKEY_CTX_set_cb(ctx, genrsa_cb);
+diff --git a/apps/include/apps.h b/apps/include/apps.h
+index 554d33e1c9..0ee8e070cd 100644
+--- a/apps/include/apps.h
++++ b/apps/include/apps.h
+@@ -209,7 +209,8 @@ int pkey_ctrl_string(EVP_PKEY_CTX *ctx, const char *value);
+ int x509_ctrl_string(X509 *x, const char *value);
+ int x509_req_ctrl_string(X509_REQ *x, const char *value);
+ int init_gen_str(EVP_PKEY_CTX **pctx,
+-                 const char *algname, ENGINE *e, int do_param);
++                 const char *algname, ENGINE *e, int do_param,
++                 OPENSSL_CTX *libctx, const char *propq);
+ int do_X509_sign(X509 *x, EVP_PKEY *pkey, const EVP_MD *md,
+                  STACK_OF(OPENSSL_STRING) *sigopts);
+ int do_X509_verify(X509 *x, EVP_PKEY *pkey, STACK_OF(OPENSSL_STRING) *vfyopts);
+diff --git a/crypto/bn/bn_rsa_fips186_4.c b/crypto/bn/bn_rsa_fips186_4.c
+index a8b0a69aee..ab1e1f14ae 100644
+--- a/crypto/bn/bn_rsa_fips186_4.c
++++ b/crypto/bn/bn_rsa_fips186_4.c
+@@ -65,7 +65,7 @@ static int bn_rsa_fips186_4_aux_prime_min_size(int nbits)
+ {
+     if (nbits &gt;= 3072)
+         return 171;
+-    if (nbits == 2048)
++    if (nbits &gt;= 2048)
+         return 141;
+     return 0;
+ }
+@@ -83,7 +83,7 @@ static int bn_rsa_fips186_4_aux_prime_max_sum_size_for_prob_primes(int nbits)
+ {
+     if (nbits &gt;= 3072)
+         return 1518;
+-    if (nbits == 2048)
++    if (nbits &gt;= 2048)
+         return 1007;
+     return 0;
+ }
+diff --git a/crypto/serializer/serializer_pkey.c b/crypto/serializer/serializer_pkey.c
+index 6e24ed73f0..d31b3cce8b 100644
+--- a/crypto/serializer/serializer_pkey.c
++++ b/crypto/serializer/serializer_pkey.c
+@@ -150,7 +150,8 @@ static int serializer_EVP_PKEY_to_bio(OSSL_SERIALIZER_CTX *ctx, BIO *out)
+     if (ctx-&gt;ser == NULL)
+         return 0;
+ 
+-    if (ctx-&gt;ser-&gt;serialize_object == NULL) {
++    if (ctx-&gt;ser-&gt;serialize_object == NULL
++        || OSSL_SERIALIZER_provider(ctx-&gt;ser) != EVP_KEYMGMT_provider(keymgmt)) {
+         struct serializer_write_data_st write_data;
+ 
+         write_data.ctx = ctx;
+diff --git a/doc/man1/openssl-genpkey.pod.in b/doc/man1/openssl-genpkey.pod.in
+index 4334d0c3c1..f3937400b7 100644
+--- a/doc/man1/openssl-genpkey.pod.in
++++ b/doc/man1/openssl-genpkey.pod.in
+@@ -24,6 +24,7 @@ B&lt;openssl&gt; B&lt;genpkey&gt;
+ [B&lt;-text&gt;]
+ {- $OpenSSL::safe::opt_engine_synopsis -}
+ {- $OpenSSL::safe::opt_provider_synopsis -}
++{- $OpenSSL::safe::opt_config_synopsis -}
+ 
+ =for openssl ifdef engine
+ 
+@@ -107,6 +108,8 @@ parameters along with the PEM or DER structure.
+ 
+ {- $OpenSSL::safe::opt_provider_item -}
+ 
++{- $OpenSSL::safe::opt_config_item -}
++
+ =back
+ 
+ =head1 KEY GENERATION OPTIONS
+diff --git a/test/recipes/15-test_genrsa.t b/test/recipes/15-test_genrsa.t
+index 17b0cbc1a0..b206267aad 100644
+--- a/test/recipes/15-test_genrsa.t
++++ b/test/recipes/15-test_genrsa.t
+@@ -11,12 +11,22 @@ use strict;
+ use warnings;
+ 
+ use File::Spec;
+-use OpenSSL::Test qw/:DEFAULT srctop_file/;
++use OpenSSL::Test qw/:DEFAULT srctop_file srctop_dir bldtop_dir bldtop_file/;
+ use OpenSSL::Test::Utils;
+ 
+-setup(&quot;test_genrsa&quot;);
++BEGIN {
++    setup(&quot;test_genrsa&quot;);
++}
++
++use lib srctop_dir('Configurations');
++use lib bldtop_dir('.');
++use platform;
+ 
+-plan tests =&gt; 12;
++my $no_fips = disabled('fips') || ($ENV{NO_FIPS} // 0);
++
++plan tests =&gt;
++    ($no_fips ? 0 : 2)          # FIPS install test + fips related test
++    + 12;
+ 
+ # We want to know that an absurdly small number of bits isn't support
+ if (disabled(&quot;deprecated-3.0&quot;)) {
+@@ -105,3 +115,27 @@ ok(!run(app([ 'openssl', 'genpkey', '-algorithm', 'RSA',
+     ok(run(app([ 'openssl', 'rsa', '-check', '-in', 'genrsatest.pem', '-noout' ])),
+        &quot;rsa -check&quot;);
+ }
++
++unless ($no_fips) {
++    my $provconf = srctop_file(&quot;test&quot;, &quot;fips.cnf&quot;);
++    my $provpath = bldtop_dir(&quot;providers&quot;);
++    my @prov = ( &quot;-provider_path&quot;, $provpath,
++                 &quot;-provider&quot;, &quot;base&quot;,
++                 &quot;-config&quot;, $provconf);
++    my $infile = bldtop_file('providers', platform-&gt;dso('fips'));
++
++    ok(run(app(['openssl', 'fipsinstall',
++                '-out', bldtop_file('providers', 'fipsmodule.cnf'),
++                '-module', $infile,
++                '-provider_name', 'fips', '-mac_name', 'HMAC',
++                '-section_name', 'fips_sect'])),
++       &quot;fipsinstall&quot;);
++
++    $ENV{OPENSSL_TEST_LIBCTX} = &quot;1&quot;;
++    ok(run(app(['openssl', 'genpkey',
++                @prov,
++               '-algorithm', 'RSA',
++               '-pkeyopt', 'bits:2080',
++               '-out', 'genrsatest2080.pem'])),
++       &quot;Generating RSA key with &gt; 2048 bits and &lt; 3072 bits&quot;);
++}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030113.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030118.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30117">[ date ]</a>
+              <a href="thread.html#30117">[ thread ]</a>
+              <a href="subject.html#30117">[ subject ]</a>
+              <a href="author.html#30117">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

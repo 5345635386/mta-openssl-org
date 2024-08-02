@@ -1,0 +1,516 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1468926884.210579.3637.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009103.html">
+   <LINK REL="Next"  HREF="009106.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1468926884.210579.3637.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Tue Jul 19 11:14:44 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009103.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="009106.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9105">[ date ]</a>
+              <a href="thread.html#9105">[ thread ]</a>
+              <a href="subject.html#9105">[ subject ]</a>
+              <a href="author.html#9105">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  eaa776da07bffbcea4ec32bdc5bf65fefb610fc5 (commit)
+       via  e4612d02c53cccd24fa97b08fc01250d1238cca1 (commit)
+      from  941b10bd954f9fb217901e4ad0a31c70972b864d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit eaa776da07bffbcea4ec32bdc5bf65fefb610fc5
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Jun 13 15:10:18 2016 +0100
+
+    Add more session tests
+    
+    Add some more tests for sessions following on from the previous commit
+    to ensure the callbacks are called when appropriate.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit e4612d02c53cccd24fa97b08fc01250d1238cca1
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Mon Jun 13 11:24:15 2016 +0100
+
+    Remove sessions from external cache, even if internal cache not used.
+    
+    If the SSL_SESS_CACHE_NO_INTERNAL_STORE cache mode is used then we weren't
+    removing sessions from the external cache, e.g. if an alert occurs the
+    session is supposed to be automatically removed.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/ssl_sess.c           |  10 +--
+ ssl/statem/statem_clnt.c |  11 +--
+ test/sslapitest.c        | 181 +++++++++++++++++++++++++++++++++++++++++++----
+ test/ssltestlib.c        |  41 +++++++----
+ 4 files changed, 201 insertions(+), 42 deletions(-)
+
+diff --git a/ssl/ssl_sess.c b/ssl/ssl_sess.c
+index 41abe44..74250c2 100644
+--- a/ssl/ssl_sess.c
++++ b/ssl/ssl_sess.c
+@@ -708,16 +708,16 @@ static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck)
+             r = lh_SSL_SESSION_delete(ctx-&gt;sessions, c);
+             SSL_SESSION_list_remove(ctx, c);
+         }
++        c-&gt;not_resumable = 1;
+ 
+         if (lck)
+             CRYPTO_THREAD_unlock(ctx-&gt;lock);
+ 
+-        if (ret) {
+-            r-&gt;not_resumable = 1;
+-            if (ctx-&gt;remove_session_cb != NULL)
+-                ctx-&gt;remove_session_cb(ctx, r);
++        if (ret)
+             SSL_SESSION_free(r);
+-        }
++
++        if (ctx-&gt;remove_session_cb != NULL)
++            ctx-&gt;remove_session_cb(ctx, c);
+     } else
+         ret = 0;
+     return (ret);
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index bef2583..4bd5a29 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1839,16 +1839,9 @@ MSG_PROCESS_RETURN tls_process_new_session_ticket(SSL *s, PACKET *pkt)
+          */
+         if (i &amp; SSL_SESS_CACHE_CLIENT) {
+             /*
+-             * Remove the old session from the cache
++             * Remove the old session from the cache. We carry on if this fails
+              */
+-            if (i &amp; SSL_SESS_CACHE_NO_INTERNAL_STORE) {
+-                if (s-&gt;session_ctx-&gt;remove_session_cb != NULL)
+-                    s-&gt;session_ctx-&gt;remove_session_cb(s-&gt;session_ctx,
+-                                                      s-&gt;session);
+-            } else {
+-                /* We carry on if this fails */
+-                SSL_CTX_remove_session(s-&gt;session_ctx, s-&gt;session);
+-            }
++            SSL_CTX_remove_session(s-&gt;session_ctx, s-&gt;session);
+         }
+ 
+         if ((new_sess = ssl_session_dup(s-&gt;session, 0)) == 0) {
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index f16947b..8a361c1 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -79,11 +79,50 @@ static int test_tlsext_status_type(void)
+     return testresult;
+ }
+ 
+-static int test_session(void)
++typedef struct ssl_session_test_fixture {
++    const char *test_case_name;
++    int use_ext_cache;
++    int use_int_cache;
++} SSL_SESSION_TEST_FIXTURE;
++
++static int new_called = 0, remove_called = 0;
++
++static SSL_SESSION_TEST_FIXTURE
++ssl_session_set_up(const char *const test_case_name)
++{
++    SSL_SESSION_TEST_FIXTURE fixture;
++
++    fixture.test_case_name = test_case_name;
++    fixture.use_ext_cache = 1;
++    fixture.use_int_cache = 1;
++
++    new_called = remove_called = 0;
++
++    return fixture;
++}
++
++static void ssl_session_tear_down(SSL_SESSION_TEST_FIXTURE fixture)
++{
++}
++
++static int new_session_cb(SSL *ssl, SSL_SESSION *sess)
++{
++    new_called++;
++
++    return 1;
++}
++
++static void remove_session_cb(SSL_CTX *ctx, SSL_SESSION *sess)
++{
++    remove_called++;
++}
++
++static int execute_test_session(SSL_SESSION_TEST_FIXTURE fix)
+ {
+     SSL_CTX *sctx = NULL, *cctx = NULL;
+     SSL *serverssl1 = NULL, *clientssl1 = NULL;
+     SSL *serverssl2 = NULL, *clientssl2 = NULL;
++    SSL *serverssl3 = NULL, *clientssl3 = NULL;
+     SSL_SESSION *sess1 = NULL, *sess2 = NULL;
+     int testresult = 0;
+ 
+@@ -93,27 +132,47 @@ static int test_session(void)
+         return 0;
+     }
+ 
+-    /* Turn on client session cache */
+-    SSL_CTX_set_session_cache_mode(cctx, SSL_SESS_CACHE_CLIENT);
++#ifndef OPENSSL_NO_TLS1_2
++    /* Only allow TLS1.2 so we can force a connection failure later */
++    SSL_CTX_set_min_proto_version(cctx, TLS1_2_VERSION);
++#endif
++
++    /* Set up session cache */
++    if (fix.use_ext_cache) {
++        SSL_CTX_sess_set_new_cb(cctx, new_session_cb);
++        SSL_CTX_sess_set_remove_cb(cctx, remove_session_cb);
++    }
++    if (fix.use_int_cache) {
++        /* Also covers instance where both are set */
++        SSL_CTX_set_session_cache_mode(cctx, SSL_SESS_CACHE_CLIENT);
++    } else {
++        SSL_CTX_set_session_cache_mode(cctx,
++                                       SSL_SESS_CACHE_CLIENT
++                                       | SSL_SESS_CACHE_NO_INTERNAL_STORE);
++    }
+ 
+     if (!create_ssl_connection(sctx, cctx, &amp;serverssl1, &amp;clientssl1, NULL,
+                                NULL)) {
+         printf(&quot;Unable to create SSL connection\n&quot;);
+         goto end;
+     }
+-
+     sess1 = SSL_get1_session(clientssl1);
+     if (sess1 == NULL) {
+         printf(&quot;Unexpected NULL session\n&quot;);
+         goto end;
+     }
+ 
+-    if (SSL_CTX_add_session(cctx, sess1)) {
++    if (fix.use_int_cache &amp;&amp; SSL_CTX_add_session(cctx, sess1)) {
+         /* Should have failed because it should already be in the cache */
+         printf(&quot;Unexpected success adding session to cache\n&quot;);
+         goto end;
+     }
+ 
++    if (fix.use_ext_cache &amp;&amp; (new_called != 1 || remove_called != 0)) {
++        printf(&quot;Session not added to cache\n&quot;);
++        goto end;
++    }
++
+     if (!create_ssl_connection(sctx, cctx, &amp;serverssl2, &amp;clientssl2, NULL,
+                                NULL)) {
+         printf(&quot;Unable to create second SSL connection\n&quot;);
+@@ -126,6 +185,11 @@ static int test_session(void)
+         goto end;
+     }
+ 
++    if (fix.use_ext_cache &amp;&amp; (new_called != 2 || remove_called != 0)) {
++        printf(&quot;Remove session callback unexpectedly called\n&quot;);
++        goto end;
++    }
++
+     /*
+      * This should clear sess2 from the cache because it is a &quot;bad&quot; session. See
+      * SSL_set_session() documentation.
+@@ -135,43 +199,130 @@ static int test_session(void)
+         goto end;
+     }
+ 
++    if (fix.use_ext_cache &amp;&amp; (new_called != 2 || remove_called != 1)) {
++        printf(&quot;Failed to call callback to remove session\n&quot;);
++        goto end;
++    }
++
++
+     if (SSL_get_session(clientssl2) != sess1) {
+         printf(&quot;Unexpected session found\n&quot;);
+         goto end;
+     }
+ 
+-    if (!SSL_CTX_add_session(cctx, sess2)) {
+-        /*
+-         * Should have succeeded because it should not already be in the cache
++    if (fix.use_int_cache) {
++        if (!SSL_CTX_add_session(cctx, sess2)) {
++            /*
++             * Should have succeeded because it should not already be in the cache
++             */
++            printf(&quot;Unexpected failure adding session to cache\n&quot;);
++            goto end;
++        }
++
++        if (!SSL_CTX_remove_session(cctx, sess2)) {
++            printf(&quot;Unexpected failure removing session from cache\n&quot;);
++            goto end;
++        }
++
++        /* This is for the purposes of internal cache testing...ignore the
++         * counter for external cache
+          */
+-        printf(&quot;Unexpected failure adding session to cache\n&quot;);
++        if (fix.use_ext_cache)
++            remove_called--;
++    }
++
++    /* This shouldn't be in the cache so should fail */
++    if (SSL_CTX_remove_session(cctx, sess2)) {
++        printf(&quot;Unexpected success removing session from cache\n&quot;);
+         goto end;
+     }
+ 
+-    if (!SSL_CTX_remove_session(cctx, sess2)) {
+-        printf(&quot;Unexpected failure removing session from cache\n&quot;);
++    if (fix.use_ext_cache &amp;&amp; (new_called != 2 || remove_called != 2)) {
++        printf(&quot;Failed to call callback to remove session #2\n&quot;);
+         goto end;
+     }
+ 
+-    if (SSL_CTX_remove_session(cctx, sess2)) {
+-        printf(&quot;Unexpected success removing session from cache\n&quot;);
++#ifndef OPENSSL_NO_TLS1_1
++    /* Force a connection failure */
++    SSL_CTX_set_max_proto_version(sctx, TLS1_1_VERSION);
++    clientssl3 = SSL_new(cctx);
++    if (clientssl3 == NULL) {
++        printf(&quot;Malloc failure\n&quot;);
++        goto end;
++    }
++    if (!SSL_set_session(clientssl3, sess1)) {
++        printf(&quot;Unable to set session for third connection\n&quot;);
++        goto end;
++    }
++
++    /* This should fail because of the mismatched protocol versions */
++    if (create_ssl_connection(sctx, cctx, &amp;serverssl3, &amp;clientssl3, NULL,
++                               NULL)) {
++        printf(&quot;Unexpected success creating SSL connection\n&quot;);
++        goto end;
++    }
++
++    /* We should have automatically removed the session from the cache */
++    if (fix.use_ext_cache &amp;&amp; (new_called != 2 || remove_called != 3)) {
++        printf(&quot;Failed to call callback to remove session #2\n&quot;);
+         goto end;
+     }
+ 
++    if (fix.use_int_cache &amp;&amp; !SSL_CTX_add_session(cctx, sess2)) {
++        /*
++         * Should have succeeded because it should not already be in the cache
++         */
++        printf(&quot;Unexpected failure adding session to cache #2\n&quot;);
++        goto end;
++    }
++#endif
++
+     testresult = 1;
++
+  end:
+     SSL_free(serverssl1);
+     SSL_free(clientssl1);
+     SSL_free(serverssl2);
+     SSL_free(clientssl2);
++    SSL_free(serverssl3);
++    SSL_free(clientssl3);
+     SSL_SESSION_free(sess1);
+     SSL_SESSION_free(sess2);
++    /*
++     * Check if we need to remove any sessions up-refed for the external cache
++     */
++    if (new_called &gt;= 1)
++        SSL_SESSION_free(sess1);
++    if (new_called &gt;= 2)
++        SSL_SESSION_free(sess2);
+     SSL_CTX_free(sctx);
+     SSL_CTX_free(cctx);
+ 
+     return testresult;
+ }
+ 
++static int test_session_with_only_int_cache(void) {
++    SETUP_TEST_FIXTURE(SSL_SESSION_TEST_FIXTURE, ssl_session_set_up);
++
++    fixture.use_ext_cache = 0;
++
++    EXECUTE_TEST(execute_test_session, ssl_session_tear_down);
++}
++
++static int test_session_with_only_ext_cache(void) {
++    SETUP_TEST_FIXTURE(SSL_SESSION_TEST_FIXTURE, ssl_session_set_up);
++
++    fixture.use_int_cache = 0;
++
++    EXECUTE_TEST(execute_test_session, ssl_session_tear_down);
++}
++
++static int test_session_with_both_cache(void) {
++    SETUP_TEST_FIXTURE(SSL_SESSION_TEST_FIXTURE, ssl_session_set_up);
++
++    EXECUTE_TEST(execute_test_session, ssl_session_tear_down);
++}
++
+ int main(int argc, char *argv[])
+ {
+     BIO *err = NULL;
+@@ -191,7 +342,9 @@ int main(int argc, char *argv[])
+     CRYPTO_mem_ctrl(CRYPTO_MEM_CHECK_ON);
+ 
+     ADD_TEST(test_tlsext_status_type);
+-    ADD_TEST(test_session);
++    ADD_TEST(test_session_with_only_int_cache);
++    ADD_TEST(test_session_with_only_ext_cache);
++    ADD_TEST(test_session_with_both_cache);
+ 
+     testresult = run_tests(argv[0]);
+ 
+diff --git a/test/ssltestlib.c b/test/ssltestlib.c
+index 357ef00..6d638a2 100644
+--- a/test/ssltestlib.c
++++ b/test/ssltestlib.c
+@@ -56,11 +56,18 @@ int create_ssl_connection(SSL_CTX *serverctx, SSL_CTX *clientctx, SSL **sssl,
+                           SSL **cssl, BIO *s_to_c_fbio, BIO *c_to_s_fbio)
+ {
+     int retc = -1, rets = -1, err, abortctr = 0;
++    int clienterr = 0, servererr = 0;
+     SSL *serverssl, *clientssl;
+     BIO *s_to_c_bio = NULL, *c_to_s_bio = NULL;
+ 
+-    serverssl = SSL_new(serverctx);
+-    clientssl = SSL_new(clientctx);
++    if (*sssl == NULL)
++        serverssl = SSL_new(serverctx);
++    else
++        serverssl = *sssl;
++    if (*cssl == NULL)
++        clientssl = SSL_new(clientctx);
++    else
++        clientssl = *cssl;
+ 
+     if (serverssl == NULL || clientssl == NULL) {
+         printf(&quot;Failed to create SSL object\n&quot;);
+@@ -100,28 +107,30 @@ int create_ssl_connection(SSL_CTX *serverctx, SSL_CTX *clientctx, SSL **sssl,
+ 
+     do {
+         err = SSL_ERROR_WANT_WRITE;
+-        while (retc &lt;= 0 &amp;&amp; err == SSL_ERROR_WANT_WRITE) {
++        while (!clienterr &amp;&amp; retc &lt;= 0 &amp;&amp; err == SSL_ERROR_WANT_WRITE) {
+             retc = SSL_connect(clientssl);
+             if (retc &lt;= 0)
+                 err = SSL_get_error(clientssl, retc);
+         }
+ 
+-        if (retc &lt;= 0 &amp;&amp; err != SSL_ERROR_WANT_READ) {
++        if (!clienterr &amp;&amp; retc &lt;= 0 &amp;&amp; err != SSL_ERROR_WANT_READ) {
+             printf(&quot;SSL_connect() failed %d, %d\n&quot;, retc, err);
+-            goto error;
++            clienterr = 1;
+         }
+ 
+         err = SSL_ERROR_WANT_WRITE;
+-        while (rets &lt;= 0 &amp;&amp; err == SSL_ERROR_WANT_WRITE) {
++        while (!servererr &amp;&amp; rets &lt;= 0 &amp;&amp; err == SSL_ERROR_WANT_WRITE) {
+             rets = SSL_accept(serverssl);
+             if (rets &lt;= 0)
+                 err = SSL_get_error(serverssl, rets);
+         }
+ 
+-        if (rets &lt;= 0 &amp;&amp; err != SSL_ERROR_WANT_READ) {
++        if (!servererr &amp;&amp; rets &lt;= 0 &amp;&amp; err != SSL_ERROR_WANT_READ) {
+             printf(&quot;SSL_accept() failed %d, %d\n&quot;, retc, err);
+-            goto error;
++            servererr = 1;
+         }
++        if (clienterr &amp;&amp; servererr)
++            goto error;
+         if (++abortctr == MAXLOOPS) {
+             printf(&quot;No progress made\n&quot;);
+             goto error;
+@@ -134,12 +143,16 @@ int create_ssl_connection(SSL_CTX *serverctx, SSL_CTX *clientctx, SSL **sssl,
+     return 1;
+ 
+  error:
+-    SSL_free(serverssl);
+-    SSL_free(clientssl);
+-    BIO_free(s_to_c_bio);
+-    BIO_free(c_to_s_bio);
+-    BIO_free(s_to_c_fbio);
+-    BIO_free(c_to_s_fbio);
++    if (*sssl == NULL) {
++        SSL_free(serverssl);
++        BIO_free(s_to_c_bio);
++        BIO_free(s_to_c_fbio);
++    }
++    if (*cssl == NULL) {
++        SSL_free(clientssl);
++        BIO_free(c_to_s_bio);
++        BIO_free(c_to_s_fbio);
++    }
+ 
+     return 0;
+ }
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009103.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="009106.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9105">[ date ]</a>
+              <a href="thread.html#9105">[ thread ]</a>
+              <a href="subject.html#9105">[ subject ]</a>
+              <a href="author.html#9105">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,200 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1466686956.925823.3612.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008515.html">
+   <LINK REL="Next"  HREF="008526.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1466686956.925823.3612.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Jun 23 13:02:36 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008515.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="008526.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8525">[ date ]</a>
+              <a href="thread.html#8525">[ thread ]</a>
+              <a href="subject.html#8525">[ subject ]</a>
+              <a href="author.html#8525">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  687b48685931638ca5fca2a7d5e13516ad40ea4b (commit)
+      from  b58614d7f5f98571b2c0bb2fb3df48f4b48a7e92 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 687b48685931638ca5fca2a7d5e13516ad40ea4b
+Author: FdaSilvaYY &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">fdasilvayy at gmail.com</A>&gt;
+Date:   Sun May 29 14:32:23 2016 +0200
+
+    Rework error handling from asn1_do_lock method.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/asn1/tasn_fre.c             |  2 +-
+ crypto/asn1/tasn_new.c             |  4 +++-
+ crypto/asn1/tasn_utl.c             | 24 ++++++++++++++----------
+ crypto/include/internal/x509_int.h |  6 +++---
+ include/openssl/asn1.h             |  1 +
+ 5 files changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/crypto/asn1/tasn_fre.c b/crypto/asn1/tasn_fre.c
+index 9b623d9..d467b89 100644
+--- a/crypto/asn1/tasn_fre.c
++++ b/crypto/asn1/tasn_fre.c
+@@ -89,7 +89,7 @@ static void asn1_item_embed_free(ASN1_VALUE **pval, const ASN1_ITEM *it,
+ 
+     case ASN1_ITYPE_NDEF_SEQUENCE:
+     case ASN1_ITYPE_SEQUENCE:
+-        if (asn1_do_lock(pval, -1, it) &gt; 0)
++        if (asn1_do_lock(pval, -1, it) != 0) /* if error or ref-counter &gt; 0 */
+             return;
+         if (asn1_cb) {
+             i = asn1_cb(ASN1_OP_FREE_PRE, pval, it, NULL);
+diff --git a/crypto/asn1/tasn_new.c b/crypto/asn1/tasn_new.c
+index 455a88a..897120d 100644
+--- a/crypto/asn1/tasn_new.c
++++ b/crypto/asn1/tasn_new.c
+@@ -123,7 +123,9 @@ int asn1_item_embed_new(ASN1_VALUE **pval, const ASN1_ITEM *it, int embed)
+             if (*pval == NULL)
+                 goto memerr;
+         }
+-        asn1_do_lock(pval, 0, it);
++        /* 0 : init. lock */
++        if (asn1_do_lock(pval, 0, it) &lt; 0)
++            goto memerr;
+         asn1_enc_init(pval, it);
+         for (i = 0, tt = it-&gt;templates; i &lt; it-&gt;tcount; tt++, i++) {
+             pseqval = asn1_get_field_ptr(pval, tt);
+diff --git a/crypto/asn1/tasn_utl.c b/crypto/asn1/tasn_utl.c
+index c215891..f79d7d6 100644
+--- a/crypto/asn1/tasn_utl.c
++++ b/crypto/asn1/tasn_utl.c
+@@ -46,13 +46,14 @@ int asn1_set_choice_selector(ASN1_VALUE **pval, int value,
+ }
+ 
+ /*
+- * Do reference counting. The value 'op' decides what to do. if it is +1
+- * then the count is incremented. If op is 0 count is set to 1. If op is -1
+- * count is decremented and the return value is the current reference count
+- * or 0 if no reference count exists.
+- * FIXME: return and manage any error from inside this method
++ * Do atomic reference counting. The value 'op' decides what to do.
++ * If it is +1 then the count is incremented.
++ * If |op| is 0, lock is initialised and count is set to 1.
++ * If |op| is -1, count is decremented and the return value is the current
++ * reference count or 0 if no reference count is active.
++ * It returns -1 on initialisation error.
++ * Used by ASN1_SEQUENCE construct of X509, X509_REQ, X509_CRL objects
+  */
+-
+ int asn1_do_lock(ASN1_VALUE **pval, int op, const ASN1_ITEM *it)
+ {
+     const ASN1_AUX *aux;
+@@ -70,18 +71,21 @@ int asn1_do_lock(ASN1_VALUE **pval, int op, const ASN1_ITEM *it)
+         *lck = 1;
+         *lock = CRYPTO_THREAD_lock_new();
+         if (*lock == NULL) {
+-            /* FIXME: should report an error (-1) at this point */
+-            return 0;
++            ASN1err(ASN1_F_ASN1_DO_LOCK, ERR_R_MALLOC_FAILURE);
++            return -1;
+         }
+         return 1;
+     }
+-    CRYPTO_atomic_add(lck, op, &amp;ret, *lock);
++    if (CRYPTO_atomic_add(lck, op, &amp;ret, *lock) &lt; 0)
++        return -1;  /* failed */
+ #ifdef REF_PRINT
+     fprintf(stderr, &quot;%p:%4d:%s\n&quot;, it, *lck, it-&gt;sname);
+ #endif
+     REF_ASSERT_ISNT(ret &lt; 0);
+-    if (ret == 0)
++    if (ret == 0) {
+         CRYPTO_THREAD_lock_free(*lock);
++        *lock = NULL;
++    }
+     return ret;
+ }
+ 
+diff --git a/crypto/include/internal/x509_int.h b/crypto/include/internal/x509_int.h
+index 6df2919..c5472e1 100644
+--- a/crypto/include/internal/x509_int.h
++++ b/crypto/include/internal/x509_int.h
+@@ -64,15 +64,15 @@ struct X509_crl_info_st {
+     X509_NAME *issuer;          /* CRL issuer name */
+     ASN1_TIME *lastUpdate;      /* lastUpdate field */
+     ASN1_TIME *nextUpdate;      /* nextUpdate field: optional */
+-    STACK_OF(X509_REVOKED) *revoked; /* revoked entries: optional */
++    STACK_OF(X509_REVOKED) *revoked;        /* revoked entries: optional */
+     STACK_OF(X509_EXTENSION) *extensions;   /* extensions: optional */
+-    ASN1_ENCODING enc;          /* encoding of signed portion of CRL */
++    ASN1_ENCODING enc;                      /* encoding of signed portion of CRL */
+ };
+ 
+ struct X509_crl_st {
+     X509_CRL_INFO crl;          /* signed CRL data */
+     X509_ALGOR sig_alg;         /* CRL signature algorithm */
+-    ASN1_BIT_STRING signature; /* CRL signature */
++    ASN1_BIT_STRING signature;  /* CRL signature */
+     int references;
+     int flags;
+     /*
+diff --git a/include/openssl/asn1.h b/include/openssl/asn1.h
+index 5bce404..ce221a9 100644
+--- a/include/openssl/asn1.h
++++ b/include/openssl/asn1.h
+@@ -885,6 +885,7 @@ void ERR_load_ASN1_strings(void);
+ # define ASN1_F_ASN1_D2I_READ_BIO                         107
+ # define ASN1_F_ASN1_DIGEST                               184
+ # define ASN1_F_ASN1_DO_ADB                               110
++# define ASN1_F_ASN1_DO_LOCK                              233
+ # define ASN1_F_ASN1_DUP                                  111
+ # define ASN1_F_ASN1_EX_C2I                               204
+ # define ASN1_F_ASN1_FIND_END                             190
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008515.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="008526.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8525">[ date ]</a>
+              <a href="thread.html#8525">[ thread ]</a>
+              <a href="subject.html#8525">[ subject ]</a>
+              <a href="author.html#8525">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

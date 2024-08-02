@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl/openssl] 6b1a12: Fix an init-deadlock in OPENSSL_init_crypto(OPENSS...
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2023-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl/openssl%5D%206b1a12%3A%20Fix%20an%20init-deadlock%20in%0A%20OPENSSL_init_crypto%28OPENSS...&In-Reply-To=%3Copenssl/openssl/push/refs/heads/master/420a08-6b1a12%40github.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="039598.html">
+   <LINK REL="Next"  HREF="039600.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl/openssl] 6b1a12: Fix an init-deadlock in OPENSSL_init_crypto(OPENSS...</H1>
+    <B>Bernd Edlinger</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl/openssl%5D%206b1a12%3A%20Fix%20an%20init-deadlock%20in%0A%20OPENSSL_init_crypto%28OPENSS...&In-Reply-To=%3Copenssl/openssl/push/refs/heads/master/420a08-6b1a12%40github.com%3E"
+       TITLE="[openssl/openssl] 6b1a12: Fix an init-deadlock in OPENSSL_init_crypto(OPENSS...">noreply at github.com
+       </A><BR>
+    <I>Thu Aug 10 14:14:22 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="039598.html">[openssl/openssl] 420a08: Don't use C++ reserved word template for function ...
+</A></li>
+        <LI>Next message (by thread): <A HREF="039600.html">[openssl/openssl] 45c021: OSSL_HTTP_{REQ_CTX_set_request_line(),_set1_reques...
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39599">[ date ]</a>
+              <a href="thread.html#39599">[ thread ]</a>
+              <a href="subject.html#39599">[ subject ]</a>
+              <a href="author.html#39599">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>  Branch: refs/heads/master
+  Home:   <A HREF="https://github.com/openssl/openssl">https://github.com/openssl/openssl</A>
+  Commit: 6b1a1275b3f3f8af0b4e0603d529a7bb2da4402a
+      <A HREF="https://github.com/openssl/openssl/commit/6b1a1275b3f3f8af0b4e0603d529a7bb2da4402a">https://github.com/openssl/openssl/commit/6b1a1275b3f3f8af0b4e0603d529a7bb2da4402a</A>
+  Author: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+  Date:   2023-08-10 (Thu, 10 Aug 2023)
+
+  Changed paths:
+    M crypto/init.c
+
+  Log Message:
+  -----------
+  Fix an init-deadlock in OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS)
+
+A recursive OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS) call
+may happen if an out-of-memory error happens at the first callstack,
+and the dead-lock happens at the second callstack, because ossl_err_get_state_int
+calls OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS) although that
+call is currently already executing.
+
+At least on posix system this causes the process to freeze at this
+point, and must be avoided whatever it takes.
+
+The fix is using err_shelve_state around the critical region, which
+makes ossl_err_get_state_int return early and not call the recursive
+OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS).
+
+This can be reproduced with my error injection patch.
+
+The test vector has been validated on the master branch:
+
+$ ERROR_INJECT=1692279870 ../util/shlib_wrap.sh ./asn1parse-test ./corpora/asn1parse/027f6e82ba01d9db9a9167b83e56cc9f2c602550
+ERROR_INJECT=1692279870
+    #0 0x7f280b42fef8 in __sanitizer_print_stack_trace ../../../../src/libsanitizer/asan/asan_stack.cpp:86
+    #1 0x5610a3f396b4 in my_malloc fuzz/test-corpus.c:114
+    #2 0x7f280a2eb94c in CRYPTO_malloc crypto/mem.c:177
+    #3 0x7f280a2dafdb in OPENSSL_LH_insert crypto/lhash/lhash.c:114
+    #4 0x7f280a1c87fe in err_load_strings crypto/err/err.c:264
+    #5 0x7f280a1c87fe in err_load_strings crypto/err/err.c:259
+    #6 0x7f280a1c87fe in ERR_load_strings_const crypto/err/err.c:301
+    #7 0x7f280a6f513b in ossl_err_load_PROV_strings providers/common/provider_err.c:233
+    #8 0x7f280a1cf015 in ossl_err_load_crypto_strings crypto/err/err_all.c:109
+    #9 0x7f280a2e9b8c in ossl_init_load_crypto_strings crypto/init.c:190
+    #10 0x7f280a2e9b8c in ossl_init_load_crypto_strings_ossl_ crypto/init.c:181
+    #11 0x7f2808cfbf67  (/lib/x86_64-linux-gnu/libc.so.6+0x99f67)
+    #12 0x7f280a32301e in CRYPTO_THREAD_run_once crypto/threads_pthread.c:154
+    #13 0x7f280a2ea1da in OPENSSL_init_crypto crypto/init.c:553
+    #14 0x5610a3f38e2f in FuzzerInitialize fuzz/asn1parse.c:29
+    #15 0x5610a3f38783 in main fuzz/test-corpus.c:194
+    #16 0x7f2808c8bd8f  (/lib/x86_64-linux-gnu/libc.so.6+0x29d8f)
+    #17 0x7f2808c8be3f in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e3f)
+    #18 0x5610a3f38d34 in _start (/home/runner/work/openssl/openssl/fuzz/asn1parse-test+0x3d34)
+
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==27629==ERROR: AddressSanitizer: ABRT on unknown address 0x03e900006e23 (pc 0x7f2808cfbef8 bp 0x7f280b36afe0 sp 0x7ffd545b2460 T0)
+    #0 0x7f2808cfbef8  (/lib/x86_64-linux-gnu/libc.so.6+0x99ef8)
+    #1 0x7f280a32301e in CRYPTO_THREAD_run_once crypto/threads_pthread.c:154
+    #2 0x7f280a2ea1da in OPENSSL_init_crypto crypto/init.c:553
+    #3 0x7f280a1c935e in ossl_err_get_state_int crypto/err/err.c:705
+    #4 0x7f280a1cf1f9 in ERR_new crypto/err/err_blocks.c:20
+    #5 0x7f280a2eb9ac in CRYPTO_malloc crypto/mem.c:205
+    #6 0x7f280a2dafdb in OPENSSL_LH_insert crypto/lhash/lhash.c:114
+    #7 0x7f280a1c87fe in err_load_strings crypto/err/err.c:264
+    #8 0x7f280a1c87fe in err_load_strings crypto/err/err.c:259
+    #9 0x7f280a1c87fe in ERR_load_strings_const crypto/err/err.c:301
+    #10 0x7f280a6f513b in ossl_err_load_PROV_strings providers/common/provider_err.c:233
+    #11 0x7f280a1cf015 in ossl_err_load_crypto_strings crypto/err/err_all.c:109
+    #12 0x7f280a2e9b8c in ossl_init_load_crypto_strings crypto/init.c:190
+    #13 0x7f280a2e9b8c in ossl_init_load_crypto_strings_ossl_ crypto/init.c:181
+    #14 0x7f2808cfbf67  (/lib/x86_64-linux-gnu/libc.so.6+0x99f67)
+    #15 0x7f280a32301e in CRYPTO_THREAD_run_once crypto/threads_pthread.c:154
+    #16 0x7f280a2ea1da in OPENSSL_init_crypto crypto/init.c:553
+    #17 0x5610a3f38e2f in FuzzerInitialize fuzz/asn1parse.c:29
+    #18 0x5610a3f38783 in main fuzz/test-corpus.c:194
+    #19 0x7f2808c8bd8f  (/lib/x86_64-linux-gnu/libc.so.6+0x29d8f)
+    #20 0x7f2808c8be3f in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e3f)
+    #21 0x5610a3f38d34 in _start (/home/runner/work/openssl/openssl/fuzz/asn1parse-test+0x3d34)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: ABRT (/lib/x86_64-linux-gnu/libc.so.6+0x99ef8)
+==27629==ABORTING
+
+Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+Reviewed-by: Tom Cosgrove &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tom.cosgrove at arm.com</A>&gt;
+(Merged from <A HREF="https://github.com/openssl/openssl/pull/21683">https://github.com/openssl/openssl/pull/21683</A>)
+
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="039598.html">[openssl/openssl] 420a08: Don't use C++ reserved word template for function ...
+</A></li>
+	<LI>Next message (by thread): <A HREF="039600.html">[openssl/openssl] 45c021: OSSL_HTTP_{REQ_CTX_set_request_line(),_set1_reques...
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39599">[ date ]</a>
+              <a href="thread.html#39599">[ thread ]</a>
+              <a href="subject.html#39599">[ subject ]</a>
+              <a href="author.html#39599">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

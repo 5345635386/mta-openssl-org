@@ -1,0 +1,169 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-March/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583731499.537044.30891.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027833.html">
+   <LINK REL="Next"  HREF="027838.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1583731499.537044.30891.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Mon Mar  9 05:24:59 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027833.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="027838.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27836">[ date ]</a>
+              <a href="thread.html#27836">[ thread ]</a>
+              <a href="subject.html#27836">[ subject ]</a>
+              <a href="author.html#27836">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  db4b3d8392fc1c3a1033045efdda222fd76c26b2 (commit)
+      from  a08e2bf548507443ce9a020dd4cc68a57c27a8b7 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit db4b3d8392fc1c3a1033045efdda222fd76c26b2
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Wed Feb 19 07:05:52 2020 +0100
+
+    Refactor CRMF_poposigningkey_init() to work with provider keys
+    
+    The code in this function was almost entirely a copy of the
+    functionality in ASN1_item_sign(), so it gets refactored to actually
+    call ASN1_item_sign(), and thereby automatically gets support for
+    EVP_PKEYs with only provider side keys.
+    
+    Reviewed-by: David von Oheimb &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">david.von.oheimb at siemens.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11126">https://github.com/openssl/openssl/pull/11126</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/crmf/crmf_lib.c | 59 ++++++++++----------------------------------------
+ 1 file changed, 12 insertions(+), 47 deletions(-)
+
+diff --git a/crypto/crmf/crmf_lib.c b/crypto/crmf/crmf_lib.c
+index 4d81569299..863d26f86e 100644
+--- a/crypto/crmf/crmf_lib.c
++++ b/crypto/crmf/crmf_lib.c
+@@ -367,65 +367,30 @@ static int CRMF_poposigningkey_init(OSSL_CRMF_POPOSIGNINGKEY *ps,
+                                     OSSL_CRMF_CERTREQUEST *cr,
+                                     EVP_PKEY *pkey, int dgst)
+ {
+-    int len;
+-    size_t crlen;
+-    size_t siglen;
+-    unsigned char *crder = NULL, *sig = NULL;
+-    int alg_nid = 0;
+-    int md_nid = 0;
+-    const EVP_MD *alg = NULL;
+-    EVP_MD_CTX *ctx = NULL;
+     int ret = 0;
++    EVP_MD *fetched_md = NULL;
++    const EVP_MD *md = EVP_get_digestbynid(dgst);
+ 
+     if (ps == NULL || cr == NULL || pkey == NULL) {
+         CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT, CRMF_R_NULL_ARGUMENT);
+         return 0;
+     }
+ 
+-    /* OpenSSL defaults all bit strings to be encoded as ASN.1 NamedBitList */
+-    ps-&gt;signature-&gt;flags &amp;= ~(ASN1_STRING_FLAG_BITS_LEFT | 0x07);
+-    ps-&gt;signature-&gt;flags |= ASN1_STRING_FLAG_BITS_LEFT;
++    /* If we didn't find legacy MD, we try an implicit fetch */
++    if (md == NULL)
++        md = fetched_md = EVP_MD_fetch(NULL, OBJ_nid2sn(dgst), NULL);
+ 
+-    len = i2d_OSSL_CRMF_CERTREQUEST(cr, &amp;crder);
+-    if (len &lt; 0 || crder == NULL) {
+-        CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT, CRMF_R_ERROR);
+-        goto err;
+-    }
+-    crlen = (size_t)len;
+-
+-    if (!OBJ_find_sigid_by_algs(&amp;alg_nid, dgst, EVP_PKEY_id(pkey))) {
+-        CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT,
+-                CRMF_R_UNSUPPORTED_ALG_FOR_POPSIGNINGKEY);
+-        goto err;
+-    }
+-    if (!OBJ_find_sigid_algs(alg_nid, &amp;md_nid, NULL)
+-            || (alg = EVP_get_digestbynid(md_nid)) == NULL) {
++    if (md == NULL) {
+         CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT,
+                 CRMF_R_UNSUPPORTED_ALG_FOR_POPSIGNINGKEY);
+-        goto err;
+-    }
+-    if (!X509_ALGOR_set0(ps-&gt;algorithmIdentifier, OBJ_nid2obj(alg_nid),
+-                         V_ASN1_NULL, NULL)
+-            || (ctx = EVP_MD_CTX_new()) == NULL
+-            || EVP_DigestSignInit(ctx, NULL, alg, NULL, pkey) &lt;= 0
+-            || EVP_DigestSignUpdate(ctx, crder, crlen) &lt;= 0
+-            || EVP_DigestSignFinal(ctx, NULL, &amp;siglen) &lt;= 0) {
+-        CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT, CRMF_R_ERROR);
+-        goto err;
+-    }
+-    if ((sig = OPENSSL_malloc(siglen)) == NULL)
+-        goto err;
+-    if (EVP_DigestSignFinal(ctx, sig, &amp;siglen) &lt;= 0
+-            || !ASN1_BIT_STRING_set(ps-&gt;signature, sig, siglen)) {
+-        CRMFerr(CRMF_F_CRMF_POPOSIGNINGKEY_INIT, CRMF_R_ERROR);
+-        goto err;
++        return 0;
+     }
+-    ret = 1;
+ 
+- err:
+-    OPENSSL_free(crder);
+-    EVP_MD_CTX_free(ctx);
+-    OPENSSL_free(sig);
++    ret = ASN1_item_sign(ASN1_ITEM_rptr(OSSL_CRMF_CERTREQUEST),
++                         ps-&gt;algorithmIdentifier, NULL, ps-&gt;signature,
++                         cr, pkey, md);
++
++    EVP_MD_free(fetched_md);
+     return ret;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027833.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="027838.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27836">[ date ]</a>
+              <a href="thread.html#27836">[ thread ]</a>
+              <a href="subject.html#27836">[ subject ]</a>
+              <a href="author.html#27836">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

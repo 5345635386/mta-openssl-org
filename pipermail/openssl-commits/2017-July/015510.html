@@ -1,0 +1,1088 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1500747563.727935.20769.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015507.html">
+   <LINK REL="Next"  HREF="015514.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1500747563.727935.20769.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Sat Jul 22 18:19:23 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015507.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="015514.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15510">[ date ]</a>
+              <a href="thread.html#15510">[ thread ]</a>
+              <a href="subject.html#15510">[ subject ]</a>
+              <a href="author.html#15510">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8389ec4b4950b9474e72a959eb0b0a6ce77ac1e8 (commit)
+      from  0d7903f83f84bba1d29225efd999c633a0c5ba01 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8389ec4b4950b9474e72a959eb0b0a6ce77ac1e8
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Tue Jul 18 09:39:21 2017 -0400
+
+    Add --with-rand-seed
+    
+    Add a new config param to specify how the CSPRNG should be seeded.
+    Illegal values or nonsensical combinations (e.g., anything other
+    than &quot;os&quot; on VMS or HP VOS etc) result in build failures.
+    Add RDSEED support.
+    Add RDTSC but leave it disabled for now pending more investigation.
+    
+    Refactor and reorganization all seeding files (rand_unix/win/vms) so
+    that they are simpler.
+    
+    Only require 128 bits of seeding material.
+    
+    Many document improvements, including why to not use RAND_add() and the
+    limitations around using load_file/write_file.
+    Document RAND_poll().
+    
+    Cleanup Windows RAND_poll and return correct status
+    
+    More completely initialize the default DRBG.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3965">https://github.com/openssl/openssl/pull/3965</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Configure                   |  23 ++++
+ apps/version.c              |  38 +++++-
+ crypto/rand/drbg_rand.c     |   6 +-
+ crypto/rand/rand_lcl.h      |  28 +++--
+ crypto/rand/rand_lib.c      |  64 ++++++++++
+ crypto/rand/rand_unix.c     | 292 ++++++++++++++------------------------------
+ crypto/rand/rand_vms.c      |   6 +-
+ crypto/rand/rand_win.c      |  98 +++++----------
+ doc/man3/RAND_add.pod       |  65 ++++++----
+ doc/man3/RAND_load_file.pod |  10 +-
+ 10 files changed, 324 insertions(+), 306 deletions(-)
+
+diff --git a/Configure b/Configure
+index 9612976..ebfe01d 100755
+--- a/Configure
++++ b/Configure
+@@ -561,6 +561,9 @@ $config{build_type} = &quot;release&quot;;
+ 
+ my %unsupported_options = ();
+ my %deprecated_options = ();
++# If you change this, update apps/version.c
++my @known_seed_sources = qw(getrandom devrandom os egd none rdcpu librandom);
++my @seed_sources = ();
+ while (@argvcopy)
+ 	{
+ 	$_ = shift @argvcopy;
+@@ -729,6 +732,15 @@ while (@argvcopy)
+ 			{
+ 			$withargs{fuzzer_include}=$1;
+ 			}
++		elsif (/^--with-rand-seed=(.*)$/)
++			{
++			foreach my $x (split(m|,|, $1))
++			    {
++			    die &quot;Unknown --with-rand-seed choice $x\n&quot;
++				if ! grep { $x eq $_ } @known_seed_sources;
++			    push @seed_sources, $x;
++			    }
++                        }
+ 		elsif (/^--cross-compile-prefix=(.*)$/)
+ 			{
+ 			$config{cross_compile_prefix}=$1;
+@@ -812,6 +824,17 @@ if ($libs =~ /(^|\s)-Wl,-rpath,/
+ 	&quot;***** any of asan, msan or ubsan\n&quot;;
+ }
+ 
++if (scalar(@seed_sources) == 0) {
++    print &quot;Using implicit seed configuration\n&quot;;
++    push @seed_sources, 'os';
++}
++die &quot;Cannot seed with none and anything else&quot;
++    if scalar(grep { $_ eq 'none' } @seed_sources) &gt; 0
++        &amp;&amp; scalar(@seed_sources) &gt; 1;
++push @{$config{openssl_other_defines}},
++     map { (my $x = $_) =~ tr|[\-a-z]|[_A-Z]|; &quot;OPENSSL_RAND_SEED_$x&quot; }
++	@seed_sources;
++
+ my @tocheckfor = (keys %disabled);
+ while (@tocheckfor) {
+     my %new_tocheckfor = ();
+diff --git a/apps/version.c b/apps/version.c
+index 24f1a80..298d837 100644
+--- a/apps/version.c
++++ b/apps/version.c
+@@ -32,7 +32,7 @@
+ 
+ typedef enum OPTION_choice {
+     OPT_ERR = -1, OPT_EOF = 0, OPT_HELP,
+-    OPT_B, OPT_D, OPT_E, OPT_F, OPT_O, OPT_P, OPT_V, OPT_A
++    OPT_B, OPT_D, OPT_E, OPT_F, OPT_O, OPT_P, OPT_V, OPT_A, OPT_R
+ } OPTION_CHOICE;
+ 
+ const OPTIONS version_options[] = {
+@@ -44,13 +44,14 @@ const OPTIONS version_options[] = {
+     {&quot;f&quot;, OPT_F, '-', &quot;Show compiler flags used&quot;},
+     {&quot;o&quot;, OPT_O, '-', &quot;Show some internal datatype options&quot;},
+     {&quot;p&quot;, OPT_P, '-', &quot;Show target build platform&quot;},
++    {&quot;r&quot;, OPT_R, '-', &quot;Show random seeding options&quot;},
+     {&quot;v&quot;, OPT_V, '-', &quot;Show library version&quot;},
+     {NULL}
+ };
+ 
+ int version_main(int argc, char **argv)
+ {
+-    int ret = 1, dirty = 0;
++    int ret = 1, dirty = 0, seed = 0;
+     int cflags = 0, version = 0, date = 0, options = 0, platform = 0, dir = 0;
+     int engdir = 0;
+     char *prog;
+@@ -85,11 +86,14 @@ int version_main(int argc, char **argv)
+         case OPT_P:
+             dirty = platform = 1;
+             break;
++        case OPT_R:
++            dirty = seed = 1;
++            break;
+         case OPT_V:
+             dirty = version = 1;
+             break;
+         case OPT_A:
+-            cflags = version = date = platform = dir = engdir = 1;
++            seed = cflags = version = date = platform = dir = engdir = 1;
+             break;
+         }
+     }
+@@ -133,6 +137,34 @@ int version_main(int argc, char **argv)
+         printf(&quot;%s\n&quot;, OpenSSL_version(OPENSSL_DIR));
+     if (engdir)
+         printf(&quot;%s\n&quot;, OpenSSL_version(OPENSSL_ENGINES_DIR));
++    if (seed) {
++        printf(&quot;Seeding source:&quot;);
++#ifdef OPENSSL_RAND_SEED_RTDSC
++        printf(&quot; rtdsc&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_RDCPU
++        printf(&quot; rdrand-hardware&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_LIBRANDOM
++        printf(&quot; C-library-random&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_GETRANDOM
++        printf(&quot; getrandom-syscall&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_DEVRANDOM
++        printf(&quot; random-device&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_EGD
++        printf(&quot; EGD&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_NONE
++        printf(&quot; none&quot;);
++#endif
++#ifdef OPENSSL_RAND_SEED_OS
++        printf(&quot; os-specific&quot;);
++#endif
++        printf(&quot;\n&quot;);
++    }
+     ret = 0;
+  end:
+     return (ret);
+diff --git a/crypto/rand/drbg_rand.c b/crypto/rand/drbg_rand.c
+index 77d59ec..8b30cd8 100644
+--- a/crypto/rand/drbg_rand.c
++++ b/crypto/rand/drbg_rand.c
+@@ -29,8 +29,12 @@ static CRYPTO_ONCE ossl_drbg_init = CRYPTO_ONCE_STATIC_INIT;
+ 
+ DEFINE_RUN_ONCE_STATIC(do_ossl_drbg_init)
+ {
++    int st = 1;
++
+     ossl_drbg.lock = CRYPTO_THREAD_lock_new();
+-    return ossl_drbg.lock != NULL;
++    st &amp;= ossl_drbg.lock != NULL;
++    st &amp;= RAND_DRBG_set(&amp;ossl_drbg, NID_aes_128_ctr, 0) == 1;
++    return st;
+ }
+ 
+ void rand_drbg_cleanup(void)
+diff --git a/crypto/rand/rand_lcl.h b/crypto/rand/rand_lcl.h
+index de1f2cd..b9df5d1 100644
+--- a/crypto/rand/rand_lcl.h
++++ b/crypto/rand/rand_lcl.h
+@@ -17,21 +17,24 @@
+ # include &lt;openssl/ec.h&gt;
+ # include &quot;internal/rand.h&quot;
+ 
+-/* we require 256 bits of randomness */
+-# define RANDOMNESS_NEEDED (256 / 8)
++/* Amount of randomness (in bytes) we want for initial seeding. */
++# define RANDOMNESS_NEEDED              (128 / 8)
+ 
+ /* Maximum count allowed in reseeding */
+ #define MAX_RESEED (1 &lt;&lt; 24)
+ 
+ /* DRBG status values */
+-#define DRBG_STATUS_UNINITIALISED	0
+-#define DRBG_STATUS_READY		1
+-#define DRBG_STATUS_RESEED		2
+-#define DRBG_STATUS_ERROR		3
++# define DRBG_STATUS_UNINITIALISED	0
++# define DRBG_STATUS_READY		1
++# define DRBG_STATUS_RESEED		2
++# define DRBG_STATUS_ERROR		3
+ 
+ /* A default maximum length: larger than any reasonable value used in pratice */
+-#define DRBG_MAX_LENGTH			0x7ffffff0
++# define DRBG_MAX_LENGTH                0x7ffffff0
+ 
++/*
++ * The context for DRBG AES-CTR
++ */
+ typedef struct drbg_ctr_ctx_st {
+     AES_KEY ks;
+     size_t keylen;
+@@ -46,6 +49,10 @@ typedef struct drbg_ctr_ctx_st {
+     unsigned char KX[48];
+ } DRBG_CTR_CTX;
+ 
++
++/*
++ * The context for all DRBG's
++ */
+ struct drbg_ctx_st {
+     CRYPTO_RWLOCK *lock;
+     DRBG_CTX *parent;
+@@ -84,9 +91,12 @@ struct drbg_ctx_st {
+ extern RAND_METHOD openssl_rand_meth;
+ void rand_drbg_cleanup(void);
+ 
++/* Hardware-based seeding functions. */
++void rand_rdtsc(void);
++int rand_rdcpu(void);
++
++/* DRBG functions implementing AES-CTR */
+ int ctr_init(DRBG_CTX *dctx);
+-int drbg_hash_init(DRBG_CTX *dctx);
+-int drbg_hmac_init(DRBG_CTX *dctx);
+ int ctr_uninstantiate(DRBG_CTX *dctx);
+ int ctr_instantiate(DRBG_CTX *dctx,
+                     const unsigned char *ent, size_t entlen,
+diff --git a/crypto/rand/rand_lib.c b/crypto/rand/rand_lib.c
+index 3168d84..05aa45c 100644
+--- a/crypto/rand/rand_lib.c
++++ b/crypto/rand/rand_lib.c
+@@ -25,6 +25,70 @@ static CRYPTO_RWLOCK *rand_meth_lock;
+ static const RAND_METHOD *default_RAND_meth;
+ static CRYPTO_ONCE rand_init = CRYPTO_ONCE_STATIC_INIT;
+ 
++#ifdef OPENSSL_RAND_SEED_RDTSC
++/*
++ * IMPORTANT NOTE:  It is not currently possible to use this code
++ * because we are not sure about the amount of randomness.  Some
++ * SP900 tests have been run, but there is internal skepticism.
++ * So for now this code is not used.
++ */
++# error &quot;RDTSC enabled?  Should not be possible!&quot;
++
++/*
++ * Since we get some randomness from the low-order bits of the
++ * high-speec clock, it can help.  But don't return a status since
++ * it's not sufficient to indicate whether or not the seeding was
++ * done.
++ */
++void rand_rdtsc(void)
++{
++    unsigned char c;
++    int i;
++
++    for (i = 0; i &lt; 10; i++) {
++        c = (unsigned char)(OPENSSL_rdtsc() &amp; 0xFF);
++        RAND_add(&amp;c, 1, 0.5);
++    }
++}
++#endif
++
++#ifdef OPENSSL_RAND_SEED_RDCPU
++size_t OPENSSL_ia32_rdseed(void);
++size_t OPENSSL_ia32_rdrand(void);
++
++extern unsigned int OPENSSL_ia32cap_P[];
++
++int rand_rdcpu(void)
++{
++    size_t i, s;
++
++    /* If RDSEED is available, use that. */
++    if ((OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; 18)) != 0) {
++        for (i = 0; i &lt; RANDOMNESS_NEEDED; i += sizeof(s)) {
++            s = OPENSSL_ia32_rdseed();
++            if (s == 0)
++                break;
++            RAND_add(&amp;s, (int)sizeof(s), sizeof(s));
++        }
++        if (i &gt;= RANDOMNESS_NEEDED)
++            return 1;
++    }
++
++    /* Second choice is RDRAND. */
++    if ((OPENSSL_ia32cap_P[1] &amp; (1 &lt;&lt; (62 - 32))) != 0) {
++        for (i = 0; i &lt; RANDOMNESS_NEEDED; i += sizeof(s)) {
++            s = OPENSSL_ia32_rdrand();
++            if (s == 0)
++                break;
++            RAND_add(&amp;s, (int)sizeof(s), sizeof(s));
++        }
++        if (i &gt;= RANDOMNESS_NEEDED)
++            return 1;
++    }
++
++    return 0;
++}
++#endif
+ 
+ DEFINE_RUN_ONCE_STATIC(do_rand_init)
+ {
+diff --git a/crypto/rand/rand_unix.c b/crypto/rand/rand_unix.c
+index bfdd3e6..2cfd20d 100644
+--- a/crypto/rand/rand_unix.c
++++ b/crypto/rand/rand_unix.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -9,32 +9,32 @@
+ 
+ #include &lt;stdio.h&gt;
+ 
+-#define USE_SOCKETS
+ #include &quot;e_os.h&quot;
+ #include &quot;internal/cryptlib.h&quot;
+ #include &lt;openssl/rand.h&gt;
+ #include &quot;rand_lcl.h&quot;
++#include &lt;stdio.h&gt;
+ 
+ #if !(defined(OPENSSL_SYS_WINDOWS) || defined(OPENSSL_SYS_WIN32) || defined(OPENSSL_SYS_VMS) || defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI))
+ 
+-# include &lt;sys/types.h&gt;
+-# include &lt;sys/time.h&gt;
+-# include &lt;sys/times.h&gt;
+-# include &lt;sys/stat.h&gt;
+-# include &lt;fcntl.h&gt;
+-# include &lt;unistd.h&gt;
+-# include &lt;time.h&gt;
+-# if defined(OPENSSL_SYS_LINUX) /* should actually be available virtually
+-                                 * everywhere */
+-#  include &lt;poll.h&gt;
+-# endif
+-# include &lt;limits.h&gt;
+-# ifndef FD_SETSIZE
+-#  define FD_SETSIZE (8*sizeof(fd_set))
++# if (defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI)) &amp;&amp; \
++        !defined(OPENSSL_RAND_SEED_NONE)
++#  error &quot;UEFI and VXWorks only support seeding NONE&quot;
+ # endif
+ 
+ # if defined(OPENSSL_SYS_VOS)
+ 
++#  ifndef OPENSSL_RAND_SEED_OS
++#   error &quot;Unsupported seeding method configured; must be os&quot;
++#  endif
++
++#  if defined(OPENSSL_SYS_VOS_HPPA) &amp;&amp; defined(OPENSSL_SYS_VOS_IA32)
++#   error &quot;Unsupported HP-PA and IA32 at the same time.&quot;
++#  endif
++#  if !defined(OPENSSL_SYS_VOS_HPPA) &amp;&amp; !defined(OPENSSL_SYS_VOS_IA32)
++#   error &quot;Must have one of HP-PA or IA32&quot;
++#  endif
++
+ /*
+  * The following algorithm repeatedly samples the real-time clock (RTC) to
+  * generate a sequence of unpredictable data.  The algorithm relies upon the
+@@ -51,7 +51,6 @@
+  * As a precaution, we generate 4 times the minimum required amount of seed
+  * data.
+  */
+-
+ int RAND_poll(void)
+ {
+     short int code;
+@@ -61,35 +60,24 @@ int RAND_poll(void)
+     int i, k;
+     struct timespec ts;
+     unsigned char v;
+-
+ #  ifdef OPENSSL_SYS_VOS_HPPA
+     long duration;
+     extern void s$sleep(long *_duration, short int *_code);
+ #  else
+-#   ifdef OPENSSL_SYS_VOS_IA32
+     long long duration;
+     extern void s$sleep2(long long *_duration, short int *_code);
+-#   else
+-#    error &quot;Unsupported Platform.&quot;
+-#   endif                       /* OPENSSL_SYS_VOS_IA32 */
+-#  endif                        /* OPENSSL_SYS_VOS_HPPA */
++#  endif
+ 
+     /*
+      * Seed with the gid, pid, and uid, to ensure *some* variation between
+      * different processes.
+      */
+-
+     curr_gid = getgid();
+-    RAND_add(&amp;curr_gid, sizeof curr_gid, 1);
+-    curr_gid = 0;
+-
++    RAND_add(&amp;curr_gid, sizeof curr_gid, 0);
+     curr_pid = getpid();
+-    RAND_add(&amp;curr_pid, sizeof curr_pid, 1);
+-    curr_pid = 0;
+-
++    RAND_add(&amp;curr_pid, sizeof curr_pid, 0);
+     curr_uid = getuid();
+-    RAND_add(&amp;curr_uid, sizeof curr_uid, 1);
+-    curr_uid = 0;
++    RAND_add(&amp;curr_uid, sizeof curr_uid, 0);
+ 
+     for (i = 0; i &lt; (RANDOMNESS_NEEDED * 4); i++) {
+         /*
+@@ -104,203 +92,111 @@ int RAND_poll(void)
+         duration = 1;
+         s$sleep(&amp;duration, &amp;code);
+ #  else
+-#   ifdef OPENSSL_SYS_VOS_IA32
+         /* sleep for 1/65536 of a second (15 us).  */
+         duration = 1;
+         s$sleep2(&amp;duration, &amp;code);
+-#   endif                       /* OPENSSL_SYS_VOS_IA32 */
+-#  endif                        /* OPENSSL_SYS_VOS_HPPA */
++#  endif
+ 
+-        /* get wall clock time.  */
++        /* Get wall clock time, take 8 bits. */
+         clock_gettime(CLOCK_REALTIME, &amp;ts);
+-
+-        /* take 8 bits */
+-        v = (unsigned char)(ts.tv_nsec % 256);
++        v = (unsigned char)(ts.tv_nsec &amp; 0xFF);
+         RAND_add(&amp;v, sizeof v, 1);
+-        v = 0;
+     }
+     return 1;
+ }
++
+ # else
+-int RAND_poll(void)
+-{
+-    unsigned long l;
+-    pid_t curr_pid = getpid();
+-#  if defined(DEVRANDOM) || (!defined(OPENSS_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD))
+-    unsigned char tmpbuf[RANDOMNESS_NEEDED];
+-    int n = 0;
+-#  endif
+-#  ifdef DEVRANDOM
+-    static const char *randomfiles[] = { DEVRANDOM };
+-    struct stat randomstats[OSSL_NELEM(randomfiles)];
+-    int fd;
+-    unsigned int i;
+-#  endif
+-#  if !defined(OPENSSL_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD)
+-    static const char *egdsockets[] = { DEVRANDOM_EGD, NULL };
+-    const char **egdsocket = NULL;
++
++#  if defined(OPENSSL_RAND_SEED_EGD) &amp;&amp; \
++        (defined(OPENSSL_NO_EGD) || !defined(DEVRANDOM_EGD))
++#   error &quot;Seeding uses EGD but EGD is turned off or no device given&quot;
+ #  endif
+ 
+-#  ifdef DEVRANDOM
+-    memset(randomstats, 0, sizeof(randomstats));
+-    /*
+-     * Use a randomness device. Linux, FreeBSD and OpenBSD have
+-     * this. Use /dev/urandom if you can as /dev/random may block if it runs
+-     * out of random entries.
+-     */
++#  if defined(OPENSSL_RAND_SEED_DEVRANDOM) &amp;&amp; !defined(DEVRANDOM)
++#   error &quot;Seeding uses urandom but DEVRANDOM is not configured&quot;
++#  endif
+ 
+-    for (i = 0; (i &lt; OSSL_NELEM(randomfiles)) &amp;&amp; (n &lt; RANDOMNESS_NEEDED); i++) {
+-        if ((fd = open(randomfiles[i], O_RDONLY
+-#   ifdef O_NONBLOCK
+-                       | O_NONBLOCK
+-#   endif
+-#   ifdef O_BINARY
+-                       | O_BINARY
+-#   endif
+-#   ifdef O_NOCTTY              /* If it happens to be a TTY (god forbid), do
+-                                 * not make it our controlling tty */
+-                       | O_NOCTTY
++#  if defined(OPENSSL_RAND_SEED_OS)
++#   if defined(DEVRANDOM)
++#    define OPENSSL_RAND_SEED_DEVRANDOM
++#   else
++#    error &quot;OS seeding requires DEVRANDOM to be configured&quot;
+ #   endif
+-             )) &gt;= 0) {
+-            int usec = 10 * 1000; /* spend 10ms on each file */
+-            int r;
+-            unsigned int j;
+-            struct stat *st = &amp;randomstats[i];
+-
+-            /*
+-             * Avoid using same input... Used to be O_NOFOLLOW above, but
+-             * it's not universally appropriate...
+-             */
+-            if (fstat(fd, st) != 0) {
+-                close(fd);
+-                continue;
+-            }
+-            for (j = 0; j &lt; i; j++) {
+-                if (randomstats[j].st_ino == st-&gt;st_ino &amp;&amp;
+-                    randomstats[j].st_dev == st-&gt;st_dev)
+-                    break;
+-            }
+-            if (j &lt; i) {
+-                close(fd);
+-                continue;
+-            }
+-
+-            do {
+-                int try_read = 0;
+-
+-#   if defined(OPENSSL_SYS_LINUX)
+-                /* use poll() */
+-                struct pollfd pset;
+-
+-                pset.fd = fd;
+-                pset.events = POLLIN;
+-                pset.revents = 0;
+-
+-                if (poll(&amp;pset, 1, usec / 1000) &lt; 0)
+-                    usec = 0;
+-                else
+-                    try_read = (pset.revents &amp; POLLIN) != 0;
++#  endif
+ 
+-#   else
+-                /* use select() */
+-                fd_set fset;
+-                struct timeval t;
++#  if defined(OPENSSL_RAND_SEED_LIBRANDOM)
++#   error &quot;librandom not (yet) supported&quot;
++#  endif
+ 
+-                t.tv_sec = 0;
+-                t.tv_usec = usec;
++int RAND_poll(void)
++{
++#  ifdef OPENSSL_RAND_SEED_NONE
++    return 0;
++#  else
++    int ok = 0;
++    char temp[RANDOMNESS_NEEDED];
++#   define TEMPSIZE (int)sizeof(temp)
+ 
+-                if (FD_SETSIZE &gt; 0 &amp;&amp; (unsigned)fd &gt;= FD_SETSIZE) {
+-                    /*
+-                     * can't use select, so just try to read once anyway
+-                     */
+-                    try_read = 1;
+-                } else {
+-                    FD_ZERO(&amp;fset);
+-                    FD_SET(fd, &amp;fset);
++#   ifdef OPENSSL_RAND_SEED_RDTSC
++    rand_rdtsc();
++#   endif
+ 
+-                    if (select(fd + 1, &amp;fset, NULL, NULL, &amp;t) &gt;= 0) {
+-                        usec = t.tv_usec;
+-                        if (FD_ISSET(fd, &amp;fset))
+-                            try_read = 1;
+-                    } else
+-                        usec = 0;
+-                }
++#   ifdef OPENSSL_RAND_SEED_RDCPU
++    if (rand_rdcpu())
++        ok++;
+ #   endif
+ 
+-                if (try_read) {
+-                    r = read(fd, (unsigned char *)tmpbuf + n,
+-                             RANDOMNESS_NEEDED - n);
+-                    if (r &gt; 0)
+-                        n += r;
+-                } else
+-                    r = -1;
++#   ifdef OPENSSL_RAND_SEED_EGD
++    {
++        static const char *paths[] = { DEVRANDOM_EGD, NULL };
++        int i;
+ 
+-                /*
+-                 * Some Unixen will update t in select(), some won't.  For
+-                 * those who won't, or if we didn't use select() in the first
+-                 * place, give up here, otherwise, we will do this once again
+-                 * for the remaining time.
+-                 */
+-                if (usec == 10 * 1000)
+-                    usec = 0;
++        for (i = 0; paths[i] != NULL; i++) {
++            if (RAND_query_egd_bytes(paths[i], temp, TEMPSIZE) == TEMPSIZE) {
++                RAND_add(temp, TEMPSIZE, TEMPSIZE);
++                ok++;
++                break;
+             }
+-            while ((r &gt; 0 ||
+-                    (errno == EINTR || errno == EAGAIN)) &amp;&amp; usec != 0
+-                   &amp;&amp; n &lt; RANDOMNESS_NEEDED);
+-
+-            close(fd);
+         }
+     }
+-#  endif                        /* defined(DEVRANDOM) */
+-
+-#  if !defined(OPENSSL_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD)
+-    /*
+-     * Use an EGD socket to read randomness from the daemon.
+-     */
+-
+-    for (egdsocket = egdsockets; *egdsocket &amp;&amp; n &lt; RANDOMNESS_NEEDED;
+-         egdsocket++) {
+-        int r;
++#   endif
+ 
+-        r = RAND_query_egd_bytes(*egdsocket, (unsigned char *)tmpbuf + n,
+-                                 RANDOMNESS_NEEDED - n);
+-        if (r &gt; 0)
+-            n += r;
+-    }
+-#  endif                        /* defined(DEVRANDOM_EGD) */
++#   ifdef OPENSSL_RAND_SEED_DEVRANDOM
++    {
++        static const char *paths[] = { DEVRANDOM, NULL };
++        FILE *fp;
++        int i;
+ 
+-#  if defined(DEVRANDOM) || (!defined(OPENSSL_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD))
+-    if (n &gt; 0) {
+-        RAND_add(tmpbuf, sizeof tmpbuf, (double)n);
+-        OPENSSL_cleanse(tmpbuf, n);
++        for (i = 0; paths[i] != NULL; i++) {
++            if ((fp = fopen(paths[i], &quot;rb&quot;)) == NULL)
++                continue;
++            setbuf(fp, NULL);
++            if (fread(temp, 1, TEMPSIZE, fp) == TEMPSIZE) {
++                RAND_add(temp, TEMPSIZE, TEMPSIZE);
++                ok++;
++                fclose(fp);
++                break;
++            }
++        }
+     }
+-#  endif
++#   endif
+ 
+-    /* put in some default random data, we need more than just this */
+-    l = curr_pid;
+-    RAND_add(&amp;l, sizeof(l), 0.0);
+-    l = getuid();
+-    RAND_add(&amp;l, sizeof(l), 0.0);
++#   ifdef OPENSSL_RAND_SEED_GETRANDOM
++    {
++        int i = getrandom(temp, TEMPSIZE, 0);
+ 
+-    l = time(NULL);
+-    RAND_add(&amp;l, sizeof(l), 0.0);
++        if (i &gt;= 0) {
++            RAND_add(temp, i, i);
++            if (i == TEMPSIZE)
++                ok++;
++        }
++    }
++#   endif
+ 
+-#  if defined(DEVRANDOM) || (!defined(OPENSSL_NO_EGD) &amp;&amp; defined(DEVRANDOM_EGD))
+-    return 1;
+-#  else
+-    return 0;
++    OPENSSL_cleanse(temp, TEMPSIZE);
++    return ok &gt; 0 ? 1 : 0;
+ #  endif
+ }
++# endif
+ 
+-# endif                         /* defined(__OpenBSD__) */
+-#endif                          /* !(defined(OPENSSL_SYS_WINDOWS) ||
+-                                 * defined(OPENSSL_SYS_WIN32) ||
+-                                 * defined(OPENSSL_SYS_VMS) ||
+-                                 * defined(OPENSSL_SYS_VXWORKS) */
+-
+-#if defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_UEFI)
+-int RAND_poll(void)
+-{
+-    return 0;
+-}
+ #endif
+diff --git a/crypto/rand/rand_vms.c b/crypto/rand/rand_vms.c
+index ec99dbf..16afae7 100644
+--- a/crypto/rand/rand_vms.c
++++ b/crypto/rand/rand_vms.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2001-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -21,6 +21,10 @@
+ #  pragma message disable DOLLARID
+ # endif
+ 
++# ifndef OPENSSL_RAND_SEED_OS
++#  error &quot;Unsupported seeding method configured; must be os&quot;
++# endif
++
+ /*
+  * Use 32-bit pointers almost everywhere.  Define the type to which to cast a
+  * pointer passed to an external function.
+diff --git a/crypto/rand/rand_win.c b/crypto/rand/rand_win.c
+index 1be0ed3..acc4286 100644
+--- a/crypto/rand/rand_win.c
++++ b/crypto/rand/rand_win.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -12,13 +12,18 @@
+ #include &quot;rand_lcl.h&quot;
+ 
+ #if defined(OPENSSL_SYS_WINDOWS) || defined(OPENSSL_SYS_WIN32)
++
++# ifndef OPENSSL_RAND_SEED_OS
++#  error &quot;Unsupported seeding method configured; must be os&quot;
++# endif
++
+ # include &lt;windows.h&gt;
+ /* On Windows 7 or higher use BCrypt instead of the legacy CryptoAPI */
+-# if defined(_MSC_VER) &amp;&amp; defined(_WIN32_WINNT) &amp;&amp; _WIN32_WINNT&gt;=0x0601
+-#  define RAND_WINDOWS_USE_BCRYPT
++# if defined(_MSC_VER) &amp;&amp; defined(_WIN32_WINNT) &amp;&amp; _WIN32_WINNT &gt;= 0x0601
++#  define USE_BCRYPTGENRANDOM
+ # endif
+ 
+-# ifdef RAND_WINDOWS_USE_BCRYPT
++# ifdef USE_BCRYPTGENRANDOM
+ #  include &lt;bcrypt.h&gt;
+ #  pragma comment(lib, &quot;bcrypt.lib&quot;)
+ #  ifndef STATUS_SUCCESS
+@@ -34,52 +39,52 @@
+ #  define INTEL_DEF_PROV L&quot;Intel Hardware Cryptographic Service Provider&quot;
+ # endif
+ 
+-static void readtimer(void);
+-
+ int RAND_poll(void)
+ {
+-    MEMORYSTATUS mst;
+-# ifndef RAND_WINDOWS_USE_BCRYPT
++# ifndef USE_BCRYPTGENRANDOM
+     HCRYPTPROV hProvider;
+ # endif
+     DWORD w;
+-    BYTE buf[64];
++    BYTE buf[RANDOMNESS_NEEDED];
++    int ok = 0;
+ 
+-# ifdef RAND_WINDOWS_USE_BCRYPT
+-    if (BCryptGenRandom(NULL, buf, (ULONG)sizeof(buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS) {
+-        RAND_add(buf, sizeof(buf), sizeof(buf));
+-    }
++# ifdef OPENSSL_RAND_SEED_RDTSC
++    rand_rdtsc();
++# endif
++# ifdef OPENSSL_RAND_SEED_RDCPU
++    if (rand_rdcpu())
++        ok++;
++# endif
++
++# ifdef USE_BCRYPTGENRANDOM
++    if (BCryptGenRandom(NULL, buf, (ULONG)sizeof(buf),
++                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS)
++        return 0;
++    RAND_add(buf, sizeof(buf), sizeof(buf));
++    return 1;
+ # else
+     /* poll the CryptoAPI PRNG */
+-    /* The CryptoAPI returns sizeof(buf) bytes of randomness */
+-    if (CryptAcquireContextW(&amp;hProvider, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
++    if (CryptAcquireContextW(&amp;hProvider, NULL, NULL, PROV_RSA_FULL,
++                             CRYPT_VERIFYCONTEXT | CRYPT_SILENT) != 0) {
+         if (CryptGenRandom(hProvider, (DWORD)sizeof(buf), buf) != 0) {
+             RAND_add(buf, sizeof(buf), sizeof(buf));
++            ok++;
+         }
+         CryptReleaseContext(hProvider, 0);
+     }
+ 
+     /* poll the Pentium PRG with CryptoAPI */
+-    if (CryptAcquireContextW(&amp;hProvider, NULL, INTEL_DEF_PROV, PROV_INTEL_SEC, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
++    if (CryptAcquireContextW(&amp;hProvider, NULL, INTEL_DEF_PROV, PROV_INTEL_SEC,
++                             CRYPT_VERIFYCONTEXT | CRYPT_SILENT) != 0) {
+         if (CryptGenRandom(hProvider, (DWORD)sizeof(buf), buf) != 0) {
+             RAND_add(buf, sizeof(buf), sizeof(buf));
++            ok++;
+         }
+         CryptReleaseContext(hProvider, 0);
+     }
+ # endif
+ 
+-    /* timer data */
+-    readtimer();
+-
+-    /* memory usage statistics */
+-    GlobalMemoryStatus(&amp;mst);
+-    RAND_add(&amp;mst, sizeof(mst), 1);
+-
+-    /* process ID */
+-    w = GetCurrentProcessId();
+-    RAND_add(&amp;w, sizeof(w), 1);
+-
+-    return (1);
++    return ok ? 1 : 0;
+ }
+ 
+ #if OPENSSL_API_COMPAT &lt; 0x10100000L
+@@ -95,41 +100,4 @@ void RAND_screen(void)
+ }
+ #endif
+ 
+-/* feed timing information to the PRNG */
+-static void readtimer(void)
+-{
+-    DWORD w;
+-    LARGE_INTEGER l;
+-    static int have_perfc = 1;
+-# if defined(_MSC_VER) &amp;&amp; defined(_M_X86)
+-    static int have_tsc = 1;
+-    DWORD cyclecount;
+-
+-    if (have_tsc) {
+-        __try {
+-            __asm {
+-            _emit 0x0f _emit 0x31 mov cyclecount, eax}
+-            RAND_add(&amp;cyclecount, sizeof(cyclecount), 1);
+-        }
+-        __except(EXCEPTION_EXECUTE_HANDLER) {
+-            have_tsc = 0;
+-        }
+-    }
+-# else
+-#  define have_tsc 0
+-# endif
+-
+-    if (have_perfc) {
+-        if (QueryPerformanceCounter(&amp;l) == 0)
+-            have_perfc = 0;
+-        else
+-            RAND_add(&amp;l, sizeof(l), 0);
+-    }
+-
+-    if (!have_tsc &amp;&amp; !have_perfc) {
+-        w = GetTickCount();
+-        RAND_add(&amp;w, sizeof(w), 0);
+-    }
+-}
+-
+ #endif
+diff --git a/doc/man3/RAND_add.pod b/doc/man3/RAND_add.pod
+index f5514f0..ee54390 100644
+--- a/doc/man3/RAND_add.pod
++++ b/doc/man3/RAND_add.pod
+@@ -2,63 +2,76 @@
+ 
+ =head1 NAME
+ 
+-RAND_add, RAND_seed, RAND_status, RAND_event, RAND_screen - add
+-randomness to the PRNG
++RAND_add, RAND_poll, RAND_seed, RAND_status, RAND_event, RAND_screen
++- add randomness to the PRNG or get its status
+ 
+ =head1 SYNOPSIS
+ 
+  #include &lt;openssl/rand.h&gt;
+ 
+- void RAND_seed(const void *buf, int num);
++ int RAND_status(void);
++ int RAND_poll()
+ 
+  void RAND_add(const void *buf, int num, double randomness);
++ void RAND_seed(const void *buf, int num);
+ 
+- int  RAND_status(void);
++Deprecated:
+ 
+  #if OPENSSL_API_COMPAT &lt; 0x10100000L
+- int  RAND_event(UINT iMsg, WPARAM wParam, LPARAM lParam);
++ int RAND_event(UINT iMsg, WPARAM wParam, LPARAM lParam);
+  void RAND_screen(void);
+  #endif
+ 
+ =head1 DESCRIPTION
+ 
+-RAND_add() mixes the B&lt;num&gt; bytes at B&lt;buf&gt; into the PRNG state. Thus,
+-if the data at B&lt;buf&gt; are unpredictable to an adversary, this
+-increases the uncertainty about the state and makes the PRNG output
+-less predictable. Suitable input comes from user interaction (random
+-key presses, mouse movements) and certain hardware events. The
+-B&lt;randomness&gt; argument is an estimate of how much randomness is contained in
++Random numbers are a vital part of cryptography, including key generation,
++creating salts, etc., and software-based
++generators must be &quot;seeded&quot; with external randomness before they can be
++used as a cryptographically-secure pseudo-random number generator (CSPRNG).
++The availability of common hardware with special instructions and
++modern operating systems, which may use items such as interrupt jitter
++and network packet timings, can be reasonable sources of seeding material.
++
++RAND_status() indicates whether or not the CSPRNG has been sufficiently
++seeded. If not, functions such as RAND_bytes(3) will fail.
++
++RAND_poll() uses the current capabilities to seed the CSPRNG. The
++exact features used depends on how OpenSSL was configured, and can
++be displayed with the OpenSSL L&lt;version(1)&gt; command. This function is
++normally called automatically during OpenSSL initialization, but
++can be called by the application to reseed the CSPRNG.
++
++RAND_add() mixes the B&lt;num&gt; bytes at B&lt;buf&gt; into the PRNG state.
++The B&lt;randomness&gt; argument is an estimate of how much randomness is
++contained in
+ B&lt;buf&gt;, in bytes, and should be a number between zero and B&lt;num&gt;.
+ Details about sources of randomness and how to estimate their randomness
+-can be found in the literature; for example IETF RFC 4086.
+-
+-RAND_add() may be called with sensitive data such as user entered
+-passwords. The seed values cannot be recovered from the PRNG output.
++can be found in the literature; for example NIST SP 800-90B.
++The content of B&lt;buf&gt; cannot be recovered from subsequent CSPRNG output.
++This function will not normally be needed, as RAND_poll() should have been
++configured to do the appropriate seeding for the local platform.
++Applications that need to keep random state in an external file should
++use L&lt;RAND_load_file(3)&gt;.
+ 
+ RAND_seed() is equivalent to RAND_add() with B&lt;randomness&gt; set to B&lt;num&gt;.
+ 
+-On systems that provide C&lt;/dev/urandom&gt; or similar source of randomess,
+-it will be used
+-to seed the PRNG transparently. On older systems, however, it might
+-be necessary to use RAND_add(), L&lt;RAND_egd(3)&gt; or L&lt;RAND_load_file(3)&gt;.
+-
+-RAND_event() and RAND_screen() are deprecated and should not be called.
++RAND_event() and RAND_screen() are equivalent to RAND_poll().
+ 
+ =head1 RETURN VALUES
+ 
+-RAND_status() returns 1 if the PRNG has been seeded
++RAND_status() returns 1 if the CSPRNG has been seeded
+ with enough data, 0 otherwise.
+ 
+-RAND_event() calls RAND_poll() and returns RAND_status().
++RAND_poll() returns 1 if it generated seed data, 0 otherwise.
+ 
+-RAND_screen calls RAND_poll().
++RAND_event() returns RAND_status().
+ 
+ The other functions do not return values.
+ 
+ =head1 HISTORY
+ 
+-RAND_event() and RAND_screen() are deprecated since OpenSSL
+-1.1.0.  Use the functions described above instead.
++RAND_event() and RAND_screen() were deprecated in OpenSSL 1.1.0 and should
++not be used.
+ 
+ =head1 SEE ALSO
+ 
+diff --git a/doc/man3/RAND_load_file.pod b/doc/man3/RAND_load_file.pod
+index 8907bdc..3cb7084 100644
+--- a/doc/man3/RAND_load_file.pod
++++ b/doc/man3/RAND_load_file.pod
+@@ -20,8 +20,12 @@ RAND_load_file() reads a number of bytes from file B&lt;filename&gt; and
+ adds them to the PRNG. If B&lt;max_bytes&gt; is non-negative,
+ up to B&lt;max_bytes&gt; are read;
+ if B&lt;max_bytes&gt; is -1, the complete file is read.
++Do not load the same file multiple times unless its contents have
++been updated by RAND_write_file() between reads.
++Also, note that B&lt;filename&gt; should be adequately protected so that an
++attacker cannot replace or examine the contents.
+ 
+-RAND_write_file() writes a number of random bytes (currently 256) to
++RAND_write_file() writes a number of random bytes (currently 128) to
+ file B&lt;filename&gt; which can be used to initialize the PRNG by calling
+ RAND_load_file() in a later session.
+ 
+@@ -56,8 +60,8 @@ B&lt;num&gt; is too small for the path name, an error occurs.
+ 
+ RAND_load_file() returns the number of bytes read.
+ 
+-RAND_write_file() returns the number of bytes written, and -1 if the
+-bytes written were generated without appropriate seed.
++RAND_write_file() returns the number of bytes written, or -1 if the
++bytes written were generated without appropriate seeding.
+ 
+ RAND_file_name() returns a pointer to B&lt;buf&gt; on success, and NULL on
+ error.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015507.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="015514.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15510">[ date ]</a>
+              <a href="thread.html#15510">[ thread ]</a>
+              <a href="subject.html#15510">[ subject ]</a>
+              <a href="author.html#15510">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

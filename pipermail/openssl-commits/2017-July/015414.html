@@ -1,0 +1,391 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-July/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499872304.316149.15057.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015407.html">
+   <LINK REL="Next"  HREF="015415.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1499872304.316149.15057.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Jul 12 15:11:44 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015407.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="015415.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15414">[ date ]</a>
+              <a href="thread.html#15414">[ thread ]</a>
+              <a href="subject.html#15414">[ subject ]</a>
+              <a href="author.html#15414">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  e0c89df9e424e681cf523fac718c425f9b5e6c27 (commit)
+      from  aa8dfbc421c1bcb5ba508802629c8005340f3a9e (commit)
+
+
+- Log -----------------------------------------------------------------
+commit e0c89df9e424e681cf523fac718c425f9b5e6c27
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Sat Jul 8 14:45:15 2017 -0400
+
+    Rewrite RAND_egd
+    
+    Use stdio and its buffering.
+    Limit to 255 bytes (could remove that if neceessary).
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/3888">https://github.com/openssl/openssl/pull/3888</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/rand/rand_egd.c | 225 +++++++++++++++----------------------------------
+ doc/man3/RAND_egd.pod  |   2 +-
+ 2 files changed, 68 insertions(+), 159 deletions(-)
+
+diff --git a/crypto/rand/rand_egd.c b/crypto/rand/rand_egd.c
+index 1b091e8..657a3bc 100644
+--- a/crypto/rand/rand_egd.c
++++ b/crypto/rand/rand_egd.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2016 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2000-2017 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the OpenSSL license (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -16,41 +16,8 @@ NON_EMPTY_TRANSLATION_UNIT
+ # include &lt;openssl/e_os2.h&gt;
+ # include &lt;openssl/rand.h&gt;
+ 
+-/*-
+- * Query the EGD &lt;URL: <A HREF="http://www.lothar.com/tech/crypto/">http://www.lothar.com/tech/crypto/</A>&gt;.
+- *
+- * This module supplies three routines:
+- *
+- * RAND_query_egd_bytes(path, buf, bytes)
+- *   will actually query &quot;bytes&quot; bytes of entropy form the egd-socket located
+- *   at path and will write them to buf (if supplied) or will directly feed
+- *   it to RAND_seed() if buf==NULL.
+- *   The number of bytes is not limited by the maximum chunk size of EGD,
+- *   which is 255 bytes. If more than 255 bytes are wanted, several chunks
+- *   of entropy bytes are requested. The connection is left open until the
+- *   query is competed.
+- *   RAND_query_egd_bytes() returns with
+- *     -1  if an error occurred during connection or communication.
+- *     num the number of bytes read from the EGD socket. This number is either
+- *         the number of bytes requested or smaller, if the EGD pool is
+- *         drained and the daemon signals that the pool is empty.
+- *   This routine does not touch any RAND_status(). This is necessary, since
+- *   PRNG functions may call it during initialization.
+- *
+- * RAND_egd_bytes(path, bytes) will query &quot;bytes&quot; bytes and have them
+- *   used to seed the PRNG.
+- *   RAND_egd_bytes() is a wrapper for RAND_query_egd_bytes() with buf=NULL.
+- *   Unlike RAND_query_egd_bytes(), RAND_status() is used to test the
+- *   seed status so that the return value can reflect the seed state:
+- *     -1  if an error occurred during connection or communication _or_
+- *         if the PRNG has still not received the required seeding.
+- *     num the number of bytes read from the EGD socket. This number is either
+- *         the number of bytes requested or smaller, if the EGD pool is
+- *         drained and the daemon signals that the pool is empty.
+- *
+- * RAND_egd(path) will query 255 bytes and use the bytes retrieved to seed
+- *   the PRNG.
+- *   RAND_egd() is a wrapper for RAND_egd_bytes() with numbytes=255.
++/*
++ * Query an EGD
+  */
+ 
+ # if defined(OPENSSL_SYS_WIN32) || defined(OPENSSL_SYS_VMS) || defined(OPENSSL_SYS_MSDOS) || defined(OPENSSL_SYS_VXWORKS) || defined(OPENSSL_SYS_VOS) || defined(OPENSSL_SYS_UEFI)
+@@ -61,14 +28,16 @@ int RAND_query_egd_bytes(const char *path, unsigned char *buf, int bytes)
+ 
+ int RAND_egd(const char *path)
+ {
+-    return -1;
++    return (-1);
+ }
+ 
+ int RAND_egd_bytes(const char *path, int bytes)
+ {
+-    return -1;
++    return (-1);
+ }
++
+ # else
++
+ #  include &lt;openssl/opensslconf.h&gt;
+ #  include OPENSSL_UNISTD
+ #  include &lt;stddef.h&gt;
+@@ -91,157 +60,97 @@ struct sockaddr_un {
+ 
+ int RAND_query_egd_bytes(const char *path, unsigned char *buf, int bytes)
+ {
+-    int ret = 0;
++    FILE *fp = NULL;
+     struct sockaddr_un addr;
+-    int len, num, numbytes;
+-    int fd = -1;
+-    int success;
+-    unsigned char egdbuf[2], tempbuf[255], *retrievebuf;
++    int mybuffer, ret = -1, i, numbytes, fd;
++    unsigned char tempbuf[255];
+ 
++    if (bytes &gt; (int)sizeof(tempbuf))
++        return -1;
++
++    /* Make socket. */
+     memset(&amp;addr, 0, sizeof(addr));
+     addr.sun_family = AF_UNIX;
+     if (strlen(path) &gt;= sizeof(addr.sun_path))
+-        return -1;
++        return (-1);
+     strcpy(addr.sun_path, path);
+-    len = offsetof(struct sockaddr_un, sun_path) + strlen(path);
++    i = offsetof(struct sockaddr_un, sun_path) + strlen(path);
+     fd = socket(AF_UNIX, SOCK_STREAM, 0);
+-    if (fd == -1)
+-        return -1;
+-    success = 0;
+-    while (!success) {
+-        if (connect(fd, (struct sockaddr *)&amp;addr, len) == 0)
+-            success = 1;
+-        else {
+-            switch (errno) {
+-#  ifdef EINTR
+-            case EINTR:
+-#  endif
+-#  ifdef EAGAIN
+-            case EAGAIN:
+-#  endif
+-#  ifdef EINPROGRESS
+-            case EINPROGRESS:
+-#  endif
+-#  ifdef EALREADY
+-            case EALREADY:
+-#  endif
+-                /* No error, try again */
+-                break;
++    if (fd == -1 || (fp = fdopen(fd, &quot;r+&quot;)) == NULL)
++        return (-1);
++
++    /* Try to connect */
++    for ( ; ; ) {
++        if (connect(fd, (struct sockaddr *)&amp;addr, i) == 0)
++            break;
+ #  ifdef EISCONN
+-            case EISCONN:
+-                success = 1;
+-                break;
++        if (errno == EISCONN)
++            break;
+ #  endif
+-            default:
+-                ret = -1;
+-                goto err;       /* failure */
+-            }
+-        }
+-    }
+-
+-    while (bytes &gt; 0) {
+-        egdbuf[0] = 1;
+-        egdbuf[1] = bytes &lt; 255 ? bytes : 255;
+-        numbytes = 0;
+-        while (numbytes != 2) {
+-            num = write(fd, egdbuf + numbytes, 2 - numbytes);
+-            if (num &gt;= 0)
+-                numbytes += num;
+-            else {
+-                switch (errno) {
++        switch (errno) {
+ #  ifdef EINTR
+-                case EINTR:
++        case EINTR:
+ #  endif
+ #  ifdef EAGAIN
+-                case EAGAIN:
++        case EAGAIN:
+ #  endif
+-                    /* No error, try again */
+-                    break;
+-                default:
+-                    ret = -1;
+-                    goto err;   /* failure */
+-                }
+-            }
+-        }
+-        numbytes = 0;
+-        while (numbytes != 1) {
+-            num = read(fd, egdbuf, 1);
+-            if (num == 0)
+-                goto err;       /* descriptor closed */
+-            else if (num &gt; 0)
+-                numbytes += num;
+-            else {
+-                switch (errno) {
+-#  ifdef EINTR
+-                case EINTR:
++#  ifdef EINPROGRESS
++        case EINPROGRESS:
+ #  endif
+-#  ifdef EAGAIN
+-                case EAGAIN:
++#  ifdef EALREADY
++        case EALREADY:
+ #  endif
+-                    /* No error, try again */
+-                    break;
+-                default:
+-                    ret = -1;
+-                    goto err;   /* failure */
+-                }
+-            }
+-        }
+-        if (egdbuf[0] == 0)
++            /* No error, try again */
++            break;
++        default:
++            ret = -1;
+             goto err;
+-        if (buf)
+-            retrievebuf = buf + ret;
+-        else
+-            retrievebuf = tempbuf;
+-        numbytes = 0;
+-        while (numbytes != egdbuf[0]) {
+-            num = read(fd, retrievebuf + numbytes, egdbuf[0] - numbytes);
+-            if (num == 0)
+-                goto err;       /* descriptor closed */
+-            else if (num &gt; 0)
+-                numbytes += num;
+-            else {
+-                switch (errno) {
+-#  ifdef EINTR
+-                case EINTR:
+-#  endif
+-#  ifdef EAGAIN
+-                case EAGAIN:
+-#  endif
+-                    /* No error, try again */
+-                    break;
+-                default:
+-                    ret = -1;
+-                    goto err;   /* failure */
+-                }
+-            }
+         }
+-        ret += egdbuf[0];
+-        bytes -= egdbuf[0];
+-        if (!buf)
+-            RAND_seed(tempbuf, egdbuf[0]);
+     }
++
++    /* Make request, see how many bytes we can get back. */
++    tempbuf[0] = 1;
++    tempbuf[1] = bytes;
++    if (fwrite(tempbuf, sizeof(char), 2, fp) != 2 || fflush(fp) == EOF)
++        goto err;
++    if (fread(tempbuf, sizeof(char), 1, fp) != 1 || tempbuf[0] == 0)
++        goto err;
++    numbytes = tempbuf[0];
++
++    /* Which buffer are we using? */
++    mybuffer = buf == NULL;
++    if (mybuffer)
++        buf = tempbuf;
++
++    /* Read bytes. */
++    i = fread(buf, sizeof(char), numbytes, fp);
++    if (i &lt; numbytes)
++        goto err;
++    ret = numbytes;
++    if (mybuffer)
++        RAND_seed(tempbuf, i);
++
+  err:
+-    if (fd != -1)
+-        close(fd);
++    if (fp != NULL)
++        fclose(fp);
+     return ret;
+ }
+ 
+ int RAND_egd_bytes(const char *path, int bytes)
+ {
+-    int num, ret = -1;
++    int num;
+ 
+     num = RAND_query_egd_bytes(path, NULL, bytes);
+     if (num &lt; 0)
+-        goto err;
+-    if (RAND_status() == 1)
+-        ret = num;
+- err:
+-    return ret;
++        return -1;
++    if (RAND_status() != 1)
++        return -1;
++    return num;
+ }
+ 
+ int RAND_egd(const char *path)
+ {
+-    return RAND_egd_bytes(path, 255);
++    return (RAND_egd_bytes(path, 255));
+ }
+ 
+ # endif
+diff --git a/doc/man3/RAND_egd.pod b/doc/man3/RAND_egd.pod
+index e2c7b3f..e68eb8f 100644
+--- a/doc/man3/RAND_egd.pod
++++ b/doc/man3/RAND_egd.pod
+@@ -26,7 +26,7 @@ specified socket B&lt;path&gt;, and passes the data it receives into RAND_add().
+ RAND_egd() is equivalent to RAND_egd_bytes() with B&lt;num&gt; set to 255.
+ 
+ RAND_query_egd_bytes() requests B&lt;num&gt; bytes of randomness from an EGD at
+-the specified socket B&lt;path&gt;.
++the specified socket B&lt;path&gt;, where B&lt;num&gt; must be less than 256.
+ If B&lt;buf&gt; is B&lt;NULL&gt;, it is equivalent to RAND_egd_bytes().
+ If B&lt;buf&gt; is not B&lt;NULL&gt;, then the data is copied to the buffer and
+ RAND_add() is not called.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015407.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="015415.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15414">[ date ]</a>
+              <a href="thread.html#15414">[ thread ]</a>
+              <a href="subject.html#15414">[ subject ]</a>
+              <a href="author.html#15414">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

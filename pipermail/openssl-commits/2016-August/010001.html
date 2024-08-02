@@ -1,0 +1,269 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] Still Failing: openssl/openssl#5640	(OpenSSL_1_0_2-stable - 2020068)
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20Still%20Failing%3A%20openssl/openssl%235640%0A%09%28OpenSSL_1_0_2-stable%20-%202020068%29&In-Reply-To=%3C57bada3cb2c42_33fc8a06b96a03632af%404d03d56e-77a7-4e88-9595-4eb8623107aa.mail%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010000.html">
+   <LINK REL="Next"  HREF="010003.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] Still Failing: openssl/openssl#5640	(OpenSSL_1_0_2-stable - 2020068)</H1>
+    <B>Travis CI</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20Still%20Failing%3A%20openssl/openssl%235640%0A%09%28OpenSSL_1_0_2-stable%20-%202020068%29&In-Reply-To=%3C57bada3cb2c42_33fc8a06b96a03632af%404d03d56e-77a7-4e88-9595-4eb8623107aa.mail%3E"
+       TITLE="[openssl-commits] Still Failing: openssl/openssl#5640	(OpenSSL_1_0_2-stable - 2020068)">builds at travis-ci.org
+       </A><BR>
+    <I>Mon Aug 22 10:55:56 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010000.html">[openssl-commits] Errored: openssl/openssl#5639 (master - 5cb4d64)
+</A></li>
+        <LI>Next message: <A HREF="010003.html">[openssl-commits] Build failed: openssl OpenSSL_1_0_2-stable.4966
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10001">[ date ]</a>
+              <a href="thread.html#10001">[ thread ]</a>
+              <a href="subject.html#10001">[ subject ]</a>
+              <a href="author.html#10001">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Build Update for openssl/openssl
+-------------------------------------
+
+Build: #5640
+Status: Still Failing
+
+Duration: 19 minutes and 20 seconds
+Commit: 2020068 (OpenSSL_1_0_2-stable)
+Author: Matt Caswell
+Message: Prevent DTLS Finished message injection
+
+Follow on from CVE-2016-2179
+
+The investigation and analysis of CVE-2016-2179 highlighted a related flaw.
+
+This commit fixes a security &quot;near miss&quot; in the buffered message handling
+code. Ultimately this is not currently believed to be exploitable due to
+the reasons outlined below, and therefore there is no CVE for this on its
+own.
+
+The issue this commit fixes is a MITM attack where the attacker can inject
+a Finished message into the handshake. In the description below it is
+assumed that the attacker injects the Finished message for the server to
+receive it. The attack could work equally well the other way around (i.e
+where the client receives the injected Finished message).
+
+The MITM requires the following capabilities:
+- The ability to manipulate the MTU that the client selects such that it
+is small enough for the client to fragment Finished messages.
+- The ability to selectively drop and modify records sent from the client
+- The ability to inject its own records and send them to the server
+
+The MITM forces the client to select a small MTU such that the client
+will fragment the Finished message. Ideally for the attacker the first
+fragment will contain all but the last byte of the Finished message,
+with the second fragment containing the final byte.
+
+During the handshake and prior to the client sending the CCS the MITM
+injects a plaintext Finished message fragment to the server containing
+all but the final byte of the Finished message. The message sequence
+number should be the one expected to be used for the real Finished message.
+
+OpenSSL will recognise that the received fragment is for the future and
+will buffer it for later use.
+
+After the client sends the CCS it then sends its own Finished message in
+two fragments. The MITM causes the first of these fragments to be
+dropped. The OpenSSL server will then receive the second of the fragments
+and reassemble the complete Finished message consisting of the MITM
+fragment and the final byte from the real client.
+
+The advantage to the attacker in injecting a Finished message is that
+this provides the capability to modify other handshake messages (e.g.
+the ClientHello) undetected. A difficulty for the attacker is knowing in
+advance what impact any of those changes might have on the final byte of
+the handshake hash that is going to be sent in the &quot;real&quot; Finished
+message. In the worst case for the attacker this means that only 1 in
+256 of such injection attempts will succeed.
+
+It may be possible in some situations for the attacker to improve this such
+that all attempts succeed. For example if the handshake includes client
+authentication then the final message flight sent by the client will
+include a Certificate. Certificates are ASN.1 objects where the signed
+portion is DER encoded. The non-signed portion could be BER encoded and so
+the attacker could re-encode the certificate such that the hash for the
+whole handshake comes to a different value. The certificate re-encoding
+would not be detectable because only the non-signed portion is changed. As
+this is the final flight of messages sent from the client the attacker
+knows what the complete hanshake hash value will be that the client will
+send - and therefore knows what the final byte will be. Through a process
+of trial and error the attacker can re-encode the certificate until the
+modified handhshake also has a hash with the same final byte. This means
+that when the Finished message is verified by the server it will be
+correct in all cases.
+
+In practice the MITM would need to be able to perform the same attack
+against both the client and the server. If the attack is only performed
+against the server (say) then the server will not detect the modified
+handshake, but the client will and will abort the connection.
+Fortunately, although OpenSSL is vulnerable to Finished message
+injection, it is not vulnerable if *both* client and server are OpenSSL.
+The reason is that OpenSSL has a hard &quot;floor&quot; for a minimum MTU size
+that it will never go below. This minimum means that a Finished message
+will never be sent in a fragmented form and therefore the MITM does not
+have one of its pre-requisites. Therefore this could only be exploited
+if using OpenSSL and some other DTLS peer that had its own and separate
+Finished message injection flaw.
+
+The fix is to ensure buffered messages are cleared on epoch change.
+
+Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+View the changeset: <A HREF="https://github.com/openssl/openssl/compare/0ee4f13bbaa4...202006812360">https://github.com/openssl/openssl/compare/0ee4f13bbaa4...202006812360</A>
+
+View the full build log and details: <A HREF="https://travis-ci.org/openssl/openssl/builds/154104212">https://travis-ci.org/openssl/openssl/builds/154104212</A>
+
+--
+
+You can configure recipients for build notifications in your .travis.yml file. See <A HREF="https://docs.travis-ci.com/user/notifications">https://docs.travis-ci.com/user/notifications</A>
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://mta.openssl.org/pipermail/openssl-commits/attachments/20160822/9fddb146/attachment-0001.html">http://mta.openssl.org/pipermail/openssl-commits/attachments/20160822/9fddb146/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010000.html">[openssl-commits] Errored: openssl/openssl#5639 (master - 5cb4d64)
+</A></li>
+	<LI>Next message: <A HREF="010003.html">[openssl-commits] Build failed: openssl OpenSSL_1_0_2-stable.4966
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10001">[ date ]</a>
+              <a href="thread.html#10001">[ thread ]</a>
+              <a href="subject.html#10001">[ subject ]</a>
+              <a href="author.html#10001">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

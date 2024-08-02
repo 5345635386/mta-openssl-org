@@ -1,0 +1,189 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1534893890.245566.19478.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020035.html">
+   <LINK REL="Next"  HREF="020043.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Paul I. Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1534893890.245566.19478.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Tue Aug 21 23:24:50 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020035.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="020043.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20042">[ date ]</a>
+              <a href="thread.html#20042">[ thread ]</a>
+              <a href="subject.html#20042">[ subject ]</a>
+              <a href="author.html#20042">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  3b8e97ab61624f4fbe8bb6a587f4da75cc3d988e (commit)
+      from  d41a8319272968596a5daa1870007f2adf1e75ee (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 3b8e97ab61624f4fbe8bb6a587f4da75cc3d988e
+Author: Pauli &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+Date:   Wed Aug 22 09:20:18 2018 +1000
+
+    Zero memory in CRYPTO_secure_malloc.
+    
+    This commit destroys the free list pointers which would otherwise be
+    present in the returned memory blocks.  This in turn helps prevent
+    information leakage from the secure memory area.
+    
+    Note: CRYPTO_secure_malloc is not guaranteed to return zeroed memory:
+    before the secure memory system is initialised or if it isn't implemented.
+    
+    Reviewed-by: Tim Hudson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tjh at openssl.org</A>&gt;
+    Reviewed-by: Matthias St. Pierre &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">Matthias.St.Pierre at ncp-e.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/7011">https://github.com/openssl/openssl/pull/7011</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/mem_sec.c  | 16 +++++++++++-----
+ test/secmemtest.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/crypto/mem_sec.c b/crypto/mem_sec.c
+index 959c637..c4190be 100644
+--- a/crypto/mem_sec.c
++++ b/crypto/mem_sec.c
+@@ -137,11 +137,12 @@ void *CRYPTO_secure_malloc(size_t num, const char *file, int line)
+ 
+ void *CRYPTO_secure_zalloc(size_t num, const char *file, int line)
+ {
+-    void *ret = CRYPTO_secure_malloc(num, file, line);
+-
+-    if (ret != NULL)
+-        memset(ret, 0, num);
+-    return ret;
++#ifdef IMPLEMENTED
++    if (secure_mem_initialized)
++        /* CRYPTO_secure_malloc() zeroes allocations when it is implemented */
++        return CRYPTO_secure_malloc(num, file, line);
++#endif
++    return CRYPTO_zalloc(num, file, line);
+ }
+ 
+ void CRYPTO_secure_free(void *ptr, const char *file, int line)
+@@ -588,6 +589,9 @@ static void *sh_malloc(size_t size)
+ 
+     OPENSSL_assert(WITHIN_ARENA(chunk));
+ 
++    /* zero the free list header as a precaution against information leakage */
++    memset(chunk, 0, sizeof(SH_LIST));
++
+     return chunk;
+ }
+ 
+@@ -620,6 +624,8 @@ static void sh_free(void *ptr)
+ 
+         list--;
+ 
++        /* Zero the higher addressed block's free list pointers */
++        memset(ptr &gt; buddy ? ptr : buddy, 0, sizeof(SH_LIST));
+         if (ptr &gt; buddy)
+             ptr = buddy;
+ 
+diff --git a/test/secmemtest.c b/test/secmemtest.c
+index 9efa2c8..2795abb 100644
+--- a/test/secmemtest.c
++++ b/test/secmemtest.c
+@@ -129,8 +129,52 @@ static int test_sec_mem(void)
+ #endif
+ }
+ 
++static int test_sec_mem_clear(void)
++{
++#if defined(OPENSSL_SYS_LINUX) || defined(OPENSSL_SYS_UNIX)
++    const int size = 64;
++    unsigned char *p = NULL;
++    int i, res = 0;
++
++    if (!TEST_true(CRYPTO_secure_malloc_init(4096, 32))
++            || !TEST_ptr(p = OPENSSL_secure_malloc(size)))
++        goto err;
++
++    for (i = 0; i &lt; size; i++)
++        if (!TEST_uchar_eq(p[i], 0))
++            goto err;
++
++    for (i = 0; i &lt; size; i++)
++        p[i] = (unsigned char)(i + ' ' + 1);
++
++    OPENSSL_secure_free(p);
++
++    /*
++     * A deliberate use after free here to verify that the memory has been
++     * cleared properly.  Since secure free doesn't return the memory to
++     * libc's memory pool, it technically isn't freed.  However, the header
++     * bytes have to be skipped and these consist of two pointers in the
++     * current implementation.
++     */
++    for (i = sizeof(void *) * 2; i &lt; size; i++)
++        if (!TEST_uchar_eq(p[i], 0))
++            return 0;
++
++    res = 1;
++    p = NULL;
++
++err:
++    OPENSSL_secure_free(p);
++    CRYPTO_secure_malloc_done();
++    return res;
++#else
++    return 1;
++#endif
++}
++
+ int setup_tests(void)
+ {
+     ADD_TEST(test_sec_mem);
++    ADD_TEST(test_sec_mem_clear);
+     return 1;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020035.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="020043.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20042">[ date ]</a>
+              <a href="thread.html#20042">[ thread ]</a>
+              <a href="subject.html#20042">[ subject ]</a>
+              <a href="author.html#20042">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

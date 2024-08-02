@@ -1,0 +1,182 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1588789031.358905.30217.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="028647.html">
+   <LINK REL="Next"  HREF="028651.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1588789031.358905.30217.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Wed May  6 18:17:11 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="028647.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="028651.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28649">[ date ]</a>
+              <a href="thread.html#28649">[ thread ]</a>
+              <a href="subject.html#28649">[ subject ]</a>
+              <a href="author.html#28649">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  4975e8b4d2cfab923d522840533334a1bbd754b8 (commit)
+      from  edbb56ee4fafc07eb77747ad25278a04b89adc09 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 4975e8b4d2cfab923d522840533334a1bbd754b8
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue May 5 16:53:43 2020 +0200
+
+    Configure: avoid perl regexp bugs
+    
+    It seems that in older perl versions '(?P' doesn't interact very well
+    with '(?|' or '(?:'.
+    
+    Since we make extensive use of '(?P' in build.info parsing, we avoid
+    combining that with '(?|' and '(?:' when parsing build.info variables,
+    and end up parsing variable modifier twice (first generally, and then
+    parse that result into the modifier components).
+    
+    Fixes #11694
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11737">https://github.com/openssl/openssl/pull/11737</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ Configure | 58 ++++++++++++++++++++++++++--------------------------------
+ 1 file changed, 26 insertions(+), 32 deletions(-)
+
+diff --git a/Configure b/Configure
+index 4a23d26a9b..7738073455 100755
+--- a/Configure
++++ b/Configure
+@@ -1831,23 +1831,13 @@ if ($builder eq &quot;unified&quot;) {
+         my $variable_name_re = qr/(?P&lt;VARIABLE&gt;[[:alpha:]][[:alnum:]_]*)/;
+         # Value modifier syntaxes
+         my $variable_subst_re = qr/\/(?P&lt;RE&gt;(?:\\\/|.)*?)\/(?P&lt;SUBST&gt;.*?)/;
+-        # Put it all together
+-        my $variable_re = qr/\$
+-                             (?|
+-                                 # Simple case, just the name
+-                                 ${variable_name_re}
+-                             |
+-                                 # Expressive case, with braces and possible
+-                                 # modifier expressions
+-                                 \{
+-                                 ${variable_name_re}
+-                                 (?:
+-                                     # Pile on modifier expressions,
+-                                     # separated by |
+-                                     ${variable_subst_re}
+-                                 )
+-                                 \}
+-                             )/x;
++        # Variable reference
++        my $variable_simple_re = qr/(?&lt;!\\)\$${variable_name_re}/;
++        my $variable_w_mod_re =
++            qr/(?&lt;!\\)\$\{${variable_name_re}(?P&lt;MOD&gt;(?:\\\/|.)*?)\}/;
++        # Tie it all together
++        my $variable_re = qr/${variable_simple_re}|${variable_w_mod_re}/;
++
+         my $expand_variables = sub {
+             my $value = '';
+             my $value_rest = shift;
+@@ -1856,25 +1846,29 @@ if ($builder eq &quot;unified&quot;) {
+                 print STDERR
+                     &quot;DEBUG[\$expand_variables] Parsed '$value_rest' ...\n&quot;
+             }
+-            while ($value_rest =~ /(?&lt;!\\)${variable_re}/) {
+-                $value_rest = $';
+-                $value .= $`;
+ 
++            while ($value_rest =~ /${variable_re}/) {
++                # We must save important regexp values, because the next
++                # regexp clears them
++                my $mod = $+{MOD};
+                 my $variable_value = $variables{$+{VARIABLE}};
+ 
++                $value_rest = $';
++                $value .= $`;
++
+                 # Process modifier expressions, if present
+-                if (defined $+{RE}) {
+-                    # We must save important %+ values, because the s///
+-                    # below clears them
+-                    my $re = $+{RE};
+-                    my $subst = $+{SUBST};
+-
+-                    $variable_value =~ s/\Q$re\E/$subst/g;
+-
+-                    if ($ENV{CONFIGURE_DEBUG_VARIABLE_EXPAND}) {
+-                        print STDERR
+-                            &quot;DEBUG[\$expand_variables] ... and substituted &quot;,
+-                            &quot;'$re' with '$subst'\n&quot;;
++                if (defined $mod) {
++                    if ($mod =~ /^${variable_subst_re}$/) {
++                        my $re = $+{RE};
++                        my $subst = $+{SUBST};
++
++                        $variable_value =~ s/\Q$re\E/$subst/g;
++
++                        if ($ENV{CONFIGURE_DEBUG_VARIABLE_EXPAND}) {
++                            print STDERR
++                                &quot;DEBUG[\$expand_variables] ... and substituted &quot;,
++                                &quot;'$re' with '$subst'\n&quot;;
++                        }
+                     }
+                 }
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="028647.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="028651.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28649">[ date ]</a>
+              <a href="thread.html#28649">[ thread ]</a>
+              <a href="subject.html#28649">[ subject ]</a>
+              <a href="author.html#28649">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

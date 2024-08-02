@@ -1,0 +1,544 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2019-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1559539419.408580.12632.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023339.html">
+   <LINK REL="Next"  HREF="023345.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>shane.lontis at oracle.com</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1559539419.408580.12632.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">shane.lontis at oracle.com
+       </A><BR>
+    <I>Mon Jun  3 05:23:39 UTC 2019</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023339.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="023345.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23341">[ date ]</a>
+              <a href="thread.html#23341">[ thread ]</a>
+              <a href="subject.html#23341">[ subject ]</a>
+              <a href="author.html#23341">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  19e512a8244a6f527d0194339a8f9fc45468537a (commit)
+      from  915bf45ee32826ed9eb612e4f82034a138dfeb41 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 19e512a8244a6f527d0194339a8f9fc45468537a
+Author: Shane Lontis &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">shane.lontis at oracle.com</A>&gt;
+Date:   Mon Jun 3 15:19:48 2019 +1000
+
+    Add the content type attribute to additional CMS signerinfo.
+    
+    Fixes #8923
+    
+    Found using the openssl cms -resign option.
+    This uses an alternate path to do the signing which was not adding the required signed attribute
+    content type. The content type attribute should always exist since it is required is there are
+    any signed attributes.
+    As the signing time attribute is always added in code, the content type attribute is also required.
+    The CMS_si_check_attributes() method adds validity checks for signed and unsigned attributes
+    e.g. The message digest attribute is a signed attribute that must exist if any signed attributes
+    exist, it cannot be an unsigned attribute and there must only be one instance containing a single
+    value.
+    
+    Reviewed-by: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/8944">https://github.com/openssl/openssl/pull/8944</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/cms/cms_att.c                               | 134 ++++++++++++++++++++-
+ crypto/cms/cms_err.c                               |   5 +-
+ crypto/cms/cms_lcl.h                               |   2 +
+ crypto/cms/cms_sd.c                                |  36 +++++-
+ crypto/err/openssl.txt                             |   2 +
+ include/openssl/cmserr.h                           |   2 +
+ test/recipes/80-test_cms.t                         |  69 ++++++++++-
+ .../recipes/80-test_cms_data/bad_signtime_attr.cms | Bin 0 -&gt; 1524 bytes
+ test/recipes/80-test_cms_data/ct_multiple_attr.cms | Bin 0 -&gt; 1549 bytes
+ test/recipes/80-test_cms_data/no_ct_attr.cms       | Bin 0 -&gt; 1496 bytes
+ test/recipes/80-test_cms_data/no_md_attr.cms       | Bin 0 -&gt; 1473 bytes
+ 11 files changed, 242 insertions(+), 8 deletions(-)
+ create mode 100644 test/recipes/80-test_cms_data/bad_signtime_attr.cms
+ create mode 100644 test/recipes/80-test_cms_data/ct_multiple_attr.cms
+ create mode 100644 test/recipes/80-test_cms_data/no_ct_attr.cms
+ create mode 100644 test/recipes/80-test_cms_data/no_md_attr.cms
+
+diff --git a/crypto/cms/cms_att.c b/crypto/cms/cms_att.c
+index a68b9bc..e548180 100644
+--- a/crypto/cms/cms_att.c
++++ b/crypto/cms/cms_att.c
+@@ -13,6 +13,56 @@
+ #include &lt;openssl/err.h&gt;
+ #include &lt;openssl/cms.h&gt;
+ #include &quot;cms_lcl.h&quot;
++#include &quot;internal/nelem.h&quot;
++
++/*-
++ * Attribute flags.
++ * CMS attribute restrictions are discussed in
++ *  - RFC 5652 Section 11.
++ * ESS attribute restrictions are discussed in
++ *  - RFC 2634 Section 1.3.4  AND
++ *  - RFC 5035 Section 5.4
++ */
++/* This is a signed attribute */
++#define CMS_ATTR_F_SIGNED         0x01
++/* This is an unsigned attribute */
++#define CMS_ATTR_F_UNSIGNED       0x02
++/* Must be present if there are any other attributes of the same type */
++#define CMS_ATTR_F_REQUIRED_COND  0x10
++/* There can only be one instance of this attribute */
++#define CMS_ATTR_F_ONLY_ONE       0x20
++/* The Attribute's value must have exactly one entry */
++#define CMS_ATTR_F_ONE_ATTR_VALUE 0x40
++
++/* Attributes rules for different attributes */
++static const struct {
++    int nid;   /* The attribute id */
++    int flags;
++} cms_attribute_properties[] = {
++    /* See RFC Section 11 */
++    { NID_pkcs9_contentType, CMS_ATTR_F_SIGNED
++                             | CMS_ATTR_F_ONLY_ONE
++                             | CMS_ATTR_F_ONE_ATTR_VALUE
++                             | CMS_ATTR_F_REQUIRED_COND },
++    { NID_pkcs9_messageDigest, CMS_ATTR_F_SIGNED
++                               | CMS_ATTR_F_ONLY_ONE
++                               | CMS_ATTR_F_ONE_ATTR_VALUE
++                               | CMS_ATTR_F_REQUIRED_COND },
++    { NID_pkcs9_signingTime, CMS_ATTR_F_SIGNED
++                             | CMS_ATTR_F_ONLY_ONE
++                             | CMS_ATTR_F_ONE_ATTR_VALUE },
++    { NID_pkcs9_countersignature, CMS_ATTR_F_UNSIGNED },
++    /* ESS */
++    { NID_id_smime_aa_signingCertificate, CMS_ATTR_F_SIGNED
++                                          | CMS_ATTR_F_ONLY_ONE
++                                          | CMS_ATTR_F_ONE_ATTR_VALUE },
++    { NID_id_smime_aa_signingCertificateV2, CMS_ATTR_F_SIGNED
++                                            | CMS_ATTR_F_ONLY_ONE
++                                            | CMS_ATTR_F_ONE_ATTR_VALUE },
++    { NID_id_smime_aa_receiptRequest, CMS_ATTR_F_SIGNED
++                                      | CMS_ATTR_F_ONLY_ONE
++                                      | CMS_ATTR_F_ONE_ATTR_VALUE }
++};
+ 
+ /* CMS SignedData Attribute utilities */
+ 
+@@ -149,4 +199,86 @@ void *CMS_unsigned_get0_data_by_OBJ(CMS_SignerInfo *si, ASN1_OBJECT *oid,
+     return X509at_get0_data_by_OBJ(si-&gt;unsignedAttrs, oid, lastpos, type);
+ }
+ 
+-/* Specific attribute cases */
++/*
++ * Retrieve an attribute by nid from a stack of attributes starting at index
++ * *lastpos + 1.
++ * Returns the attribute or NULL if there is no attribute.
++ * If an attribute was found *lastpos returns the index of the found attribute.
++ */
++static X509_ATTRIBUTE *cms_attrib_get(int nid,
++                                      const STACK_OF(X509_ATTRIBUTE) *attrs,
++                                      int *lastpos)
++{
++    X509_ATTRIBUTE *at;
++    int loc;
++
++    loc = X509at_get_attr_by_NID(attrs, nid, *lastpos);
++    if (loc &lt; 0)
++        return NULL;
++
++    at = X509at_get_attr(attrs, loc);
++    *lastpos = loc;
++    return at;
++}
++
++static int cms_check_attribute(int nid, int flags, int type,
++                               const STACK_OF(X509_ATTRIBUTE) *attrs,
++                               int have_attrs)
++{
++    int lastpos = -1;
++    X509_ATTRIBUTE *at = cms_attrib_get(nid, attrs, &amp;lastpos);
++
++    if (at != NULL) {
++        int count = X509_ATTRIBUTE_count(at);
++
++        /* Is this attribute allowed? */
++        if (((flags &amp; type) == 0)
++            /* check if multiple attributes of the same type are allowed */
++            || (((flags &amp; CMS_ATTR_F_ONLY_ONE) != 0)
++                &amp;&amp; cms_attrib_get(nid, attrs, &amp;lastpos) != NULL)
++            /* Check if attribute should have exactly one value in its set */
++            || (((flags &amp; CMS_ATTR_F_ONE_ATTR_VALUE) != 0)
++                &amp;&amp; count != 1)
++            /* There should be at least one value */
++            || count == 0)
++        return 0;
++    } else {
++        /* fail if a required attribute is missing */
++        if (have_attrs
++            &amp;&amp; ((flags &amp; CMS_ATTR_F_REQUIRED_COND) != 0)
++            &amp;&amp; (flags &amp; type) != 0)
++            return 0;
++    }
++    return 1;
++}
++
++/*
++ * Check that the signerinfo attributes obey the attribute rules which includes
++ * the following checks
++ * - If any signed attributes exist then there must be a Content Type
++ * and Message Digest attribute in the signed attributes.
++ * - The countersignature attribute is an optional unsigned attribute only.
++ * - Content Type, Message Digest, and Signing time attributes are signed
++ *     attributes. Only one instance of each is allowed, with each of these
++ *     attributes containing a single attribute value in its set.
++ */
++int CMS_si_check_attributes(const CMS_SignerInfo *si)
++{
++    int i;
++    int have_signed_attrs = (CMS_signed_get_attr_count(si) &gt; 0);
++    int have_unsigned_attrs = (CMS_unsigned_get_attr_count(si) &gt; 0);
++
++    for (i = 0; i &lt; (int)OSSL_NELEM(cms_attribute_properties); ++i) {
++        int nid = cms_attribute_properties[i].nid;
++        int flags = cms_attribute_properties[i].flags;
++
++        if (!cms_check_attribute(nid, flags, CMS_ATTR_F_SIGNED,
++                                 si-&gt;signedAttrs, have_signed_attrs)
++            || !cms_check_attribute(nid, flags, CMS_ATTR_F_UNSIGNED,
++                                    si-&gt;unsignedAttrs, have_unsigned_attrs)) {
++            CMSerr(CMS_F_CMS_SI_CHECK_ATTRIBUTES, CMS_R_ATTRIBUTE_ERROR);
++            return 0;
++        }
++    }
++    return 1;
++}
+diff --git a/crypto/cms/cms_err.c b/crypto/cms/cms_err.c
+index f7d4b7f..c05de0e 100644
+--- a/crypto/cms/cms_err.c
++++ b/crypto/cms/cms_err.c
+@@ -1,6 +1,6 @@
+ /*
+  * Generated by util/mkerr.pl DO NOT EDIT
+- * Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 1995-2019 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -150,6 +150,8 @@ static const ERR_STRING_DATA CMS_str_functs[] = {
+     {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_SIGNERINFO_VERIFY_CONTENT, 0),
+      &quot;CMS_SignerInfo_verify_content&quot;},
+     {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_SIGN_RECEIPT, 0), &quot;CMS_sign_receipt&quot;},
++    {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_SI_CHECK_ATTRIBUTES, 0),
++     &quot;CMS_si_check_attributes&quot;},
+     {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_STREAM, 0), &quot;CMS_stream&quot;},
+     {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_UNCOMPRESS, 0), &quot;CMS_uncompress&quot;},
+     {ERR_PACK(ERR_LIB_CMS, CMS_F_CMS_VERIFY, 0), &quot;CMS_verify&quot;},
+@@ -159,6 +161,7 @@ static const ERR_STRING_DATA CMS_str_functs[] = {
+ 
+ static const ERR_STRING_DATA CMS_str_reasons[] = {
+     {ERR_PACK(ERR_LIB_CMS, 0, CMS_R_ADD_SIGNER_ERROR), &quot;add signer error&quot;},
++    {ERR_PACK(ERR_LIB_CMS, 0, CMS_R_ATTRIBUTE_ERROR), &quot;attribute error&quot;},
+     {ERR_PACK(ERR_LIB_CMS, 0, CMS_R_CERTIFICATE_ALREADY_PRESENT),
+     &quot;certificate already present&quot;},
+     {ERR_PACK(ERR_LIB_CMS, 0, CMS_R_CERTIFICATE_HAS_NO_KEYID),
+diff --git a/crypto/cms/cms_lcl.h b/crypto/cms/cms_lcl.h
+index 64b673a..dbc329d 100644
+--- a/crypto/cms/cms_lcl.h
++++ b/crypto/cms/cms_lcl.h
+@@ -416,6 +416,8 @@ int cms_RecipientInfo_kari_encrypt(const CMS_ContentInfo *cms,
+ /* PWRI routines */
+ int cms_RecipientInfo_pwri_crypt(const CMS_ContentInfo *cms, CMS_RecipientInfo *ri,
+                                  int en_de);
++/* SignerInfo routines */
++int CMS_si_check_attributes(const CMS_SignerInfo *si);
+ 
+ DECLARE_ASN1_ITEM(CMS_CertificateChoices)
+ DECLARE_ASN1_ITEM(CMS_DigestedData)
+diff --git a/crypto/cms/cms_sd.c b/crypto/cms/cms_sd.c
+index 65261cf..40a3356 100644
+--- a/crypto/cms/cms_sd.c
++++ b/crypto/cms/cms_sd.c
+@@ -109,6 +109,27 @@ static void cms_sd_set_version(CMS_SignedData *sd)
+ 
+ }
+ 
++/*
++ * RFC 5652 Section 11.1 Content Type
++ * The content-type attribute within signed-data MUST
++ *   1) be present if there are signed attributes
++ *   2) match the content type in the signed-data,
++ *   3) be a signed attribute.
++ *   4) not have more than one copy of the attribute.
++ *
++ * Note that since the CMS_SignerInfo_sign() always adds the &quot;signing time&quot;
++ * attribute, the content type attribute MUST be added also.
++ * Assumptions: This assumes that the attribute does not already exist.
++ */
++static int cms_set_si_contentType_attr(CMS_ContentInfo *cms, CMS_SignerInfo *si)
++{
++    ASN1_OBJECT *ctype = cms-&gt;d.signedData-&gt;encapContentInfo-&gt;eContentType;
++
++    /* Add the contentType attribute */
++    return CMS_signed_add1_attr_by_NID(si, NID_pkcs9_contentType,
++                                       V_ASN1_OBJECT, ctype, -1) &gt; 0;
++}
++
+ /* Copy an existing messageDigest value */
+ 
+ static int cms_copy_messageDigest(CMS_ContentInfo *cms, CMS_SignerInfo *si)
+@@ -349,6 +370,8 @@ CMS_SignerInfo *CMS_add1_signer(CMS_ContentInfo *cms,
+         if (flags &amp; CMS_REUSE_DIGEST) {
+             if (!cms_copy_messageDigest(cms, si))
+                 goto err;
++            if (!cms_set_si_contentType_attr(cms, si))
++                goto err;
+             if (!(flags &amp; (CMS_PARTIAL | CMS_KEY_PARAM)) &amp;&amp;
+                 !CMS_SignerInfo_sign(si))
+                 goto err;
+@@ -578,8 +601,6 @@ static int cms_SignerInfo_content_sign(CMS_ContentInfo *cms,
+      */
+ 
+     if (CMS_signed_get_attr_count(si) &gt;= 0) {
+-        ASN1_OBJECT *ctype =
+-            cms-&gt;d.signedData-&gt;encapContentInfo-&gt;eContentType;
+         unsigned char md[EVP_MAX_MD_SIZE];
+         unsigned int mdlen;
+         if (!EVP_DigestFinal_ex(mctx, md, &amp;mdlen))
+@@ -588,9 +609,9 @@ static int cms_SignerInfo_content_sign(CMS_ContentInfo *cms,
+                                          V_ASN1_OCTET_STRING, md, mdlen))
+             goto err;
+         /* Copy content type across */
+-        if (CMS_signed_add1_attr_by_NID(si, NID_pkcs9_contentType,
+-                                        V_ASN1_OBJECT, ctype, -1) &lt;= 0)
++        if (!cms_set_si_contentType_attr(cms, si))
+             goto err;
++
+         if (!CMS_SignerInfo_sign(si))
+             goto err;
+     } else if (si-&gt;pctx) {
+@@ -670,6 +691,9 @@ int CMS_SignerInfo_sign(CMS_SignerInfo *si)
+             goto err;
+     }
+ 
++    if (!CMS_si_check_attributes(si))
++        goto err;
++
+     if (si-&gt;pctx)
+         pctx = si-&gt;pctx;
+     else {
+@@ -716,7 +740,6 @@ int CMS_SignerInfo_sign(CMS_SignerInfo *si)
+     OPENSSL_free(abuf);
+     EVP_MD_CTX_reset(mctx);
+     return 0;
+-
+ }
+ 
+ int CMS_SignerInfo_verify(CMS_SignerInfo *si)
+@@ -731,6 +754,9 @@ int CMS_SignerInfo_verify(CMS_SignerInfo *si)
+         return -1;
+     }
+ 
++    if (!CMS_si_check_attributes(si))
++        return -1;
++
+     md = EVP_get_digestbyobj(si-&gt;digestAlgorithm-&gt;algorithm);
+     if (md == NULL)
+         return -1;
+diff --git a/crypto/err/openssl.txt b/crypto/err/openssl.txt
+index 46a1f88..72057ac 100644
+--- a/crypto/err/openssl.txt
++++ b/crypto/err/openssl.txt
+@@ -318,6 +318,7 @@ CMS_F_CMS_SIGNERINFO_VERIFY:152:CMS_SignerInfo_verify
+ CMS_F_CMS_SIGNERINFO_VERIFY_CERT:153:cms_signerinfo_verify_cert
+ CMS_F_CMS_SIGNERINFO_VERIFY_CONTENT:154:CMS_SignerInfo_verify_content
+ CMS_F_CMS_SIGN_RECEIPT:163:CMS_sign_receipt
++CMS_F_CMS_SI_CHECK_ATTRIBUTES:183:CMS_si_check_attributes
+ CMS_F_CMS_STREAM:155:CMS_stream
+ CMS_F_CMS_UNCOMPRESS:156:CMS_uncompress
+ CMS_F_CMS_VERIFY:157:CMS_verify
+@@ -2061,6 +2062,7 @@ BN_R_P_IS_NOT_PRIME:112:p is not prime
+ BN_R_TOO_MANY_ITERATIONS:113:too many iterations
+ BN_R_TOO_MANY_TEMPORARY_VARIABLES:109:too many temporary variables
+ CMS_R_ADD_SIGNER_ERROR:99:add signer error
++CMS_R_ATTRIBUTE_ERROR:161:attribute error
+ CMS_R_CERTIFICATE_ALREADY_PRESENT:175:certificate already present
+ CMS_R_CERTIFICATE_HAS_NO_KEYID:160:certificate has no keyid
+ CMS_R_CERTIFICATE_VERIFY_ERROR:100:certificate verify error
+diff --git a/include/openssl/cmserr.h b/include/openssl/cmserr.h
+index 1919a88..eba163a 100644
+--- a/include/openssl/cmserr.h
++++ b/include/openssl/cmserr.h
+@@ -107,6 +107,7 @@ int ERR_load_CMS_strings(void);
+ #  define CMS_F_CMS_SIGNERINFO_VERIFY_CERT                 153
+ #  define CMS_F_CMS_SIGNERINFO_VERIFY_CONTENT              154
+ #  define CMS_F_CMS_SIGN_RECEIPT                           163
++#  define CMS_F_CMS_SI_CHECK_ATTRIBUTES                    183
+ #  define CMS_F_CMS_STREAM                                 155
+ #  define CMS_F_CMS_UNCOMPRESS                             156
+ #  define CMS_F_CMS_VERIFY                                 157
+@@ -116,6 +117,7 @@ int ERR_load_CMS_strings(void);
+  * CMS reason codes.
+  */
+ #  define CMS_R_ADD_SIGNER_ERROR                           99
++#  define CMS_R_ATTRIBUTE_ERROR                            161
+ #  define CMS_R_CERTIFICATE_ALREADY_PRESENT                175
+ #  define CMS_R_CERTIFICATE_HAS_NO_KEYID                   160
+ #  define CMS_R_CERTIFICATE_VERIFY_ERROR                   100
+diff --git a/test/recipes/80-test_cms.t b/test/recipes/80-test_cms.t
+index 1e28058..868affc 100644
+--- a/test/recipes/80-test_cms.t
++++ b/test/recipes/80-test_cms.t
+@@ -21,12 +21,13 @@ setup(&quot;test_cms&quot;);
+ plan skip_all =&gt; &quot;CMS is not supported by this OpenSSL build&quot;
+     if disabled(&quot;cms&quot;);
+ 
++my $datadir = srctop_dir(&quot;test&quot;, &quot;recipes&quot;, &quot;80-test_cms_data&quot;);
+ my $smdir    = srctop_dir(&quot;test&quot;, &quot;smime-certs&quot;);
+ my $smcont   = srctop_file(&quot;test&quot;, &quot;smcont.txt&quot;);
+ my ($no_des, $no_dh, $no_dsa, $no_ec, $no_ec2m, $no_rc2, $no_zlib)
+     = disabled qw/des dh dsa ec ec2m rc2 zlib/;
+ 
+-plan tests =&gt; 4;
++plan tests =&gt; 6;
+ 
+ my @smime_pkcs7_tests = (
+ 
+@@ -416,6 +417,26 @@ my @smime_cms_param_tests = (
+     ]
+     );
+ 
++my @contenttype_cms_test = (
++    [ &quot;signed content test - check that content type is added to additional signerinfo, RSA keys&quot;,
++      [ &quot;-sign&quot;, &quot;-binary&quot;, &quot;-nodetach&quot;, &quot;-stream&quot;, &quot;-in&quot;, $smcont, &quot;-outform&quot;, &quot;DER&quot;,
++        &quot;-signer&quot;, catfile($smdir, &quot;smrsa1.pem&quot;), &quot;-md&quot;, &quot;SHA256&quot;,
++        &quot;-out&quot;, &quot;test.cms&quot; ],
++      [ &quot;-resign&quot;, &quot;-binary&quot;, &quot;-nodetach&quot;, &quot;-in&quot;, &quot;test.cms&quot;, &quot;-inform&quot;, &quot;DER&quot;, &quot;-outform&quot;, &quot;DER&quot;,
++        &quot;-signer&quot;, catfile($smdir, &quot;smrsa2.pem&quot;), &quot;-md&quot;, &quot;SHA256&quot;,
++        &quot;-out&quot;, &quot;test2.cms&quot; ],
++      [ &quot;-verify&quot;, &quot;-in&quot;, &quot;test2.cms&quot;, &quot;-inform&quot;, &quot;DER&quot;,
++        &quot;-CAfile&quot;, catfile($smdir, &quot;smroot.pem&quot;), &quot;-out&quot;, &quot;smtst.txt&quot; ]
++    ],
++);
++
++my @incorrect_attribute_cms_test = (
++    &quot;bad_signtime_attr.cms&quot;,
++    &quot;no_ct_attr.cms&quot;,
++    &quot;no_md_attr.cms&quot;,
++    &quot;ct_multiple_attr.cms&quot;
++);
++
+ subtest &quot;CMS =&gt; PKCS#7 compatibility tests\n&quot; =&gt; sub {
+     plan tests =&gt; scalar @smime_pkcs7_tests;
+ 
+@@ -509,6 +530,52 @@ subtest &quot;CMS &lt;=&gt; CMS consistency tests, modified key parameters\n&quot; =&gt; sub {
+     }
+ };
+ 
++# Returns the number of matches of a Content Type Attribute in a binary file.
++sub contentType_matches {
++  # Read in a binary file
++  my ($in) = @_;
++  open (HEX_IN, &quot;$in&quot;) or die(&quot;open failed for $in : $!&quot;);
++  binmode(HEX_IN);
++  local $/;
++  my $str = &lt;HEX_IN&gt;;
++
++  # Find ASN1 data for a Content Type Attribute (with a OID of PKCS7 data)
++  my @c = $str =~ /\x30\x18\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x09\x03\x31\x0B\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x07\x01/gs;
++
++  close(HEX_IN);
++  return scalar(@c);
++}
++
++subtest &quot;CMS Check the content type attribute is added for additional signers\n&quot; =&gt; sub {
++    plan tests =&gt;
++        (scalar @contenttype_cms_test);
++
++    foreach (@contenttype_cms_test) {
++      SKIP: {
++          my $skip_reason = check_availability($$_[0]);
++          skip $skip_reason, 1 if $skip_reason;
++
++          ok(run(app([&quot;openssl&quot;, &quot;cms&quot;, @{$$_[1]}]))
++             &amp;&amp; run(app([&quot;openssl&quot;, &quot;cms&quot;, @{$$_[2]}]))
++             &amp;&amp; contentType_matches(&quot;test2.cms&quot;) == 2
++             &amp;&amp; run(app([&quot;openssl&quot;, &quot;cms&quot;, @{$$_[3]}])),
++             $$_[0]);
++        }
++    }
++};
++
++subtest &quot;CMS Check that bad attributes fail when verifying signers\n&quot; =&gt; sub {
++    plan tests =&gt;
++        (scalar @incorrect_attribute_cms_test);
++
++    foreach my $name (@incorrect_attribute_cms_test) {
++        ok(!run(app([&quot;openssl&quot;, &quot;cms&quot;, &quot;-verify&quot;, &quot;-in&quot;,
++                     catfile($datadir, $name), &quot;-inform&quot;, &quot;DER&quot;, &quot;-CAfile&quot;,
++                     catfile($smdir, &quot;smroot.pem&quot;), &quot;-out&quot;, &quot;smtst.txt&quot; ])),
++            $name);
++    }
++};
++
+ unlink &quot;test.cms&quot;;
+ unlink &quot;test2.cms&quot;;
+ unlink &quot;smtst.txt&quot;;
+diff --git a/test/recipes/80-test_cms_data/bad_signtime_attr.cms b/test/recipes/80-test_cms_data/bad_signtime_attr.cms
+new file mode 100644
+index 0000000..048a493
+Binary files /dev/null and b/test/recipes/80-test_cms_data/bad_signtime_attr.cms differ
+diff --git a/test/recipes/80-test_cms_data/ct_multiple_attr.cms b/test/recipes/80-test_cms_data/ct_multiple_attr.cms
+new file mode 100644
+index 0000000..974db6e
+Binary files /dev/null and b/test/recipes/80-test_cms_data/ct_multiple_attr.cms differ
+diff --git a/test/recipes/80-test_cms_data/no_ct_attr.cms b/test/recipes/80-test_cms_data/no_ct_attr.cms
+new file mode 100644
+index 0000000..64b688b
+Binary files /dev/null and b/test/recipes/80-test_cms_data/no_ct_attr.cms differ
+diff --git a/test/recipes/80-test_cms_data/no_md_attr.cms b/test/recipes/80-test_cms_data/no_md_attr.cms
+new file mode 100644
+index 0000000..d0a3afa
+Binary files /dev/null and b/test/recipes/80-test_cms_data/no_md_attr.cms differ
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023339.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="023345.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23341">[ date ]</a>
+              <a href="thread.html#23341">[ thread ]</a>
+              <a href="subject.html#23341">[ subject ]</a>
+              <a href="author.html#23341">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

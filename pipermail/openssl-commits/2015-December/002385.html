@@ -1,0 +1,2611 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-December/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1449749454.820756.11921.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002384.html">
+   <LINK REL="Next"  HREF="002388.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1449749454.820756.11921.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Thu Dec 10 12:10:54 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002384.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="002388.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2385">[ date ]</a>
+              <a href="thread.html#2385">[ thread ]</a>
+              <a href="subject.html#2385">[ subject ]</a>
+              <a href="author.html#2385">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  02dc0b82ab19c32bf072213feff746b5b35f8ef6 (commit)
+       via  bd30091c9725bdad1c82bce10839f33ceaa5623b (commit)
+      from  2fb5535e64c395f01151315474fd10574677e3d6 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 02dc0b82ab19c32bf072213feff746b5b35f8ef6
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Tue Dec 8 19:46:28 2015 +0100
+
+    evp/e_aes.c: wire hardware-assisted block function to OCB.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit bd30091c9725bdad1c82bce10839f33ceaa5623b
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Wed Dec 2 14:27:23 2015 +0100
+
+    x86[_64] assembly pack: add optimized AES-NI OCB subroutines.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/aes/asm/aesni-x86.pl    |  887 ++++++++++++++++++++++++++++++++++-
+ crypto/aes/asm/aesni-x86_64.pl | 1013 +++++++++++++++++++++++++++++++++++++++-
+ crypto/evp/e_aes.c             |   63 ++-
+ crypto/modes/modes_lcl.h       |    1 +
+ crypto/modes/ocb128.c          |  173 ++++---
+ include/openssl/modes.h        |   13 +-
+ test/evptests.txt              |   40 ++
+ 7 files changed, 2097 insertions(+), 93 deletions(-)
+
+diff --git a/crypto/aes/asm/aesni-x86.pl b/crypto/aes/asm/aesni-x86.pl
+index 9b2e37a..536f035 100644
+--- a/crypto/aes/asm/aesni-x86.pl
++++ b/crypto/aes/asm/aesni-x86.pl
+@@ -43,16 +43,20 @@
+ # Add aesni_xts_[en|de]crypt. Westmere spends 1.50 cycles processing
+ # one byte out of 8KB with 128-bit key, Sandy Bridge - 1.09.
+ 
++# November 2015
++#
++# Add aesni_ocb_[en|de]crypt.
++
+ ######################################################################
+ # Current large-block performance in cycles per byte processed with
+ # 128-bit key (less is better).
+ #
+-#		CBC en-/decrypt	CTR	XTS	ECB
++#		CBC en-/decrypt	CTR	XTS	ECB	OCB
+ # Westmere	3.77/1.37	1.37	1.52	1.27
+-# * Bridge	5.07/0.98	0.99	1.09	0.91
+-# Haswell	4.44/0.80	0.97	1.03	0.72
+-# Silvermont	5.77/3.56	3.67	4.03	3.46
+-# Bulldozer	5.80/0.98	1.05	1.24	0.93
++# * Bridge	5.07/0.98	0.99	1.09	0.91	1.10
++# Haswell	4.44/0.80	0.97	1.03	0.72	0.76
++# Silvermont	5.77/3.56	3.67	4.03	3.46	4.03
++# Bulldozer	5.80/0.98	1.05	1.24	0.93	1.23
+ 
+ $PREFIX=&quot;aesni&quot;;	# if $PREFIX is set to &quot;AES&quot;, the script
+ 			# generates drop-in replacement for
+@@ -1831,6 +1835,877 @@ if ($PREFIX eq &quot;aesni&quot;) {
+ 	&amp;mov	(&quot;esp&quot;,&amp;DWP(16*7+4,&quot;esp&quot;));	# restore %esp
+ &amp;function_end(&quot;aesni_xts_decrypt&quot;);
+ }
++
+
++######################################################################
++# void aesni_ocb_[en|de]crypt(const char *inp, char *out, size_t blocks,
++#	const AES_KEY *key, unsigned int start_block_num,
++#	unsigned char offset_i[16], const unsigned char L_[][16],
++#	unsigned char checksum[16]);
++#
++{
++# offsets within stack frame
++my $checksum = 16*6;
++my ($key_off,$rounds_off,$out_off,$end_off,$esp_off)=map(16*7+4*$_,(0..4));
++
++# reassigned registers
++my ($l_,$block,$i1,$i3,$i5) = ($rounds_,$key_,$rounds,$len,$out);
++# $l_, $blocks, $inp, $key are permanently allocated in registers;
++# remaining non-volatile ones are offloaded to stack, which even
++# stay invariant after written to stack.
++
++&amp;function_begin(&quot;aesni_ocb_encrypt&quot;);
++	&amp;mov	($rounds,&amp;wparam(5));		# &amp;offset_i
++	&amp;mov	($rounds_,&amp;wparam(7));		# &amp;checksum
++
++	&amp;mov	($inp,&amp;wparam(0));
++	&amp;mov	($out,&amp;wparam(1));
++	&amp;mov	($len,&amp;wparam(2));
++	&amp;mov	($key,&amp;wparam(3));
++	&amp;movdqu	($rndkey0,&amp;QWP(0,$rounds));	# load offset_i
++	&amp;mov	($block,&amp;wparam(4));		# start_block_num
++	&amp;movdqu	($rndkey1,&amp;QWP(0,$rounds_));	# load checksum
++	&amp;mov	($l_,&amp;wparam(6));		# L_
++
++	&amp;mov	($rounds,&quot;esp&quot;);
++	&amp;sub	(&quot;esp&quot;,$esp_off+4);		# alloca
++	&amp;and	(&quot;esp&quot;,-16);			# align stack
++
++	&amp;sub	($out,$inp);
++	&amp;shl	($len,4);
++	&amp;lea	($len,&amp;DWP(-16*6,$inp,$len));	# end of input - 16*6
++	&amp;mov	(&amp;DWP($out_off,&quot;esp&quot;),$out);
++	&amp;mov	(&amp;DWP($end_off,&quot;esp&quot;),$len);
++	&amp;mov	(&amp;DWP($esp_off,&quot;esp&quot;),$rounds);
++
++	&amp;mov	($rounds,&amp;DWP(240,$key));
++
++	&amp;test	($block,1);
++	&amp;jnz	(&amp;label(&quot;odd&quot;));
++
++	&amp;bsf		($i3,$block);
++	&amp;add		($block,1);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i3));
++	&amp;mov		($i3,$key);			# put aside key
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;lea		($inp,&amp;DWP(16,$inp));
++
++	&amp;pxor		($inout5,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$inout5);		# ^ offset_i
++
++	&amp;movdqa		($inout4,$rndkey1);
++	if ($inline)
++	{   &amp;aesni_inline_generate1(&quot;enc&quot;);	}
++	else
++	{   &amp;call	(&quot;_aesni_encrypt1&quot;);	}
++
++	&amp;xorps		($inout0,$inout5);		# ^ offset_i
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movdqa		($rndkey1,$inout4);		# pass the checksum
++
++	&amp;movups		(&amp;QWP(-16,$out,$inp),$inout0);	# store output
++
++	&amp;mov		($rounds,&amp;DWP(240,$i3));
++	&amp;mov		($key,$i3);			# restore key
++	&amp;mov		($len,&amp;DWP($end_off,&quot;esp&quot;));
++
++&amp;set_label(&quot;odd&quot;);
++	&amp;shl		($rounds,4);
++	&amp;mov		($out,16);
++	&amp;sub		($out,$rounds);			# twisted rounds
++	&amp;mov		(&amp;DWP($key_off,&quot;esp&quot;),$key);
++	&amp;lea		($key,&amp;DWP(32,$key,$rounds));	# end of key schedule
++	&amp;mov		(&amp;DWP($rounds_off,&quot;esp&quot;),$out);
++
++	&amp;cmp		($inp,$len);
++	&amp;ja		(&amp;label(&quot;short&quot;));
++	&amp;jmp		(&amp;label(&quot;grandloop&quot;));
++
++&amp;set_label(&quot;grandloop&quot;,32);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;lea		($i5,&amp;DWP(5,$block));
++	&amp;add		($block,6);
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;bsf		($i5,$i5);
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;shl		($i5,4);
++	&amp;movdqu		($inout0,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout1,&amp;QWP(0,$l_,$i1));
++	&amp;mov		($rounds,&amp;DWP($rounds_off,&quot;esp&quot;));
++	&amp;movdqa		($inout2,$inout0);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i3));
++	&amp;movdqa		($inout4,$inout0);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i5));
++
++	&amp;pxor		($inout0,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout1,$inout0);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout0);
++	&amp;pxor		($inout2,$inout1);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout1);
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqa		(&amp;QWP(16*2,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*3,&quot;esp&quot;),$inout3);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*4,&quot;esp&quot;),$inout4);
++	&amp;movdqa		(&amp;QWP(16*5,&quot;esp&quot;),$inout5);
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-48,$key,$rounds));
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;movdqu		($inout4,&amp;QWP(16*4,$inp));
++	&amp;movdqu		($inout5,&amp;QWP(16*5,$inp));
++	&amp;lea		($inp,&amp;DWP(16*6,$inp));
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$rndkey0);		# ^ roundkey[0]
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;pxor		($inout1,$rndkey0);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;pxor		($inout2,$rndkey0);
++	&amp;pxor		($rndkey1,$inout3);
++	&amp;pxor		($inout3,$rndkey0);
++	&amp;pxor		($rndkey1,$inout4);
++	&amp;pxor		($inout4,$rndkey0);
++	&amp;pxor		($rndkey1,$inout5);
++	&amp;pxor		($inout5,$rndkey0);
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++
++	&amp;$movekey	($rndkey1,&amp;QWP(-32,$key,$rounds));
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++	&amp;pxor		($inout5,&amp;QWP(16*5,&quot;esp&quot;));
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-16,$key,$rounds));
++	&amp;aesenc		($inout0,$rndkey1);
++	&amp;aesenc		($inout1,$rndkey1);
++	&amp;aesenc		($inout2,$rndkey1);
++	&amp;aesenc		($inout3,$rndkey1);
++	&amp;aesenc		($inout4,$rndkey1);
++	&amp;aesenc		($inout5,$rndkey1);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;mov		($len,&amp;DWP($end_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_encrypt6_enter&quot;);
++
++	&amp;movdqa		($rndkey0,&amp;QWP(16*5,&quot;esp&quot;));	# pass last offset_i
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++	&amp;pxor		($inout5,$rndkey0);
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++
++	&amp;movdqu		(&amp;QWP(-16*6,$out,$inp),$inout0);# store output
++	&amp;movdqu		(&amp;QWP(-16*5,$out,$inp),$inout1);
++	&amp;movdqu		(&amp;QWP(-16*4,$out,$inp),$inout2);
++	&amp;movdqu		(&amp;QWP(-16*3,$out,$inp),$inout3);
++	&amp;movdqu		(&amp;QWP(-16*2,$out,$inp),$inout4);
++	&amp;movdqu		(&amp;QWP(-16*1,$out,$inp),$inout5);
++	&amp;cmp		($inp,$len);			# done yet?
++	&amp;jb		(&amp;label(&quot;grandloop&quot;));
++
++&amp;set_label(&quot;short&quot;);
++	&amp;add		($len,16*6);
++	&amp;sub		($len,$inp);
++	&amp;jz		(&amp;label(&quot;done&quot;));
++
++	&amp;cmp		($len,16*2);
++	&amp;jb		(&amp;label(&quot;one&quot;));
++	&amp;je		(&amp;label(&quot;two&quot;));
++
++	&amp;cmp		($len,16*4);
++	&amp;jb		(&amp;label(&quot;three&quot;));
++	&amp;je		(&amp;label(&quot;four&quot;));
++
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout0,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout1,&amp;QWP(0,$l_,$i1));
++	&amp;mov		($rounds,&amp;DWP($rounds_off,&quot;esp&quot;));
++	&amp;movdqa		($inout2,$inout0);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i3));
++	&amp;movdqa		($inout4,$inout0);
++
++	&amp;pxor		($inout0,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout1,$inout0);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout0);
++	&amp;pxor		($inout2,$inout1);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout1);
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqa		(&amp;QWP(16*2,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*3,&quot;esp&quot;),$inout3);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*4,&quot;esp&quot;),$inout4);
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-48,$key,$rounds));
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;movdqu		($inout4,&amp;QWP(16*4,$inp));
++	&amp;pxor		($inout5,$inout5);
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$rndkey0);		# ^ roundkey[0]
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;pxor		($inout1,$rndkey0);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;pxor		($inout2,$rndkey0);
++	&amp;pxor		($rndkey1,$inout3);
++	&amp;pxor		($inout3,$rndkey0);
++	&amp;pxor		($rndkey1,$inout4);
++	&amp;pxor		($inout4,$rndkey0);
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++
++	&amp;$movekey	($rndkey1,&amp;QWP(-32,$key,$rounds));
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-16,$key,$rounds));
++	&amp;aesenc		($inout0,$rndkey1);
++	&amp;aesenc		($inout1,$rndkey1);
++	&amp;aesenc		($inout2,$rndkey1);
++	&amp;aesenc		($inout3,$rndkey1);
++	&amp;aesenc		($inout4,$rndkey1);
++	&amp;aesenc		($inout5,$rndkey1);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_encrypt6_enter&quot;);
++
++	&amp;movdqa		($rndkey0,&amp;QWP(16*4,&quot;esp&quot;));	# pass last offset_i
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,$rndkey0);
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++
++	&amp;movdqu		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;movdqu		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;movdqu		(&amp;QWP(16*2,$out,$inp),$inout2);
++	&amp;movdqu		(&amp;QWP(16*3,$out,$inp),$inout3);
++	&amp;movdqu		(&amp;QWP(16*4,$out,$inp),$inout4);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;one&quot;,16);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;pxor		($inout5,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$inout5);		# ^ offset_i
++
++	&amp;movdqa		($inout4,$rndkey1);
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	if ($inline)
++	{   &amp;aesni_inline_generate1(&quot;enc&quot;);	}
++	else
++	{   &amp;call	(&quot;_aesni_encrypt1&quot;);	}
++
++	&amp;xorps		($inout0,$inout5);		# ^ offset_i
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movdqa		($rndkey1,$inout4);		# pass the checksum
++	&amp;movups		(&amp;QWP(0,$out,$inp),$inout0);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;two&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;bsf		($i1,$i1);
++	&amp;shl		($i1,4);
++	&amp;movdqu		($inout4,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i1));
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;pxor		($inout4,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout5,$inout4);
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$inout4);		# ^ offset_i
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;pxor		($inout1,$inout5);
++
++	&amp;movdqa		($inout3,$rndkey1)
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_encrypt2&quot;);
++
++	&amp;xorps		($inout0,$inout4);		# ^ offset_i
++	&amp;xorps		($inout1,$inout5);
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movdqa		($rndkey1,$inout3);		# pass the checksum
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;three&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;bsf		($i1,$i1);
++	&amp;shl		($i1,4);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout4,&amp;QWP(0,$l_,$i1));
++	&amp;movdqa		($inout5,$inout3);
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;pxor		($inout3,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout4,$inout3);
++	&amp;pxor		($inout5,$inout4);
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,$inout3);		# ^ offset_i
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;pxor		($inout1,$inout4);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;pxor		($inout2,$inout5);
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_encrypt3&quot;);
++
++	&amp;xorps		($inout0,$inout3);		# ^ offset_i
++	&amp;xorps		($inout1,$inout4);
++	&amp;xorps		($inout2,$inout5);
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;movups		(&amp;QWP(16*2,$out,$inp),$inout2);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;four&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout2,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i1));
++	&amp;movdqa		($inout4,$inout2);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i3));
++
++	&amp;pxor		($inout2,$rndkey0);		# ^ last offset_i
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout3);
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;pxor		($inout2,$inout4);
++	&amp;pxor		($rndkey1,$inout3);
++	&amp;pxor		($inout3,$inout5);
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1)
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_encrypt4&quot;);
++
++	&amp;xorps		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;xorps		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;xorps		($inout2,$inout4);
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;xorps		($inout3,$inout5);
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movups		(&amp;QWP(16*2,$out,$inp),$inout2);
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++	&amp;movups		(&amp;QWP(16*3,$out,$inp),$inout3);
++
++&amp;set_label(&quot;done&quot;);
++	&amp;mov	($key,&amp;DWP($esp_off,&quot;esp&quot;));
++	&amp;pxor	($inout0,$inout0);		# clear register bank
++	&amp;pxor	($inout1,$inout1);
++	&amp;movdqa	(&amp;QWP(16*0,&quot;esp&quot;),$inout0);	# clear stack
++	&amp;pxor	($inout2,$inout2);
++	&amp;movdqa	(&amp;QWP(16*1,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout3,$inout3);
++	&amp;movdqa	(&amp;QWP(16*2,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout4,$inout4);
++	&amp;movdqa	(&amp;QWP(16*3,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout5,$inout5);
++	&amp;movdqa	(&amp;QWP(16*4,&quot;esp&quot;),$inout0);
++	&amp;movdqa	(&amp;QWP(16*5,&quot;esp&quot;),$inout0);
++	&amp;movdqa	(&amp;QWP(16*6,&quot;esp&quot;),$inout0);
++
++	&amp;lea	(&quot;esp&quot;,&amp;DWP(0,$key));
++	&amp;mov	($rounds,&amp;wparam(5));		# &amp;offset_i
++	&amp;mov	($rounds_,&amp;wparam(7));		# &amp;checksum
++	&amp;movdqu	(&amp;QWP(0,$rounds),$rndkey0);
++	&amp;pxor	($rndkey0,$rndkey0);
++	&amp;movdqu	(&amp;QWP(0,$rounds_),$rndkey1);
++	&amp;pxor	($rndkey1,$rndkey1);
++&amp;function_end(&quot;aesni_ocb_encrypt&quot;);
++
++&amp;function_begin(&quot;aesni_ocb_decrypt&quot;);
++	&amp;mov	($rounds,&amp;wparam(5));		# &amp;offset_i
++	&amp;mov	($rounds_,&amp;wparam(7));		# &amp;checksum
++
++	&amp;mov	($inp,&amp;wparam(0));
++	&amp;mov	($out,&amp;wparam(1));
++	&amp;mov	($len,&amp;wparam(2));
++	&amp;mov	($key,&amp;wparam(3));
++	&amp;movdqu	($rndkey0,&amp;QWP(0,$rounds));	# load offset_i
++	&amp;mov	($block,&amp;wparam(4));		# start_block_num
++	&amp;movdqu	($rndkey1,&amp;QWP(0,$rounds_));	# load checksum
++	&amp;mov	($l_,&amp;wparam(6));		# L_
++
++	&amp;mov	($rounds,&quot;esp&quot;);
++	&amp;sub	(&quot;esp&quot;,$esp_off+4);		# alloca
++	&amp;and	(&quot;esp&quot;,-16);			# align stack
++
++	&amp;sub	($out,$inp);
++	&amp;shl	($len,4);
++	&amp;lea	($len,&amp;DWP(-16*6,$inp,$len));	# end of input - 16*6
++	&amp;mov	(&amp;DWP($out_off,&quot;esp&quot;),$out);
++	&amp;mov	(&amp;DWP($end_off,&quot;esp&quot;),$len);
++	&amp;mov	(&amp;DWP($esp_off,&quot;esp&quot;),$rounds);
++
++	&amp;mov	($rounds,&amp;DWP(240,$key));
++
++	&amp;test	($block,1);
++	&amp;jnz	(&amp;label(&quot;odd&quot;));
++
++	&amp;bsf		($i3,$block);
++	&amp;add		($block,1);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i3));
++	&amp;mov		($i3,$key);			# put aside key
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;lea		($inp,&amp;DWP(16,$inp));
++
++	&amp;pxor		($inout5,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout0,$inout5);		# ^ offset_i
++
++	&amp;movdqa		($inout4,$rndkey1);
++	if ($inline)
++	{   &amp;aesni_inline_generate1(&quot;dec&quot;);	}
++	else
++	{   &amp;call	(&quot;_aesni_decrypt1&quot;);	}
++
++	&amp;xorps		($inout0,$inout5);		# ^ offset_i
++	&amp;movaps		($rndkey1,$inout4);		# pass the checksum
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;xorps		($rndkey1,$inout0);		# checksum
++	&amp;movups		(&amp;QWP(-16,$out,$inp),$inout0);	# store output
++
++	&amp;mov		($rounds,&amp;DWP(240,$i3));
++	&amp;mov		($key,$i3);			# restore key
++	&amp;mov		($len,&amp;DWP($end_off,&quot;esp&quot;));
++
++&amp;set_label(&quot;odd&quot;);
++	&amp;shl		($rounds,4);
++	&amp;mov		($out,16);
++	&amp;sub		($out,$rounds);			# twisted rounds
++	&amp;mov		(&amp;DWP($key_off,&quot;esp&quot;),$key);
++	&amp;lea		($key,&amp;DWP(32,$key,$rounds));	# end of key schedule
++	&amp;mov		(&amp;DWP($rounds_off,&quot;esp&quot;),$out);
++
++	&amp;cmp		($inp,$len);
++	&amp;ja		(&amp;label(&quot;short&quot;));
++	&amp;jmp		(&amp;label(&quot;grandloop&quot;));
++
++&amp;set_label(&quot;grandloop&quot;,32);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;lea		($i5,&amp;DWP(5,$block));
++	&amp;add		($block,6);
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;bsf		($i5,$i5);
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;shl		($i5,4);
++	&amp;movdqu		($inout0,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout1,&amp;QWP(0,$l_,$i1));
++	&amp;mov		($rounds,&amp;DWP($rounds_off,&quot;esp&quot;));
++	&amp;movdqa		($inout2,$inout0);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i3));
++	&amp;movdqa		($inout4,$inout0);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i5));
++
++	&amp;pxor		($inout0,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout1,$inout0);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout0);
++	&amp;pxor		($inout2,$inout1);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout1);
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqa		(&amp;QWP(16*2,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*3,&quot;esp&quot;),$inout3);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*4,&quot;esp&quot;),$inout4);
++	&amp;movdqa		(&amp;QWP(16*5,&quot;esp&quot;),$inout5);
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-48,$key,$rounds));
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;movdqu		($inout4,&amp;QWP(16*4,$inp));
++	&amp;movdqu		($inout5,&amp;QWP(16*5,$inp));
++	&amp;lea		($inp,&amp;DWP(16*6,$inp));
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++	&amp;pxor		($inout0,$rndkey0);		# ^ roundkey[0]
++	&amp;pxor		($inout1,$rndkey0);
++	&amp;pxor		($inout2,$rndkey0);
++	&amp;pxor		($inout3,$rndkey0);
++	&amp;pxor		($inout4,$rndkey0);
++	&amp;pxor		($inout5,$rndkey0);
++
++	&amp;$movekey	($rndkey1,&amp;QWP(-32,$key,$rounds));
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++	&amp;pxor		($inout5,&amp;QWP(16*5,&quot;esp&quot;));
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-16,$key,$rounds));
++	&amp;aesdec		($inout0,$rndkey1);
++	&amp;aesdec		($inout1,$rndkey1);
++	&amp;aesdec		($inout2,$rndkey1);
++	&amp;aesdec		($inout3,$rndkey1);
++	&amp;aesdec		($inout4,$rndkey1);
++	&amp;aesdec		($inout5,$rndkey1);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;mov		($len,&amp;DWP($end_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_decrypt6_enter&quot;);
++
++	&amp;movdqa		($rndkey0,&amp;QWP(16*5,&quot;esp&quot;));	# pass last offset_i
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++	&amp;pxor		($inout5,$rndkey0);
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;movdqu		(&amp;QWP(-16*6,$out,$inp),$inout0);# store output
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;movdqu		(&amp;QWP(-16*5,$out,$inp),$inout1);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;movdqu		(&amp;QWP(-16*4,$out,$inp),$inout2);
++	&amp;pxor		($rndkey1,$inout3);
++	&amp;movdqu		(&amp;QWP(-16*3,$out,$inp),$inout3);
++	&amp;pxor		($rndkey1,$inout4);
++	&amp;movdqu		(&amp;QWP(-16*2,$out,$inp),$inout4);
++	&amp;pxor		($rndkey1,$inout5);
++	&amp;movdqu		(&amp;QWP(-16*1,$out,$inp),$inout5);
++	&amp;cmp		($inp,$len);			# done yet?
++	&amp;jb		(&amp;label(&quot;grandloop&quot;));
++
++&amp;set_label(&quot;short&quot;);
++	&amp;add		($len,16*6);
++	&amp;sub		($len,$inp);
++	&amp;jz		(&amp;label(&quot;done&quot;));
++
++	&amp;cmp		($len,16*2);
++	&amp;jb		(&amp;label(&quot;one&quot;));
++	&amp;je		(&amp;label(&quot;two&quot;));
++
++	&amp;cmp		($len,16*4);
++	&amp;jb		(&amp;label(&quot;three&quot;));
++	&amp;je		(&amp;label(&quot;four&quot;));
++
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout0,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout1,&amp;QWP(0,$l_,$i1));
++	&amp;mov		($rounds,&amp;DWP($rounds_off,&quot;esp&quot;));
++	&amp;movdqa		($inout2,$inout0);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i3));
++	&amp;movdqa		($inout4,$inout0);
++
++	&amp;pxor		($inout0,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout1,$inout0);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout0);
++	&amp;pxor		($inout2,$inout1);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout1);
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqa		(&amp;QWP(16*2,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*3,&quot;esp&quot;),$inout3);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*4,&quot;esp&quot;),$inout4);
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-48,$key,$rounds));
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;movdqu		($inout4,&amp;QWP(16*4,$inp));
++	&amp;pxor		($inout5,$inout5);
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++	&amp;pxor		($inout0,$rndkey0);		# ^ roundkey[0]
++	&amp;pxor		($inout1,$rndkey0);
++	&amp;pxor		($inout2,$rndkey0);
++	&amp;pxor		($inout3,$rndkey0);
++	&amp;pxor		($inout4,$rndkey0);
++
++	&amp;$movekey	($rndkey1,&amp;QWP(-32,$key,$rounds));
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,&amp;QWP(16*4,&quot;esp&quot;));
++
++	&amp;$movekey	($rndkey0,&amp;QWP(-16,$key,$rounds));
++	&amp;aesdec		($inout0,$rndkey1);
++	&amp;aesdec		($inout1,$rndkey1);
++	&amp;aesdec		($inout2,$rndkey1);
++	&amp;aesdec		($inout3,$rndkey1);
++	&amp;aesdec		($inout4,$rndkey1);
++	&amp;aesdec		($inout5,$rndkey1);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_decrypt6_enter&quot;);
++
++	&amp;movdqa		($rndkey0,&amp;QWP(16*4,&quot;esp&quot;));	# pass last offset_i
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,&amp;QWP(16*2,&quot;esp&quot;));
++	&amp;pxor		($inout3,&amp;QWP(16*3,&quot;esp&quot;));
++	&amp;pxor		($inout4,$rndkey0);
++
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;movdqu		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;movdqu		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;movdqu		(&amp;QWP(16*2,$out,$inp),$inout2);
++	&amp;pxor		($rndkey1,$inout3);
++	&amp;movdqu		(&amp;QWP(16*3,$out,$inp),$inout3);
++	&amp;pxor		($rndkey1,$inout4);
++	&amp;movdqu		(&amp;QWP(16*4,$out,$inp),$inout4);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;one&quot;,16);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;pxor		($inout5,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout0,$inout5);		# ^ offset_i
++
++	&amp;movdqa		($inout4,$rndkey1);
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	if ($inline)
++	{   &amp;aesni_inline_generate1(&quot;dec&quot;);	}
++	else
++	{   &amp;call	(&quot;_aesni_decrypt1&quot;);	}
++
++	&amp;xorps		($inout0,$inout5);		# ^ offset_i
++	&amp;movaps		($rndkey1,$inout4);		# pass the checksum
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;xorps		($rndkey1,$inout0);		# checksum
++	&amp;movups		(&amp;QWP(0,$out,$inp),$inout0);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;two&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;bsf		($i1,$i1);
++	&amp;shl		($i1,4);
++	&amp;movdqu		($inout4,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i1));
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;movdqa		($inout3,$rndkey1);
++	&amp;pxor		($inout4,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout5,$inout4);
++
++	&amp;pxor		($inout0,$inout4);		# ^ offset_i
++	&amp;pxor		($inout1,$inout5);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_decrypt2&quot;);
++
++	&amp;xorps		($inout0,$inout4);		# ^ offset_i
++	&amp;xorps		($inout1,$inout5);
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;xorps		($inout3,$inout0);		# checksum
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;xorps		($inout3,$inout1);
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;movaps		($rndkey1,$inout3);		# pass the checksum
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;three&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;bsf		($i1,$i1);
++	&amp;shl		($i1,4);
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout4,&amp;QWP(0,$l_,$i1));
++	&amp;movdqa		($inout5,$inout3);
++
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++	&amp;pxor		($inout3,$rndkey0);		# ^ last offset_i
++	&amp;pxor		($inout4,$inout3);
++	&amp;pxor		($inout5,$inout4);
++
++	&amp;pxor		($inout0,$inout3);		# ^ offset_i
++	&amp;pxor		($inout1,$inout4);
++	&amp;pxor		($inout2,$inout5);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_decrypt3&quot;);
++
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++	&amp;xorps		($inout0,$inout3);		# ^ offset_i
++	&amp;xorps		($inout1,$inout4);
++	&amp;xorps		($inout2,$inout5);
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;movups		(&amp;QWP(16*2,$out,$inp),$inout2);
++	&amp;pxor		($rndkey1,$inout2);
++
++	&amp;jmp		(&amp;label(&quot;done&quot;));
++
++&amp;set_label(&quot;four&quot;,16);
++	&amp;lea		($i1,&amp;DWP(1,$block));
++	&amp;lea		($i3,&amp;DWP(3,$block));
++	&amp;bsf		($i1,$i1);
++	&amp;bsf		($i3,$i3);
++	&amp;mov		($key,&amp;DWP($key_off,&quot;esp&quot;));	# restore key
++	&amp;shl		($i1,4);
++	&amp;shl		($i3,4);
++	&amp;movdqu		($inout2,&amp;QWP(0,$l_));
++	&amp;movdqu		($inout3,&amp;QWP(0,$l_,$i1));
++	&amp;movdqa		($inout4,$inout2);
++	&amp;movdqu		($inout5,&amp;QWP(0,$l_,$i3));
++
++	&amp;pxor		($inout2,$rndkey0);		# ^ last offset_i
++	&amp;movdqu		($inout0,&amp;QWP(16*0,$inp));	# load input
++	&amp;pxor		($inout3,$inout2);
++	&amp;movdqu		($inout1,&amp;QWP(16*1,$inp));
++	&amp;pxor		($inout4,$inout3);
++	&amp;movdqa		(&amp;QWP(16*0,&quot;esp&quot;),$inout2);
++	&amp;pxor		($inout5,$inout4);
++	&amp;movdqa		(&amp;QWP(16*1,&quot;esp&quot;),$inout3);
++	&amp;movdqu		($inout2,&amp;QWP(16*2,$inp));
++	&amp;movdqu		($inout3,&amp;QWP(16*3,$inp));
++	&amp;mov		($rounds,&amp;DWP(240,$key));
++
++	&amp;movdqa		(&amp;QWP($checksum,&quot;esp&quot;),$rndkey1);
++	&amp;pxor		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;pxor		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;pxor		($inout2,$inout4);
++	&amp;pxor		($inout3,$inout5);
++
++	&amp;mov		($out,&amp;DWP($out_off,&quot;esp&quot;));
++	&amp;call		(&quot;_aesni_decrypt4&quot;);
++
++	&amp;movdqa		($rndkey1,&amp;QWP($checksum,&quot;esp&quot;));# pass the checksum
++	&amp;xorps		($inout0,&amp;QWP(16*0,&quot;esp&quot;));	# ^ offset_i
++	&amp;xorps		($inout1,&amp;QWP(16*1,&quot;esp&quot;));
++	&amp;xorps		($inout2,$inout4);
++	&amp;movups		(&amp;QWP(16*0,$out,$inp),$inout0);	# store output
++	&amp;pxor		($rndkey1,$inout0);		# checksum
++	&amp;xorps		($inout3,$inout5);
++	&amp;movups		(&amp;QWP(16*1,$out,$inp),$inout1);
++	&amp;pxor		($rndkey1,$inout1);
++	&amp;movdqa		($rndkey0,$inout5);		# pass last offset_i
++	&amp;movups		(&amp;QWP(16*2,$out,$inp),$inout2);
++	&amp;pxor		($rndkey1,$inout2);
++	&amp;movups		(&amp;QWP(16*3,$out,$inp),$inout3);
++	&amp;pxor		($rndkey1,$inout3);
++
++&amp;set_label(&quot;done&quot;);
++	&amp;mov	($key,&amp;DWP($esp_off,&quot;esp&quot;));
++	&amp;pxor	($inout0,$inout0);		# clear register bank
++	&amp;pxor	($inout1,$inout1);
++	&amp;movdqa	(&amp;QWP(16*0,&quot;esp&quot;),$inout0);	# clear stack
++	&amp;pxor	($inout2,$inout2);
++	&amp;movdqa	(&amp;QWP(16*1,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout3,$inout3);
++	&amp;movdqa	(&amp;QWP(16*2,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout4,$inout4);
++	&amp;movdqa	(&amp;QWP(16*3,&quot;esp&quot;),$inout0);
++	&amp;pxor	($inout5,$inout5);
++	&amp;movdqa	(&amp;QWP(16*4,&quot;esp&quot;),$inout0);
++	&amp;movdqa	(&amp;QWP(16*5,&quot;esp&quot;),$inout0);
++	&amp;movdqa	(&amp;QWP(16*6,&quot;esp&quot;),$inout0);
++
++	&amp;lea	(&quot;esp&quot;,&amp;DWP(0,$key));
++	&amp;mov	($rounds,&amp;wparam(5));		# &amp;offset_i
++	&amp;mov	($rounds_,&amp;wparam(7));		# &amp;checksum
++	&amp;movdqu	(&amp;QWP(0,$rounds),$rndkey0);
++	&amp;pxor	($rndkey0,$rndkey0);
++	&amp;movdqu	(&amp;QWP(0,$rounds_),$rndkey1);
++	&amp;pxor	($rndkey1,$rndkey1);
++&amp;function_end(&quot;aesni_ocb_decrypt&quot;);
++}
+ }
+ 
+
+ ######################################################################
+@@ -2419,7 +3294,7 @@ if ($PREFIX eq &quot;aesni&quot;) {
+ 	&amp;pxor		(&quot;xmm3&quot;,&quot;xmm3&quot;);
+ 	&amp;aesenclast	(&quot;xmm2&quot;,&quot;xmm3&quot;);
+ 
+-	&amp;movdqa		(&quot;xmm3&quot;,&quot;xmm1&quot;)
++	&amp;movdqa		(&quot;xmm3&quot;,&quot;xmm1&quot;);
+ 	&amp;pslldq		(&quot;xmm1&quot;,4);
+ 	&amp;pxor		(&quot;xmm3&quot;,&quot;xmm1&quot;);
+ 	&amp;pslldq		(&quot;xmm1&quot;,4);
+diff --git a/crypto/aes/asm/aesni-x86_64.pl b/crypto/aes/asm/aesni-x86_64.pl
+index 6037e9e..6e41a1a 100644
+--- a/crypto/aes/asm/aesni-x86_64.pl
++++ b/crypto/aes/asm/aesni-x86_64.pl
+@@ -157,17 +157,22 @@
+ # one byte out of 8KB with 128-bit key, Sandy Bridge - 0.90. Just like
+ # in CTR mode AES instruction interleave factor was chosen to be 6x.
+ 
++# November 2015
++#
++# Add aesni_ocb_[en|de]crypt. AES instruction interleave factor was
++# chosen to be 6x.
++
+ ######################################################################
+ # Current large-block performance in cycles per byte processed with
+ # 128-bit key (less is better).
+ #
+-#		CBC en-/decrypt	CTR	XTS	ECB
++#		CBC en-/decrypt	CTR	XTS	ECB	OCB
+ # Westmere	3.77/1.25	1.25	1.25	1.26
+-# * Bridge	5.07/0.74	0.75	0.90	0.85
+-# Haswell	4.44/0.63	0.63	0.73	0.63
++# * Bridge	5.07/0.74	0.75	0.90	0.85	0.98
++# Haswell	4.44/0.63	0.63	0.73	0.63	0.70
+ # Skylake	2.62/0.63	0.63	0.63	0.63
+-# Silvermont	5.75/3.54	3.56	4.12	3.87(*)
+-# Bulldozer	5.77/0.70	0.72	0.90	0.70
++# Silvermont	5.75/3.54	3.56	4.12	3.87(*)	4.11
++# Bulldozer	5.77/0.70	0.72	0.90	0.70	0.95
+ #
+ # (*)	Atom Silvermont ECB result is suboptimal because of penalties
+ #	incurred by operations on %xmm8-15. As ECB is not considered
+@@ -2709,6 +2714,925 @@ $code.=&lt;&lt;___;
+ 	ret
+ .size	aesni_xts_decrypt,.-aesni_xts_decrypt
+ ___
++}
++
+
++######################################################################
++# void aesni_ocb_[en|de]crypt(const char *inp, char *out, size_t blocks,
++#	const AES_KEY *key, unsigned int start_block_num,
++#	unsigned char offset_i[16], const unsigned char L_[][16],
++#	unsigned char checksum[16]);
++#
++{
++my @offset=map(&quot;%xmm$_&quot;,(10..15));
++my ($checksum,$rndkey0l)=(&quot;%xmm8&quot;,&quot;%xmm9&quot;);
++my ($block_num,$offset_p)=(&quot;%r8&quot;,&quot;%r9&quot;);		# 5th and 6th arguments
++my ($L_p,$checksum_p) = (&quot;%rbx&quot;,&quot;%rbp&quot;);
++my ($i1,$i3,$i5) = (&quot;%r12&quot;,&quot;%r13&quot;,&quot;%r14&quot;);
++my $seventh_arg = $win64 ? 56 : 8;
++my $blocks = $len;
++
++$code.=&lt;&lt;___;
++.globl	aesni_ocb_encrypt
++.type	aesni_ocb_encrypt,\@function,6
++.align	32
++aesni_ocb_encrypt:
++	lea	(%rsp),%rax
++	push	%rbx
++	push	%rbp
++	push	%r12
++	push	%r13
++	push	%r14
++___
++$code.=&lt;&lt;___ if ($win64);
++	lea	-0xa0(%rsp),%rsp
++	movaps	%xmm6,0x00(%rsp)		# offload everything
++	movaps	%xmm7,0x10(%rsp)
++	movaps	%xmm8,0x20(%rsp)
++	movaps	%xmm9,0x30(%rsp)
++	movaps	%xmm10,0x40(%rsp)
++	movaps	%xmm11,0x50(%rsp)
++	movaps	%xmm12,0x60(%rsp)
++	movaps	%xmm13,0x70(%rsp)
++	movaps	%xmm14,0x80(%rsp)
++	movaps	%xmm15,0x90(%rsp)
++.Locb_enc_body:
++___
++$code.=&lt;&lt;___;
++	mov	$seventh_arg(%rax),$L_p		# 7th argument
++	mov	$seventh_arg+8(%rax),$checksum_p# 8th argument
++
++	mov	240($key),$rnds_
++	mov	$key,$key_
++	shl	\$4,$rnds_
++	$movkey	($key),$rndkey0l		# round[0]
++	$movkey	16($key,$rnds_),$rndkey1	# round[last]
++
++	movdqu	($offset_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]		# load last offset_i
++	pxor	$rndkey1,$rndkey0l		# round[0] ^ round[last]
++	pxor	$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey1, at offset</A>[5]		# offset_i ^ round[last]
++
++	mov	\$16+32,$rounds
++	lea	32($key_,$rnds_),$key
++	$movkey	16($key_),$rndkey1		# round[1]
++	sub	%r10,%rax			# twisted $rounds
++	mov	%rax,%r10			# backup twisted $rounds
++
++	movdqu	($L_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]		# L_0 for all odd-numbered blocks
++	movdqu	($checksum_p),$checksum		# load checksum
++
++	test	\$1,$block_num			# is first block number odd?
++	jnz	.Locb_enc_odd
++
++	bsf	$block_num,$i1
++	add	\$1,$block_num
++	shl	\$4,$i1
++	movdqu	($L_p,$i1),$inout5		# borrow
++	movdqu	($inp),$inout0
++	lea	16($inp),$inp
++
++	call	__ocb_encrypt1
++
++	movdqa	$<A HREF="../../../mailman/listinfo/openssl-commits.html">inout5, at offset</A>[5]
++	movups	$inout0,($out)
++	lea	16($out),$out
++	sub	\$1,$blocks
++	jz	.Locb_enc_done
++
++.Locb_enc_odd:
++	lea	1($block_num),$i1		# even-numbered blocks
++	lea	3($block_num),$i3
++	lea	5($block_num),$i5
++	lea	6($block_num),$block_num
++	bsf	$i1,$i1				# ntz(block)
++	bsf	$i3,$i3
++	bsf	$i5,$i5
++	shl	\$4,$i1				# ntz(block) -&gt; table offset
++	shl	\$4,$i3
++	shl	\$4,$i5
++
++	sub	\$6,$blocks
++	jc	.Locb_enc_short
++	jmp	.Locb_enc_grandloop
++
++.align	32
++.Locb_enc_grandloop:
++	movdqu	`16*0`($inp),$inout0		# load input
++	movdqu	`16*1`($inp),$inout1
++	movdqu	`16*2`($inp),$inout2
++	movdqu	`16*3`($inp),$inout3
++	movdqu	`16*4`($inp),$inout4
++	movdqu	`16*5`($inp),$inout5
++	lea	`16*6`($inp),$inp
++
++	call	__ocb_encrypt6
++
++	movups	$inout0,`16*0`($out)		# store output
++	movups	$inout1,`16*1`($out)
++	movups	$inout2,`16*2`($out)
++	movups	$inout3,`16*3`($out)
++	movups	$inout4,`16*4`($out)
++	movups	$inout5,`16*5`($out)
++	lea	`16*6`($out),$out
++	sub	\$6,$blocks
++	jnc	.Locb_enc_grandloop
++
++.Locb_enc_short:
++	add	\$6,$blocks
++	jz	.Locb_enc_done
++
++	movdqu	`16*0`($inp),$inout0
++	cmp	\$2,$blocks
++	jb	.Locb_enc_one
++	movdqu	`16*1`($inp),$inout1
++	je	.Locb_enc_two
++
++	movdqu	`16*2`($inp),$inout2
++	cmp	\$4,$blocks
++	jb	.Locb_enc_three
++	movdqu	`16*3`($inp),$inout3
++	je	.Locb_enc_four
++
++	movdqu	`16*4`($inp),$inout4
++	pxor	$inout5,$inout5
++
++	call	__ocb_encrypt6
++
++	movdqa	@offset[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)
++	movups	$inout1,`16*1`($out)
++	movups	$inout2,`16*2`($out)
++	movups	$inout3,`16*3`($out)
++	movups	$inout4,`16*4`($out)
++
++	jmp	.Locb_enc_done
++
++.align	16
++.Locb_enc_one:
++	movdqa	@offset[0],$inout5		# borrow
++
++	call	__ocb_encrypt1
++
++	movdqa	$<A HREF="../../../mailman/listinfo/openssl-commits.html">inout5, at offset</A>[5]
++	movups	$inout0,`16*0`($out)
++	jmp	.Locb_enc_done
++
++.align	16
++.Locb_enc_two:
++	pxor	$inout2,$inout2
++	pxor	$inout3,$inout3
++
++	call	__ocb_encrypt4
++
++	movdqa	@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)
++	movups	$inout1,`16*1`($out)
++
++	jmp	.Locb_enc_done
++
++.align	16
++.Locb_enc_three:
++	pxor	$inout3,$inout3
++
++	call	__ocb_encrypt4
++
++	movdqa	@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)
++	movups	$inout1,`16*1`($out)
++	movups	$inout2,`16*2`($out)
++
++	jmp	.Locb_enc_done
++
++.align	16
++.Locb_enc_four:
++	call	__ocb_encrypt4
++
++	movdqa	@offset[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)
++	movups	$inout1,`16*1`($out)
++	movups	$inout2,`16*2`($out)
++	movups	$inout3,`16*3`($out)
++
++.Locb_enc_done:
++	pxor	$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0, at offset</A>[5]		# &quot;remove&quot; round[last]
++	movdqu	$checksum,($checksum_p)		# store checksum
++	movdqu	@offset[5],($offset_p)		# store last offset_i
++
++	xorps	%xmm0,%xmm0			# clear register bank
++	pxor	%xmm1,%xmm1
++	pxor	%xmm2,%xmm2
++	pxor	%xmm3,%xmm3
++	pxor	%xmm4,%xmm4
++	pxor	%xmm5,%xmm5
++___
++$code.=&lt;&lt;___ if (!$win64);
++	pxor	%xmm6,%xmm6
++	pxor	%xmm7,%xmm7
++	pxor	%xmm8,%xmm8
++	pxor	%xmm9,%xmm9
++	pxor	%xmm10,%xmm10
++	pxor	%xmm11,%xmm11
++	pxor	%xmm12,%xmm12
++	pxor	%xmm13,%xmm13
++	pxor	%xmm14,%xmm14
++	pxor	%xmm15,%xmm15
++___
++$code.=&lt;&lt;___ if ($win64);
++	movaps	0x00(%rsp),%xmm6
++	movaps	%xmm0,0x00(%rsp)		# clear stack
++	movaps	0x10(%rsp),%xmm7
++	movaps	%xmm0,0x10(%rsp)
++	movaps	0x20(%rsp),%xmm8
++	movaps	%xmm0,0x20(%rsp)
++	movaps	0x30(%rsp),%xmm9
++	movaps	%xmm0,0x30(%rsp)
++	movaps	0x40(%rsp),%xmm10
++	movaps	%xmm0,0x40(%rsp)
++	movaps	0x50(%rsp),%xmm11
++	movaps	%xmm0,0x50(%rsp)
++	movaps	0x60(%rsp),%xmm12
++	movaps	%xmm0,0x60(%rsp)
++	movaps	0x70(%rsp),%xmm13
++	movaps	%xmm0,0x70(%rsp)
++	movaps	0x80(%rsp),%xmm14
++	movaps	%xmm0,0x80(%rsp)
++	movaps	0x90(%rsp),%xmm15
++	movaps	%xmm0,0x90(%rsp)
++	lea	0xa0+0x28(%rsp),%rax
++.Locb_enc_pop:
++	lea	0xa0(%rsp),%rsp
++___
++$code.=&lt;&lt;___;
++	pop	%r14
++	pop	%r13
++	pop	%r12
++	pop	%rbp
++	pop	%rbx
++.Locb_enc_epilogue:
++	ret
++.size	aesni_ocb_encrypt,.-aesni_ocb_encrypt
++
++.type	__ocb_encrypt6,\@abi-omnipotent
++.align	32
++__ocb_encrypt6:
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]	# offset_i ^ round[0]
++	 movdqu		($L_p,$i1)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	 movdqu		($L_p,$i3)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[4]
++	 pxor		@offset[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]
++	 movdqu		($L_p,$i5)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	 pxor		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	pxor		$inout0,$checksum	# accumulate checksum
++	pxor		@offset[0],$inout0	# input ^ round[0] ^ offset_i
++	 pxor		@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	pxor		$inout1,$checksum
++	pxor		@offset[1],$inout1
++	 pxor		@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	pxor		$inout2,$checksum
++	pxor		@offset[2],$inout2
++	 pxor		@offset[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[4]
++	pxor		$inout3,$checksum
++	pxor		@offset[3],$inout3
++	 pxor		@offset[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	pxor		$inout4,$checksum
++	pxor		@offset[4],$inout4
++	pxor		$inout5,$checksum
++	pxor		@offset[5],$inout5
++	$movkey		32($key_),$rndkey0
++
++	lea		1($block_num),$i1	# even-numbered blocks
++	lea		3($block_num),$i3
++	lea		5($block_num),$i5
++	add		\$6,$block_num
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[0]	# offset_i ^ round[last]
++	bsf		$i1,$i1			# ntz(block)
++	bsf		$i3,$i3
++	bsf		$i5,$i5
++
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[1]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[2]
++	aesenc		$rndkey1,$inout4
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[3]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[4]
++	aesenc		$rndkey1,$inout5
++	$movkey		48($key_),$rndkey1
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]
++
++	aesenc		$rndkey0,$inout0
++	aesenc		$rndkey0,$inout1
++	aesenc		$rndkey0,$inout2
++	aesenc		$rndkey0,$inout3
++	aesenc		$rndkey0,$inout4
++	aesenc		$rndkey0,$inout5
++	$movkey		64($key_),$rndkey0
++	shl		\$4,$i1			# ntz(block) -&gt; table offset
++	shl		\$4,$i3
++	jmp		.Locb_enc_loop6
++
++.align	32
++.Locb_enc_loop6:
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	aesenc		$rndkey1,$inout4
++	aesenc		$rndkey1,$inout5
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesenc		$rndkey0,$inout0
++	aesenc		$rndkey0,$inout1
++	aesenc		$rndkey0,$inout2
++	aesenc		$rndkey0,$inout3
++	aesenc		$rndkey0,$inout4
++	aesenc		$rndkey0,$inout5
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_enc_loop6
++
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	aesenc		$rndkey1,$inout4
++	aesenc		$rndkey1,$inout5
++	$movkey		16($key_),$rndkey1
++	shl		\$4,$i5
++
++	aesenclast	@offset[0],$inout0
++	movdqu		($L_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]	# L_0 for all odd-numbered blocks
++	mov		%r10,%rax		# restore twisted rounds
++	aesenclast	@offset[1],$inout1
++	aesenclast	@offset[2],$inout2
++	aesenclast	@offset[3],$inout3
++	aesenclast	@offset[4],$inout4
++	aesenclast	@offset[5],$inout5
++	ret
++.size	__ocb_encrypt6,.-__ocb_encrypt6
++
++.type	__ocb_encrypt4,\@abi-omnipotent
++.align	32
++__ocb_encrypt4:
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]	# offset_i ^ round[0]
++	 movdqu		($L_p,$i1)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	 movdqu		($L_p,$i3)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	 pxor		@offset[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]
++	 pxor		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	pxor		$inout0,$checksum	# accumulate checksum
++	pxor		@offset[0],$inout0	# input ^ round[0] ^ offset_i
++	 pxor		@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	pxor		$inout1,$checksum
++	pxor		@offset[1],$inout1
++	 pxor		@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	pxor		$inout2,$checksum
++	pxor		@offset[2],$inout2
++	pxor		$inout3,$checksum
++	pxor		@offset[3],$inout3
++	$movkey		32($key_),$rndkey0
++
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[0]	# offset_i ^ round[last]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[1]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[2]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[3]
++
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	$movkey		48($key_),$rndkey1
++
++	aesenc		$rndkey0,$inout0
++	aesenc		$rndkey0,$inout1
++	aesenc		$rndkey0,$inout2
++	aesenc		$rndkey0,$inout3
++	$movkey		64($key_),$rndkey0
++	jmp		.Locb_enc_loop4
++
++.align	32
++.Locb_enc_loop4:
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesenc		$rndkey0,$inout0
++	aesenc		$rndkey0,$inout1
++	aesenc		$rndkey0,$inout2
++	aesenc		$rndkey0,$inout3
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_enc_loop4
++
++	aesenc		$rndkey1,$inout0
++	aesenc		$rndkey1,$inout1
++	aesenc		$rndkey1,$inout2
++	aesenc		$rndkey1,$inout3
++	$movkey		16($key_),$rndkey1
++	mov		%r10,%rax		# restore twisted rounds
++
++	aesenclast	@offset[0],$inout0
++	aesenclast	@offset[1],$inout1
++	aesenclast	@offset[2],$inout2
++	aesenclast	@offset[3],$inout3
++	ret
++.size	__ocb_encrypt4,.-__ocb_encrypt4
++
++.type	__ocb_encrypt1,\@abi-omnipotent
++.align	32
++__ocb_encrypt1:
++	 pxor		@offset[5],$inout5	# offset_i
++	 pxor		$rndkey0l,$inout5	# offset_i ^ round[0]
++	pxor		$inout0,$checksum	# accumulate checksum
++	pxor		$inout5,$inout0		# input ^ round[0] ^ offset_i
++	$movkey		32($key_),$rndkey0
++
++	aesenc		$rndkey1,$inout0
++	$movkey		48($key_),$rndkey1
++	pxor		$rndkey0l,$inout5	# offset_i ^ round[last]
++
++	aesenc		$rndkey0,$inout0
++	$movkey		64($key_),$rndkey0
++	jmp		.Locb_enc_loop1
++
++.align	32
++.Locb_enc_loop1:
++	aesenc		$rndkey1,$inout0
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesenc		$rndkey0,$inout0
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_enc_loop1
++
++	aesenc		$rndkey1,$inout0
++	$movkey		16($key_),$rndkey1	# redundant in tail
++	mov		%r10,%rax		# restore twisted rounds
++
++	aesenclast	$inout5,$inout0
++	ret
++.size	__ocb_encrypt1,.-__ocb_encrypt1
++
++.globl	aesni_ocb_decrypt
++.type	aesni_ocb_decrypt,\@function,6
++.align	32
++aesni_ocb_decrypt:
++	lea	(%rsp),%rax
++	push	%rbx
++	push	%rbp
++	push	%r12
++	push	%r13
++	push	%r14
++___
++$code.=&lt;&lt;___ if ($win64);
++	lea	-0xa0(%rsp),%rsp
++	movaps	%xmm6,0x00(%rsp)		# offload everything
++	movaps	%xmm7,0x10(%rsp)
++	movaps	%xmm8,0x20(%rsp)
++	movaps	%xmm9,0x30(%rsp)
++	movaps	%xmm10,0x40(%rsp)
++	movaps	%xmm11,0x50(%rsp)
++	movaps	%xmm12,0x60(%rsp)
++	movaps	%xmm13,0x70(%rsp)
++	movaps	%xmm14,0x80(%rsp)
++	movaps	%xmm15,0x90(%rsp)
++.Locb_dec_body:
++___
++$code.=&lt;&lt;___;
++	mov	$seventh_arg(%rax),$L_p		# 7th argument
++	mov	$seventh_arg+8(%rax),$checksum_p# 8th argument
++
++	mov	240($key),$rnds_
++	mov	$key,$key_
++	shl	\$4,$rnds_
++	$movkey	($key),$rndkey0l		# round[0]
++	$movkey	16($key,$rnds_),$rndkey1	# round[last]
++
++	movdqu	($offset_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]		# load last offset_i
++	pxor	$rndkey1,$rndkey0l		# round[0] ^ round[last]
++	pxor	$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey1, at offset</A>[5]		# offset_i ^ round[last]
++
++	mov	\$16+32,$rounds
++	lea	32($key_,$rnds_),$key
++	$movkey	16($key_),$rndkey1		# round[1]
++	sub	%r10,%rax			# twisted $rounds
++	mov	%rax,%r10			# backup twisted $rounds
++
++	movdqu	($L_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]		# L_0 for all odd-numbered blocks
++	movdqu	($checksum_p),$checksum		# load checksum
++
++	test	\$1,$block_num			# is first block number odd?
++	jnz	.Locb_dec_odd
++
++	bsf	$block_num,$i1
++	add	\$1,$block_num
++	shl	\$4,$i1
++	movdqu	($L_p,$i1),$inout5		# borrow
++	movdqu	($inp),$inout0
++	lea	16($inp),$inp
++
++	call	__ocb_decrypt1
++
++	movdqa	$<A HREF="../../../mailman/listinfo/openssl-commits.html">inout5, at offset</A>[5]
++	movups	$inout0,($out)
++	xorps	$inout0,$checksum		# accumulate checksum
++	lea	16($out),$out
++	sub	\$1,$blocks
++	jz	.Locb_dec_done
++
++.Locb_dec_odd:
++	lea	1($block_num),$i1		# even-numbered blocks
++	lea	3($block_num),$i3
++	lea	5($block_num),$i5
++	lea	6($block_num),$block_num
++	bsf	$i1,$i1				# ntz(block)
++	bsf	$i3,$i3
++	bsf	$i5,$i5
++	shl	\$4,$i1				# ntz(block) -&gt; table offset
++	shl	\$4,$i3
++	shl	\$4,$i5
++
++	sub	\$6,$blocks
++	jc	.Locb_dec_short
++	jmp	.Locb_dec_grandloop
++
++.align	32
++.Locb_dec_grandloop:
++	movdqu	`16*0`($inp),$inout0		# load input
++	movdqu	`16*1`($inp),$inout1
++	movdqu	`16*2`($inp),$inout2
++	movdqu	`16*3`($inp),$inout3
++	movdqu	`16*4`($inp),$inout4
++	movdqu	`16*5`($inp),$inout5
++	lea	`16*6`($inp),$inp
++
++	call	__ocb_decrypt6
++
++	movups	$inout0,`16*0`($out)		# store output
++	pxor	$inout0,$checksum		# accumulate checksum
++	movups	$inout1,`16*1`($out)
++	pxor	$inout1,$checksum
++	movups	$inout2,`16*2`($out)
++	pxor	$inout2,$checksum
++	movups	$inout3,`16*3`($out)
++	pxor	$inout3,$checksum
++	movups	$inout4,`16*4`($out)
++	pxor	$inout4,$checksum
++	movups	$inout5,`16*5`($out)
++	pxor	$inout5,$checksum
++	lea	`16*6`($out),$out
++	sub	\$6,$blocks
++	jnc	.Locb_dec_grandloop
++
++.Locb_dec_short:
++	add	\$6,$blocks
++	jz	.Locb_dec_done
++
++	movdqu	`16*0`($inp),$inout0
++	cmp	\$2,$blocks
++	jb	.Locb_dec_one
++	movdqu	`16*1`($inp),$inout1
++	je	.Locb_dec_two
++
++	movdqu	`16*2`($inp),$inout2
++	cmp	\$4,$blocks
++	jb	.Locb_dec_three
++	movdqu	`16*3`($inp),$inout3
++	je	.Locb_dec_four
++
++	movdqu	`16*4`($inp),$inout4
++	pxor	$inout5,$inout5
++
++	call	__ocb_decrypt6
++
++	movdqa	@offset[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)		# store output
++	pxor	$inout0,$checksum		# accumulate checksum
++	movups	$inout1,`16*1`($out)
++	pxor	$inout1,$checksum
++	movups	$inout2,`16*2`($out)
++	pxor	$inout2,$checksum
++	movups	$inout3,`16*3`($out)
++	pxor	$inout3,$checksum
++	movups	$inout4,`16*4`($out)
++	pxor	$inout4,$checksum
++
++	jmp	.Locb_dec_done
++
++.align	16
++.Locb_dec_one:
++	movdqa	@offset[0],$inout5		# borrow
++
++	call	__ocb_decrypt1
++
++	movdqa	$<A HREF="../../../mailman/listinfo/openssl-commits.html">inout5, at offset</A>[5]
++	movups	$inout0,`16*0`($out)		# store output
++	xorps	$inout0,$checksum		# accumulate checksum
++	jmp	.Locb_dec_done
++
++.align	16
++.Locb_dec_two:
++	pxor	$inout2,$inout2
++	pxor	$inout3,$inout3
++
++	call	__ocb_decrypt4
++
++	movdqa	@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)		# store output
++	xorps	$inout0,$checksum		# accumulate checksum
++	movups	$inout1,`16*1`($out)
++	xorps	$inout1,$checksum
++
++	jmp	.Locb_dec_done
++
++.align	16
++.Locb_dec_three:
++	pxor	$inout3,$inout3
++
++	call	__ocb_decrypt4
++
++	movdqa	@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)		# store output
++	xorps	$inout0,$checksum		# accumulate checksum
++	movups	$inout1,`16*1`($out)
++	xorps	$inout1,$checksum
++	movups	$inout2,`16*2`($out)
++	xorps	$inout2,$checksum
++
++	jmp	.Locb_dec_done
++
++.align	16
++.Locb_dec_four:
++	call	__ocb_decrypt4
++
++	movdqa	@offset[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	movups	$inout0,`16*0`($out)		# store output
++	pxor	$inout0,$checksum		# accumulate checksum
++	movups	$inout1,`16*1`($out)
++	pxor	$inout1,$checksum
++	movups	$inout2,`16*2`($out)
++	pxor	$inout2,$checksum
++	movups	$inout3,`16*3`($out)
++	pxor	$inout3,$checksum
++
++.Locb_dec_done:
++	pxor	$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0, at offset</A>[5]		# &quot;remove&quot; round[last]
++	movdqu	$checksum,($checksum_p)		# store checksum
++	movdqu	@offset[5],($offset_p)		# store last offset_i
++
++	xorps	%xmm0,%xmm0			# clear register bank
++	pxor	%xmm1,%xmm1
++	pxor	%xmm2,%xmm2
++	pxor	%xmm3,%xmm3
++	pxor	%xmm4,%xmm4
++	pxor	%xmm5,%xmm5
++___
++$code.=&lt;&lt;___ if (!$win64);
++	pxor	%xmm6,%xmm6
++	pxor	%xmm7,%xmm7
++	pxor	%xmm8,%xmm8
++	pxor	%xmm9,%xmm9
++	pxor	%xmm10,%xmm10
++	pxor	%xmm11,%xmm11
++	pxor	%xmm12,%xmm12
++	pxor	%xmm13,%xmm13
++	pxor	%xmm14,%xmm14
++	pxor	%xmm15,%xmm15
++___
++$code.=&lt;&lt;___ if ($win64);
++	movaps	0x00(%rsp),%xmm6
++	movaps	%xmm0,0x00(%rsp)		# clear stack
++	movaps	0x10(%rsp),%xmm7
++	movaps	%xmm0,0x10(%rsp)
++	movaps	0x20(%rsp),%xmm8
++	movaps	%xmm0,0x20(%rsp)
++	movaps	0x30(%rsp),%xmm9
++	movaps	%xmm0,0x30(%rsp)
++	movaps	0x40(%rsp),%xmm10
++	movaps	%xmm0,0x40(%rsp)
++	movaps	0x50(%rsp),%xmm11
++	movaps	%xmm0,0x50(%rsp)
++	movaps	0x60(%rsp),%xmm12
++	movaps	%xmm0,0x60(%rsp)
++	movaps	0x70(%rsp),%xmm13
++	movaps	%xmm0,0x70(%rsp)
++	movaps	0x80(%rsp),%xmm14
++	movaps	%xmm0,0x80(%rsp)
++	movaps	0x90(%rsp),%xmm15
++	movaps	%xmm0,0x90(%rsp)
++	lea	0xa0+0x28(%rsp),%rax
++.Locb_dec_pop:
++	lea	0xa0(%rsp),%rsp
++___
++$code.=&lt;&lt;___;
++	pop	%r14
++	pop	%r13
++	pop	%r12
++	pop	%rbp
++	pop	%rbx
++.Locb_dec_epilogue:
++	ret
++.size	aesni_ocb_decrypt,.-aesni_ocb_decrypt
++
++.type	__ocb_decrypt6,\@abi-omnipotent
++.align	32
++__ocb_decrypt6:
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]	# offset_i ^ round[0]
++	 movdqu		($L_p,$i1)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	 movdqu		($L_p,$i3)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[4]
++	 pxor		@offset[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]
++	 movdqu		($L_p,$i5)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	 pxor		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	pxor		@offset[0],$inout0	# input ^ round[0] ^ offset_i
++	 pxor		@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	pxor		@offset[1],$inout1
++	 pxor		@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	pxor		@offset[2],$inout2
++	 pxor		@offset[3]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[4]
++	pxor		@offset[3],$inout3
++	 pxor		@offset[4]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[5]
++	pxor		@offset[4],$inout4
++	pxor		@offset[5],$inout5
++	$movkey		32($key_),$rndkey0
++
++	lea		1($block_num),$i1	# even-numbered blocks
++	lea		3($block_num),$i3
++	lea		5($block_num),$i5
++	add		\$6,$block_num
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[0]	# offset_i ^ round[last]
++	bsf		$i1,$i1			# ntz(block)
++	bsf		$i3,$i3
++	bsf		$i5,$i5
++
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[1]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[2]
++	aesdec		$rndkey1,$inout4
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[3]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[4]
++	aesdec		$rndkey1,$inout5
++	$movkey		48($key_),$rndkey1
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]
++
++	aesdec		$rndkey0,$inout0
++	aesdec		$rndkey0,$inout1
++	aesdec		$rndkey0,$inout2
++	aesdec		$rndkey0,$inout3
++	aesdec		$rndkey0,$inout4
++	aesdec		$rndkey0,$inout5
++	$movkey		64($key_),$rndkey0
++	shl		\$4,$i1			# ntz(block) -&gt; table offset
++	shl		\$4,$i3
++	jmp		.Locb_dec_loop6
++
++.align	32
++.Locb_dec_loop6:
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	aesdec		$rndkey1,$inout4
++	aesdec		$rndkey1,$inout5
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesdec		$rndkey0,$inout0
++	aesdec		$rndkey0,$inout1
++	aesdec		$rndkey0,$inout2
++	aesdec		$rndkey0,$inout3
++	aesdec		$rndkey0,$inout4
++	aesdec		$rndkey0,$inout5
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_dec_loop6
++
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	aesdec		$rndkey1,$inout4
++	aesdec		$rndkey1,$inout5
++	$movkey		16($key_),$rndkey1
++	shl		\$4,$i5
++
++	aesdeclast	@offset[0],$inout0
++	movdqu		($L_p)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]	# L_0 for all odd-numbered blocks
++	mov		%r10,%rax		# restore twisted rounds
++	aesdeclast	@offset[1],$inout1
++	aesdeclast	@offset[2],$inout2
++	aesdeclast	@offset[3],$inout3
++	aesdeclast	@offset[4],$inout4
++	aesdeclast	@offset[5],$inout5
++	ret
++.size	__ocb_decrypt6,.-__ocb_decrypt6
++
++.type	__ocb_decrypt4,\@abi-omnipotent
++.align	32
++__ocb_decrypt4:
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[5]	# offset_i ^ round[0]
++	 movdqu		($L_p,$i1)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	 movdqa		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	 movdqu		($L_p,$i3)<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	 pxor		@offset[5]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[0]
++	 pxor		@offset[0]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[1]
++	pxor		@offset[0],$inout0	# input ^ round[0] ^ offset_i
++	 pxor		@offset[1]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[2]
++	pxor		@offset[1],$inout1
++	 pxor		@offset[2]<A HREF="../../../mailman/listinfo/openssl-commits.html">, at offset</A>[3]
++	pxor		@offset[2],$inout2
++	pxor		@offset[3],$inout3
++	$movkey		32($key_),$rndkey0
++
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[0]	# offset_i ^ round[last]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[1]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[2]
++	 pxor		$<A HREF="../../../mailman/listinfo/openssl-commits.html">rndkey0l, at offset</A>[3]
++
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	$movkey		48($key_),$rndkey1
++
++	aesdec		$rndkey0,$inout0
++	aesdec		$rndkey0,$inout1
++	aesdec		$rndkey0,$inout2
++	aesdec		$rndkey0,$inout3
++	$movkey		64($key_),$rndkey0
++	jmp		.Locb_dec_loop4
++
++.align	32
++.Locb_dec_loop4:
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesdec		$rndkey0,$inout0
++	aesdec		$rndkey0,$inout1
++	aesdec		$rndkey0,$inout2
++	aesdec		$rndkey0,$inout3
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_dec_loop4
++
++	aesdec		$rndkey1,$inout0
++	aesdec		$rndkey1,$inout1
++	aesdec		$rndkey1,$inout2
++	aesdec		$rndkey1,$inout3
++	$movkey		16($key_),$rndkey1
++	mov		%r10,%rax		# restore twisted rounds
++
++	aesdeclast	@offset[0],$inout0
++	aesdeclast	@offset[1],$inout1
++	aesdeclast	@offset[2],$inout2
++	aesdeclast	@offset[3],$inout3
++	ret
++.size	__ocb_decrypt4,.-__ocb_decrypt4
++
++.type	__ocb_decrypt1,\@abi-omnipotent
++.align	32
++__ocb_decrypt1:
++	 pxor		@offset[5],$inout5	# offset_i
++	 pxor		$rndkey0l,$inout5	# offset_i ^ round[0]
++	pxor		$inout5,$inout0		# input ^ round[0] ^ offset_i
++	$movkey		32($key_),$rndkey0
++
++	aesdec		$rndkey1,$inout0
++	$movkey		48($key_),$rndkey1
++	pxor		$rndkey0l,$inout5	# offset_i ^ round[last]
++
++	aesdec		$rndkey0,$inout0
++	$movkey		64($key_),$rndkey0
++	jmp		.Locb_dec_loop1
++
++.align	32
++.Locb_dec_loop1:
++	aesdec		$rndkey1,$inout0
++	$movkey		($key,%rax),$rndkey1
++	add		\$32,%rax
++
++	aesdec		$rndkey0,$inout0
++	$movkey		-16($key,%rax),$rndkey0
++	jnz		.Locb_dec_loop1
++
++	aesdec		$rndkey1,$inout0
++	$movkey		16($key_),$rndkey1	# redundant in tail
++	mov		%r10,%rax		# restore twisted rounds
++
++	aesdeclast	$inout5,$inout0
++	ret
++.size	__ocb_decrypt1,.-__ocb_decrypt1
++___
+ } }}
+ 
+
+ ########################################################################
+@@ -3820,6 +4744,65 @@ ctr_xts_se_handler:
+ 
+ 	jmp	.Lcommon_rbp_tail
+ .size	ctr_xts_se_handler,.-ctr_xts_se_handler
++
++.type	ocb_se_handler,\@abi-omnipotent
++.align	16
++ocb_se_handler:
++	push	%rsi
++	push	%rdi
++	push	%rbx
++	push	%rbp
++	push	%r12
++	push	%r13
++	push	%r14
++	push	%r15
++	pushfq
++	sub	\$64,%rsp
++
++	mov	120($context),%rax	# pull context-&gt;Rax
++	mov	248($context),%rbx	# pull context-&gt;Rip
++
++	mov	8($disp),%rsi		# disp-&gt;ImageBase
++	mov	56($disp),%r11		# disp-&gt;HandlerData
++
++	mov	0(%r11),%r10d		# HandlerData[0]
++	lea	(%rsi,%r10),%r10	# prologue lable
++	cmp	%r10,%rbx		# context-&gt;Rip&lt;prologue label
++	jb	.Lcommon_seh_tail
++
++	mov	4(%r11),%r10d		# HandlerData[1]
++	lea	(%rsi,%r10),%r10	# epilogue label
++	cmp	%r10,%rbx		# context-&gt;Rip&gt;=epilogue label
++	jae	.Lcommon_seh_tail
++
++	mov	8(%r11),%r10d		# HandlerData[2]
++	lea	(%rsi,%r10),%r10
++	cmp	%r10,%rbx		# context-&gt;Rip&gt;=pop label
++	jae	.Locb_no_xmm
++
++	mov	152($context),%rax	# pull context-&gt;Rsp
++
++	lea	(%rax),%rsi		# %xmm save area
++	lea	512($context),%rdi	# &amp; context.Xmm6
++	mov	\$20,%ecx		# 10*sizeof(%xmm0)/sizeof(%rax)
++	.long	0xa548f3fc		# cld; rep movsq
++	lea	0xa0+0x28(%rax),%rax
++
++.Locb_no_xmm:
++	mov	-8(%rax),%rbx
++	mov	-16(%rax),%rbp
++	mov	-24(%rax),%r12
++	mov	-32(%rax),%r13
++	mov	-40(%rax),%r14
++
++	mov	%rbx,144($context)	# restore context-&gt;Rbx
++	mov	%rbp,160($context)	# restore context-&gt;Rbp
++	mov	%r12,216($context)	# restore context-&gt;R12
++	mov	%r13,224($context)	# restore context-&gt;R13
++	mov	%r14,232($context)	# restore context-&gt;R14
++
++	jmp	.Lcommon_seh_tail
++.size	ocb_se_handler,.-ocb_se_handler
+ ___
+ $code.=&lt;&lt;___;
+ .type	cbc_se_handler,\@abi-omnipotent
+@@ -3933,6 +4916,14 @@ $code.=&lt;&lt;___ if ($PREFIX eq &quot;aesni&quot;);
+ 	.rva	.LSEH_begin_aesni_xts_decrypt
+ 	.rva	.LSEH_end_aesni_xts_decrypt
+ 	.rva	.LSEH_info_xts_dec
++
++	.rva	.LSEH_begin_aesni_ocb_encrypt
++	.rva	.LSEH_end_aesni_ocb_encrypt
++	.rva	.LSEH_info_ocb_enc
++
++	.rva	.LSEH_begin_aesni_ocb_decrypt
++	.rva	.LSEH_end_aesni_ocb_decrypt
++	.rva	.LSEH_info_ocb_dec
+ ___
+ $code.=&lt;&lt;___;
+ 	.rva	.LSEH_begin_${PREFIX}_cbc_encrypt
+@@ -3974,6 +4965,18 @@ $code.=&lt;&lt;___ if ($PREFIX eq &quot;aesni&quot;);
+ 	.byte	9,0,0,0
+ 	.rva	ctr_xts_se_handler
+ 	.rva	.Lxts_dec_body,.Lxts_dec_epilogue	# HandlerData[]
++.LSEH_info_ocb_enc:
++	.byte	9,0,0,0
++	.rva	ocb_se_handler
++	.rva	.Locb_enc_body,.Locb_enc_epilogue	# HandlerData[]
++	.rva	.Locb_enc_pop
++	.long	0
++.LSEH_info_ocb_dec:
++	.byte	9,0,0,0
++	.rva	ocb_se_handler
++	.rva	.Locb_dec_body,.Locb_dec_epilogue	# HandlerData[]
++	.rva	.Locb_dec_pop
++	.long	0
+ ___
+ $code.=&lt;&lt;___;
+ .LSEH_info_cbc:
+diff --git a/crypto/evp/e_aes.c b/crypto/evp/e_aes.c
+index efa724a..b067dcf 100644
+--- a/crypto/evp/e_aes.c
++++ b/crypto/evp/e_aes.c
+@@ -461,6 +461,19 @@ static int aesni_ccm_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
+                             const unsigned char *in, size_t len);
+ 
+ #  ifndef OPENSSL_NO_OCB
++void aesni_ocb_encrypt(const unsigned char *in, unsigned char *out,
++                       size_t blocks, const void *key,
++                       size_t start_block_num,
++                       unsigned char offset_i[16],
++                       const unsigned char L_[][16],
++                       unsigned char checksum[16]);
++void aesni_ocb_decrypt(const unsigned char *in, unsigned char *out,
++                       size_t blocks, const void *key,
++                       size_t start_block_num,
++                       unsigned char offset_i[16],
++                       const unsigned char L_[][16],
++                       unsigned char checksum[16]);
++
+ static int aesni_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+                               const unsigned char *iv, int enc)
+ {
+@@ -479,7 +492,9 @@ static int aesni_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+             if (!CRYPTO_ocb128_init(&amp;octx-&gt;ocb,
+                                     &amp;octx-&gt;ksenc.ks, &amp;octx-&gt;ksdec.ks,
+                                     (block128_f) aesni_encrypt,
+-                                    (block128_f) aesni_decrypt))
++                                    (block128_f) aesni_decrypt,
++                                    enc ? aesni_ocb_encrypt
++                                        : aesni_ocb_decrypt))
+                 return 0;
+         }
+         while (0);
+@@ -871,7 +886,8 @@ static int aes_t4_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+             if (!CRYPTO_ocb128_init(&amp;octx-&gt;ocb,
+                                     &amp;octx-&gt;ksenc.ks, &amp;octx-&gt;ksdec.ks,
+                                     (block128_f) aes_t4_encrypt,
+-                                    (block128_f) aes_t4_decrypt))
++                                    (block128_f) aes_t4_decrypt,
++                                    NULL))
+                 return 0;
+         }
+         while (0);
+@@ -2328,6 +2344,29 @@ static int aes_ocb_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr)
+     }
+ }
+ 
++#  ifdef HWAES_CAPABLE
++#   ifdef HWAES_ocb_encrypt
++void HWAES_ocb_encrypt(const unsigned char *in, unsigned char *out,
++                       size_t blocks, const void *key,
++                       size_t start_block_num,
++                       unsigned char offset_i[16],
++                       const unsigned char L_[][16],
++                       unsigned char checksum[16]);
++#   else
++#     define HWAES_ocb_encrypt NULL
++#   endif
++#   ifdef HWAES_ocb_decrypt
++void HWAES_ocb_decrypt(const unsigned char *in, unsigned char *out,
++                       size_t blocks, const void *key,
++                       size_t start_block_num,
++                       unsigned char offset_i[16],
++                       const unsigned char L_[][16],
++                       unsigned char checksum[16]);
++#   else
++#     define HWAES_ocb_decrypt NULL
++#   endif
++#  endif
++
+ static int aes_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+                             const unsigned char *iv, int enc)
+ {
+@@ -2341,6 +2380,20 @@ static int aes_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+              * needs both. We could possibly optimise to remove setting the
+              * decrypt for an encryption operation.
+              */
++#  ifdef HWAES_CAPABLE
++            if (HWAES_CAPABLE) {
++                HWAES_set_encrypt_key(key, ctx-&gt;key_len * 8, &amp;octx-&gt;ksenc.ks);
++                HWAES_set_decrypt_key(key, ctx-&gt;key_len * 8, &amp;octx-&gt;ksdec.ks);
++                if (!CRYPTO_ocb128_init(&amp;octx-&gt;ocb,
++                                        &amp;octx-&gt;ksenc.ks, &amp;octx-&gt;ksdec.ks,
++                                        (block128_f) HWAES_encrypt,
++                                        (block128_f) HWAES_decrypt,
++                                        enc ? HWAES_ocb_encrypt
++                                            : HWAES_ocb_decrypt))
++                    return 0;
++                break;
++            }
++#  endif
+ #  ifdef VPAES_CAPABLE
+             if (VPAES_CAPABLE) {
+                 vpaes_set_encrypt_key(key, ctx-&gt;key_len * 8, &amp;octx-&gt;ksenc.ks);
+@@ -2348,7 +2401,8 @@ static int aes_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+                 if (!CRYPTO_ocb128_init(&amp;octx-&gt;ocb,
+                                         &amp;octx-&gt;ksenc.ks, &amp;octx-&gt;ksdec.ks,
+                                         (block128_f) vpaes_encrypt,
+-                                        (block128_f) vpaes_decrypt))
++                                        (block128_f) vpaes_decrypt,
++                                        NULL))
+                     return 0;
+                 break;
+             }
+@@ -2358,7 +2412,8 @@ static int aes_ocb_init_key(EVP_CIPHER_CTX *ctx, const unsigned char *key,
+             if (!CRYPTO_ocb128_init(&amp;octx-&gt;ocb,
+                                     &amp;octx-&gt;ksenc.ks, &amp;octx-&gt;ksdec.ks,
+                                     (block128_f) AES_encrypt,
+-                                    (block128_f) AES_decrypt))
++                                    (block128_f) AES_decrypt,
++                                    NULL))
+                 return 0;
+         }
+         while (0);
+diff --git a/crypto/modes/modes_lcl.h b/crypto/modes/modes_lcl.h
+index 2f61afe..071b014 100644
+--- a/crypto/modes/modes_lcl.h
++++ b/crypto/modes/modes_lcl.h
+@@ -164,6 +164,7 @@ struct ocb128_context {
+     block128_f decrypt;
+     void *keyenc;
+     void *keydec;
++    ocb128_f stream;    /* direction dependent */
+     /* Key dependent variables. Can be reused if key remains the same */
+     size_t l_index;
+     size_t max_l_index;
+diff --git a/crypto/modes/ocb128.c b/crypto/modes/ocb128.c
+index 3a3f7a8..c3daf7c 100644
+--- a/crypto/modes/ocb128.c
++++ b/crypto/modes/ocb128.c
+@@ -159,7 +159,7 @@ static OCB_BLOCK *ocb_lookup_l(OCB128_CONTEXT *ctx, size_t idx)
+         ctx-&gt;max_l_index += (idx - ctx-&gt;max_l_index + 4) &amp; ~3;
+         ctx-&gt;l =
+             OPENSSL_realloc(ctx-&gt;l, ctx-&gt;max_l_index * sizeof(OCB_BLOCK));
+-        if (!ctx-&gt;l)
++        if (ctx-&gt;l == NULL)
+             return NULL;
+     }
+     while (l_index &lt; idx) {
+@@ -172,34 +172,18 @@ static OCB_BLOCK *ocb_lookup_l(OCB128_CONTEXT *ctx, size_t idx)
+ }
+ 
+ /*
+- * Encrypt a block from |in| and store the result in |out|
+- */
+-static void ocb_encrypt(OCB128_CONTEXT *ctx, OCB_BLOCK *in, OCB_BLOCK *out,
+-                        void *keyenc)
+-{
+-    ctx-&gt;encrypt(in-&gt;c, out-&gt;c, keyenc);
+-}
+-
+-/*
+- * Decrypt a block from |in| and store the result in |out|
+- */
+-static void ocb_decrypt(OCB128_CONTEXT *ctx, OCB_BLOCK *in, OCB_BLOCK *out,
+-                        void *keydec)
+-{
+-    ctx-&gt;decrypt(in-&gt;c, out-&gt;c, keydec);
+-}
+-
+-/*
+  * Create a new OCB128_CONTEXT
+  */
+ OCB128_CONTEXT *CRYPTO_ocb128_new(void *keyenc, void *keydec,
+-                                  block128_f encrypt, block128_f decrypt)
++                                  block128_f encrypt, block128_f decrypt,
++                                  ocb128_f stream)
+ {
+     OCB128_CONTEXT *octx;
+     int ret;
+ 
+     if ((octx = OPENSSL_malloc(sizeof(*octx))) != NULL) {
+-        ret = CRYPTO_ocb128_init(octx, keyenc, keydec, encrypt, decrypt);
++        ret = CRYPTO_ocb128_init(octx, keyenc, keydec, encrypt, decrypt,
++                                 stream);
+         if (ret)
+             return octx;
+         OPENSSL_free(octx);
+@@ -212,7 +196,8 @@ OCB128_CONTEXT *CRYPTO_ocb128_new(void *keyenc, void *keydec,
+  * Initialise an existing OCB128_CONTEXT
+  */
+ int CRYPTO_ocb128_init(OCB128_CONTEXT *ctx, void *keyenc, void *keydec,
+-                       block128_f encrypt, block128_f decrypt)
++                       block128_f encrypt, block128_f decrypt,
++                       ocb128_f stream)
+ {
+     memset(ctx, 0, sizeof(*ctx));
+     ctx-&gt;l_index = 0;
+@@ -228,11 +213,12 @@ int CRYPTO_ocb128_init(OCB128_CONTEXT *ctx, void *keyenc, void *keydec,
+      */
+     ctx-&gt;encrypt = encrypt;
+     ctx-&gt;decrypt = decrypt;
++    ctx-&gt;stream = stream;
+     ctx-&gt;keyenc = keyenc;
+     ctx-&gt;keydec = keydec;
+ 
+     /* L_* = ENCIPHER(K, zeros(128)) */
+-    ocb_encrypt(ctx, &amp;ctx-&gt;l_star, &amp;ctx-&gt;l_star, ctx-&gt;keyenc);
++    ctx-&gt;encrypt(ctx-&gt;l_star.c, ctx-&gt;l_star.c, ctx-&gt;keyenc);
+ 
+     /* L_$ = double(L_*) */
+     ocb_double(&amp;ctx-&gt;l_star, &amp;ctx-&gt;l_dollar);
+@@ -324,11 +310,10 @@ int CRYPTO_ocb128_setiv(OCB128_CONTEXT *ctx, const unsigned char *iv,
+ int CRYPTO_ocb128_aad(OCB128_CONTEXT *ctx, const unsigned char *aad,
+                       size_t len)
+ {
+-    u64 all_num_blocks, num_blocks;
+-    u64 i;
++    u64 i, all_num_blocks;
++    size_t num_blocks, last_len;
+     OCB_BLOCK tmp1;
+     OCB_BLOCK tmp2;
+-    int last_len;
+ 
+     /* Calculate the number of blocks of AAD provided now, and so far */
+     num_blocks = len / 16;
+@@ -341,14 +326,14 @@ int CRYPTO_ocb128_aad(OCB128_CONTEXT *ctx, const unsigned char *aad,
+ 
+         /* Offset_i = Offset_{i-1} xor L_{ntz(i)} */
+         lookup = ocb_lookup_l(ctx, ocb_ntz(i));
+-        if (!lookup)
++        if (lookup == NULL)
+             return 0;
+         ocb_block16_xor(&amp;ctx-&gt;offset_aad, lookup, &amp;ctx-&gt;offset_aad);
+ 
+         /* Sum_i = Sum_{i-1} xor ENCIPHER(K, A_i xor Offset_i) */
+         aad_block = (OCB_BLOCK *)(aad + ((i - ctx-&gt;blocks_hashed - 1) * 16));
+         ocb_block16_xor(&amp;ctx-&gt;offset_aad, aad_block, &amp;tmp1);
+-        ocb_encrypt(ctx, &amp;tmp1, &amp;tmp2, ctx-&gt;keyenc);
++        ctx-&gt;encrypt(tmp1.c, tmp2.c, ctx-&gt;keyenc);
+         ocb_block16_xor(&amp;ctx-&gt;sum, &amp;tmp2, &amp;ctx-&gt;sum);
+     }
+ 
+@@ -369,7 +354,7 @@ int CRYPTO_ocb128_aad(OCB128_CONTEXT *ctx, const unsigned char *aad,
+         ocb_block16_xor(&amp;ctx-&gt;offset_aad, &amp;tmp1, &amp;tmp2);
+ 
+         /* Sum = Sum_m xor ENCIPHER(K, CipherInput) */
+-        ocb_encrypt(ctx, &amp;tmp2, &amp;tmp1, ctx-&gt;keyenc);
++        ctx-&gt;encrypt(tmp2.c, tmp1.c, ctx-&gt;keyenc);
+         ocb_block16_xor(&amp;ctx-&gt;sum, &amp;tmp1, &amp;ctx-&gt;sum);
+     }
+ 
+@@ -386,12 +371,11 @@ int CRYPTO_ocb128_encrypt(OCB128_CONTEXT *ctx,
+                           const unsigned char *in, unsigned char *out,
+                           size_t len)
+ {
+-    u64 i;
+-    u64 all_num_blocks, num_blocks;
++    u64 i, all_num_blocks;
++    size_t num_blocks, last_len;
+     OCB_BLOCK tmp1;
+     OCB_BLOCK tmp2;
+     OCB_BLOCK pad;
+-    int last_len;
+ 
+     /*
+      * Calculate the number of blocks of data to be encrypted provided now, and
+@@ -400,28 +384,46 @@ int CRYPTO_ocb128_encrypt(OCB128_CONTEXT *ctx,
+     num_blocks = len / 16;
+     all_num_blocks = num_blocks + ctx-&gt;blocks_processed;
+ 
+-    /* Loop through all full blocks to be encrypted */
+-    for (i = ctx-&gt;blocks_processed + 1; i &lt;= all_num_blocks; i++) {
+-        OCB_BLOCK *lookup;
+-        OCB_BLOCK *inblock;
+-        OCB_BLOCK *outblock;
++    if (num_blocks &amp;&amp; all_num_blocks == (size_t)all_num_blocks
++        &amp;&amp; ctx-&gt;stream != NULL) {
++        size_t max_idx = 0, top = (size_t)all_num_blocks;
+ 
+-        /* Offset_i = Offset_{i-1} xor L_{ntz(i)} */
+-        lookup = ocb_lookup_l(ctx, ocb_ntz(i));
+-        if (!lookup)
++        /*
++         * See how many L_{i} entries we need to process data at hand
++         * and pre-compute missing entries in the table [if any]...
++         */
++        while (top &gt;&gt;= 1)
++            max_idx++;
++        if (ocb_lookup_l(ctx, max_idx) == NULL)
+             return 0;
+-        ocb_block16_xor(&amp;ctx-&gt;offset, lookup, &amp;ctx-&gt;offset);
+-
+-        /* C_i = Offset_i xor ENCIPHER(K, P_i xor Offset_i) */
+-        inblock = (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
+-        /* Checksum_i = Checksum_{i-1} xor P_i */
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, inblock, &amp;ctx-&gt;checksum);
+-        ocb_encrypt(ctx, &amp;tmp1, &amp;tmp2, ctx-&gt;keyenc);
+-        outblock =
+-            (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
+ 
++        ctx-&gt;stream(in, out, num_blocks, ctx-&gt;keyenc,
++                    (size_t)ctx-&gt;blocks_processed + 1, ctx-&gt;offset.c,
++                    (const unsigned char (*)[16])ctx-&gt;l, ctx-&gt;checksum.c);
++    } else {
++        /* Loop through all full blocks to be encrypted */
++        for (i = ctx-&gt;blocks_processed + 1; i &lt;= all_num_blocks; i++) {
++            OCB_BLOCK *lookup;
++            OCB_BLOCK *inblock;
++            OCB_BLOCK *outblock;
++
++            /* Offset_i = Offset_{i-1} xor L_{ntz(i)} */
++            lookup = ocb_lookup_l(ctx, ocb_ntz(i));
++            if (lookup == NULL)
++                return 0;
++            ocb_block16_xor(&amp;ctx-&gt;offset, lookup, &amp;ctx-&gt;offset);
++
++            /* C_i = Offset_i xor ENCIPHER(K, P_i xor Offset_i) */
++            inblock =
++	        (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
++            /* Checksum_i = Checksum_{i-1} xor P_i */
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, inblock, &amp;ctx-&gt;checksum);
++            ctx-&gt;encrypt(tmp1.c, tmp2.c, ctx-&gt;keyenc);
++            outblock =
++                (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
++        }
+     }
+ 
+     /*
+@@ -435,7 +437,7 @@ int CRYPTO_ocb128_encrypt(OCB128_CONTEXT *ctx,
+         ocb_block16_xor(&amp;ctx-&gt;offset, &amp;ctx-&gt;l_star, &amp;ctx-&gt;offset);
+ 
+         /* Pad = ENCIPHER(K, Offset_*) */
+-        ocb_encrypt(ctx, &amp;ctx-&gt;offset, &amp;pad, ctx-&gt;keyenc);
++        ctx-&gt;encrypt(ctx-&gt;offset.c, pad.c, ctx-&gt;keyenc);
+ 
+         /* C_* = P_* xor Pad[1..bitlen(P_*)] */
+         ocb_block_xor(in + (len / 16) * 16, (unsigned char *)&amp;pad, last_len,
+@@ -461,12 +463,12 @@ int CRYPTO_ocb128_decrypt(OCB128_CONTEXT *ctx,
+                           const unsigned char *in, unsigned char *out,
+                           size_t len)
+ {
+-    u64 i;
+-    u64 all_num_blocks, num_blocks;
++    u64 i, all_num_blocks;
++    size_t num_blocks, last_len;
+     OCB_BLOCK tmp1;
+     OCB_BLOCK tmp2;
+     OCB_BLOCK pad;
+-    int last_len;
++
+     /*
+      * Calculate the number of blocks of data to be decrypted provided now, and
+      * so far
+@@ -474,27 +476,46 @@ int CRYPTO_ocb128_decrypt(OCB128_CONTEXT *ctx,
+     num_blocks = len / 16;
+     all_num_blocks = num_blocks + ctx-&gt;blocks_processed;
+ 
+-    /* Loop through all full blocks to be decrypted */
+-    for (i = ctx-&gt;blocks_processed + 1; i &lt;= all_num_blocks; i++) {
+-        OCB_BLOCK *inblock;
+-        OCB_BLOCK *outblock;
++    if (num_blocks &amp;&amp; all_num_blocks == (size_t)all_num_blocks
++        &amp;&amp; ctx-&gt;stream != NULL) {
++        size_t max_idx = 0, top = (size_t)all_num_blocks;
+ 
+-        /* Offset_i = Offset_{i-1} xor L_{ntz(i)} */
+-        OCB_BLOCK *lookup = ocb_lookup_l(ctx, ocb_ntz(i));
+-        if (!lookup)
++        /*
++         * See how many L_{i} entries we need to process data at hand
++         * and pre-compute missing entries in the table [if any]...
++         */
++        while (top &gt;&gt;= 1)
++            max_idx++;
++        if (ocb_lookup_l(ctx, max_idx) == NULL)
+             return 0;
+-        ocb_block16_xor(&amp;ctx-&gt;offset, lookup, &amp;ctx-&gt;offset);
+-
+-        /* P_i = Offset_i xor DECIPHER(K, C_i xor Offset_i) */
+-        inblock = (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
+-        ocb_decrypt(ctx, &amp;tmp1, &amp;tmp2, ctx-&gt;keydec);
+-        outblock =
+-            (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
+-
+-        /* Checksum_i = Checksum_{i-1} xor P_i */
+-        ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, outblock, &amp;ctx-&gt;checksum);
++
++        ctx-&gt;stream(in, out, num_blocks, ctx-&gt;keydec,
++                    (size_t)ctx-&gt;blocks_processed + 1, ctx-&gt;offset.c,
++                    (const unsigned char (*)[16])ctx-&gt;l, ctx-&gt;checksum.c);
++    } else {
++        /* Loop through all full blocks to be decrypted */
++        for (i = ctx-&gt;blocks_processed + 1; i &lt;= all_num_blocks; i++) {
++            OCB_BLOCK *inblock;
++            OCB_BLOCK *outblock;
++
++            /* Offset_i = Offset_{i-1} xor L_{ntz(i)} */
++            OCB_BLOCK *lookup = ocb_lookup_l(ctx, ocb_ntz(i));
++            if (lookup == NULL)
++                return 0;
++            ocb_block16_xor(&amp;ctx-&gt;offset, lookup, &amp;ctx-&gt;offset);
++
++            /* P_i = Offset_i xor DECIPHER(K, C_i xor Offset_i) */
++            inblock =
++                (OCB_BLOCK *)(in + ((i - ctx-&gt;blocks_processed - 1) * 16));
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, inblock, &amp;tmp1);
++            ctx-&gt;decrypt(tmp1.c, tmp2.c, ctx-&gt;keydec);
++            outblock =
++                (OCB_BLOCK *)(out + ((i - ctx-&gt;blocks_processed - 1) * 16));
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;offset, &amp;tmp2, outblock);
++
++            /* Checksum_i = Checksum_{i-1} xor P_i */
++            ocb_block16_xor_misaligned(&amp;ctx-&gt;checksum, outblock, &amp;ctx-&gt;checksum);
++        }
+     }
+ 
+     /*
+@@ -508,7 +529,7 @@ int CRYPTO_ocb128_decrypt(OCB128_CONTEXT *ctx,
+         ocb_block16_xor(&amp;ctx-&gt;offset, &amp;ctx-&gt;l_star, &amp;ctx-&gt;offset);
+ 
+         /* Pad = ENCIPHER(K, Offset_*) */
+-        ocb_encrypt(ctx, &amp;ctx-&gt;offset, &amp;pad, ctx-&gt;keyenc);
++        ctx-&gt;encrypt(ctx-&gt;offset.c, pad.c, ctx-&gt;keyenc);
+ 
+         /* P_* = C_* xor Pad[1..bitlen(C_*)] */
+         ocb_block_xor(in + (len / 16) * 16, (unsigned char *)&amp;pad, last_len,
+@@ -539,7 +560,7 @@ int CRYPTO_ocb128_finish(OCB128_CONTEXT *ctx, const unsigned char *tag,
+      */
+     ocb_block16_xor(&amp;ctx-&gt;checksum, &amp;ctx-&gt;offset, &amp;tmp1);
+     ocb_block16_xor(&amp;tmp1, &amp;ctx-&gt;l_dollar, &amp;tmp2);
+-    ocb_encrypt(ctx, &amp;tmp2, &amp;tmp1, ctx-&gt;keyenc);
++    ctx-&gt;encrypt(tmp2.c, tmp1.c, ctx-&gt;keyenc);
+     ocb_block16_xor(&amp;tmp1, &amp;ctx-&gt;sum, &amp;ctx-&gt;tag);
+ 
+     if (len &gt; 16 || len &lt; 1) {
+diff --git a/include/openssl/modes.h b/include/openssl/modes.h
+index f5767f5..11bbb68 100644
+--- a/include/openssl/modes.h
++++ b/include/openssl/modes.h
+@@ -167,10 +167,19 @@ size_t CRYPTO_128_unwrap_pad(void *key, const unsigned char *icv,
+ #ifndef OPENSSL_NO_OCB
+ typedef struct ocb128_context OCB128_CONTEXT;
+ 
++typedef void (*ocb128_f) (const unsigned char *in, unsigned char *out,
++                          size_t blocks, const void *key,
++                          size_t start_block_num,
++                          unsigned char offset_i[16],
++                          const unsigned char L_[][16],
++                          unsigned char checksum[16]);
++
+ OCB128_CONTEXT *CRYPTO_ocb128_new(void *keyenc, void *keydec,
+-                                  block128_f encrypt, block128_f decrypt);
++                                  block128_f encrypt, block128_f decrypt,
++                                  ocb128_f stream);
+ int CRYPTO_ocb128_init(OCB128_CONTEXT *ctx, void *keyenc, void *keydec,
+-                       block128_f encrypt, block128_f decrypt);
++                       block128_f encrypt, block128_f decrypt,
++                       ocb128_f stream);
+ int CRYPTO_ocb128_copy_ctx(OCB128_CONTEXT *dest, OCB128_CONTEXT *src,
+                            void *keyenc, void *keydec);
+ int CRYPTO_ocb128_setiv(OCB128_CONTEXT *ctx, const unsigned char *iv,
+diff --git a/test/evptests.txt b/test/evptests.txt
+index 8bdca59..99ffe60 100644
+--- a/test/evptests.txt
++++ b/test/evptests.txt
+@@ -1854,6 +1854,46 @@ Tag = 1ad62009901f40cba7cd7156f94a7324
+ Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
+ Ciphertext = 5e2fa7367ffbdb3938845cfd415fcc71ec79634eb31451609d27505f5e2978f43c44213d8fa441ee
+ 
++Cipher = aes-128-ocb
++Key = 000102030405060708090A0B0C0D0E0F
++IV = 000102030405060708090A0B
++AAD = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++Tag = C203F98CE28F7DAD3F31C021
++Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031
++Ciphertext = 09A4FD29DE949D9A9AA9924248422097AD4883B4713E6C214FF6567ADA08A967B2176C12F110DD441B7CAA3A509B13C822D6
++
++Cipher = aes-128-ocb
++Key = 000102030405060708090A0B0C0D0E0F
++IV = 000102030405060708090A0B
++AAD = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++Tag = 8346D7D47C5D893ED472F5AB
++Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F4041
++Ciphertext = 09A4FD29DE949D9A9AA9924248422097AD4883B4713E6C214FF6567ADA08A967B2176C12F110DD441B7CAA3A509B13C86A023AFCEE998BEE42028D44507B15F714FF
++
++Cipher = aes-128-ocb
++Key = 000102030405060708090A0B0C0D0E0F
++IV = 000102030405060708090A0B
++AAD = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++Tag = 5822A9A70FDF55D29D2984A6
++Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F5051
++Ciphertext = 09A4FD29DE949D9A9AA9924248422097AD4883B4713E6C214FF6567ADA08A967B2176C12F110DD441B7CAA3A509B13C86A023AFCEE998BEE42028D44507B15F77C528A1DE6406B519BCEE8FCB8294170634D
++
++Cipher = aes-128-ocb
++Key = 000102030405060708090A0B0C0D0E0F
++IV = 000102030405060708090A0B
++AAD = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++Tag = 81772B6741ABB4ECA9D2DEB2
++Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F6061
++Ciphertext = 09A4FD29DE949D9A9AA9924248422097AD4883B4713E6C214FF6567ADA08A967B2176C12F110DD441B7CAA3A509B13C86A023AFCEE998BEE42028D44507B15F77C528A1DE6406B519BCEE8FCB829417001E54E15A7576C4DF32366E0F439C7050FAA
++
++Cipher = aes-128-ocb
++Key = 000102030405060708090A0B0C0D0E0F
++IV = 000102030405060708090A0B
++AAD = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++Tag = 3E52A01D068DE85456DB03B7
++Plaintext = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F7071
++Ciphertext = 09A4FD29DE949D9A9AA9924248422097AD4883B4713E6C214FF6567ADA08A967B2176C12F110DD441B7CAA3A509B13C86A023AFCEE998BEE42028D44507B15F77C528A1DE6406B519BCEE8FCB829417001E54E15A7576C4DF32366E0F439C7051CB4824B8114E9A720CBC1CE0185B156B486
++
+ # AES XTS test vectors from IEEE Std 1619-2007
+ Cipher = aes-128-xts
+ Key = 0000000000000000000000000000000000000000000000000000000000000000
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002384.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="002388.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2385">[ date ]</a>
+              <a href="thread.html#2385">[ thread ]</a>
+              <a href="subject.html#2385">[ subject ]</a>
+              <a href="author.html#2385">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,178 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1430343451.681903.15749.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000982.html">
+   <LINK REL="Next"  HREF="000984.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1430343451.681903.15749.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Wed Apr 29 21:37:31 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000982.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000984.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#983">[ date ]</a>
+              <a href="thread.html#983">[ thread ]</a>
+              <a href="subject.html#983">[ subject ]</a>
+              <a href="author.html#983">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  995101d6547c9bc88e10fc85cfa2cbc3a92ede93 (commit)
+      from  db4c08f0194d58c6192f0d8311bf3f20e251cf4f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 995101d6547c9bc88e10fc85cfa2cbc3a92ede93
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Wed Apr 29 17:37:04 2015 -0400
+
+    Add HTTP GET support to OCSP server
+    
+    Reviewed-by: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES     |  3 +++
+ apps/ocsp.c | 51 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index b44f645..b6342bd 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -4,6 +4,9 @@
+ 
+  Changes between 1.0.2 and 1.1.0  [xx XXX xxxx]
+ 
++  *) Added HTTP GET support to the ocsp command.
++     [Rich Salz]
++
+   *) RAND_pseudo_bytes has been deprecated. Users should use RAND bytes instead.
+ 
+   *) Added support for TLS extended master secret from
+diff --git a/apps/ocsp.c b/apps/ocsp.c
+index d22ce7d..fb60e3b 100644
+--- a/apps/ocsp.c
++++ b/apps/ocsp.c
+@@ -1043,13 +1043,32 @@ static BIO *init_responder(const char *port)
+     return NULL;
+ }
+ 
++
++static char *urldecode(char *p)
++{
++    unsigned char *out = (unsigned char *)p;
++    char *save = p;
++
++    for (; *p; p++) {
++        if (*p != '%')
++            *out++ = *p;
++        else if (p[1] &amp;&amp; p[2]) {
++            *out++ = (app_hex(p[1]) &lt;&lt; 4) | app_hex(p[2]);
++            p += 2;
++        }
++    }
++    *p = '\0';
++    return save;
++}
++
+ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+                         const char *port)
+ {
+     int len;
+     OCSP_REQUEST *req = NULL;
+     char inbuf[2048];
+-    BIO *cbio = NULL;
++    char *p, *q;
++    BIO *cbio = NULL, *getbio = NULL, *b64 = NULL;
+ 
+     if (BIO_do_accept(acbio) &lt;= 0) {
+         BIO_printf(bio_err, &quot;Error accepting connection\n&quot;);
+@@ -1064,7 +1083,29 @@ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+     len = BIO_gets(cbio, inbuf, sizeof inbuf);
+     if (len &lt;= 0)
+         return 1;
+-    if (strncmp(inbuf, &quot;POST&quot;, 4) != 0) {
++    if (strncmp(inbuf, &quot;GET&quot;, 3) == 0) {
++        /* Expecting GET {sp} /URL {sp} HTTP/1.x */
++        for (p = inbuf + 3; *p == ' ' || *p == '\t'; ++p)
++            continue;
++        if (*p) {
++            /* Move past the slash before the URL part. */
++            p++;
++        }
++        /* Splice off the HTTP version identifier. */
++        for (q = p; *q; q++)
++            if (*q == ' ' || *q == '\t')
++                break;
++        if (*q == '\0') {
++            BIO_printf(bio_err, &quot;Invalid request\n&quot;);
++            return 1;
++        }
++        *q = '\0';
++        p = urldecode(p);
++        getbio = BIO_new_mem_buf(p, strlen(p));
++        b64 = BIO_new(BIO_f_base64());
++        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
++        getbio = BIO_push(b64, getbio);
++    } else if (strncmp(inbuf, &quot;POST&quot;, 4) != 0) {
+         BIO_printf(bio_err, &quot;Invalid request\n&quot;);
+         return 1;
+     }
+@@ -1078,7 +1119,11 @@ static int do_responder(OCSP_REQUEST **preq, BIO **pcbio, BIO *acbio,
+     }
+ 
+     /* Try to read OCSP request */
+-    req = d2i_OCSP_REQUEST_bio(cbio, NULL);
++    if (getbio) {
++        req = d2i_OCSP_REQUEST_bio(getbio, NULL);
++        BIO_free_all(getbio);
++    } else
++        req = d2i_OCSP_REQUEST_bio(cbio, NULL);
+ 
+     if (!req) {
+         BIO_printf(bio_err, &quot;Error parsing OCSP request\n&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000982.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000984.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#983">[ date ]</a>
+              <a href="thread.html#983">[ thread ]</a>
+              <a href="subject.html#983">[ subject ]</a>
+              <a href="author.html#983">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,226 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1528903711.492238.20124.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019562.html">
+   <LINK REL="Next"  HREF="019566.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1528903711.492238.20124.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Jun 13 15:28:31 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019562.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="019566.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19563">[ date ]</a>
+              <a href="thread.html#19563">[ thread ]</a>
+              <a href="subject.html#19563">[ subject ]</a>
+              <a href="author.html#19563">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  a3e9d5aa980f238805970f420adf5e903d35bf09 (commit)
+      from  d3273ef6c549d1bf74d18c9056218c1d8b98a2b9 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit a3e9d5aa980f238805970f420adf5e903d35bf09
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Fri May 25 12:10:13 2018 +0100
+
+    Add blinding to an ECDSA signature
+    
+    Keegan Ryan (NCC Group) has demonstrated a side channel attack on an
+    ECDSA signature operation. During signing the signer calculates:
+    
+    s:= k^-1 * (m + r * priv_key) mod order
+    
+    The addition operation above provides a sufficient signal for a
+    flush+reload attack to derive the private key given sufficient signature
+    operations.
+    
+    As a mitigation (based on a suggestion from Keegan) we add blinding to
+    the operation so that:
+    
+    s := k^-1 * blind^-1 (blind * m + blind * r * priv_key) mod order
+    
+    Since this attack is a localhost side channel only no CVE is assigned.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ CHANGES                |  4 +++
+ crypto/ec/ecdsa_ossl.c | 70 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGES b/CHANGES
+index 7a47852..fe3e13a 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -8,6 +8,10 @@
+  release branch.
+ 
+  Changes between 1.1.0h and 1.1.1 [xx XXX xxxx]
++  *) Add blinding to an ECDSA signature to protect against side channel attacks
++     discovered by Keegan Ryan (NCC Group).
++     [Matt Caswell]
++
+   *) Enforce checking in the pkeyutl command line app to ensure that the input
+      length does not exceed the maximum supported digest length when performing
+      a sign, verify or verifyrecover operation.
+diff --git a/crypto/ec/ecdsa_ossl.c b/crypto/ec/ecdsa_ossl.c
+index 7842851..640593b 100644
+--- a/crypto/ec/ecdsa_ossl.c
++++ b/crypto/ec/ecdsa_ossl.c
+@@ -196,7 +196,8 @@ ECDSA_SIG *ossl_ecdsa_sign_sig(const unsigned char *dgst, int dgst_len,
+                                EC_KEY *eckey)
+ {
+     int ok = 0, i;
+-    BIGNUM *kinv = NULL, *s, *m = NULL, *tmp = NULL;
++    BIGNUM *kinv = NULL, *s, *m = NULL, *tmp = NULL, *blind = NULL;
++    BIGNUM *blindm = NULL;
+     const BIGNUM *order, *ckinv;
+     BN_CTX *ctx = NULL;
+     const EC_GROUP *group;
+@@ -229,8 +230,18 @@ ECDSA_SIG *ossl_ecdsa_sign_sig(const unsigned char *dgst, int dgst_len,
+     }
+     s = ret-&gt;s;
+ 
+-    if ((ctx = BN_CTX_new()) == NULL ||
+-        (tmp = BN_new()) == NULL || (m = BN_new()) == NULL) {
++    ctx = BN_CTX_secure_new();
++    if (ctx == NULL) {
++        ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    BN_CTX_start(ctx);
++    tmp = BN_CTX_get(ctx);
++    m = BN_CTX_get(ctx);
++    blind = BN_CTX_get(ctx);
++    blindm = BN_CTX_get(ctx);
++    if (blindm == NULL) {
+         ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_MALLOC_FAILURE);
+         goto err;
+     }
+@@ -270,18 +281,64 @@ ECDSA_SIG *ossl_ecdsa_sign_sig(const unsigned char *dgst, int dgst_len,
+             }
+         }
+ 
+-        if (!BN_mod_mul(tmp, priv_key, ret-&gt;r, order, ctx)) {
++        /*
++         * The normal signature calculation is:
++         *
++         *   s := k^-1 * (m + r * priv_key) mod order
++         *
++         * We will blind this to protect against side channel attacks
++         *
++         *   s := k^-1 * blind^-1 * (blind * m + blind * r * priv_key) mod order
++         */
++
++        /* Generate a blinding value */
++        do {
++            if (!BN_priv_rand(blind, BN_num_bits(order) - 1,
++                              BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY))
++                goto err;
++        } while (BN_is_zero(blind));
++        BN_set_flags(blind, BN_FLG_CONSTTIME);
++        BN_set_flags(blindm, BN_FLG_CONSTTIME);
++        BN_set_flags(tmp, BN_FLG_CONSTTIME);
++
++        /* tmp := blind * priv_key * r mod order */
++        if (!BN_mod_mul(tmp, blind, priv_key, order, ctx)) {
+             ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
+             goto err;
+         }
+-        if (!BN_mod_add_quick(s, tmp, m, order)) {
++        if (!BN_mod_mul(tmp, tmp, ret-&gt;r, order, ctx)) {
+             ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
+             goto err;
+         }
++
++        /* blindm := blind * m mod order */
++        if (!BN_mod_mul(blindm, blind, m, order, ctx)) {
++            ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
++            goto err;
++        }
++
++        /* s : = (blind * priv_key * r) + (blind * m) mod order */
++        if (!BN_mod_add_quick(s, tmp, blindm, order)) {
++            ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
++            goto err;
++        }
++
++        /* s:= s * blind^-1 mod order */
++        if (BN_mod_inverse(blind, blind, order, ctx) == NULL) {
++            ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
++            goto err;
++        }
++        if (!BN_mod_mul(s, s, blind, order, ctx)) {
++            ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
++            goto err;
++        }
++
++        /* s := s * k^-1 mod order */
+         if (!BN_mod_mul(s, s, ckinv, order, ctx)) {
+             ECerr(EC_F_OSSL_ECDSA_SIGN_SIG, ERR_R_BN_LIB);
+             goto err;
+         }
++
+         if (BN_is_zero(s)) {
+             /*
+              * if kinv and r have been supplied by the caller, don't
+@@ -303,9 +360,8 @@ ECDSA_SIG *ossl_ecdsa_sign_sig(const unsigned char *dgst, int dgst_len,
+         ECDSA_SIG_free(ret);
+         ret = NULL;
+     }
++    BN_CTX_end(ctx);
+     BN_CTX_free(ctx);
+-    BN_clear_free(m);
+-    BN_clear_free(tmp);
+     BN_clear_free(kinv);
+     return ret;
+ }
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019562.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="019566.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19563">[ date ]</a>
+              <a href="thread.html#19563">[ thread ]</a>
+              <a href="subject.html#19563">[ subject ]</a>
+              <a href="author.html#19563">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

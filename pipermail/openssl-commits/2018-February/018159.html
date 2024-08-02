@@ -1,0 +1,144 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2018-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1519211521.583164.9549.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018154.html">
+   <LINK REL="Next"  HREF="018160.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1519211521.583164.9549.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Wed Feb 21 11:12:01 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018154.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="018160.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18159">[ date ]</a>
+              <a href="thread.html#18159">[ thread ]</a>
+              <a href="subject.html#18159">[ subject ]</a>
+              <a href="author.html#18159">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  6c61b2749634246956f8ec7adc9520e5d22dcbf4 (commit)
+      from  b8a3f39b890304757058deb730c855b72c14947b (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 6c61b2749634246956f8ec7adc9520e5d22dcbf4
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Wed Feb 14 17:29:32 2018 +0000
+
+    Remove a spurious TLSProxy byte in TLSv1.3
+    
+    When the proxy re-encrypted a TLSv1.3 record it was adding a spurious
+    byte onto the end. This commit removes that.
+    
+    The &quot;extra&quot; byte was intended to be the inner content type of the record.
+    However, TLSProxy was actually adding the original encrypted data into the
+    record (which already has the inner content type in it) and then adding
+    the spurious additional content type byte on the end (and adjusting the
+    record length accordingly).
+    
+    It is interesting to look at why this didn't cause a failure:
+    
+    The receiving peer first attempts to decrypt the data. Because this is
+    TLSProxy we always use a GCM based ciphersuite with a 16 byte tag. When
+    we decrypt this it actually gets diverted to the ossltest engine. All this
+    does is go through the motions of encrypting/decrypting but just passes
+    back the original data. Crucially it will never fail because of a bad tag!
+    The receiving party thinks the spurious additional byte is part of the
+    tag and the ossltest engine ignores it.
+    
+    This means the data that gets passed back to the record layer still has
+    an additional spurious byte on it - but because the 16 byte tag has been
+    removed, this is actually the first byte of the original tag. Again
+    because we are using ossltest engine we aren't actually creating &quot;real&quot;
+    tags - we only ever emit 16, 0 bytes for the tag. So the spurious
+    additional byte always has the value 0. The TLSv1.3 spec says that records
+    can have additional 0 bytes on the end of them - this is &quot;padding&quot;. So the
+    record layer interprets this 0 byte as padding and strips it off to end up
+    with the originally transmitted record data - which it can now process
+    successfully.
+    
+    Reviewed-by: Bernd Edlinger &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bernd.edlinger at hotmail.de</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/5370">https://github.com/openssl/openssl/pull/5370</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ util/perl/TLSProxy/Record.pm | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/util/perl/TLSProxy/Record.pm b/util/perl/TLSProxy/Record.pm
+index c949287..773f759 100644
+--- a/util/perl/TLSProxy/Record.pm
++++ b/util/perl/TLSProxy/Record.pm
+@@ -286,15 +286,13 @@ sub reconstruct_record
+     my $self = shift;
+     my $server = shift;
+     my $data;
+-    my $tls13_enc = 0;
+ 
+     if ($self-&gt;sslv2) {
+         $data = pack('n', $self-&gt;len | 0x8000);
+     } else {
+         if (TLSProxy::Proxy-&gt;is_tls13() &amp;&amp; $self-&gt;encrypted) {
+             $data = pack('Cnn', $self-&gt;outer_content_type, $self-&gt;version,
+-                         $self-&gt;len + 1);
+-            $tls13_enc = 1;
++                         $self-&gt;len);
+         } else {
+             $data = pack('Cnn', $self-&gt;content_type, $self-&gt;version,
+                          $self-&gt;len);
+@@ -303,10 +301,6 @@ sub reconstruct_record
+     }
+     $data .= $self-&gt;data;
+ 
+-    if ($tls13_enc) {
+-        $data .= pack('C', $self-&gt;content_type);
+-    }
+-
+     return $data;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018154.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="018160.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18159">[ date ]</a>
+              <a href="thread.html#18159">[ thread ]</a>
+              <a href="subject.html#18159">[ subject ]</a>
+              <a href="author.html#18159">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

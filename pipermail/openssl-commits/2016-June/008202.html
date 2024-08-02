@@ -1,0 +1,709 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1465939793.432765.14681.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008201.html">
+   <LINK REL="Next"  HREF="008205.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Andy Polyakov</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1465939793.432765.14681.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">appro at openssl.org
+       </A><BR>
+    <I>Tue Jun 14 21:29:53 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008201.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="008205.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8202">[ date ]</a>
+              <a href="thread.html#8202">[ thread ]</a>
+              <a href="subject.html#8202">[ subject ]</a>
+              <a href="author.html#8202">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cc77d0d84ab8e476f74373cad3d65210042baf02 (commit)
+      from  627c95337611151b4293944e1b706fea7e1ba5dc (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cc77d0d84ab8e476f74373cad3d65210042baf02
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Mon May 23 20:34:11 2016 +0200
+
+    modes/asm/ghashp8-ppc.pl: improve performance by 2.7x.
+    
+    Reviewed-by: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/modes/asm/ghashp8-ppc.pl | 469 ++++++++++++++++++++++++++++++++++++++--
+ test/evptests.txt               |   9 +
+ 2 files changed, 458 insertions(+), 20 deletions(-)
+
+diff --git a/crypto/modes/asm/ghashp8-ppc.pl b/crypto/modes/asm/ghashp8-ppc.pl
+index 70a6353..f0598cb 100755
+--- a/crypto/modes/asm/ghashp8-ppc.pl
++++ b/crypto/modes/asm/ghashp8-ppc.pl
+@@ -25,6 +25,12 @@
+ # faster than &quot;4-bit&quot; integer-only compiler-generated 64-bit code.
+ # &quot;Initial version&quot; means that there is room for futher improvement.
+ 
++# May 2016
++#
++# 2x aggregated reduction improves performance by 50% (resulting
++# performance on POWER8 is 1 cycle per processed byte), and 4x
++# aggregated reduction - by 170% or 2.7x (resulting in 0.55 cpb).
++
+ $flavour=shift;
+ $output =shift;
+ 
+@@ -34,14 +40,21 @@ if ($flavour =~ /64/) {
+ 	$STU=&quot;stdu&quot;;
+ 	$POP=&quot;ld&quot;;
+ 	$PUSH=&quot;std&quot;;
++	$UCMP=&quot;cmpld&quot;;
++	$SHRI=&quot;srdi&quot;;
+ } elsif ($flavour =~ /32/) {
+ 	$SIZE_T=4;
+ 	$LRSAVE=$SIZE_T;
+ 	$STU=&quot;stwu&quot;;
+ 	$POP=&quot;lwz&quot;;
+ 	$PUSH=&quot;stw&quot;;
++	$UCMP=&quot;cmplw&quot;;
++	$SHRI=&quot;srwi&quot;;
+ } else { die &quot;nonsense $flavour&quot;; }
+ 
++$sp=&quot;r1&quot;;
++$FRAME=6*$SIZE_T+13*16;	# 13*16 is for v20-v31 offload
++
+ $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
+ ( $xlate=&quot;${dir}ppc-xlate.pl&quot; and -f $xlate ) or
+ ( $xlate=&quot;${dir}../../perlasm/ppc-xlate.pl&quot; and -f $xlate) or
+@@ -53,6 +66,7 @@ my ($Xip,$Htbl,$inp,$len)=map(&quot;r$_&quot;,(3..6));	# argument block
+ 
+ my ($Xl,$Xm,$Xh,$IN)=map(&quot;v$_&quot;,(0..3));
+ my ($zero,$t0,$t1,$t2,$xC2,$H,$Hh,$Hl,$lemask)=map(&quot;v$_&quot;,(4..12));
++my ($Xl1,$Xm1,$Xh1,$IN1,$H2,$H2h,$H2l)=map(&quot;v$_&quot;,(13..19));
+ my $vrsave=&quot;r12&quot;;
+ 
+ $code=&lt;&lt;___;
+@@ -63,7 +77,7 @@ $code=&lt;&lt;___;
+ .globl	.gcm_init_p8
+ .align	5
+ .gcm_init_p8:
+-	lis		r0,0xfff0
++	li		r0,-4096
+ 	li		r8,0x10
+ 	mfspr		$vrsave,256
+ 	li		r9,0x20
+@@ -85,17 +99,103 @@ $code=&lt;&lt;___;
+ 	vsl		$H,$H,$t0		# H&lt;&lt;=1
+ 	vsrab		$t1,$t1,$t2		# broadcast carry bit
+ 	vand		$t1,$t1,$xC2
+-	vxor		$H,$H,$t1		# twisted H
++	vxor		$IN,$H,$t1		# twisted H
+ 
+-	vsldoi		$H,$H,$H,8		# twist even more ...
++	vsldoi		$H,$IN,$IN,8		# twist even more ...
+ 	vsldoi		$xC2,$zero,$xC2,8	# 0xc2.0
+ 	vsldoi		$Hl,$zero,$H,8		# ... and split
+ 	vsldoi		$Hh,$H,$zero,8
+ 
+ 	stvx_u		$xC2,0,r3		# save pre-computed table
+ 	stvx_u		$Hl,r8,r3
++	li		r8,0x40
+ 	stvx_u		$H, r9,r3
++	li		r9,0x50
++	stvx_u		$Hh,r10,r3
++	li		r10,0x60
++
++	vpmsumd		$Xl,$IN,$Hl		# H.lo&#183;H.lo
++	vpmsumd		$Xm,$IN,$H		# H.hi&#183;H.lo+H.lo&#183;H.hi
++	vpmsumd		$Xh,$IN,$Hh		# H.hi&#183;H.hi
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
++
++	vsldoi		$t0,$Xm,$zero,8
++	vsldoi		$t1,$zero,$Xm,8
++	vxor		$Xl,$Xl,$t0
++	vxor		$Xh,$Xh,$t1
++
++	vsldoi		$Xl,$Xl,$Xl,8
++	vxor		$Xl,$Xl,$t2
++
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
++	vpmsumd		$Xl,$Xl,$xC2
++	vxor		$t1,$t1,$Xh
++	vxor		$IN1,$Xl,$t1
++
++	vsldoi		$H2,$IN1,$IN1,8
++	vsldoi		$H2l,$zero,$H2,8
++	vsldoi		$H2h,$H2,$zero,8
++
++	stvx_u		$H2l,r8,r3		# save H^2
++	li		r8,0x70
++	stvx_u		$H2,r9,r3
++	li		r9,0x80
++	stvx_u		$H2h,r10,r3
++	li		r10,0x90
++___
++{
++my ($t4,$t5,$t6) = ($Hl,$H,$Hh);
++$code.=&lt;&lt;___;
++	vpmsumd		$Xl,$IN,$H2l		# H.lo&#183;H^2.lo
++	 vpmsumd	$Xl1,$IN1,$H2l		# H^2.lo&#183;H^2.lo
++	vpmsumd		$Xm,$IN,$H2		# H.hi&#183;H^2.lo+H.lo&#183;H^2.hi
++	 vpmsumd	$Xm1,$IN1,$H2		# H^2.hi&#183;H^2.lo+H^2.lo&#183;H^2.hi
++	vpmsumd		$Xh,$IN,$H2h		# H.hi&#183;H^2.hi
++	 vpmsumd	$Xh1,$IN1,$H2h		# H^2.hi&#183;H^2.hi
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
++	 vpmsumd	$t6,$Xl1,$xC2		# 1st reduction phase
++
++	vsldoi		$t0,$Xm,$zero,8
++	vsldoi		$t1,$zero,$Xm,8
++	 vsldoi		$t4,$Xm1,$zero,8
++	 vsldoi		$t5,$zero,$Xm1,8
++	vxor		$Xl,$Xl,$t0
++	vxor		$Xh,$Xh,$t1
++	 vxor		$Xl1,$Xl1,$t4
++	 vxor		$Xh1,$Xh1,$t5
++
++	vsldoi		$Xl,$Xl,$Xl,8
++	 vsldoi		$Xl1,$Xl1,$Xl1,8
++	vxor		$Xl,$Xl,$t2
++	 vxor		$Xl1,$Xl1,$t6
++
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
++	 vsldoi		$t5,$Xl1,$Xl1,8		# 2nd reduction phase
++	vpmsumd		$Xl,$Xl,$xC2
++	 vpmsumd	$Xl1,$Xl1,$xC2
++	vxor		$t1,$t1,$Xh
++	 vxor		$t5,$t5,$Xh1
++	vxor		$Xl,$Xl,$t1
++	 vxor		$Xl1,$Xl1,$t5
++
++	vsldoi		$H,$Xl,$Xl,8
++	 vsldoi		$H2,$Xl1,$Xl1,8
++	vsldoi		$Hl,$zero,$H,8
++	vsldoi		$Hh,$H,$zero,8
++	 vsldoi		$H2l,$zero,$H2,8
++	 vsldoi		$H2h,$H2,$zero,8
++
++	stvx_u		$Hl,r8,r3		# save H^3
++	li		r8,0xa0
++	stvx_u		$H,r9,r3
++	li		r9,0xb0
+ 	stvx_u		$Hh,r10,r3
++	li		r10,0xc0
++	 stvx_u		$H2l,r8,r3		# save H^4
++	 stvx_u		$H2,r9,r3
++	 stvx_u		$H2h,r10,r3
+ 
+ 	mtspr		256,$vrsave
+ 	blr
+@@ -103,7 +203,9 @@ $code=&lt;&lt;___;
+ 	.byte		0,12,0x14,0,0,0,2,0
+ 	.long		0
+ .size	.gcm_init_p8,.-.gcm_init_p8
+-
++___
++}
++$code.=&lt;&lt;___;
+ .globl	.gcm_gmult_p8
+ .align	5
+ .gcm_gmult_p8:
+@@ -129,7 +231,7 @@ $code=&lt;&lt;___;
+ 	vpmsumd		$Xm,$IN,$H		# H.hi&#183;Xi.lo+H.lo&#183;Xi.hi
+ 	vpmsumd		$Xh,$IN,$Hh		# H.hi&#183;Xi.hi
+ 
+-	vpmsumd		$t2,$Xl,$xC2		# 1st phase
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
+ 
+ 	vsldoi		$t0,$Xm,$zero,8
+ 	vsldoi		$t1,$zero,$Xm,8
+@@ -139,7 +241,7 @@ $code=&lt;&lt;___;
+ 	vsldoi		$Xl,$Xl,$Xl,8
+ 	vxor		$Xl,$Xl,$t2
+ 
+-	vsldoi		$t1,$Xl,$Xl,8		# 2nd phase
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
+ 	vpmsumd		$Xl,$Xl,$xC2
+ 	vxor		$t1,$t1,$Xh
+ 	vxor		$Xl,$Xl,$t1
+@@ -157,7 +259,7 @@ $code=&lt;&lt;___;
+ .globl	.gcm_ghash_p8
+ .align	5
+ .gcm_ghash_p8:
+-	lis		r0,0xfff8
++	li		r0,-4096
+ 	li		r8,0x10
+ 	mfspr		$vrsave,256
+ 	li		r9,0x20
+@@ -166,52 +268,99 @@ $code=&lt;&lt;___;
+ 	lvx_u		$Xl,0,$Xip		# load Xi
+ 
+ 	lvx_u		$Hl,r8,$Htbl		# load pre-computed table
++	li		r8,0x40
+ 	 le?lvsl	$lemask,r0,r0
+ 	lvx_u		$H, r9,$Htbl
++	li		r9,0x50
+ 	 le?vspltisb	$t0,0x07
+ 	lvx_u		$Hh,r10,$Htbl
++	li		r10,0x60
+ 	 le?vxor	$lemask,$lemask,$t0
+ 	lvx_u		$xC2,0,$Htbl
+ 	 le?vperm	$Xl,$Xl,$Xl,$lemask
+ 	vxor		$zero,$zero,$zero
+ 
++	${UCMP}i	$len,64
++	bge		Lgcm_ghash_p8_4x
++
+ 	lvx_u		$IN,0,$inp
+ 	addi		$inp,$inp,16
+-	subi		$len,$len,16
++	subic.		$len,$len,16
+ 	 le?vperm	$IN,$IN,$IN,$lemask
+ 	vxor		$IN,$IN,$Xl
+-	b		Loop
++	beq		Lshort
++
++	lvx_u		$H2l,r8,$Htbl		# load H^2
++	li		r8,16
++	lvx_u		$H2, r9,$Htbl
++	add		r9,$inp,$len		# end of input
++	lvx_u		$H2h,r10,$Htbl
++	be?b		Loop_2x
+ 
+ .align	5
+-Loop:
+-	 subic		$len,$len,16
+-	vpmsumd		$Xl,$IN,$Hl		# H.lo&#183;Xi.lo
+-	 subfe.		r0,r0,r0		# borrow?-1:0
+-	vpmsumd		$Xm,$IN,$H		# H.hi&#183;Xi.lo+H.lo&#183;Xi.hi
++Loop_2x:
++	lvx_u		$IN1,0,$inp
++	le?vperm	$IN1,$IN1,$IN1,$lemask
++
++	 subic		$len,$len,32
++	vpmsumd		$Xl,$IN,$H2l		# H^2.lo&#183;Xi.lo
++	 vpmsumd	$Xl1,$IN1,$Hl		# H.lo&#183;Xi+1.lo
++	 subfe		r0,r0,r0		# borrow?-1:0
++	vpmsumd		$Xm,$IN,$H2		# H^2.hi&#183;Xi.lo+H^2.lo&#183;Xi.hi
++	 vpmsumd	$Xm1,$IN1,$H		# H.hi&#183;Xi+1.lo+H.lo&#183;Xi+1.hi
+ 	 and		r0,r0,$len
+-	vpmsumd		$Xh,$IN,$Hh		# H.hi&#183;Xi.hi
++	vpmsumd		$Xh,$IN,$H2h		# H^2.hi&#183;Xi.hi
++	 vpmsumd	$Xh1,$IN1,$Hh		# H.hi&#183;Xi+1.hi
+ 	 add		$inp,$inp,r0
+ 
+-	vpmsumd		$t2,$Xl,$xC2		# 1st phase
++	vxor		$Xl,$Xl,$Xl1
++	vxor		$Xm,$Xm,$Xm1
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
+ 
+ 	vsldoi		$t0,$Xm,$zero,8
+ 	vsldoi		$t1,$zero,$Xm,8
++	 vxor		$Xh,$Xh,$Xh1
+ 	vxor		$Xl,$Xl,$t0
+ 	vxor		$Xh,$Xh,$t1
+ 
+ 	vsldoi		$Xl,$Xl,$Xl,8
+ 	vxor		$Xl,$Xl,$t2
+-	 lvx_u		$IN,0,$inp
+-	 addi		$inp,$inp,16
++	 lvx_u		$IN,r8,$inp
++	 addi		$inp,$inp,32
+ 
+-	vsldoi		$t1,$Xl,$Xl,8		# 2nd phase
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
+ 	vpmsumd		$Xl,$Xl,$xC2
+ 	 le?vperm	$IN,$IN,$IN,$lemask
+ 	vxor		$t1,$t1,$Xh
+ 	vxor		$IN,$IN,$t1
+ 	vxor		$IN,$IN,$Xl
+-	beq		Loop			# did $len-=16 borrow?
++	$UCMP		r9,$inp
++	bgt		Loop_2x			# done yet?
++
++	cmplwi		$len,0
++	bne		Leven
++
++Lshort:
++	vpmsumd		$Xl,$IN,$Hl		# H.lo&#183;Xi.lo
++	vpmsumd		$Xm,$IN,$H		# H.hi&#183;Xi.lo+H.lo&#183;Xi.hi
++	vpmsumd		$Xh,$IN,$Hh		# H.hi&#183;Xi.hi
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
++
++	vsldoi		$t0,$Xm,$zero,8
++	vsldoi		$t1,$zero,$Xm,8
++	vxor		$Xl,$Xl,$t0
++	vxor		$Xh,$Xh,$t1
++
++	vsldoi		$Xl,$Xl,$Xl,8
++	vxor		$Xl,$Xl,$t2
++
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
++	vpmsumd		$Xl,$Xl,$xC2
++	vxor		$t1,$t1,$Xh
+ 
++Leven:
+ 	vxor		$Xl,$Xl,$t1
+ 	le?vperm	$Xl,$Xl,$Xl,$lemask
+ 	stvx_u		$Xl,0,$Xip		# write out Xi
+@@ -221,6 +370,284 @@ Loop:
+ 	.long		0
+ 	.byte		0,12,0x14,0,0,0,4,0
+ 	.long		0
++___
++{
++my ($Xl3,$Xm2,$IN2,$H3l,$H3,$H3h,
++    $Xh3,$Xm3,$IN3,$H4l,$H4,$H4h) = map(&quot;v$_&quot;,(20..31));
++my $IN0=$IN;
++my ($H21l,$H21h,$loperm,$hiperm) = ($Hl,$Hh,$H2l,$H2h);
++
++$code.=&lt;&lt;___;
++.align	5
++.gcm_ghash_p8_4x:
++Lgcm_ghash_p8_4x:
++	$STU		$sp,-$FRAME($sp)
++	li		r10,`15+6*$SIZE_T`
++	li		r11,`31+6*$SIZE_T`
++	stvx		v20,r10,$sp
++	addi		r10,r10,32
++	stvx		v21,r11,$sp
++	addi		r11,r11,32
++	stvx		v22,r10,$sp
++	addi		r10,r10,32
++	stvx		v23,r11,$sp
++	addi		r11,r11,32
++	stvx		v24,r10,$sp
++	addi		r10,r10,32
++	stvx		v25,r11,$sp
++	addi		r11,r11,32
++	stvx		v26,r10,$sp
++	addi		r10,r10,32
++	stvx		v27,r11,$sp
++	addi		r11,r11,32
++	stvx		v28,r10,$sp
++	addi		r10,r10,32
++	stvx		v29,r11,$sp
++	addi		r11,r11,32
++	stvx		v30,r10,$sp
++	li		r10,0x60
++	stvx		v31,r11,$sp
++	li		r0,-1
++	stw		$vrsave,`$FRAME-4`($sp)	# save vrsave
++	mtspr		256,r0			# preserve all AltiVec registers
++
++	lvsl		$t0,0,r8		# 0x0001..0e0f
++	#lvx_u		$H2l,r8,$Htbl		# load H^2
++	li		r8,0x70
++	lvx_u		$H2, r9,$Htbl
++	li		r9,0x80
++	vspltisb	$t1,8			# 0x0808..0808
++	#lvx_u		$H2h,r10,$Htbl
++	li		r10,0x90
++	lvx_u		$H3l,r8,$Htbl		# load H^3
++	li		r8,0xa0
++	lvx_u		$H3, r9,$Htbl
++	li		r9,0xb0
++	lvx_u		$H3h,r10,$Htbl
++	li		r10,0xc0
++	lvx_u		$H4l,r8,$Htbl		# load H^4
++	li		r8,0x10
++	lvx_u		$H4, r9,$Htbl
++	li		r9,0x20
++	lvx_u		$H4h,r10,$Htbl
++	li		r10,0x30
++
++	vsldoi		$t2,$zero,$t1,8		# 0x0000..0808
++	vaddubm		$hiperm,$t0,$t2		# 0x0001..1617
++	vaddubm		$loperm,$t1,$hiperm	# 0x0809..1e1f
++
++	$SHRI		$len,$len,4		# this allows to use sign bit
++						# as carry
++	lvx_u		$IN0,0,$inp		# load input
++	lvx_u		$IN1,r8,$inp
++	subic.		$len,$len,8
++	lvx_u		$IN2,r9,$inp
++	lvx_u		$IN3,r10,$inp
++	addi		$inp,$inp,0x40
++	le?vperm	$IN0,$IN0,$IN0,$lemask
++	le?vperm	$IN1,$IN1,$IN1,$lemask
++	le?vperm	$IN2,$IN2,$IN2,$lemask
++	le?vperm	$IN3,$IN3,$IN3,$lemask
++
++	vxor		$Xh,$IN0,$Xl
++
++	 vpmsumd	$Xl1,$IN1,$H3l
++	 vpmsumd	$Xm1,$IN1,$H3
++	 vpmsumd	$Xh1,$IN1,$H3h
++
++	 vperm		$H21l,$H2,$H,$hiperm
++	 vperm		$t0,$IN2,$IN3,$loperm
++	 vperm		$H21h,$H2,$H,$loperm
++	 vperm		$t1,$IN2,$IN3,$hiperm
++	 vpmsumd	$Xm2,$IN2,$H2		# H^2.lo&#183;Xi+2.hi+H^2.hi&#183;Xi+2.lo
++	 vpmsumd	$Xl3,$t0,$H21l		# H^2.lo&#183;Xi+2.lo+H.lo&#183;Xi+3.lo
++	 vpmsumd	$Xm3,$IN3,$H		# H.hi&#183;Xi+3.lo  +H.lo&#183;Xi+3.hi
++	 vpmsumd	$Xh3,$t1,$H21h		# H^2.hi&#183;Xi+2.hi+H.hi&#183;Xi+3.hi
++
++	 vxor		$Xm2,$Xm2,$Xm1
++	 vxor		$Xl3,$Xl3,$Xl1
++	 vxor		$Xm3,$Xm3,$Xm2
++	 vxor		$Xh3,$Xh3,$Xh1
++
++	blt		Ltail_4x
++
++Loop_4x:
++	lvx_u		$IN0,0,$inp
++	lvx_u		$IN1,r8,$inp
++	subic.		$len,$len,4
++	lvx_u		$IN2,r9,$inp
++	lvx_u		$IN3,r10,$inp
++	addi		$inp,$inp,0x40
++	le?vperm	$IN1,$IN1,$IN1,$lemask
++	le?vperm	$IN2,$IN2,$IN2,$lemask
++	le?vperm	$IN3,$IN3,$IN3,$lemask
++	le?vperm	$IN0,$IN0,$IN0,$lemask
++
++	vpmsumd		$Xl,$Xh,$H4l		# H^4.lo&#183;Xi.lo
++	vpmsumd		$Xm,$Xh,$H4		# H^4.hi&#183;Xi.lo+H^4.lo&#183;Xi.hi
++	vpmsumd		$Xh,$Xh,$H4h		# H^4.hi&#183;Xi.hi
++	 vpmsumd	$Xl1,$IN1,$H3l
++	 vpmsumd	$Xm1,$IN1,$H3
++	 vpmsumd	$Xh1,$IN1,$H3h
++
++	vxor		$Xl,$Xl,$Xl3
++	vxor		$Xm,$Xm,$Xm3
++	vxor		$Xh,$Xh,$Xh3
++	 vperm		$t0,$IN2,$IN3,$loperm
++	 vperm		$t1,$IN2,$IN3,$hiperm
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
++	 vpmsumd	$Xl3,$t0,$H21l		# H.lo&#183;Xi+3.lo  +H^2.lo&#183;Xi+2.lo
++	 vpmsumd	$Xh3,$t1,$H21h		# H.hi&#183;Xi+3.hi  +H^2.hi&#183;Xi+2.hi
++
++	vsldoi		$t0,$Xm,$zero,8
++	vsldoi		$t1,$zero,$Xm,8
++	vxor		$Xl,$Xl,$t0
++	vxor		$Xh,$Xh,$t1
++
++	vsldoi		$Xl,$Xl,$Xl,8
++	vxor		$Xl,$Xl,$t2
++
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
++	 vpmsumd	$Xm2,$IN2,$H2		# H^2.hi&#183;Xi+2.lo+H^2.lo&#183;Xi+2.hi
++	 vpmsumd	$Xm3,$IN3,$H		# H.hi&#183;Xi+3.lo  +H.lo&#183;Xi+3.hi
++	vpmsumd		$Xl,$Xl,$xC2
++
++	 vxor		$Xl3,$Xl3,$Xl1
++	 vxor		$Xh3,$Xh3,$Xh1
++	vxor		$Xh,$Xh,$IN0
++	 vxor		$Xm2,$Xm2,$Xm1
++	vxor		$Xh,$Xh,$t1
++	 vxor		$Xm3,$Xm3,$Xm2
++	vxor		$Xh,$Xh,$Xl
++	bge		Loop_4x
++
++Ltail_4x:
++	vpmsumd		$Xl,$Xh,$H4l		# H^4.lo&#183;Xi.lo
++	vpmsumd		$Xm,$Xh,$H4		# H^4.hi&#183;Xi.lo+H^4.lo&#183;Xi.hi
++	vpmsumd		$Xh,$Xh,$H4h		# H^4.hi&#183;Xi.hi
++
++	vxor		$Xl,$Xl,$Xl3
++	vxor		$Xm,$Xm,$Xm3
++
++	vpmsumd		$t2,$Xl,$xC2		# 1st reduction phase
++
++	vsldoi		$t0,$Xm,$zero,8
++	vsldoi		$t1,$zero,$Xm,8
++	 vxor		$Xh,$Xh,$Xh3
++	vxor		$Xl,$Xl,$t0
++	vxor		$Xh,$Xh,$t1
++
++	vsldoi		$Xl,$Xl,$Xl,8
++	vxor		$Xl,$Xl,$t2
++
++	vsldoi		$t1,$Xl,$Xl,8		# 2nd reduction phase
++	vpmsumd		$Xl,$Xl,$xC2
++	vxor		$t1,$t1,$Xh
++	vxor		$Xl,$Xl,$t1
++
++	addic.		$len,$len,4
++	beq		Ldone_4x
++
++	lvx_u		$IN0,0,$inp
++	${UCMP}i	$len,2
++	li		$len,-4
++	blt		Lone
++	lvx_u		$IN1,r8,$inp
++	beq		Ltwo
++
++Lthree:
++	lvx_u		$IN2,r9,$inp
++	le?vperm	$IN0,$IN0,$IN0,$lemask
++	le?vperm	$IN1,$IN1,$IN1,$lemask
++	le?vperm	$IN2,$IN2,$IN2,$lemask
++
++	vxor		$Xh,$IN0,$Xl
++	vmr		$H4l,$H3l
++	vmr		$H4, $H3
++	vmr		$H4h,$H3h
++
++	vperm		$t0,$IN1,$IN2,$loperm
++	vperm		$t1,$IN1,$IN2,$hiperm
++	vpmsumd		$Xm2,$IN1,$H2		# H^2.lo&#183;Xi+1.hi+H^2.hi&#183;Xi+1.lo
++	vpmsumd		$Xm3,$IN2,$H		# H.hi&#183;Xi+2.lo  +H.lo&#183;Xi+2.hi
++	vpmsumd		$Xl3,$t0,$H21l		# H^2.lo&#183;Xi+1.lo+H.lo&#183;Xi+2.lo
++	vpmsumd		$Xh3,$t1,$H21h		# H^2.hi&#183;Xi+1.hi+H.hi&#183;Xi+2.hi
++
++	vxor		$Xm3,$Xm3,$Xm2
++	b		Ltail_4x
++
++.align	4
++Ltwo:
++	le?vperm	$IN0,$IN0,$IN0,$lemask
++	le?vperm	$IN1,$IN1,$IN1,$lemask
++
++	vxor		$Xh,$IN0,$Xl
++	vperm		$t0,$zero,$IN1,$loperm
++	vperm		$t1,$zero,$IN1,$hiperm
++
++	vsldoi		$H4l,$zero,$H2,8
++	vmr		$H4, $H2
++	vsldoi		$H4h,$H2,$zero,8
++
++	vpmsumd		$Xl3,$t0, $H21l		# H.lo&#183;Xi+1.lo
++	vpmsumd		$Xm3,$IN1,$H		# H.hi&#183;Xi+1.lo+H.lo&#183;Xi+2.hi
++	vpmsumd		$Xh3,$t1, $H21h		# H.hi&#183;Xi+1.hi
++
++	b		Ltail_4x
++
++.align	4
++Lone:
++	le?vperm	$IN0,$IN0,$IN0,$lemask
++
++	vsldoi		$H4l,$zero,$H,8
++	vmr		$H4, $H
++	vsldoi		$H4h,$H,$zero,8
++
++	vxor		$Xh,$IN0,$Xl
++	vxor		$Xl3,$Xl3,$Xl3
++	vxor		$Xm3,$Xm3,$Xm3
++	vxor		$Xh3,$Xh3,$Xh3
++
++	b		Ltail_4x
++
++Ldone_4x:
++	le?vperm	$Xl,$Xl,$Xl,$lemask
++	stvx_u		$Xl,0,$Xip		# write out Xi
++
++	li		r10,`15+6*$SIZE_T`
++	li		r11,`31+6*$SIZE_T`
++	mtspr		256,$vrsave
++	lvx		v20,r10,$sp
++	addi		r10,r10,32
++	lvx		v21,r11,$sp
++	addi		r11,r11,32
++	lvx		v22,r10,$sp
++	addi		r10,r10,32
++	lvx		v23,r11,$sp
++	addi		r11,r11,32
++	lvx		v24,r10,$sp
++	addi		r10,r10,32
++	lvx		v25,r11,$sp
++	addi		r11,r11,32
++	lvx		v26,r10,$sp
++	addi		r10,r10,32
++	lvx		v27,r11,$sp
++	addi		r11,r11,32
++	lvx		v28,r10,$sp
++	addi		r10,r10,32
++	lvx		v29,r11,$sp
++	addi		r11,r11,32
++	lvx		v30,r10,$sp
++	lvx		v31,r11,$sp
++	addi		$sp,$sp,$FRAME
++	blr
++	.long		0
++	.byte		0,12,0x04,0,0x80,0,4,0
++	.long		0
++___
++}
++$code.=&lt;&lt;___;
+ .size	.gcm_ghash_p8,.-.gcm_ghash_p8
+ 
+ .asciz  &quot;GHASH for PowerISA 2.07, CRYPTOGAMS by &lt;appro\@openssl.org&gt;&quot;
+@@ -228,6 +655,8 @@ Loop:
+ ___
+ 
+ foreach (split(&quot;\n&quot;,$code)) {
++	s/\`([^\`]*)\`/eval $1/geo;
++
+ 	if ($flavour =~ /le$/o) {	# little-endian
+ 	    s/le\?//o		or
+ 	    s/be\?/#be#/o;
+diff --git a/test/evptests.txt b/test/evptests.txt
+index 47e2a72..c0e906d 100644
+--- a/test/evptests.txt
++++ b/test/evptests.txt
+@@ -1775,6 +1775,15 @@ Tag = 566f8ef683078bfdeeffa869d751a017
+ Plaintext = 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+ Ciphertext = 56b3373ca9ef6e4a2b64fe1e9a17b61425f10d47a75a5fce13efc6bc784af24f4141bdd48cf7c770887afd573cca5418a9aeffcd7c5ceddfc6a78397b9a85b499da558257267caab2ad0b23ca476a53cb17fb41c4b8b475cb4f3f7165094c229c9e8c4dc0a2a5ff1903e501511221376a1cdb8364c5061a20cae74bc4acd76ceb0abc9fd3217ef9f8c90be402ddf6d8697f4f880dff15bfb7a6b28241ec8fe183c2d59e3f9dfff653c7126f0acb9e64211f42bae12af462b1070bef1ab5e3606
+ 
++# 240 bytes plaintext, iv is chosen so that initial counter LSB is 0xFF
++Cipher = aes-128-gcm
++Key = 00000000000000000000000000000000
++IV = ffffffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++AAD =
++Tag = fd0c7011ff07f0071324bdfb2d0f3a29
++Plaintext = 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++Ciphertext = 56b3373ca9ef6e4a2b64fe1e9a17b61425f10d47a75a5fce13efc6bc784af24f4141bdd48cf7c770887afd573cca5418a9aeffcd7c5ceddfc6a78397b9a85b499da558257267caab2ad0b23ca476a53cb17fb41c4b8b475cb4f3f7165094c229c9e8c4dc0a2a5ff1903e501511221376a1cdb8364c5061a20cae74bc4acd76ceb0abc9fd3217ef9f8c90be402ddf6d8697f4f880dff15bfb7a6b28241ec8fe183c2d59e3f9dfff653c7126f0acb9e64211f42bae12af462b1070bef1ab5e3606872ca10dee15b3249b1a1b958f23134c4bccb7d03200bce420a2f8eb66dcf3644d1423c1b5699003c13ecef4bf38a3b6
++
+ # 288 bytes plaintext, iv is chosen so that initial counter LSB is 0xFF
+ Cipher = aes-128-gcm
+ Key = 00000000000000000000000000000000
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008201.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="008205.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8202">[ date ]</a>
+              <a href="thread.html#8202">[ thread ]</a>
+              <a href="subject.html#8202">[ subject ]</a>
+              <a href="author.html#8202">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

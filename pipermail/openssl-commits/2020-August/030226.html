@@ -1,0 +1,315 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1597919563.129155.24044.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030220.html">
+   <LINK REL="Next"  HREF="030227.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1597919563.129155.24044.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Thu Aug 20 10:32:43 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030220.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="030227.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30226">[ date ]</a>
+              <a href="thread.html#30226">[ thread ]</a>
+              <a href="subject.html#30226">[ subject ]</a>
+              <a href="author.html#30226">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  22b814443eea4ef4ea86d5d5677601d6645606d9 (commit)
+      from  3b1fd0b003572554ad9bb3914527c160bc6a7727 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 22b814443eea4ef4ea86d5d5677601d6645606d9
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Tue Aug 18 20:39:45 2020 +0200
+
+    X509: Add d2i_PUBKEY_ex(), which take a libctx and propq
+    
+    Just like d2i_PrivateKey() / d2i_PrivateKey_ex(), there's a need to
+    associate an EVP_PKEY extracted from a PUBKEY to a library context and
+    a property query string.  Without it, a provider-native EVP_PKEY can
+    only fetch necessary internal algorithms from the default library
+    context, even though an application specific context should be used.
+    
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">paul.dale at oracle.com</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/12671">https://github.com/openssl/openssl/pull/12671</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_ameth.c                               |  8 +++-
+ crypto/x509/x_pubkey.c                             | 55 ++++++++++++++++++----
+ doc/man3/X509_PUBKEY_new.pod                       | 16 +++++--
+ include/crypto/x509.h                              |  3 ++
+ include/openssl/x509.h                             |  2 +
+ .../serializers/deserialize_der2key.c              |  4 +-
+ util/libcrypto.num                                 |  1 +
+ 7 files changed, 73 insertions(+), 16 deletions(-)
+
+diff --git a/crypto/ec/ec_ameth.c b/crypto/ec/ec_ameth.c
+index f8251a6de2..6cd0bf6279 100644
+--- a/crypto/ec/ec_ameth.c
++++ b/crypto/ec/ec_ameth.c
+@@ -22,6 +22,7 @@
+ #include &lt;openssl/asn1t.h&gt;
+ #include &quot;crypto/asn1.h&quot;
+ #include &quot;crypto/evp.h&quot;
++#include &quot;crypto/x509.h&quot;
+ #include &lt;openssl/core_names.h&gt;
+ #include &quot;openssl/param_build.h&quot;
+ #include &quot;ec_local.h&quot;
+@@ -161,12 +162,15 @@ static int eckey_pub_decode(EVP_PKEY *pkey, const X509_PUBKEY *pubkey)
+     int ptype, pklen;
+     EC_KEY *eckey = NULL;
+     X509_ALGOR *palg;
++    OPENSSL_CTX *libctx = NULL;
++    const char *propq = NULL;
+ 
+-    if (!X509_PUBKEY_get0_param(NULL, &amp;p, &amp;pklen, &amp;palg, pubkey))
++    if (!X509_PUBKEY_get0_libctx(&amp;libctx, &amp;propq, pubkey)
++        || !X509_PUBKEY_get0_param(NULL, &amp;p, &amp;pklen, &amp;palg, pubkey))
+         return 0;
+     X509_ALGOR_get0(NULL, &amp;ptype, &amp;pval, palg);
+ 
+-    eckey = eckey_type2param(ptype, pval, NULL, NULL);
++    eckey = eckey_type2param(ptype, pval, libctx, propq);
+ 
+     if (!eckey) {
+         ECerr(EC_F_ECKEY_PUB_DECODE, ERR_R_EC_LIB);
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index c73ea7a4ed..59f4a14895 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -28,6 +28,10 @@ struct X509_pubkey_st {
+     X509_ALGOR *algor;
+     ASN1_BIT_STRING *public_key;
+     EVP_PKEY *pkey;
++
++    /* extra data for the callback, used by d2i_PUBKEY_ex */
++    OPENSSL_CTX *libctx;
++    const char *propq;
+ };
+ 
+ static int x509_pubkey_decode(EVP_PKEY **pk, const X509_PUBKEY *key);
+@@ -228,32 +232,57 @@ EVP_PKEY *X509_PUBKEY_get(const X509_PUBKEY *key)
+ }
+ 
+ /*
+- * Now two pseudo ASN1 routines that take an EVP_PKEY structure and encode or
+- * decode as X509_PUBKEY
++ * Now three pseudo ASN1 routines that take an EVP_PKEY structure and encode
++ * or decode as X509_PUBKEY
+  */
+ 
+-EVP_PKEY *d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length)
++EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
++                        OPENSSL_CTX *libctx, const char *propq)
+ {
+-    X509_PUBKEY *xpk;
+-    EVP_PKEY *pktmp;
++    X509_PUBKEY *xpk, *xpk2 = NULL, **pxpk = NULL;
++    EVP_PKEY *pktmp = NULL;
+     const unsigned char *q;
+ 
+     q = *pp;
+-    xpk = d2i_X509_PUBKEY(NULL, &amp;q, length);
++
++    /*
++     * If libctx or propq are non-NULL, we take advantage of the reuse
++     * feature.  It's not generally recommended, but is safe enough for
++     * newly created structures.
++     */
++    if (libctx != NULL || propq != NULL) {
++        xpk2 = OPENSSL_zalloc(sizeof(*xpk2));
++        if (xpk2 == NULL) {
++            ERR_raise(ERR_LIB_X509, ERR_R_MALLOC_FAILURE);
++            return NULL;
++        }
++        xpk2-&gt;libctx = libctx;
++        xpk2-&gt;propq = propq;
++        pxpk = &amp;xpk2;
++    }
++    xpk = d2i_X509_PUBKEY(pxpk, &amp;q, length);
+     if (xpk == NULL)
+-        return NULL;
++        goto end;
+     pktmp = X509_PUBKEY_get(xpk);
+     X509_PUBKEY_free(xpk);
++    xpk2 = NULL;                 /* We know that xpk == xpk2 */
+     if (pktmp == NULL)
+-        return NULL;
++        goto end;
+     *pp = q;
+     if (a != NULL) {
+         EVP_PKEY_free(*a);
+         *a = pktmp;
+     }
++ end:
++    X509_PUBKEY_free(xpk2);
+     return pktmp;
+ }
+ 
++EVP_PKEY *d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length)
++{
++    return d2i_PUBKEY_ex(a, pp, length, NULL, NULL);
++}
++
+ int i2d_PUBKEY(const EVP_PKEY *a, unsigned char **pp)
+ {
+     int ret = -1;
+@@ -493,3 +522,13 @@ int X509_PUBKEY_eq(const X509_PUBKEY *a, const X509_PUBKEY *b)
+         return -2;
+     return EVP_PKEY_eq(pA, pB);
+ }
++
++int X509_PUBKEY_get0_libctx(OPENSSL_CTX **plibctx, const char **ppropq,
++                            const X509_PUBKEY *key)
++{
++    if (plibctx)
++        *plibctx = key-&gt;libctx;
++    if (ppropq)
++        *ppropq = key-&gt;propq;
++    return 1;
++}
+diff --git a/doc/man3/X509_PUBKEY_new.pod b/doc/man3/X509_PUBKEY_new.pod
+index 76034fa878..e6acb89213 100644
+--- a/doc/man3/X509_PUBKEY_new.pod
++++ b/doc/man3/X509_PUBKEY_new.pod
+@@ -4,7 +4,7 @@
+ 
+ X509_PUBKEY_new, X509_PUBKEY_free, X509_PUBKEY_dup,
+ X509_PUBKEY_set, X509_PUBKEY_get0, X509_PUBKEY_get,
+-d2i_PUBKEY, i2d_PUBKEY, d2i_PUBKEY_bio, d2i_PUBKEY_fp,
++d2i_PUBKEY_ex, d2i_PUBKEY, i2d_PUBKEY, d2i_PUBKEY_bio, d2i_PUBKEY_fp,
+ i2d_PUBKEY_fp, i2d_PUBKEY_bio, X509_PUBKEY_set0_param, X509_PUBKEY_get0_param,
+ X509_PUBKEY_eq - SubjectPublicKeyInfo public key functions
+ 
+@@ -20,6 +20,8 @@ X509_PUBKEY_eq - SubjectPublicKeyInfo public key functions
+  EVP_PKEY *X509_PUBKEY_get0(const X509_PUBKEY *key);
+  EVP_PKEY *X509_PUBKEY_get(const X509_PUBKEY *key);
+ 
++ EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
++                         OPENSSL_CTX *libctx, const char *propq);
+  EVP_PKEY *d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length);
+  int i2d_PUBKEY(const EVP_PKEY *a, unsigned char **pp);
+ 
+@@ -58,9 +60,15 @@ X509_PUBKEY_get() is similar to X509_PUBKEY_get0() except the reference
+ count on the returned key is incremented so it B&lt;MUST&gt; be freed using
+ EVP_PKEY_free() after use.
+ 
+-d2i_PUBKEY() and i2d_PUBKEY() decode and encode an B&lt;EVP_PKEY&gt; structure
+-using B&lt;SubjectPublicKeyInfo&gt; format. They otherwise follow the conventions of
+-other ASN.1 functions such as d2i_X509().
++d2i_PUBKEY_ex() decodes an B&lt;EVP_PKEY&gt; structure using B&lt;SubjectPublicKeyInfo&gt;
++format.  Some public key decoding implementations may use cryptographic
++algorithms. In this case the supplied library context I&lt;libctx&gt; and property
++query string I&lt;propq&gt; are used.
++d2i_PUBKEY() does the same as d2i_PUBKEY_ex() except that the default
++library context and property query string are used.
++
++i2d_PUBKEY() encodes an B&lt;EVP_PKEY&gt; structure using B&lt;SubjectPublicKeyInfo&gt;
++format.
+ 
+ d2i_PUBKEY_bio(), d2i_PUBKEY_fp(), i2d_PUBKEY_bio() and i2d_PUBKEY_fp() are
+ similar to d2i_PUBKEY() and i2d_PUBKEY() except they decode or encode using a
+diff --git a/include/crypto/x509.h b/include/crypto/x509.h
+index 87d71de420..c663b68abd 100644
+--- a/include/crypto/x509.h
++++ b/include/crypto/x509.h
+@@ -306,3 +306,6 @@ int asn1_item_digest_with_libctx(const ASN1_ITEM *it, const EVP_MD *type,
+                                  unsigned int *len, OPENSSL_CTX *libctx,
+                                  const char *propq);
+ int X509_add_cert_new(STACK_OF(X509) **sk, X509 *cert, int flags);
++
++int X509_PUBKEY_get0_libctx(OPENSSL_CTX **plibctx, const char **ppropq,
++                            const X509_PUBKEY *key);
+diff --git a/include/openssl/x509.h b/include/openssl/x509.h
+index 71a5f77301..c373fc9845 100644
+--- a/include/openssl/x509.h
++++ b/include/openssl/x509.h
+@@ -522,6 +522,8 @@ EVP_PKEY *X509_PUBKEY_get(const X509_PUBKEY *key);
+ int X509_get_pubkey_parameters(EVP_PKEY *pkey, STACK_OF(X509) *chain);
+ long X509_get_pathlen(X509 *x);
+ DECLARE_ASN1_ENCODE_FUNCTIONS_only(EVP_PKEY, PUBKEY)
++EVP_PKEY *d2i_PUBKEY_ex(EVP_PKEY **a, const unsigned char **pp, long length,
++                        OPENSSL_CTX *libctx, const char *propq);
+ # ifndef OPENSSL_NO_RSA
+ DECLARE_ASN1_ENCODE_FUNCTIONS_only(RSA, RSA_PUBKEY)
+ # endif
+diff --git a/providers/implementations/serializers/deserialize_der2key.c b/providers/implementations/serializers/deserialize_der2key.c
+index 702119b74c..6975c9ceab 100644
+--- a/providers/implementations/serializers/deserialize_der2key.c
++++ b/providers/implementations/serializers/deserialize_der2key.c
+@@ -127,7 +127,7 @@ static int der2key_deserialize(void *vctx, OSSL_CORE_BIO *cin,
+                              libctx, NULL);
+     if (pkey == NULL) {
+         derp = der;
+-        pkey = d2i_PUBKEY(NULL, &amp;derp, der_len);
++        pkey = d2i_PUBKEY_ex(NULL, &amp;derp, der_len, libctx, NULL);
+     }
+ 
+     if (pkey == NULL) {
+@@ -142,7 +142,7 @@ static int der2key_deserialize(void *vctx, OSSL_CORE_BIO *cin,
+          *
+          * TODO(3.0): The check should be done with EVP_PKEY_is_a(), but
+          * as long as we still have #legacy internal keys, it's safer to
+-         * use the type numbers in side the provider.
++         * use the type numbers inside the provider.
+          */
+         if (EVP_PKEY_id(pkey) == ctx-&gt;desc-&gt;type)
+             key = ctx-&gt;desc-&gt;extract_key(pkey);
+diff --git a/util/libcrypto.num b/util/libcrypto.num
+index b38670b1ab..6aa0109de3 100644
+--- a/util/libcrypto.num
++++ b/util/libcrypto.num
+@@ -5262,3 +5262,4 @@ EVP_SIGNATURE_gettable_ctx_params       ?	3_0_0	EXIST::FUNCTION:
+ EVP_SIGNATURE_settable_ctx_params       ?	3_0_0	EXIST::FUNCTION:
+ EVP_KEYEXCH_gettable_ctx_params         ?	3_0_0	EXIST::FUNCTION:
+ EVP_KEYEXCH_settable_ctx_params         ?	3_0_0	EXIST::FUNCTION:
++d2i_PUBKEY_ex                           ?	3_0_0	EXIST::FUNCTION:
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030220.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="030227.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30226">[ date ]</a>
+              <a href="thread.html#30226">[ thread ]</a>
+              <a href="subject.html#30226">[ subject ]</a>
+              <a href="author.html#30226">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

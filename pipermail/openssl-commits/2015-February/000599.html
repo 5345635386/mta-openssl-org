@@ -1,0 +1,286 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-February/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C20150227153105.6DCF61DF124%40butler.localdomain%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000597.html">
+   <LINK REL="Next"  HREF="000601.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C20150227153105.6DCF61DF124%40butler.localdomain%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri Feb 27 15:31:05 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000597.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="000601.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#599">[ date ]</a>
+              <a href="thread.html#599">[ thread ]</a>
+              <a href="subject.html#599">[ subject ]</a>
+              <a href="author.html#599">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  eadf70d2c885e3e4e943091eabfec1e73d4f3883 (commit)
+       via  687eaf27a7e4bdfc58dd455e2566b915a7a25c20 (commit)
+      from  366448ec5e28df12d75e9e7f8908078573ef2585 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit eadf70d2c885e3e4e943091eabfec1e73d4f3883
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Feb 26 11:54:58 2015 +0000
+
+    Fixed missing return value checks.
+    
+    Added various missing return value checks in tls1_change_cipher_state.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit 687eaf27a7e4bdfc58dd455e2566b915a7a25c20
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Thu Feb 26 11:53:55 2015 +0000
+
+    Fix missing return value checks.
+    
+    Fixed various missing return value checks in ssl3_send_newsession_ticket.
+    Also a mem leak on error.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/s3_srvr.c |   79 +++++++++++++++++++++++++++++++++++----------------------
+ ssl/t1_enc.c  |   26 ++++++++++++-------
+ 2 files changed, 66 insertions(+), 39 deletions(-)
+
+diff --git a/ssl/s3_srvr.c b/ssl/s3_srvr.c
+index 48dee10..39c1574 100644
+--- a/ssl/s3_srvr.c
++++ b/ssl/s3_srvr.c
+@@ -3256,14 +3256,16 @@ int ssl3_send_server_certificate(SSL *s)
+ /* send a new session ticket (not necessarily for a new session) */
+ int ssl3_send_newsession_ticket(SSL *s)
+ {
++    unsigned char *senc = NULL;
++    EVP_CIPHER_CTX ctx;
++    HMAC_CTX hctx;
++
+     if (s-&gt;state == SSL3_ST_SW_SESSION_TICKET_A) {
+-        unsigned char *p, *senc, *macstart;
++        unsigned char *p, *macstart;
+         const unsigned char *const_p;
+         int len, slen_full, slen;
+         SSL_SESSION *sess;
+         unsigned int hlen;
+-        EVP_CIPHER_CTX ctx;
+-        HMAC_CTX hctx;
+         SSL_CTX *tctx = s-&gt;initial_ctx;
+         unsigned char iv[EVP_MAX_IV_LENGTH];
+         unsigned char key_name[16];
+@@ -3274,32 +3276,38 @@ int ssl3_send_newsession_ticket(SSL *s)
+          * Some length values are 16 bits, so forget it if session is too
+          * long
+          */
+-        if (slen_full &gt; 0xFF00)
++        if (slen_full == 0 || slen_full &gt; 0xFF00)
+             return -1;
+         senc = OPENSSL_malloc(slen_full);
+         if (!senc)
+             return -1;
++
++        EVP_CIPHER_CTX_init(&amp;ctx);
++        HMAC_CTX_init(&amp;hctx);
++
+         p = senc;
+-        i2d_SSL_SESSION(s-&gt;session, &amp;p);
++        if (!i2d_SSL_SESSION(s-&gt;session, &amp;p))
++            goto err;
+ 
+         /*
+          * create a fresh copy (not shared with other threads) to clean up
+          */
+         const_p = senc;
+         sess = d2i_SSL_SESSION(NULL, &amp;const_p, slen_full);
+-        if (sess == NULL) {
+-            OPENSSL_free(senc);
+-            return -1;
+-        }
++        if (sess == NULL)
++            goto err;
+         sess-&gt;session_id_length = 0; /* ID is irrelevant for the ticket */
+ 
+         slen = i2d_SSL_SESSION(sess, NULL);
+-        if (slen &gt; slen_full) { /* shouldn't ever happen */
+-            OPENSSL_free(senc);
+-            return -1;
++        if (slen == 0 || slen &gt; slen_full) { /* shouldn't ever happen */
++            SSL_SESSION_free(sess);
++            goto err;
+         }
+         p = senc;
+-        i2d_SSL_SESSION(sess, &amp;p);
++        if (!i2d_SSL_SESSION(sess, &amp;p)) {
++            SSL_SESSION_free(sess);
++            goto err;
++        }
+         SSL_SESSION_free(sess);
+ 
+         /*-
+@@ -3313,26 +3321,26 @@ int ssl3_send_newsession_ticket(SSL *s)
+         if (!BUF_MEM_grow(s-&gt;init_buf,
+                           SSL_HM_HEADER_LENGTH(s) + 22 + EVP_MAX_IV_LENGTH +
+                           EVP_MAX_BLOCK_LENGTH + EVP_MAX_MD_SIZE + slen))
+-            return -1;
++            goto err;
++
+         p = ssl_handshake_start(s);
+-        EVP_CIPHER_CTX_init(&amp;ctx);
+-        HMAC_CTX_init(&amp;hctx);
+         /*
+          * Initialize HMAC and cipher contexts. If callback present it does
+          * all the work otherwise use generated values from parent ctx.
+          */
+         if (tctx-&gt;tlsext_ticket_key_cb) {
+             if (tctx-&gt;tlsext_ticket_key_cb(s, key_name, iv, &amp;ctx,
+-                                           &amp;hctx, 1) &lt; 0) {
+-                OPENSSL_free(senc);
+-                return -1;
+-            }
++                                           &amp;hctx, 1) &lt; 0)
++                goto err;
+         } else {
+-            RAND_pseudo_bytes(iv, 16);
+-            EVP_EncryptInit_ex(&amp;ctx, EVP_aes_128_cbc(), NULL,
+-                               tctx-&gt;tlsext_tick_aes_key, iv);
+-            HMAC_Init_ex(&amp;hctx, tctx-&gt;tlsext_tick_hmac_key, 16,
+-                         EVP_sha256(), NULL);
++            if (RAND_bytes(iv, 16) &lt;= 0)
++                goto err;
++            if (!EVP_EncryptInit_ex(&amp;ctx, EVP_aes_128_cbc(), NULL,
++                                    tctx-&gt;tlsext_tick_aes_key, iv))
++                goto err;
++            if (!HMAC_Init_ex(&amp;hctx, tctx-&gt;tlsext_tick_hmac_key, 16,
++                              EVP_sha256(), NULL))
++                goto err;
+             memcpy(key_name, tctx-&gt;tlsext_tick_key_name, 16);
+         }
+ 
+@@ -3353,14 +3361,19 @@ int ssl3_send_newsession_ticket(SSL *s)
+         memcpy(p, iv, EVP_CIPHER_CTX_iv_length(&amp;ctx));
+         p += EVP_CIPHER_CTX_iv_length(&amp;ctx);
+         /* Encrypt session data */
+-        EVP_EncryptUpdate(&amp;ctx, p, &amp;len, senc, slen);
++        if (!EVP_EncryptUpdate(&amp;ctx, p, &amp;len, senc, slen))
++            goto err;
+         p += len;
+-        EVP_EncryptFinal(&amp;ctx, p, &amp;len);
++        if (!EVP_EncryptFinal(&amp;ctx, p, &amp;len))
++            goto err;
+         p += len;
+-        EVP_CIPHER_CTX_cleanup(&amp;ctx);
+ 
+-        HMAC_Update(&amp;hctx, macstart, p - macstart);
+-        HMAC_Final(&amp;hctx, p, &amp;hlen);
++        if (!HMAC_Update(&amp;hctx, macstart, p - macstart))
++            goto err;
++        if (!HMAC_Final(&amp;hctx, p, &amp;hlen))
++            goto err;
++
++        EVP_CIPHER_CTX_cleanup(&amp;ctx);
+         HMAC_CTX_cleanup(&amp;hctx);
+ 
+         p += hlen;
+@@ -3377,6 +3390,12 @@ int ssl3_send_newsession_ticket(SSL *s)
+ 
+     /* SSL3_ST_SW_SESSION_TICKET_B */
+     return ssl_do_write(s);
++ err:
++    if (senc)
++        OPENSSL_free(senc);
++    EVP_CIPHER_CTX_cleanup(&amp;ctx);
++    HMAC_CTX_cleanup(&amp;hctx);
++    return -1;
+ }
+ 
+ int ssl3_send_cert_status(SSL *s)
+diff --git a/ssl/t1_enc.c b/ssl/t1_enc.c
+index 7333ba9..6fad8be 100644
+--- a/ssl/t1_enc.c
++++ b/ssl/t1_enc.c
+@@ -548,16 +548,24 @@ int tls1_change_cipher_state(SSL *s, int which)
+ #endif                          /* KSSL_DEBUG */
+ 
+     if (EVP_CIPHER_mode(c) == EVP_CIPH_GCM_MODE) {
+-        EVP_CipherInit_ex(dd, c, NULL, key, NULL, (which &amp; SSL3_CC_WRITE));
+-        EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_GCM_SET_IV_FIXED, k, iv);
+-    } else
+-        EVP_CipherInit_ex(dd, c, NULL, key, iv, (which &amp; SSL3_CC_WRITE));
+-
++        if (!EVP_CipherInit_ex(dd, c, NULL, key, NULL, (which &amp; SSL3_CC_WRITE))
++            || !EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_GCM_SET_IV_FIXED, k, iv)) {
++            SSLerr(SSL_F_TLS1_CHANGE_CIPHER_STATE, ERR_R_INTERNAL_ERROR);
++            goto err2;
++        }
++    } else {
++        if (!EVP_CipherInit_ex(dd, c, NULL, key, iv, (which &amp; SSL3_CC_WRITE))) {
++            SSLerr(SSL_F_TLS1_CHANGE_CIPHER_STATE, ERR_R_INTERNAL_ERROR);
++            goto err2;
++        }
++    }
+     /* Needed for &quot;composite&quot; AEADs, such as RC4-HMAC-MD5 */
+-    if ((EVP_CIPHER_flags(c) &amp; EVP_CIPH_FLAG_AEAD_CIPHER) &amp;&amp; *mac_secret_size)
+-        EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_AEAD_SET_MAC_KEY,
+-                            *mac_secret_size, mac_secret);
+-
++    if ((EVP_CIPHER_flags(c) &amp; EVP_CIPH_FLAG_AEAD_CIPHER) &amp;&amp; *mac_secret_size
++        &amp;&amp; !EVP_CIPHER_CTX_ctrl(dd, EVP_CTRL_AEAD_SET_MAC_KEY,
++                                *mac_secret_size, mac_secret)) {
++        SSLerr(SSL_F_TLS1_CHANGE_CIPHER_STATE, ERR_R_INTERNAL_ERROR);
++        goto err2;
++    }
+ #ifdef OPENSSL_SSL_TRACE_CRYPTO
+     if (s-&gt;msg_callback) {
+         int wh = which &amp; SSL3_CC_WRITE ? TLS1_RT_CRYPTO_WRITE : 0;
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000597.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="000601.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#599">[ date ]</a>
+              <a href="thread.html#599">[ thread ]</a>
+              <a href="subject.html#599">[ subject ]</a>
+              <a href="author.html#599">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

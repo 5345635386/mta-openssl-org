@@ -1,0 +1,321 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2017-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1503407610.994767.24574.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016043.html">
+   <LINK REL="Next"  HREF="016048.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1503407610.994767.24574.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Tue Aug 22 13:13:30 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016043.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="016048.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16047">[ date ]</a>
+              <a href="thread.html#16047">[ thread ]</a>
+              <a href="subject.html#16047">[ subject ]</a>
+              <a href="author.html#16047">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ffb46830e2dfd3203044e6190f50a20fec50162d (commit)
+      from  932c0df29b7a5a2902c52e2f536b5b83392e2d42 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ffb46830e2dfd3203044e6190f50a20fec50162d
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at openssl.org</A>&gt;
+Date:   Wed Aug 16 15:49:25 2017 -0400
+
+    Add random serial# support.
+    
+    Add -rand_serial to CA command and &quot;serial_rand&quot; config option.
+    
+    Up RAND_BITS to 159, and comment why: now confirms to CABForum
+    guidelines (Ballot 164) as well as IETF RFC 5280 (PKIX).
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/4185">https://github.com/openssl/openssl/pull/4185</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/apps.c               |  8 ++----
+ apps/apps.h               |  7 +++++-
+ apps/ca.c                 | 62 +++++++++++++++++++++++++++++++----------------
+ doc/man1/ca.pod           |  9 +++++++
+ test/recipes/80-test_ca.t |  2 +-
+ 5 files changed, 59 insertions(+), 29 deletions(-)
+
+diff --git a/apps/apps.c b/apps/apps.c
+index 6ff4197..79ef933 100644
+--- a/apps/apps.c
++++ b/apps/apps.c
+@@ -1503,15 +1503,11 @@ int rand_serial(BIGNUM *b, ASN1_INTEGER *ai)
+     BIGNUM *btmp;
+     int ret = 0;
+ 
+-    if (b)
+-        btmp = b;
+-    else
+-        btmp = BN_new();
+-
++    btmp = b == NULL ? BN_new() : b;
+     if (btmp == NULL)
+         return 0;
+ 
+-    if (!BN_rand(btmp, SERIAL_RAND_BITS, 0, 0))
++    if (!BN_rand(btmp, SERIAL_RAND_BITS, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY))
+         goto error;
+     if (ai &amp;&amp; !BN_to_ASN1_INTEGER(btmp, ai))
+         goto error;
+diff --git a/apps/apps.h b/apps/apps.h
+index 3b65978..fdf316a 100644
+--- a/apps/apps.h
++++ b/apps/apps.h
+@@ -568,7 +568,12 @@ void store_setup_crl_download(X509_STORE *st);
+ 
+ # define APP_PASS_LEN    1024
+ 
+-# define SERIAL_RAND_BITS        64
++/*
++ * IETF RFC 5280 says serial number must be &lt;= 20 bytes. Use 159 bits
++ * so that the first bit will never be one, so that the DER encoding
++ * rules won't force a leading octet.
++ */
++# define SERIAL_RAND_BITS        159
+ 
+ int app_isdir(const char *);
+ int app_access(const char *, int flag);
+diff --git a/apps/ca.c b/apps/ca.c
+index c1c2c49..436aa85 100644
+--- a/apps/ca.c
++++ b/apps/ca.c
+@@ -62,6 +62,7 @@
+ #define ENV_NEW_CERTS_DIR       &quot;new_certs_dir&quot;
+ #define ENV_CERTIFICATE         &quot;certificate&quot;
+ #define ENV_SERIAL              &quot;serial&quot;
++#define ENV_RAND_SERIAL         &quot;rand_serial&quot;
+ #define ENV_CRLNUMBER           &quot;crlnumber&quot;
+ #define ENV_PRIVATE_KEY         &quot;private_key&quot;
+ #define ENV_DEFAULT_DAYS        &quot;default_days&quot;
+@@ -153,6 +154,7 @@ typedef enum OPTION_choice {
+     OPT_GENCRL, OPT_MSIE_HACK, OPT_CRLDAYS, OPT_CRLHOURS, OPT_CRLSEC,
+     OPT_INFILES, OPT_SS_CERT, OPT_SPKAC, OPT_REVOKE, OPT_VALID,
+     OPT_EXTENSIONS, OPT_EXTFILE, OPT_STATUS, OPT_UPDATEDB, OPT_CRLEXTS,
++    OPT_RAND_SERIAL,
+     OPT_R_ENUM,
+     /* Do not change the order here; see related case statements below */
+     OPT_CRL_REASON, OPT_CRL_HOLD, OPT_CRL_COMPROMISE, OPT_CRL_CA_COMPROMISE
+@@ -167,6 +169,8 @@ const OPTIONS ca_options[] = {
+     {&quot;utf8&quot;, OPT_UTF8, '-', &quot;Input characters are UTF8 (default ASCII)&quot;},
+     {&quot;create_serial&quot;, OPT_CREATE_SERIAL, '-',
+      &quot;If reading serial fails, create a new random serial&quot;},
++    {&quot;rand_serial&quot;, OPT_RAND_SERIAL, '-',
++     &quot;Always create a random serial; do not store it&quot;},
+     {&quot;multivalue-rdn&quot;, OPT_MULTIVALUE_RDN, '-',
+      &quot;Enable support for multivalued RDNs&quot;},
+     {&quot;startdate&quot;, OPT_STARTDATE, 's', &quot;Cert notBefore, YYMMDDHHMMSSZ&quot;},
+@@ -258,7 +262,7 @@ int ca_main(int argc, char **argv)
+     int batch = 0, default_op = 1, doupdatedb = 0, ext_copy = EXT_COPY_NONE;
+     int keyformat = FORMAT_PEM, multirdn = 0, notext = 0, output_der = 0;
+     int ret = 1, email_dn = 1, req = 0, verbose = 0, gencrl = 0, dorevoke = 0;
+-    int i, j, selfsign = 0;
++    int rand_ser = 0, i, j, selfsign = 0;
+     long crldays = 0, crlhours = 0, crlsec = 0, days = 0;
+     unsigned long chtype = MBSTRING_ASC, certopt = 0;
+     X509 *x509 = NULL, *x509p = NULL, *x = NULL;
+@@ -303,6 +307,9 @@ opthelp:
+         case OPT_UTF8:
+             chtype = MBSTRING_UTF8;
+             break;
++        case OPT_RAND_SERIAL:
++            rand_ser = 1;
++            break;
+         case OPT_CREATE_SERIAL:
+             create_ser = 1;
+             break;
+@@ -774,9 +781,13 @@ end_of_options:
+         if (verbose)
+             BIO_printf(bio_err, &quot;policy is %s\n&quot;, policy);
+ 
+-        serialfile = lookup_conf(conf, section, ENV_SERIAL);
+-        if (serialfile == NULL)
+-            goto end;
++        if (NCONF_get_string(conf, section, ENV_RAND_SERIAL) != NULL) {
++            rand_ser = 1;
++        } else {
++            serialfile = lookup_conf(conf, section, ENV_SERIAL);
++            if (serialfile == NULL)
++                goto end;
++        }
+ 
+         if (extconf == NULL) {
+             /*
+@@ -838,18 +849,25 @@ end_of_options:
+             goto end;
+         }
+ 
+-        if ((serial = load_serial(serialfile, create_ser, NULL)) == NULL) {
+-            BIO_printf(bio_err, &quot;error while loading serial number\n&quot;);
+-            goto end;
+-        }
+-        if (verbose) {
+-            if (BN_is_zero(serial)) {
+-                BIO_printf(bio_err, &quot;next serial number is 00\n&quot;);
+-            } else {
+-                if ((f = BN_bn2hex(serial)) == NULL)
+-                    goto end;
+-                BIO_printf(bio_err, &quot;next serial number is %s\n&quot;, f);
+-                OPENSSL_free(f);
++        if (rand_ser) {
++            if ((serial = BN_new()) == NULL || !rand_serial(serial, NULL)) {
++                BIO_printf(bio_err, &quot;error generating serial number\n&quot;);
++                goto end;
++            }
++        } else {
++            if ((serial = load_serial(serialfile, create_ser, NULL)) == NULL) {
++                BIO_printf(bio_err, &quot;error while loading serial number\n&quot;);
++                goto end;
++            }
++            if (verbose) {
++                if (BN_is_zero(serial)) {
++                    BIO_printf(bio_err, &quot;next serial number is 00\n&quot;);
++                } else {
++                    if ((f = BN_bn2hex(serial)) == NULL)
++                        goto end;
++                    BIO_printf(bio_err, &quot;next serial number is %s\n&quot;, f);
++                    OPENSSL_free(f);
++                }
+             }
+         }
+ 
+@@ -973,7 +991,8 @@ end_of_options:
+             BIO_printf(bio_err, &quot;Write out database with %d new entries\n&quot;,
+                        sk_X509_num(cert_sk));
+ 
+-            if (!save_serial(serialfile, &quot;new&quot;, serial, NULL))
++            if (!rand_ser
++                    &amp;&amp; !save_serial(serialfile, &quot;new&quot;, serial, NULL))
+                 goto end;
+ 
+             if (!save_index(dbfile, &quot;new&quot;, db))
+@@ -1171,7 +1190,8 @@ end_of_options:
+ 
+         /* we have a CRL number that need updating */
+         if (crlnumberfile != NULL)
+-            if (!save_serial(crlnumberfile, &quot;new&quot;, crlnumber, NULL))
++            if (!rand_ser
++                    &amp;&amp; !save_serial(crlnumberfile, &quot;new&quot;, crlnumber, NULL))
+                 goto end;
+ 
+         BN_free(crlnumber);
+@@ -1213,16 +1233,16 @@ end_of_options:
+             BIO_printf(bio_err, &quot;Data Base Updated\n&quot;);
+         }
+     }
+-    /*****************************************************************/
+     ret = 0;
++
+  end:
++    if (ret)
++        ERR_print_errors(bio_err);
+     BIO_free_all(Sout);
+     BIO_free_all(out);
+     BIO_free_all(in);
+     sk_X509_pop_free(cert_sk, X509_free);
+ 
+-    if (ret)
+-        ERR_print_errors(bio_err);
+     if (free_key)
+         OPENSSL_free(key);
+     BN_free(serial);
+diff --git a/doc/man1/ca.pod b/doc/man1/ca.pod
+index a985631..21e692e 100644
+--- a/doc/man1/ca.pod
++++ b/doc/man1/ca.pod
+@@ -51,6 +51,7 @@ B&lt;openssl&gt; B&lt;ca&gt;
+ [B&lt;-subj arg&gt;]
+ [B&lt;-utf8&gt;]
+ [B&lt;-create_serial&gt;]
++[B&lt;-rand_serial&gt;]
+ [B&lt;-multivalue-rdn&gt;]
+ [B&lt;-rand file...&gt;]
+ [B&lt;-writerand file&gt;]
+@@ -262,6 +263,13 @@ configuration file, must be valid UTF8 strings.
+ If reading serial from the text file as specified in the configuration
+ fails, specifying this option creates a new random serial to be used as next
+ serial number.
++To get random serial numbers, use the B&lt;-rand_serial&gt; flag instead; this
++should only be used for simple error-recovery.
++
++=item B&lt;-rand_serial&gt;
++
++Generate a large random number to use as the serial number.
++This overrides any option or configuration to use a serial number file.
+ 
+ =item B&lt;-multivalue-rdn&gt;
+ 
+@@ -614,6 +622,7 @@ A sample configuration file with the relevant sections for B&lt;ca&gt;:
+ 
+  certificate    = $dir/cacert.pem       # The CA cert
+  serial         = $dir/serial           # serial no file
++ #rand_serial    = yes                  # for random serial#'s
+  private_key    = $dir/private/cakey.pem# CA private key
+  RANDFILE       = $dir/private/.rand    # random number file
+ 
+diff --git a/test/recipes/80-test_ca.t b/test/recipes/80-test_ca.t
+index 4c470fb..557777e 100644
+--- a/test/recipes/80-test_ca.t
++++ b/test/recipes/80-test_ca.t
+@@ -35,7 +35,7 @@ plan tests =&gt; 5;
+ 	 if !ok(run(perlapp([&quot;CA.pl&quot;,&quot;-newreq&quot;])),
+ 		'creating certificate request');
+ 
+-     $ENV{OPENSSL_CONFIG} = '-config &quot;'.$std_openssl_cnf.'&quot;';
++     $ENV{OPENSSL_CONFIG} = '-rand_serial -config &quot;'.$std_openssl_cnf.'&quot;';
+      skip &quot;failed to sign certificate request&quot;, 2
+ 	 if !is(yes(cmdstr(perlapp([&quot;CA.pl&quot;, &quot;-sign&quot;]))), 0,
+ 		'signing certificate request');
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016043.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="016048.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16047">[ date ]</a>
+              <a href="thread.html#16047">[ thread ]</a>
+              <a href="subject.html#16047">[ subject ]</a>
+              <a href="author.html#16047">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

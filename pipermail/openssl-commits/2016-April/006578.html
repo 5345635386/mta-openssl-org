@@ -1,0 +1,199 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-April/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461336035.668740.16487.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006576.html">
+   <LINK REL="Next"  HREF="006579.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1461336035.668740.16487.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Fri Apr 22 14:40:35 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006576.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="006579.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6578">[ date ]</a>
+              <a href="thread.html#6578">[ thread ]</a>
+              <a href="subject.html#6578">[ subject ]</a>
+              <a href="author.html#6578">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  ee85fc1dd67faebdeecb8fe8834facaee0566324 (commit)
+      from  48c1e15ceb2252e65ba63f93a7bf39c1d368f38f (commit)
+
+
+- Log -----------------------------------------------------------------
+commit ee85fc1dd67faebdeecb8fe8834facaee0566324
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Apr 19 23:33:35 2016 +0100
+
+    Don't set peer_tmp until we have finished constructing it
+    
+    If we fail halfway through constructing the peer_tmp EVP_PKEY but we have
+    already stored it in s-&gt;s3-&gt;peer_tmp then if anything tries to use it then
+    it will likely fail. This was causing s_client to core dump in the
+    sslskewith0p test. s_client was trying to print out the connection
+    parameters that it had negotiated so far. Arguably s_client should not do
+    that if the connection has failed...but given it is existing functionality
+    it's easier to fix libssl.
+    
+    Reviewed-by: Viktor Dukhovni &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">viktor at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ ssl/statem/statem_clnt.c | 63 +++++++++++++++++++++++++++---------------------
+ 1 file changed, 36 insertions(+), 27 deletions(-)
+
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 5b53b86..768cf83 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1525,9 +1525,10 @@ MSG_PROCESS_RETURN tls_process_key_exchange(SSL *s, PACKET *pkt)
+ #ifndef OPENSSL_NO_DH
+     else if (alg_k &amp; (SSL_kDHE | SSL_kDHEPSK)) {
+         PACKET prime, generator, pub_key;
++        EVP_PKEY *peer_tmp = NULL;
+ 
+-        DH *dh;
+-        BIGNUM *p, *g, *bnpub_key;
++        DH *dh = NULL;
++        BIGNUM *p = NULL, *g = NULL, *bnpub_key = NULL;
+ 
+         if (!PACKET_get_length_prefixed_2(pkt, &amp;prime)
+             || !PACKET_get_length_prefixed_2(pkt, &amp;generator)
+@@ -1536,19 +1537,13 @@ MSG_PROCESS_RETURN tls_process_key_exchange(SSL *s, PACKET *pkt)
+             goto f_err;
+         }
+ 
+-        s-&gt;s3-&gt;peer_tmp = EVP_PKEY_new();
++        peer_tmp = EVP_PKEY_new();
+         dh = DH_new();
+ 
+-        if (s-&gt;s3-&gt;peer_tmp == NULL || dh == NULL) {
++        if (peer_tmp == NULL || dh == NULL) {
++            al = SSL_AD_INTERNAL_ERROR;
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_MALLOC_FAILURE);
+-            DH_free(dh);
+-            goto err;
+-        }
+-
+-        if (EVP_PKEY_assign_DH(s-&gt;s3-&gt;peer_tmp, dh) == 0) {
+-            SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_EVP_LIB);
+-            DH_free(dh);
+-            goto err;
++            goto dherr;
+         }
+ 
+         p = BN_bin2bn(PACKET_data(&amp;prime), PACKET_remaining(&amp;prime), NULL);
+@@ -1558,39 +1553,53 @@ MSG_PROCESS_RETURN tls_process_key_exchange(SSL *s, PACKET *pkt)
+                               NULL);
+         if (p == NULL || g == NULL || bnpub_key == NULL) {
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_BN_LIB);
+-            BN_free(p);
+-            BN_free(g);
+-            BN_free(bnpub_key);
+-            goto err;
++            goto dherr;
+         }
+ 
+         if (BN_is_zero(p) || BN_is_zero(g) || BN_is_zero(bnpub_key)) {
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, SSL_R_BAD_DH_VALUE);
+-            BN_free(p);
+-            BN_free(g);
+-            BN_free(bnpub_key);
+-            goto f_err;
++            goto dherr;
+         }
+ 
+         if (!DH_set0_pqg(dh, p, NULL, g)) {
++            al = SSL_AD_INTERNAL_ERROR;
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_BN_LIB);
+-            BN_free(p);
+-            BN_free(g);
+-            BN_free(bnpub_key);
+-            goto err;
++            goto dherr;
+         }
+ 
+         if (!DH_set0_key(dh, bnpub_key, NULL)) {
++            al = SSL_AD_INTERNAL_ERROR;
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_BN_LIB);
+-            BN_free(bnpub_key);
+-            goto err;
++            goto dherr;
+         }
+ 
+         if (!ssl_security(s, SSL_SECOP_TMP_DH, DH_security_bits(dh), 0, dh)) {
+             al = SSL_AD_HANDSHAKE_FAILURE;
+             SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, SSL_R_DH_KEY_TOO_SMALL);
+-            goto f_err;
++            goto dherr;
++        }
++
++        if (EVP_PKEY_assign_DH(peer_tmp, dh) == 0) {
++            al = SSL_AD_INTERNAL_ERROR;
++            SSLerr(SSL_F_TLS_PROCESS_KEY_EXCHANGE, ERR_R_EVP_LIB);
++            goto dherr;
+         }
++
++        s-&gt;s3-&gt;peer_tmp = peer_tmp;
++
++        goto dhend;
++ dherr:
++        BN_free(p);
++        BN_free(g);
++        BN_free(bnpub_key);
++        DH_free(dh);
++        EVP_PKEY_free(peer_tmp);
++        goto f_err;
++ dhend:
++        /*
++         * FIXME: This makes assumptions about which ciphersuites come with
++         * public keys. We should have a less ad-hoc way of doing this
++         */
+         if (alg_a &amp; (SSL_aRSA|SSL_aDSS))
+             pkey = X509_get0_pubkey(s-&gt;session-&gt;peer);
+         /* else anonymous DH, so no certificate or pkey. */
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006576.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="006579.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6578">[ date ]</a>
+              <a href="thread.html#6578">[ thread ]</a>
+              <a href="subject.html#6578">[ subject ]</a>
+              <a href="author.html#6578">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

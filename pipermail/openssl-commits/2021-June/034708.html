@@ -1,0 +1,451 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623661361.717763.22726.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034707.html">
+   <LINK REL="Next"  HREF="034709.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1623661361.717763.22726.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Mon Jun 14 09:02:41 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034707.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034709.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34708">[ date ]</a>
+              <a href="thread.html#34708">[ thread ]</a>
+              <a href="subject.html#34708">[ subject ]</a>
+              <a href="author.html#34708">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  8c7c1c84cbaa38a4053404883d666ea8dff81b3a (commit)
+      from  1c49be8673713d2ceb03a63be03531d9b28a46bd (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 8c7c1c84cbaa38a4053404883d666ea8dff81b3a
+Author: Matt Caswell &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">matt at openssl.org</A>&gt;
+Date:   Tue Jun 8 11:49:06 2021 +0100
+
+    Add a generic SubjectPublicKeyInfo decoder
+    
+    Previously all the SubjectPublicKeyInfo decoders were specific to a key
+    type. We would iterate over all them until a match was found for the correct
+    key type. Each one would fully decode the key before then testing whether
+    it was a match or not - throwing it away if not. This was very inefficient.
+    
+    Instead we introduce a generic SubjectPublicKeyInfo decoder which figures
+    out what type of key is contained within it, before subsequently passing on
+    the data to a key type specific SubjectPublicKeyInfo decoder.
+    
+    Fixes #15646
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15662">https://github.com/openssl/openssl/pull/15662</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/ec/ec_backend.c                             |  29 +++++
+ crypto/x509/x_pubkey.c                             |  17 +++
+ include/crypto/ec.h                                |   1 +
+ include/crypto/x509.h                              |   4 +
+ providers/decoders.inc                             |   5 +
+ providers/implementations/encode_decode/build.info |   3 +-
+ .../implementations/encode_decode/decode_der2key.c |  18 +--
+ .../encode_decode/decode_spki2typespki.c           | 124 +++++++++++++++++++++
+ .../encode_decode/endecoder_common.c               |  19 +++-
+ .../encode_decode/endecoder_local.h                |   2 +
+ .../implementations/include/prov/implementations.h |   1 +
+ 11 files changed, 204 insertions(+), 19 deletions(-)
+ create mode 100644 providers/implementations/encode_decode/decode_spki2typespki.c
+
+diff --git a/crypto/ec/ec_backend.c b/crypto/ec/ec_backend.c
+index defcb649fb..9b4467f2be 100644
+--- a/crypto/ec/ec_backend.c
++++ b/crypto/ec/ec_backend.c
+@@ -726,6 +726,35 @@ int ossl_ec_pt_format_param2id(const OSSL_PARAM *p, int *id)
+ }
+ 
+ #ifndef FIPS_MODULE
++int ossl_x509_algor_is_sm2(const X509_ALGOR *palg)
++{
++    int ptype = 0;
++    const void *pval = NULL;
++
++    X509_ALGOR_get0(NULL, &amp;ptype, &amp;pval, palg);
++
++    if (ptype == V_ASN1_OBJECT)
++        return OBJ_obj2nid((ASN1_OBJECT *)pval) == NID_sm2;
++
++    if (ptype == V_ASN1_SEQUENCE) {
++        const ASN1_STRING *str = pval;
++        const unsigned char *der = str-&gt;data;
++        int derlen = str-&gt;length;
++        EC_GROUP *group;
++        int ret;
++
++        if ((group = d2i_ECPKParameters(NULL, &amp;der, derlen)) == NULL)
++            ret = 0;
++        else
++            ret = (EC_GROUP_get_curve_name(group) == NID_sm2);
++
++        EC_GROUP_free(group);
++        return ret;
++    }
++
++    return 0;
++}
++
+ EC_KEY *ossl_ec_key_param_from_x509_algor(const X509_ALGOR *palg,
+                                      OSSL_LIB_CTX *libctx, const char *propq)
+ {
+diff --git a/crypto/x509/x_pubkey.c b/crypto/x509/x_pubkey.c
+index 3f447c4c12..e669ae3574 100644
+--- a/crypto/x509/x_pubkey.c
++++ b/crypto/x509/x_pubkey.c
+@@ -65,6 +65,23 @@ ASN1_SEQUENCE(X509_PUBKEY_INTERNAL) = {
+         ASN1_SIMPLE(X509_PUBKEY, public_key, ASN1_BIT_STRING)
+ } static_ASN1_SEQUENCE_END_name(X509_PUBKEY, X509_PUBKEY_INTERNAL)
+ 
++X509_PUBKEY *ossl_d2i_X509_PUBKEY_INTERNAL(const unsigned char **pp,
++                                           long len, OSSL_LIB_CTX *libctx)
++{
++    X509_PUBKEY *xpub = OPENSSL_zalloc(sizeof(*xpub));
++
++    if (xpub == NULL)
++        return NULL;
++    return (X509_PUBKEY *)ASN1_item_d2i_ex((ASN1_VALUE **)&amp;xpub, pp, len,
++                                           ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL),
++                                           libctx, NULL);
++}
++
++void ossl_X509_PUBKEY_INTERNAL_free(X509_PUBKEY *xpub)
++{
++    ASN1_item_free((ASN1_VALUE *)xpub, ASN1_ITEM_rptr(X509_PUBKEY_INTERNAL));
++}
++
+ static void x509_pubkey_ex_free(ASN1_VALUE **pval, const ASN1_ITEM *it)
+ {
+     X509_PUBKEY *pubkey = (X509_PUBKEY *)*pval;
+diff --git a/include/crypto/ec.h b/include/crypto/ec.h
+index acb14effc9..77972c3650 100644
+--- a/include/crypto/ec.h
++++ b/include/crypto/ec.h
+@@ -80,6 +80,7 @@ int ossl_ec_key_fromdata(EC_KEY *ecx, const OSSL_PARAM params[],
+ int ossl_ec_key_otherparams_fromdata(EC_KEY *ec, const OSSL_PARAM params[]);
+ int ossl_ec_key_is_foreign(const EC_KEY *ec);
+ EC_KEY *ossl_ec_key_dup(const EC_KEY *key, int selection);
++int ossl_x509_algor_is_sm2(const X509_ALGOR *palg);
+ EC_KEY *ossl_ec_key_param_from_x509_algor(const X509_ALGOR *palg,
+                                           OSSL_LIB_CTX *libctx,
+                                           const char *propq);
+diff --git a/include/crypto/x509.h b/include/crypto/x509.h
+index acb1d7b64a..db83db0c92 100644
+--- a/include/crypto/x509.h
++++ b/include/crypto/x509.h
+@@ -332,6 +332,10 @@ int ossl_x509_PUBKEY_get0_libctx(OSSL_LIB_CTX **plibctx, const char **ppropq,
+ /* Calculate default key identifier according to RFC 5280 section 4.2.1.2 (1) */
+ ASN1_OCTET_STRING *ossl_x509_pubkey_hash(X509_PUBKEY *pubkey);
+ 
++X509_PUBKEY *ossl_d2i_X509_PUBKEY_INTERNAL(const unsigned char **pp,
++                                           long len, OSSL_LIB_CTX *libctx);
++void ossl_X509_PUBKEY_INTERNAL_free(X509_PUBKEY *xpub);
++
+ RSA *ossl_d2i_RSA_PSS_PUBKEY(RSA **a, const unsigned char **pp, long length);
+ int ossl_i2d_RSA_PSS_PUBKEY(const RSA *a, unsigned char **pp);
+ # ifndef OPENSSL_NO_DH
+diff --git a/providers/decoders.inc b/providers/decoders.inc
+index 02b2b32c3f..b562a45ee9 100644
+--- a/providers/decoders.inc
++++ b/providers/decoders.inc
+@@ -80,6 +80,11 @@ DECODER_w_structure(&quot;RSA-PSS&quot;, der, SubjectPublicKeyInfo, rsapss, yes),
+ DECODER(&quot;RSA&quot;, msblob, rsa, yes),
+ DECODER(&quot;RSA&quot;, pvk, rsa, yes),
+ 
++/*
++ * A decoder that takes a SubjectPublicKeyInfo and figures out the types of key
++ * that it contains. The output is the same SubjectPublicKeyInfo
++ */
++DECODER_w_structure(&quot;DER&quot;, der, SubjectPublicKeyInfo, der, yes),
+ DECODER(&quot;DER&quot;, pem, der, yes),
+ /*
+  * A decoder that recognises PKCS#8 EncryptedPrivateKeyInfo structure
+diff --git a/providers/implementations/encode_decode/build.info b/providers/implementations/encode_decode/build.info
+index 22f11cbceb..d3f6ca4abd 100644
+--- a/providers/implementations/encode_decode/build.info
++++ b/providers/implementations/encode_decode/build.info
+@@ -7,7 +7,8 @@ $DECODER_GOAL=../../libdefault.a
+ SOURCE[$ENCODER_GOAL]=endecoder_common.c
+ 
+ SOURCE[$DECODER_GOAL]=decode_der2key.c decode_epki2pki.c decode_pem2der.c \
+-                      decode_msblob2key.c decode_pvk2key.c
++                      decode_msblob2key.c decode_pvk2key.c \
++                      decode_spki2typespki.c
+ 
+ SOURCE[$ENCODER_GOAL]=encode_key2any.c encode_key2text.c encode_key2ms.c
+ # encode_key2blob.c is only being included when EC is enabled, because we
+diff --git a/providers/implementations/encode_decode/decode_der2key.c b/providers/implementations/encode_decode/decode_der2key.c
+index 7de44ed75d..fd4a7c6e2a 100644
+--- a/providers/implementations/encode_decode/decode_der2key.c
++++ b/providers/implementations/encode_decode/decode_der2key.c
+@@ -93,22 +93,6 @@ struct der2key_ctx_st {
+     unsigned int flag_fatal : 1;
+ };
+ 
+-static int read_der(PROV_CTX *provctx, OSSL_CORE_BIO *cin,
+-                    unsigned char **data, long *len)
+-{
+-    BUF_MEM *mem = NULL;
+-    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
+-    int ok = (asn1_d2i_read_bio(in, &amp;mem) &gt;= 0);
+-
+-    if (ok) {
+-        *data = (unsigned char *)mem-&gt;data;
+-        *len = (long)mem-&gt;length;
+-        OPENSSL_free(mem);
+-    }
+-    BIO_free(in);
+-    return ok;
+-}
+-
+ typedef void *key_from_pkcs8_t(const PKCS8_PRIV_KEY_INFO *p8inf,
+                                OSSL_LIB_CTX *libctx, const char *propq);
+ static void *der2key_decode_p8(const unsigned char **input_der,
+@@ -214,7 +198,7 @@ static int der2key_decode(void *vctx, OSSL_CORE_BIO *cin, int selection,
+         return 0;
+     }
+ 
+-    ok = read_der(ctx-&gt;provctx, cin, &amp;der, &amp;der_len);
++    ok = ossl_read_der(ctx-&gt;provctx, cin, &amp;der, &amp;der_len);
+     if (!ok)
+         goto next;
+ 
+diff --git a/providers/implementations/encode_decode/decode_spki2typespki.c b/providers/implementations/encode_decode/decode_spki2typespki.c
+new file mode 100644
+index 0000000000..3a4c83e8b5
+--- /dev/null
++++ b/providers/implementations/encode_decode/decode_spki2typespki.c
+@@ -0,0 +1,124 @@
++/*
++ * Copyright 2020-2021 The OpenSSL Project Authors. All Rights Reserved.
++ *
++ * Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++ * this file except in compliance with the License.  You can obtain a copy
++ * in the file LICENSE in the source distribution or at
++ * <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++ */
++
++#include &lt;string.h&gt;
++#include &lt;openssl/asn1t.h&gt;
++#include &lt;openssl/core_names.h&gt;
++#include &lt;openssl/core_object.h&gt;
++#include &lt;openssl/params.h&gt;
++#include &lt;openssl/x509.h&gt;
++#include &quot;internal/sizes.h&quot;
++#include &quot;crypto/x509.h&quot;
++#include &quot;crypto/ec.h&quot;
++#include &quot;prov/bio.h&quot;
++#include &quot;prov/implementations.h&quot;
++#include &quot;endecoder_local.h&quot;
++
++static OSSL_FUNC_decoder_newctx_fn spki2typespki_newctx;
++static OSSL_FUNC_decoder_freectx_fn spki2typespki_freectx;
++static OSSL_FUNC_decoder_decode_fn spki2typespki_decode;
++
++/*
++ * Context used for SubjectPublicKeyInfo to Type specific SubjectPublicKeyInfo
++ * decoding.
++ */
++struct spki2typespki_ctx_st {
++    PROV_CTX *provctx;
++};
++
++static void *spki2typespki_newctx(void *provctx)
++{
++    struct spki2typespki_ctx_st *ctx = OPENSSL_zalloc(sizeof(*ctx));
++
++    if (ctx != NULL)
++        ctx-&gt;provctx = provctx;
++    return ctx;
++}
++
++static void spki2typespki_freectx(void *vctx)
++{
++    struct spki2typespki_ctx_st *ctx = vctx;
++
++    OPENSSL_free(ctx);
++}
++
++static int spki2typespki_decode(void *vctx, OSSL_CORE_BIO *cin, int selection,
++                                OSSL_CALLBACK *data_cb, void *data_cbarg,
++                                OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
++{
++    struct spki2typespki_ctx_st *ctx = vctx;
++    unsigned char *der, *derp;
++    long len;
++    int ok = 0;
++    int objtype = OSSL_OBJECT_PKEY;
++    X509_PUBKEY *xpub = NULL;
++    X509_ALGOR *algor = NULL;
++    const ASN1_OBJECT *oid = NULL;
++    char dataname[OSSL_MAX_NAME_SIZE];
++    OSSL_PARAM params[5], *p = params;
++
++    if (!ossl_read_der(ctx-&gt;provctx, cin, &amp;der, &amp;len))
++        return 1;
++    derp = der;
++    xpub = ossl_d2i_X509_PUBKEY_INTERNAL((const unsigned char **)&amp;derp, len,
++                                         PROV_LIBCTX_OF(ctx-&gt;provctx));
++
++
++    if (xpub == NULL) {
++        /* We return &quot;empty handed&quot;.  This is not an error. */
++        ok = 1;
++        goto end;
++    }
++
++    if (!X509_PUBKEY_get0_param(NULL, NULL, NULL, &amp;algor, xpub))
++        goto end;
++    X509_ALGOR_get0(&amp;oid, NULL, NULL, algor);
++
++#ifndef OPENSSL_NO_EC
++    /* SM2 abuses the EC oid, so this could actually be SM2 */
++    if (OBJ_obj2nid(oid) == NID_X9_62_id_ecPublicKey
++            &amp;&amp; ossl_x509_algor_is_sm2(algor))
++        strcpy(dataname, &quot;SM2&quot;);
++    else
++#endif
++    if (!OBJ_obj2txt(dataname, sizeof(dataname), oid, 0))
++        goto end;
++
++    ossl_X509_PUBKEY_INTERNAL_free(xpub);
++    xpub = NULL;
++
++    *p++ =
++        OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
++                                            dataname, 0);
++
++    *p++ =
++        OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_STRUCTURE,
++                                            &quot;SubjectPublicKeyInfo&quot;,
++                                            0);
++    *p++ =
++        OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_DATA, der, len);
++    *p++ =
++        OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &amp;objtype);
++
++    *p = OSSL_PARAM_construct_end();
++
++    ok = data_cb(params, data_cbarg);
++
++ end:
++    ossl_X509_PUBKEY_INTERNAL_free(xpub);
++    OPENSSL_free(der);
++    return ok;
++}
++
++const OSSL_DISPATCH ossl_SubjectPublicKeyInfo_der_to_der_decoder_functions[] = {
++    { OSSL_FUNC_DECODER_NEWCTX, (void (*)(void))spki2typespki_newctx },
++    { OSSL_FUNC_DECODER_FREECTX, (void (*)(void))spki2typespki_freectx },
++    { OSSL_FUNC_DECODER_DECODE, (void (*)(void))spki2typespki_decode },
++    { 0, NULL }
++};
+diff --git a/providers/implementations/encode_decode/endecoder_common.c b/providers/implementations/encode_decode/endecoder_common.c
+index c85fe915ac..7d26e2a340 100644
+--- a/providers/implementations/encode_decode/endecoder_common.c
++++ b/providers/implementations/encode_decode/endecoder_common.c
+@@ -8,7 +8,9 @@
+  */
+ 
+ #include &lt;openssl/core.h&gt;
+-
++#include &lt;openssl/buffer.h&gt;
++#include &quot;internal/asn1.h&quot;
++#include &quot;prov/bio.h&quot;
+ #include &quot;endecoder_local.h&quot;
+ 
+ OSSL_FUNC_keymgmt_new_fn *
+@@ -82,3 +84,18 @@ void ossl_prov_free_key(const OSSL_DISPATCH *fns, void *key)
+         kmgmt_free(key);
+ }
+ 
++int ossl_read_der(PROV_CTX *provctx, OSSL_CORE_BIO *cin,  unsigned char **data,
++                  long *len)
++{
++    BUF_MEM *mem = NULL;
++    BIO *in = ossl_bio_new_from_core_bio(provctx, cin);
++    int ok = (asn1_d2i_read_bio(in, &amp;mem) &gt;= 0);
++
++    if (ok) {
++        *data = (unsigned char *)mem-&gt;data;
++        *len = (long)mem-&gt;length;
++        OPENSSL_free(mem);
++    }
++    BIO_free(in);
++    return ok;
++}
+diff --git a/providers/implementations/encode_decode/endecoder_local.h b/providers/implementations/encode_decode/endecoder_local.h
+index ab431b8086..96941e4d16 100644
+--- a/providers/implementations/encode_decode/endecoder_local.h
++++ b/providers/implementations/encode_decode/endecoder_local.h
+@@ -24,3 +24,5 @@ int ossl_prov_der_from_p8(unsigned char **new_der, long *new_der_len,
+ void *ossl_prov_import_key(const OSSL_DISPATCH *fns, void *provctx,
+                            int selection, const OSSL_PARAM params[]);
+ void ossl_prov_free_key(const OSSL_DISPATCH *fns, void *key);
++int ossl_read_der(PROV_CTX *provctx, OSSL_CORE_BIO *cin,  unsigned char **data,
++                  long *len);
+diff --git a/providers/implementations/include/prov/implementations.h b/providers/implementations/include/prov/implementations.h
+index 7b59e7308d..855bd90919 100644
+--- a/providers/implementations/include/prov/implementations.h
++++ b/providers/implementations/include/prov/implementations.h
+@@ -484,6 +484,7 @@ extern const OSSL_DISPATCH ossl_PrivateKeyInfo_der_to_rsapss_decoder_functions[]
+ extern const OSSL_DISPATCH ossl_SubjectPublicKeyInfo_der_to_rsapss_decoder_functions[];
+ 
+ extern const OSSL_DISPATCH ossl_EncryptedPrivateKeyInfo_der_to_der_decoder_functions[];
++extern const OSSL_DISPATCH ossl_SubjectPublicKeyInfo_der_to_der_decoder_functions[];
+ extern const OSSL_DISPATCH ossl_pem_to_der_decoder_functions[];
+ 
+ extern const OSSL_DISPATCH ossl_file_store_functions[];
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034707.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034709.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34708">[ date ]</a>
+              <a href="thread.html#34708">[ thread ]</a>
+              <a href="subject.html#34708">[ subject ]</a>
+              <a href="author.html#34708">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

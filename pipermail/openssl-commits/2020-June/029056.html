@@ -1,0 +1,322 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2020-June/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1591120894.588631.23548.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029046.html">
+   <LINK REL="Next"  HREF="029058.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Richard Levitte</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1591120894.588631.23548.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">levitte at openssl.org
+       </A><BR>
+    <I>Tue Jun  2 18:01:34 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029046.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="029058.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29056">[ date ]</a>
+              <a href="thread.html#29056">[ thread ]</a>
+              <a href="subject.html#29056">[ subject ]</a>
+              <a href="author.html#29056">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  29c49b2534fbd60338f61e94c2893d774f9361a9 (commit)
+       via  eb2bba2569a3637b8477c56f82b616222f5af46f (commit)
+      from  a5a87011baeef71c86938a2bae54f89fbe99e5dc (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 29c49b2534fbd60338f61e94c2893d774f9361a9
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Mon May 18 08:35:29 2020 +0200
+
+    TEST: Test i2d_PKCS8PrivateKey_bio() and PEM_write_bio_PKCS8PrivateKey()
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11855">https://github.com/openssl/openssl/pull/11855</A>)
+
+commit eb2bba2569a3637b8477c56f82b616222f5af46f
+Author: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+Date:   Mon May 18 08:32:28 2020 +0200
+
+    PEM: Make PKCS8 serializers aware of OSSL_SERIALIZERs
+    
+    PEM_write_bio_PKCS8PrivateKey(), i2d_PKCS8PrivateKey_bio(),
+    PEM_write_PKCS8PrivateKey(), and i2d_PKCS8PrivateKey_fp() are affected
+    by this.
+    
+    Fixes #11845
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/11855">https://github.com/openssl/openssl/pull/11855</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/pem/pem_pk8.c  | 117 +++++++++++++++++++++++++++++++++++---------------
+ test/evp_extra_test.c |  35 +++++++++++++++
+ 2 files changed, 117 insertions(+), 35 deletions(-)
+
+diff --git a/crypto/pem/pem_pk8.c b/crypto/pem/pem_pk8.c
+index 6b7840508b..6098d92342 100644
+--- a/crypto/pem/pem_pk8.c
++++ b/crypto/pem/pem_pk8.c
+@@ -15,6 +15,7 @@
+ #include &lt;openssl/x509.h&gt;
+ #include &lt;openssl/pkcs12.h&gt;
+ #include &lt;openssl/pem.h&gt;
++#include &lt;openssl/serializer.h&gt;
+ 
+ static int do_pk8pkey(BIO *bp, const EVP_PKEY *x, int isder,
+                       int nid, const EVP_CIPHER *enc,
+@@ -66,49 +67,95 @@ static int do_pk8pkey(BIO *bp, const EVP_PKEY *x, int isder, int nid,
+                       const EVP_CIPHER *enc, const char *kstr, int klen,
+                       pem_password_cb *cb, void *u)
+ {
+-    X509_SIG *p8;
+-    PKCS8_PRIV_KEY_INFO *p8inf;
+-    char buf[PEM_BUFSIZE];
+-    int ret;
++    int ret = 0;
++    const char *pq = isder
++        ? OSSL_SERIALIZER_PrivateKey_TO_DER_PQ
++        : OSSL_SERIALIZER_PrivateKey_TO_PEM_PQ;
++    OSSL_SERIALIZER_CTX *ctx = OSSL_SERIALIZER_CTX_new_by_EVP_PKEY(x, pq);
+ 
+-    if ((p8inf = EVP_PKEY2PKCS8(x)) == NULL) {
+-        PEMerr(PEM_F_DO_PK8PKEY, PEM_R_ERROR_CONVERTING_PRIVATE_KEY);
++    if (ctx == NULL)
+         return 0;
++
++    /*
++     * If no keystring or callback is set, OpenSSL traditionally uses the
++     * user's cb argument as a password string, or if that's NULL, it falls
++     * back on PEM_def_callback().
++     */
++    if (kstr == NULL &amp;&amp; cb == NULL) {
++        if (u != NULL) {
++            kstr = u;
++            klen = strlen(u);
++        } else {
++            cb = PEM_def_callback;
++        }
+     }
+-    if (enc || (nid != -1)) {
+-        if (!kstr) {
+-            if (!cb)
+-                klen = PEM_def_callback(buf, PEM_BUFSIZE, 1, u);
+-            else
+-                klen = cb(buf, PEM_BUFSIZE, 1, u);
+-            if (klen &lt;= 0) {
+-                PEMerr(PEM_F_DO_PK8PKEY, PEM_R_READ_KEY);
+-                PKCS8_PRIV_KEY_INFO_free(p8inf);
+-                return 0;
+-            }
+ 
+-            kstr = buf;
++    if (OSSL_SERIALIZER_CTX_get_serializer(ctx) != NULL) {
++        ret = 1;
++        if (enc != NULL) {
++            ret = 0;
++            if (OSSL_SERIALIZER_CTX_set_cipher(ctx, EVP_CIPHER_name(enc),
++                                               NULL)) {
++                const unsigned char *ukstr = (const unsigned char *)kstr;
++
++                /*
++                 * Try to pass the passphrase if one was given, or the
++                 * passphrase callback if one was given.  If none of them
++                 * are given and that's wrong, we rely on the _to_bio()
++                 * call to generate errors.
++                 */
++                ret = 1;
++                if (kstr != NULL
++                    &amp;&amp; !OSSL_SERIALIZER_CTX_set_passphrase(ctx, ukstr, klen))
++                    ret = 0;
++                else if (cb != NULL
++                         &amp;&amp; !OSSL_SERIALIZER_CTX_set_passphrase_cb(ctx, 1,
++                                                                   cb, u))
++                    ret = 0;
++            }
+         }
+-        p8 = PKCS8_encrypt(nid, enc, kstr, klen, NULL, 0, 0, p8inf);
+-        if (kstr == buf)
+-            OPENSSL_cleanse(buf, klen);
+-        PKCS8_PRIV_KEY_INFO_free(p8inf);
+-        if (p8 == NULL)
+-            return 0;
+-        if (isder)
+-            ret = i2d_PKCS8_bio(bp, p8);
+-        else
+-            ret = PEM_write_bio_PKCS8(bp, p8);
+-        X509_SIG_free(p8);
+-        return ret;
++        ret = ret &amp;&amp; OSSL_SERIALIZER_to_bio(ctx, bp);
+     } else {
+-        if (isder)
+-            ret = i2d_PKCS8_PRIV_KEY_INFO_bio(bp, p8inf);
+-        else
+-            ret = PEM_write_bio_PKCS8_PRIV_KEY_INFO(bp, p8inf);
++        X509_SIG *p8;
++        PKCS8_PRIV_KEY_INFO *p8inf;
++        char buf[PEM_BUFSIZE];
++
++        ret = 0;
++        if ((p8inf = EVP_PKEY2PKCS8(x)) == NULL) {
++            PEMerr(PEM_F_DO_PK8PKEY, PEM_R_ERROR_CONVERTING_PRIVATE_KEY);
++            goto legacy_end;
++        }
++        if (enc || (nid != -1)) {
++            if (kstr == NULL) {
++                klen = cb(buf, PEM_BUFSIZE, 1, u);
++                if (klen &lt;= 0) {
++                    PEMerr(PEM_F_DO_PK8PKEY, PEM_R_READ_KEY);
++                    goto legacy_end;
++                }
++
++                kstr = buf;
++            }
++            p8 = PKCS8_encrypt(nid, enc, kstr, klen, NULL, 0, 0, p8inf);
++            if (kstr == buf)
++                OPENSSL_cleanse(buf, klen);
++            if (p8 == NULL)
++                goto legacy_end;
++            if (isder)
++                ret = i2d_PKCS8_bio(bp, p8);
++            else
++                ret = PEM_write_bio_PKCS8(bp, p8);
++            X509_SIG_free(p8);
++        } else {
++            if (isder)
++                ret = i2d_PKCS8_PRIV_KEY_INFO_bio(bp, p8inf);
++            else
++                ret = PEM_write_bio_PKCS8_PRIV_KEY_INFO(bp, p8inf);
++        }
++     legacy_end:
+         PKCS8_PRIV_KEY_INFO_free(p8inf);
+-        return ret;
+     }
++    OSSL_SERIALIZER_CTX_free(ctx);
++    return ret;
+ }
+ 
+ EVP_PKEY *d2i_PKCS8PrivateKey_bio(BIO *bp, EVP_PKEY **x, pem_password_cb *cb,
+diff --git a/test/evp_extra_test.c b/test/evp_extra_test.c
+index e6a76a1fa6..7f07ab738e 100644
+--- a/test/evp_extra_test.c
++++ b/test/evp_extra_test.c
+@@ -767,6 +767,40 @@ static int test_EVP_PKCS82PKEY(void)
+ }
+ #endif
+ 
++/* This uses kExampleRSAKeyDER and kExampleRSAKeyPKCS8 to verify encoding */
++static int test_privatekey_to_pkcs8(void)
++{
++    EVP_PKEY *pkey = NULL;
++    BIO *membio = NULL;
++    char *membuf = NULL;
++    size_t membuf_len = 0;
++    int ok = 0;
++
++    if (!TEST_ptr(membio = BIO_new(BIO_s_mem()))
++        || !TEST_ptr(pkey = load_example_rsa_key())
++        || !TEST_int_gt(i2d_PKCS8PrivateKey_bio(membio, pkey, NULL,
++                                                NULL, 0, NULL, NULL),
++                        0)
++        || !TEST_ptr((membuf_len = (size_t)BIO_get_mem_data(membio, &amp;membuf),
++                      membuf))
++        || !TEST_mem_eq(membuf, membuf_len,
++                        kExampleRSAKeyPKCS8, sizeof(kExampleRSAKeyPKCS8))
++        /*
++         * We try to write PEM as well, just to see that it doesn't err, but
++         * assume that the result is correct.
++         */
++        || !TEST_int_gt(PEM_write_bio_PKCS8PrivateKey(membio, pkey, NULL,
++                                                      NULL, 0, NULL, NULL),
++                        0))
++        goto done;
++
++    ok = 1;
++ done:
++    EVP_PKEY_free(pkey);
++    BIO_free_all(membio);
++    return ok;
++}
++
+ #if !defined(OPENSSL_NO_SM2) &amp;&amp; !defined(FIPS_MODULE)
+ 
+ static int test_EVP_SM2_verify(void)
+@@ -1718,6 +1752,7 @@ int setup_tests(void)
+     ADD_TEST(test_EVP_DigestVerifyInit);
+     ADD_TEST(test_EVP_Enveloped);
+     ADD_ALL_TESTS(test_d2i_AutoPrivateKey, OSSL_NELEM(keydata));
++    ADD_TEST(test_privatekey_to_pkcs8);
+ #ifndef OPENSSL_NO_EC
+     ADD_TEST(test_EVP_PKCS82PKEY);
+ #endif
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029046.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="029058.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29056">[ date ]</a>
+              <a href="thread.html#29056">[ thread ]</a>
+              <a href="subject.html#29056">[ subject ]</a>
+              <a href="author.html#29056">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

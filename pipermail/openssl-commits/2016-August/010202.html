@@ -1,0 +1,288 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2016-August/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1472121859.547246.11646.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010201.html">
+   <LINK REL="Next"  HREF="010203.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Matt Caswell</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1472121859.547246.11646.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">matt at openssl.org
+       </A><BR>
+    <I>Thu Aug 25 10:44:19 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010201.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="010203.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10202">[ date ]</a>
+              <a href="thread.html#10202">[ thread ]</a>
+              <a href="subject.html#10202">[ subject ]</a>
+              <a href="author.html#10202">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  647ac8d3d7143e3721d55e1f57730b6f26e72fc9 (commit)
+       via  0fe17491c34848db3cbb39c1841099161b4b449f (commit)
+      from  cc069067075d77c7a61e44a253aec917d0b6a2f5 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 647ac8d3d7143e3721d55e1f57730b6f26e72fc9
+Author: Dr. Stephen Henson &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">steve at openssl.org</A>&gt;
+Date:   Wed Aug 24 18:55:51 2016 +0100
+
+    Support broken PKCS#12 key generation.
+    
+    OpenSSL versions before 1.1.0 didn't convert non-ASCII
+    UTF8 PKCS#12 passwords to Unicode correctly.
+    
+    To correctly decrypt older files, if MAC verification fails
+    with the supplied password attempt to use the broken format
+    which is compatible with earlier versions of OpenSSL.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+commit 0fe17491c34848db3cbb39c1841099161b4b449f
+Author: Andy Polyakov &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">appro at openssl.org</A>&gt;
+Date:   Wed Aug 24 18:54:10 2016 +0100
+
+    Don't switch password formats using global state.
+    
+    To avoid possible race conditions don't switch password format using
+    global state in crypto/pkcs12
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/pkcs12.c            | 27 +++++++++++++++++++++----
+ crypto/pkcs12/p12_crpt.c | 18 +----------------
+ crypto/pkcs12/p12_lcl.h  | 10 ----------
+ crypto/pkcs12/p12_mutl.c | 52 ++----------------------------------------------
+ 4 files changed, 26 insertions(+), 81 deletions(-)
+
+diff --git a/apps/pkcs12.c b/apps/pkcs12.c
+index f8806b9..93489d6 100644
+--- a/apps/pkcs12.c
++++ b/apps/pkcs12.c
+@@ -132,7 +132,7 @@ int pkcs12_main(int argc, char **argv)
+     int noprompt = 0;
+     char *passinarg = NULL, *passoutarg = NULL, *passarg = NULL;
+     char *passin = NULL, *passout = NULL, *inrand = NULL, *macalg = NULL;
+-    char *cpass = NULL, *mpass = NULL;
++    char *cpass = NULL, *mpass = NULL, *badpass = NULL;
+     const char *CApath = NULL, *CAfile = NULL, *prog;
+     int noCApath = 0, noCAfile = 0;
+     ENGINE *e = NULL;
+@@ -539,9 +539,27 @@ int pkcs12_main(int argc, char **argv)
+             if (!twopass)
+                 cpass = NULL;
+         } else if (!PKCS12_verify_mac(p12, mpass, -1)) {
+-            BIO_printf(bio_err, &quot;Mac verify error: invalid password?\n&quot;);
+-            ERR_print_errors(bio_err);
+-            goto end;
++            /*
++             * May be UTF8 from previous version of OpenSSL:
++             * convert to a UTF8 form which will translate
++             * to the same Unicode password.
++             */
++            unsigned char *utmp;
++            int utmplen;
++            utmp = OPENSSL_asc2uni(mpass, -1, NULL, &amp;utmplen);
++            if (utmp == NULL)
++                goto end;
++            badpass = OPENSSL_uni2utf8(utmp, utmplen);
++            OPENSSL_free(utmp);
++            if (!PKCS12_verify_mac(p12, badpass, -1)) {
++                BIO_printf(bio_err, &quot;Mac verify error: invalid password?\n&quot;);
++                ERR_print_errors(bio_err);
++                goto end;
++            } else {
++                BIO_printf(bio_err, &quot;Warning: using broken algorithm\n&quot;);
++                if (!twopass)
++                    cpass = badpass;
++            }
+         }
+     }
+ 
+@@ -559,6 +577,7 @@ int pkcs12_main(int argc, char **argv)
+     BIO_free(in);
+     BIO_free_all(out);
+     sk_OPENSSL_STRING_free(canames);
++    OPENSSL_free(badpass);
+     OPENSSL_free(passin);
+     OPENSSL_free(passout);
+     return (ret);
+diff --git a/crypto/pkcs12/p12_crpt.c b/crypto/pkcs12/p12_crpt.c
+index d30aab3..feef9d1 100644
+--- a/crypto/pkcs12/p12_crpt.c
++++ b/crypto/pkcs12/p12_crpt.c
+@@ -17,16 +17,6 @@ void PKCS12_PBE_add(void)
+ {
+ }
+ 
+-#undef PKCS12_key_gen
+-/*
+- * See p12_multi.c:PKCS12_verify_mac() for details...
+- */
+-extern int (*PKCS12_key_gen)(const char *pass, int passlen,
+-                             unsigned char *salt, int slen,
+-                             int id, int iter, int n,
+-                             unsigned char *out,
+-                             const EVP_MD *md_type);
+-
+ int PKCS12_PBE_keyivgen(EVP_CIPHER_CTX *ctx, const char *pass, int passlen,
+                         ASN1_TYPE *param, const EVP_CIPHER *cipher,
+                         const EVP_MD *md, int en_de)
+@@ -41,13 +31,7 @@ int PKCS12_PBE_keyivgen(EVP_CIPHER_CTX *ctx, const char *pass, int passlen,
+                           unsigned char *out,
+                           const EVP_MD *md_type);
+ 
+-    if (PKCS12_key_gen == NULL || en_de)
+-        /*
+-         * Default to UTF-8, but force it in encrypt case.
+-         */
+-        pkcs12_key_gen = PKCS12_key_gen_utf8;
+-    else
+-        pkcs12_key_gen = PKCS12_key_gen;
++    pkcs12_key_gen = PKCS12_key_gen_utf8;
+ 
+     if (cipher == NULL)
+         return 0;
+diff --git a/crypto/pkcs12/p12_lcl.h b/crypto/pkcs12/p12_lcl.h
+index 9a27f2f..0b52f1e 100644
+--- a/crypto/pkcs12/p12_lcl.h
++++ b/crypto/pkcs12/p12_lcl.h
+@@ -41,13 +41,3 @@ struct pkcs12_bag_st {
+         ASN1_TYPE *other;       /* Secret or other bag */
+     } value;
+ };
+-
+-#undef PKCS12_key_gen
+-/*
+- * See p12_multi.c:PKCS12_verify_mac() for details...
+- */
+-extern int (*PKCS12_key_gen)(const char *pass, int passlen,
+-                             unsigned char *salt, int slen,
+-                             int id, int iter, int n,
+-                             unsigned char *out,
+-                             const EVP_MD *md_type);
+diff --git a/crypto/pkcs12/p12_mutl.c b/crypto/pkcs12/p12_mutl.c
+index 325da0c..d6b8919 100644
+--- a/crypto/pkcs12/p12_mutl.c
++++ b/crypto/pkcs12/p12_mutl.c
+@@ -66,32 +66,6 @@ static int pkcs12_gen_gost_mac_key(const char *pass, int passlen,
+     return 1;
+ }
+ 
+-#undef PKCS12_key_gen
+-/*
+- * |PKCS12_key_gen| is used to convey information about old-style broken
+- * password being used to PKCS12_PBE_keyivgen in decrypt cases. Workflow
+- * is if PKCS12_verify_mac notes that password encoded with compliant
+- * PKCS12_key_gen_utf8 conversion subroutine isn't right, while encoded
+- * with legacy non-compliant one is, then it sets |PKCS12_key_gen| to
+- * legacy PKCS12_key_gen_asc conversion subroutine, which is then picked
+- * by PKCS12_PBE_keyivgen. This applies to reading data. Written data
+- * on the other hand is protected with standard-compliant encoding, i.e.
+- * in backward-incompatible manner. Note that formally the approach is
+- * not MT-safe. Rationale is that in order to access PKCS#12 files from
+- * MT or even production application, you would be required to convert
+- * data to correct interoperable format. In which case this variable
+- * won't have to change. Conversion would have to be done with pkcs12
+- * utility, which is not MT, and hence can tolerate it. In other words
+- * goal is not to make this heuristic approach work in general case,
+- * but in one specific one, apps/pkcs12.c.
+- */
+-int (*PKCS12_key_gen)(const char *pass, int passlen,
+-                      unsigned char *salt, int slen,
+-                      int id, int iter, int n,
+-                      unsigned char *out,
+-                      const EVP_MD *md_type) = NULL;
+-
+-
+ /* Generate a MAC */
+ static int pkcs12_gen_mac(PKCS12 *p12, const char *pass, int passlen,
+                           unsigned char *mac, unsigned int *maclen,
+@@ -111,8 +85,6 @@ static int pkcs12_gen_mac(PKCS12 *p12, const char *pass, int passlen,
+     const ASN1_OBJECT *macoid;
+ 
+     if (pkcs12_key_gen == NULL)
+-        pkcs12_key_gen = PKCS12_key_gen;
+-    if (pkcs12_key_gen == NULL)
+         pkcs12_key_gen = PKCS12_key_gen_utf8;
+ 
+     if (!PKCS7_type_is_data(p12-&gt;authsafes)) {
+@@ -187,30 +159,10 @@ int PKCS12_verify_mac(PKCS12 *p12, const char *pass, int passlen)
+         return 0;
+     }
+     X509_SIG_get0(p12-&gt;mac-&gt;dinfo, NULL, &amp;macoct);
+-    if (maclen != (unsigned int)ASN1_STRING_length(macoct))
++    if ((maclen != (unsigned int)ASN1_STRING_length(macoct))
++        || CRYPTO_memcmp(mac, ASN1_STRING_get0_data(macoct), maclen) != 0)
+         return 0;
+ 
+-    if (CRYPTO_memcmp(mac, ASN1_STRING_get0_data(macoct), maclen) != 0) {
+-        if (pass == NULL)
+-            return 0;
+-        /*
+-         * In order to facilitate accessing old data retry with
+-         * old-style broken password ...
+-         */
+-        if (!pkcs12_gen_mac(p12, pass, passlen, mac, &amp;maclen,
+-                            PKCS12_key_gen_asc)) {
+-            PKCS12err(PKCS12_F_PKCS12_VERIFY_MAC, PKCS12_R_MAC_GENERATION_ERROR);
+-            return 0;
+-        }
+-        if ((maclen != (unsigned int)ASN1_STRING_length(macoct))
+-            || CRYPTO_memcmp(mac, ASN1_STRING_get0_data(macoct), maclen) != 0)
+-            return 0;
+-        else
+-            PKCS12_key_gen = PKCS12_key_gen_asc;
+-        /*
+-         * ... and if suceeded, pass it on to PKCS12_PBE_keyivgen.
+-         */
+-    }
+     return 1;
+ }
+ 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010201.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="010203.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10202">[ date ]</a>
+              <a href="thread.html#10202">[ thread ]</a>
+              <a href="subject.html#10202">[ subject ]</a>
+              <a href="author.html#10202">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

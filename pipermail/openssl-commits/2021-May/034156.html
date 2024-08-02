@@ -1,0 +1,776 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620470427.071823.25513.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034155.html">
+   <LINK REL="Next"  HREF="034157.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>Dr. Paul Dale</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1620470427.071823.25513.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">pauli at openssl.org
+       </A><BR>
+    <I>Sat May  8 10:40:27 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034155.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="034157.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34156">[ date ]</a>
+              <a href="thread.html#34156">[ thread ]</a>
+              <a href="subject.html#34156">[ subject ]</a>
+              <a href="author.html#34156">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  0d40ca47bd86e74a95c3a2f5fb6c67cdbee93c79 (commit)
+      from  531df8185ff4a083aca550b2c8a56d7993b2c60d (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 0d40ca47bd86e74a95c3a2f5fb6c67cdbee93c79
+Author: Martin Schwenke &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">martin at meltin.net</A>&gt;
+Date:   Wed Apr 14 14:31:58 2021 +1000
+
+    bn: Add fixed length (n=6), unrolled PPC Montgomery Multiplication
+    
+    Overall improvement for p384 of ~18% on Power 9, compared to existing
+    Power assembling code.  See comment in code for more details.
+    
+    Multiple unrolled versions could be generated for values other than
+    6.  However, for TLS 1.3 the only other ECC algorithms that might use
+    Montgomery Multiplication are p256 and p521, but these have custom
+    algorithms that don't use Montgomery Multiplication.  Non-ECC
+    algorithms are likely to use larger key lengths that won't fit into
+    the n &lt;= 10 length limitation of this code.
+    
+    Signed-off-by: Amitay Isaacs &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">amitay at ozlabs.org</A>&gt;
+    Signed-off-by: Alastair D'Silva &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alastair at d-silva.org</A>&gt;
+    Signed-off-by: Martin Schwenke &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">martin at meltin.net</A>&gt;
+    
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tomas at openssl.org</A>&gt;
+    Reviewed-by: Paul Dale &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">pauli at openssl.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/15175">https://github.com/openssl/openssl/pull/15175</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/bn/asm/ppc64-mont-fixed.pl | 585 ++++++++++++++++++++++++++++++++++++++
+ crypto/bn/build.info              |   3 +-
+ crypto/ppccap.c                   |  12 +
+ providers/fips-sources.checksums  |   1 +
+ providers/fips.checksum           |   2 +-
+ providers/fips.module.sources     |   1 +
+ 6 files changed, 602 insertions(+), 2 deletions(-)
+ create mode 100755 crypto/bn/asm/ppc64-mont-fixed.pl
+
+diff --git a/crypto/bn/asm/ppc64-mont-fixed.pl b/crypto/bn/asm/ppc64-mont-fixed.pl
+new file mode 100755
+index 0000000000..62d2db0006
+--- /dev/null
++++ b/crypto/bn/asm/ppc64-mont-fixed.pl
+@@ -0,0 +1,585 @@
++#! /usr/bin/env perl
++# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the Apache License 2.0 (the &quot;License&quot;).  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# <A HREF="https://www.openssl.org/source/license.html">https://www.openssl.org/source/license.html</A>
++
++# ====================================================================
++# Written by Amitay Isaacs &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">amitay at ozlabs.org</A>&gt;, Martin Schwenke
++# &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">martin at meltin.net</A>&gt; &amp; Alastair D'Silva &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">alastair at d-silva.org</A>&gt; for
++# the OpenSSL project.
++# ====================================================================
++
++#
++# Fixed length (n=6), unrolled PPC Montgomery Multiplication
++#
++
++# 2021
++#
++# Although this is a generic implementation for unrolling Montgomery
++# Multiplication for arbitrary values of n, this is currently only
++# used for n = 6 to improve the performance of ECC p384.
++#
++# Unrolling allows intermediate results to be stored in registers,
++# rather than on the stack, improving performance by ~7% compared to
++# the existing PPC assembly code.
++#
++# The ISA 3.0 implementation uses combination multiply/add
++# instructions (maddld, maddhdu) to improve performance by an
++# additional ~10% on Power 9.
++#
++# Finally, saving non-volatile registers into volatile vector
++# registers instead of onto the stack saves a little more.
++#
++# On a Power 9 machine we see an overall improvement of ~18%.
++#
++
++use strict;
++use warnings;
++
++my ($flavour, $output, $dir, $xlate);
++
++# $output is the last argument if it looks like a file (it has an extension)
++# $flavour is the first argument if it doesn't look like a file
++$output = $#ARGV &gt;= 0 &amp;&amp; $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
++$flavour = $#ARGV &gt;= 0 &amp;&amp; $ARGV[0] !~ m|\.| ? shift : undef;
++
++$0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
++( $xlate=&quot;${dir}ppc-xlate.pl&quot; and -f $xlate ) or
++( $xlate=&quot;${dir}../../perlasm/ppc-xlate.pl&quot; and -f $xlate) or
++die &quot;can't locate ppc-xlate.pl&quot;;
++
++open STDOUT,&quot;| $^X $xlate $flavour \&quot;$output\&quot;&quot;
++    or die &quot;can't call $xlate: $!&quot;;
++
++if ($flavour !~ /64/) {
++	die &quot;bad flavour ($flavour) - only ppc64 permitted&quot;;
++}
++
++my $SIZE_T= 8;
++
++# Registers are global so the code is remotely readable
++
++# Parameters for Montgomery multiplication
++my $sp	= &quot;r1&quot;;
++my $toc	= &quot;r2&quot;;
++my $rp	= &quot;r3&quot;;
++my $ap	= &quot;r4&quot;;
++my $bp	= &quot;r5&quot;;
++my $np	= &quot;r6&quot;;
++my $n0	= &quot;r7&quot;;
++my $num	= &quot;r8&quot;;
++
++$rp	= &quot;r9&quot;;	# $rp is reassigned
++
++my $c0	= &quot;r10&quot;;
++my $bp0	= &quot;r11&quot;;
++my $bpi	= &quot;r11&quot;;
++my $bpj	= &quot;r11&quot;;
++my $tj	= &quot;r12&quot;;
++my $apj	= &quot;r12&quot;;
++my $npj	= &quot;r12&quot;;
++my $lo	= &quot;r14&quot;;
++my $c1	= &quot;r14&quot;;
++my $i	= &quot;r15&quot;;
++
++# Non-volatile registers used for tp[i]
++#
++# 12 registers are available but the limit on unrolling is 10,
++# since registers from $tp[0] to $tp[$n+1] are used.
++my @tp = (&quot;r20&quot; .. &quot;r31&quot;);
++
++# volatile VSRs for saving non-volatile GPRs - faster than stack
++my @vsrs = (&quot;v32&quot; .. &quot;v46&quot;);
++
++package Mont;
++
++sub new($$)
++{
++	my ($class, $n) = @_;
++
++	if ($n &gt; 10) {
++		die &quot;Can't unroll for BN length ${n} (maximum 10)&quot;
++	}
++
++	my $self = {
++		code =&gt; &quot;&quot;,
++		n =&gt; $n,
++	};
++	bless $self, $class;
++
++	return $self;
++}
++
++sub add_code($$)
++{
++	my ($self, $c) = @_;
++
++	$self-&gt;{code} .= $c;
++}
++
++sub get_code($)
++{
++	my ($self) = @_;
++
++	return $self-&gt;{code};
++}
++
++sub get_function_name($)
++{
++	my ($self) = @_;
++
++	return &quot;bn_mul_mont_fixed_n&quot; . $self-&gt;{n};
++}
++
++sub get_label($$)
++{
++	my ($self, $l) = @_;
++
++	return &quot;L&quot; . $l . &quot;_&quot; . $self-&gt;{n};
++}
++
++sub get_labels($@)
++{
++	my ($self, @labels) = @_;
++
++	my %out = ();
++
++	foreach my $l (@labels) {
++		$out{&quot;$l&quot;} = $self-&gt;get_label(&quot;$l&quot;);
++	}
++
++	return \%out;
++}
++
++sub nl($)
++{
++	my ($self) = @_;
++
++	$self-&gt;add_code(&quot;\n&quot;);
++}
++
++sub copy_result($)
++{
++	my ($self) = @_;
++
++	my ($n) = $self-&gt;{n};
++
++	for (my $j = 0; $j &lt; $n; $j++) {
++		$self-&gt;add_code(&lt;&lt;___);
++	std		$tp[$j],`$j*$SIZE_T`($rp)
++___
++	}
++
++}
++
++sub mul_mont_fixed($)
++{
++	my ($self) = @_;
++
++	my ($n) = $self-&gt;{n};
++	my $fname = $self-&gt;get_function_name();
++	my $label = $self-&gt;get_labels(&quot;outer&quot;, &quot;enter&quot;, &quot;sub&quot;, &quot;copy&quot;, &quot;end&quot;);
++
++	$self-&gt;add_code(&lt;&lt;___);
++
++.globl	.${fname}
++.${fname}:
++	mr	$rp,r3
++
++___
++
++	$self-&gt;save_registers();
++
++	$self-&gt;add_code(&lt;&lt;___);
++	ld		$n0,0($n0)
++
++	ld		$bp0,0($bp)
++
++	ld		$apj,0($ap)
++___
++
++	$self-&gt;mul_c_0($tp[0], $apj, $bp0, $c0);
++
++	for (my $j = 1; $j &lt; $n - 1; $j++) {
++		$self-&gt;add_code(&lt;&lt;___);
++	ld		$apj,`$j*$SIZE_T`($ap)
++___
++		$self-&gt;mul($tp[$j], $apj, $bp0, $c0);
++	}
++
++	$self-&gt;add_code(&lt;&lt;___);
++	ld		$apj,`($n-1)*$SIZE_T`($ap)
++___
++
++	$self-&gt;mul_last($tp[$n-1], $tp[$n], $apj, $bp0, $c0);
++
++	$self-&gt;add_code(&lt;&lt;___);
++	li		$tp[$n+1],0
++
++___
++
++	$self-&gt;add_code(&lt;&lt;___);
++	li		$i,0
++	mtctr		$num
++	b		$label-&gt;{&quot;enter&quot;}
++
++$label-&gt;{&quot;outer&quot;}:
++	ldx		$bpi,$bp,$i
++
++	ld		$apj,0($ap)
++___
++
++	$self-&gt;mul_add_c_0($tp[0], $tp[0], $apj, $bpi, $c0);
++
++	for (my $j = 1; $j &lt; $n; $j++) {
++		$self-&gt;add_code(&lt;&lt;___);
++	ld		$apj,`$j*$SIZE_T`($ap)
++___
++		$self-&gt;mul_add($tp[$j], $tp[$j], $apj, $bpi, $c0);
++	}
++
++	$self-&gt;add_code(&lt;&lt;___);
++	addc		$tp[$n],$tp[$n],$c0
++	addze		$tp[$n+1],$tp[$n+1]
++___
++
++	$self-&gt;add_code(&lt;&lt;___);
++$label-&gt;{&quot;enter&quot;}:
++	mulld		$bpi,$tp[0],$n0
++
++	ld		$npj,0($np)
++___
++
++	$self-&gt;mul_add_c_0($lo, $tp[0], $bpi, $npj, $c0);
++
++	for (my $j = 1; $j &lt; $n; $j++) {
++		$self-&gt;add_code(&lt;&lt;___);
++	ld		$npj,`$j*$SIZE_T`($np)
++___
++		$self-&gt;mul_add($tp[$j-1], $tp[$j], $npj, $bpi, $c0);
++	}
++
++	$self-&gt;add_code(&lt;&lt;___);
++	addc		$tp[$n-1],$tp[$n],$c0
++	addze		$tp[$n],$tp[$n+1]
++
++	addi		$i,$i,$SIZE_T
++	bc		25,0,$label-&gt;{&quot;outer&quot;}
++
++	and.		$tp[$n],$tp[$n],$tp[$n]
++	bne		$label-&gt;{&quot;sub&quot;}
++
++	cmpld	$tp[$n-1],$npj
++	blt		$label-&gt;{&quot;copy&quot;}
++
++$label-&gt;{&quot;sub&quot;}:
++___
++
++	#
++	# Reduction
++	#
++
++		$self-&gt;add_code(&lt;&lt;___);
++	ld		$bpj,`0*$SIZE_T`($np)
++	subfc		$c1,$bpj,$tp[0]
++	std		$c1,`0*$SIZE_T`($rp)
++
++___
++	for (my $j = 1; $j &lt; $n - 1; $j++) {
++		$self-&gt;add_code(&lt;&lt;___);
++	ld		$bpj,`$j*$SIZE_T`($np)
++	subfe		$c1,$bpj,$tp[$j]
++	std		$c1,`$j*$SIZE_T`($rp)
++
++___
++	}
++
++		$self-&gt;add_code(&lt;&lt;___);
++	subfe		$c1,$npj,$tp[$n-1]
++	std		$c1,`($n-1)*$SIZE_T`($rp)
++
++___
++
++	$self-&gt;add_code(&lt;&lt;___);
++	addme.		$tp[$n],$tp[$n]
++	beq		$label-&gt;{&quot;end&quot;}
++
++$label-&gt;{&quot;copy&quot;}:
++___
++
++	$self-&gt;copy_result();
++
++	$self-&gt;add_code(&lt;&lt;___);
++
++$label-&gt;{&quot;end&quot;}:
++___
++
++	$self-&gt;restore_registers();
++
++	$self-&gt;add_code(&lt;&lt;___);
++	li		r3,1
++	blr
++.size ${fname},.-${fname}
++___
++
++}
++
++package Mont::GPR;
++
++our @ISA = ('Mont');
++
++sub new($$)
++{
++    my ($class, $n) = @_;
++
++    return $class-&gt;SUPER::new($n);
++}
++
++sub save_registers($)
++{
++	my ($self) = @_;
++
++	my $n = $self-&gt;{n};
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mtvsrd	$vsrs[0],$lo
++	mtvsrd	$vsrs[1],$i
++___
++
++	for (my $j = 0; $j &lt;= $n+1; $j++) {
++		$self-&gt;{code}.=&lt;&lt;___;
++	mtvsrd	$vsrs[$j+2],$tp[$j]
++___
++	}
++
++	$self-&gt;add_code(&lt;&lt;___);
++
++___
++}
++
++sub restore_registers($)
++{
++	my ($self) = @_;
++
++	my $n = $self-&gt;{n};
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mfvsrd	$lo,$vsrs[0]
++	mfvsrd	$i,$vsrs[1]
++___
++
++	for (my $j = 0; $j &lt;= $n+1; $j++) {
++		$self-&gt;{code}.=&lt;&lt;___;
++	mfvsrd	$tp[$j],$vsrs[$j+2]
++___
++	}
++
++	$self-&gt;{code} .=&lt;&lt;___;
++
++___
++}
++
++# Direct translation of C mul()
++sub mul($$$$$)
++{
++	my ($self, $r, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld		$lo,$a,$w
++	addc		$r,$lo,$c
++	mulhdu		$c,$a,$w
++	addze		$c,$c
++
++___
++}
++
++# Like mul() but $c is ignored as an input - an optimisation to save a
++# preliminary instruction that would set input $c to 0
++sub mul_c_0($$$$$)
++{
++	my ($self, $r, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld		$r,$a,$w
++	mulhdu		$c,$a,$w
++
++___
++}
++
++# Like mul() but does not to the final addition of CA into $c - an
++# optimisation to save an instruction
++sub mul_last($$$$$$)
++{
++	my ($self, $r1, $r2, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld		$lo,$a,$w
++	addc		$r1,$lo,$c
++	mulhdu		$c,$a,$w
++
++	addze		$r2,$c
++___
++}
++
++# Like C mul_add() but allow $r_out and $r_in to be different
++sub mul_add($$$$$$)
++{
++	my ($self, $r_out, $r_in, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld		$lo,$a,$w
++	addc		$lo,$lo,$c
++	mulhdu		$c,$a,$w
++	addze		$c,$c
++	addc		$r_out,$r_in,$lo
++	addze		$c,$c
++
++___
++}
++
++# Like mul_add() but $c is ignored as an input - an optimisation to save a
++# preliminary instruction that would set input $c to 0
++sub mul_add_c_0($$$$$$)
++{
++	my ($self, $r_out, $r_in, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld		$lo,$a,$w
++	addc		$r_out,$r_in,$lo
++	mulhdu		$c,$a,$w
++	addze		$c,$c
++
++___
++}
++
++package Mont::GPR_300;
++
++our @ISA = ('Mont::GPR');
++
++sub new($$)
++{
++	my ($class, $n) = @_;
++
++	my $mont = $class-&gt;SUPER::new($n);
++
++	return $mont;
++}
++
++sub get_function_name($)
++{
++	my ($self) = @_;
++
++	return &quot;bn_mul_mont_300_fixed_n&quot; . $self-&gt;{n};
++}
++
++sub get_label($$)
++{
++	my ($self, $l) = @_;
++
++	return &quot;L&quot; . $l . &quot;_300_&quot; . $self-&gt;{n};
++}
++
++# Direct translation of C mul()
++sub mul($$$$$)
++{
++	my ($self, $r, $a, $w, $c, $last) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	maddld		$r,$a,$w,$c
++	maddhdu		$c,$a,$w,$c
++
++___
++}
++
++# Save the last carry as the final entry
++sub mul_last($$$$$)
++{
++	my ($self, $r1, $r2, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	maddld		$r1,$a,$w,$c
++	maddhdu		$r2,$a,$w,$c
++
++___
++}
++
++# Like mul() but $c is ignored as an input - an optimisation to save a
++# preliminary instruction that would set input $c to 0
++sub mul_c_0($$$$$)
++{
++	my ($self, $r, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	mulld          $r,$a,$w
++	mulhdu          $c,$a,$w
++
++___
++}
++
++# Like C mul_add() but allow $r_out and $r_in to be different
++sub mul_add($$$$$$)
++{
++	my ($self, $r_out, $r_in, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	maddld		$lo,$a,$w,$c
++	maddhdu		$c,$a,$w,$c
++	addc		$r_out,$r_in,$lo
++	addze		$c,$c
++
++___
++}
++
++# Like mul_add() but $c is ignored as an input - an optimisation to save a
++# preliminary instruction that would set input $c to 0
++sub mul_add_c_0($$$$$$)
++{
++	my ($self, $r_out, $r_in, $a, $w, $c) = @_;
++
++	$self-&gt;add_code(&lt;&lt;___);
++	maddld		$lo,$a,$w,$r_in
++	maddhdu		$c,$a,$w,$r_in
++___
++
++	if ($r_out ne $lo) {
++		$self-&gt;add_code(&lt;&lt;___);
++	mr			$r_out,$lo
++___
++	}
++
++	$self-&gt;nl();
++}
++
++
++package main;
++
++my $code;
++
++$code.=&lt;&lt;___;
++.machine &quot;any&quot;
++.text
++.align	5
++.p2align	5,,31
++___
++
++my $mont;
++
++$mont = new Mont::GPR(6);
++$mont-&gt;mul_mont_fixed();
++$code .= $mont-&gt;get_code();
++
++$mont = new Mont::GPR_300(6);
++$mont-&gt;mul_mont_fixed();
++$code .= $mont-&gt;get_code();
++
++$code =~ s/\`([^\`]*)\`/eval $1/gem;
++
++$code.=&lt;&lt;___;
++.asciz  &quot;Montgomery Multiplication for PPC by &lt;amitay\@ozlabs.org&gt;, &lt;alastair\@d-silva.org&gt;&quot;
++___
++
++print $code;
++close STDOUT or die &quot;error closing STDOUT: $!&quot;;
+diff --git a/crypto/bn/build.info b/crypto/bn/build.info
+index 5e948b8433..3c32e83067 100644
+--- a/crypto/bn/build.info
++++ b/crypto/bn/build.info
+@@ -79,7 +79,7 @@ IF[{- !$disabled{asm} -}]
+ 
+   $BNASM_ppc32=bn-ppc.s ppc-mont.s
+   $BNDEF_ppc32=OPENSSL_BN_ASM_MONT
+-  $BNASM_ppc64=$BNASM_ppc32
++  $BNASM_ppc64=$BNASM_ppc32 ppc64-mont-fixed.s
+   $BNDEF_ppc64=$BNDEF_ppc32
+ 
+   $BNASM_c64xplus=asm/bn-c64xplus.asm
+@@ -168,6 +168,7 @@ GENERATE[parisc-mont.s]=asm/parisc-mont.pl
+ GENERATE[bn-ppc.s]=asm/ppc.pl
+ GENERATE[ppc-mont.s]=asm/ppc-mont.pl
+ GENERATE[ppc64-mont.s]=asm/ppc64-mont.pl
++GENERATE[ppc64-mont-fixed.s]=asm/ppc64-mont-fixed.pl
+ 
+ GENERATE[alpha-mont.S]=asm/alpha-mont.pl
+ 
+diff --git a/crypto/ppccap.c b/crypto/ppccap.c
+index 9ed1d80db5..a504bc59b0 100644
+--- a/crypto/ppccap.c
++++ b/crypto/ppccap.c
+@@ -47,6 +47,12 @@ int bn_mul_mont(BN_ULONG *rp, const BN_ULONG *ap, const BN_ULONG *bp,
+                         const BN_ULONG *np, const BN_ULONG *n0, int num);
+     int bn_mul4x_mont_int(BN_ULONG *rp, const BN_ULONG *ap, const BN_ULONG *bp,
+                           const BN_ULONG *np, const BN_ULONG *n0, int num);
++    int bn_mul_mont_fixed_n6(BN_ULONG *rp, const BN_ULONG *ap,
++                             const BN_ULONG *bp, const BN_ULONG *np,
++                             const BN_ULONG *n0, int num);
++    int bn_mul_mont_300_fixed_n6(BN_ULONG *rp, const BN_ULONG *ap,
++                                 const BN_ULONG *bp, const BN_ULONG *np,
++                                 const BN_ULONG *n0, int num);
+ 
+     if (num &lt; 4)
+         return 0;
+@@ -62,6 +68,12 @@ int bn_mul_mont(BN_ULONG *rp, const BN_ULONG *ap, const BN_ULONG *bp,
+      * no opportunity to figure it out...
+      */
+ 
++    if (num == 6)
++        if (OPENSSL_ppccap_P &amp; PPC_MADD300)
++            return bn_mul_mont_300_fixed_n6(rp, ap, bp, np, n0, num);
++        else
++            return bn_mul_mont_fixed_n6(rp, ap, bp, np, n0, num);
++
+     return bn_mul_mont_int(rp, ap, bp, np, n0, num);
+ }
+ #endif
+diff --git a/providers/fips-sources.checksums b/providers/fips-sources.checksums
+index 01968b7e6f..b1ec8f2339 100644
+--- a/providers/fips-sources.checksums
++++ b/providers/fips-sources.checksums
+@@ -42,6 +42,7 @@ eb240c1f72063048abe026ab7fab340361a329d5cd355276a25950be446cc091  crypto/bn/asm/
+ b27ec5181e387e812925bb26823b830f49d7a6e4971b6d11ea583f5632a1504b  crypto/bn/asm/parisc-mont.pl
+ 9973523b361db963eea4938a7a8a3adc692e1a4e1aec4fa1f1e57dc93da37921  crypto/bn/asm/ppc-mont.pl
+ 59cd27e1e10c4984b7fb684b27f491e7634473b1bcff197a07e0ca653124aa9a  crypto/bn/asm/ppc.pl
++13ba6625cc6c673dc6f7ef69a7bbe40487c5553b3873a996af4904de5b1cd82b  crypto/bn/asm/ppc64-mont-fixed.pl
+ a25be64867ab837d93855af232e2bfa71b85b2c6f00e35e620fdc5618187fb6f  crypto/bn/asm/ppc64-mont.pl
+ 231579e532443665020d4d522d9f11713d9c5d5c814b95b434b0f65452e16de4  crypto/bn/asm/rsaz-avx2.pl
+ c9bd8679a5104affd9f3f0bcda726f823a1a53cac872e4a21a6f2370489dae08  crypto/bn/asm/rsaz-avx512.pl
+diff --git a/providers/fips.checksum b/providers/fips.checksum
+index e5ff9a8040..e9adf327b3 100644
+--- a/providers/fips.checksum
++++ b/providers/fips.checksum
+@@ -1 +1 @@
+-2e67c3ed3222fedf2d26e91f47b2b7708a95f39a74bd1489412f324f84daa57d  providers/fips-sources.checksums
++4fcfc6375eef7bed6219191cce24513be04a6ebb8b2d5da8e404150a2ecc0eba  providers/fips-sources.checksums
+diff --git a/providers/fips.module.sources b/providers/fips.module.sources
+index 7e17658602..416a2b97f7 100644
+--- a/providers/fips.module.sources
++++ b/providers/fips.module.sources
+@@ -42,6 +42,7 @@ crypto/bn/asm/mips.pl
+ crypto/bn/asm/parisc-mont.pl
+ crypto/bn/asm/ppc-mont.pl
+ crypto/bn/asm/ppc.pl
++crypto/bn/asm/ppc64-mont-fixed.pl
+ crypto/bn/asm/ppc64-mont.pl
+ crypto/bn/asm/rsaz-avx2.pl
+ crypto/bn/asm/rsaz-avx512.pl
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034155.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="034157.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34156">[ date ]</a>
+              <a href="thread.html#34156">[ thread ]</a>
+              <a href="subject.html#34156">[ subject ]</a>
+              <a href="author.html#34156">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

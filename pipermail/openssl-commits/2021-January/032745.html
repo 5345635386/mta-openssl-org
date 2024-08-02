@@ -1,0 +1,253 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2021-January/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1610104359.532482.21386.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032743.html">
+   <LINK REL="Next"  HREF="032747.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl]  master update</H1>
+    <B>tmraz at fedoraproject.org</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1610104359.532482.21386.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl]  master update">tmraz at fedoraproject.org
+       </A><BR>
+    <I>Fri Jan  8 11:12:39 UTC 2021</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032743.html">[openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="032747.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32745">[ date ]</a>
+              <a href="thread.html#32745">[ thread ]</a>
+              <a href="subject.html#32745">[ subject ]</a>
+              <a href="author.html#32745">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  22aa4a3afb53984201c84970ec03b251d0117f00 (commit)
+      from  d0afb30ef3950cacff50ec539e90073b95a276df (commit)
+
+
+- Log -----------------------------------------------------------------
+commit 22aa4a3afb53984201c84970ec03b251d0117f00
+Author: Billy Brumley &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">bbrumley at gmail.com</A>&gt;
+Date:   Tue Jan 5 13:08:09 2021 +0200
+
+    [crypto/dh] side channel hardening for computing DH shared keys
+    
+    Reviewed-by: Nicola Tuveri &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">nic.tuv at gmail.com</A>&gt;
+    Reviewed-by: Tomas Mraz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">tmraz at fedoraproject.org</A>&gt;
+    (Merged from <A HREF="https://github.com/openssl/openssl/pull/13783">https://github.com/openssl/openssl/pull/13783</A>)
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ crypto/dh/dh_key.c           | 34 +++++++++++++++++++++++++++++++---
+ doc/man3/DH_generate_key.pod | 27 +++++++++++++++++++++------
+ 2 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/crypto/dh/dh_key.c b/crypto/dh/dh_key.c
+index 2e61ccbaa2..4535715367 100644
+--- a/crypto/dh/dh_key.c
++++ b/crypto/dh/dh_key.c
+@@ -86,26 +86,53 @@ static int compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+         goto err;
+     }
+ 
+-    ret = BN_bn2bin(tmp, key);
++    /* return the padded key, i.e. same number of bytes as the modulus */
++    ret = BN_bn2binpad(tmp, key, BN_num_bytes(dh-&gt;params.p));
+  err:
+     BN_CTX_end(ctx);
+     BN_CTX_free(ctx);
+     return ret;
+ }
+ 
++/*-
++ * NB: This function is inherently not constant time due to the
++ * RFC 5246 (8.1.2) padding style that strips leading zero bytes.
++ */
+ int DH_compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+ {
++    int ret = 0, i;
++    volatile size_t npad = 0, mask = 1;
++
++    /* compute the key; ret is constant unless compute_key is external */
+ #ifdef FIPS_MODULE
+-    return compute_key(key, pub_key, dh);
++    ret = compute_key(key, pub_key, dh);
+ #else
+-    return dh-&gt;meth-&gt;compute_key(key, pub_key, dh);
++    ret = dh-&gt;meth-&gt;compute_key(key, pub_key, dh);
+ #endif
++    if (ret &lt;= 0)
++        return ret;
++
++    /* count leading zero bytes, yet still touch all bytes */
++    for (i = 0; i &lt; ret; i++) {
++        mask &amp;= !key[i];
++        npad += mask;
++    }
++
++    /* unpad key */
++    ret -= npad;
++    /* key-dependent memory access, potentially leaking npad / ret */
++    memmove(key, key + npad, ret);
++    /* key-dependent memory access, potentially leaking npad / ret */
++    memset(key + ret, 0, npad);
++
++    return ret;
+ }
+ 
+ int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+ {
+     int rv, pad;
+ 
++    /* rv is constant unless compute_key is external */
+ #ifdef FIPS_MODULE
+     rv = compute_key(key, pub_key, dh);
+ #else
+@@ -114,6 +141,7 @@ int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
+     if (rv &lt;= 0)
+         return rv;
+     pad = BN_num_bytes(dh-&gt;params.p) - rv;
++    /* pad is constant (zero) unless compute_key is external */
+     if (pad &gt; 0) {
+         memmove(key + pad, key, rv);
+         memset(key, 0, pad);
+diff --git a/doc/man3/DH_generate_key.pod b/doc/man3/DH_generate_key.pod
+index 7cc9e84a44..c5b58615e0 100644
+--- a/doc/man3/DH_generate_key.pod
++++ b/doc/man3/DH_generate_key.pod
+@@ -2,7 +2,8 @@
+ 
+ =head1 NAME
+ 
+-DH_generate_key, DH_compute_key - perform Diffie-Hellman key exchange
++DH_generate_key, DH_compute_key, DH_compute_key_padded - perform
++Diffie-Hellman key exchange
+ 
+ =head1 SYNOPSIS
+ 
+@@ -14,18 +15,20 @@ L&lt;openssl_user_macros(7)&gt;:
+ 
+  int DH_generate_key(DH *dh);
+ 
+- int DH_compute_key(unsigned char *key, BIGNUM *pub_key, DH *dh);
++ int DH_compute_key(unsigned char *key, const BIGNUM *pub_key, DH *dh);
++
++ int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh);
+ 
+ =head1 DESCRIPTION
+ 
+-Both of the functions described on this page are deprecated.
++All of the functions described on this page are deprecated.
+ Applications should instead use L&lt;EVP_PKEY_derive_init(3)&gt;
+ and L&lt;EVP_PKEY_derive(3)&gt;.
+ 
+ DH_generate_key() performs the first step of a Diffie-Hellman key
+ exchange by generating private and public DH values. By calling
+-DH_compute_key(), these are combined with the other party's public
+-value to compute the shared key.
++DH_compute_key() or DH_compute_key_padded(), these are combined with
++the other party's public value to compute the shared key.
+ 
+ DH_generate_key() expects B&lt;dh&gt; to contain the shared parameters
+ B&lt;dh-E&lt;gt&gt;p&gt; and B&lt;dh-E&lt;gt&gt;g&gt;. It generates a random private DH value
+@@ -36,6 +39,14 @@ published.
+ DH_compute_key() computes the shared secret from the private DH value
+ in B&lt;dh&gt; and the other party's public value in B&lt;pub_key&gt; and stores
+ it in B&lt;key&gt;. B&lt;key&gt; must point to B&lt;DH_size(dh)&gt; bytes of memory.
++The padding style is RFC 5246 (8.1.2) that strips leading zero bytes.
++It is not constant time due to the leading zero bytes being stripped.
++The return value should be considered public.
++
++DH_compute_key_padded() is similar but stores a fixed number of bytes.
++The padding style is NIST SP 800-56A (C.1) that retains leading zero bytes.
++It is constant time due to the leading zero bytes being retained.
++The return value should be considered public.
+ 
+ =head1 RETURN VALUES
+ 
+@@ -44,6 +55,8 @@ DH_generate_key() returns 1 on success, 0 otherwise.
+ DH_compute_key() returns the size of the shared secret on success, -1
+ on error.
+ 
++DH_compute_key_padded() returns B&lt;DH_size(dh)&gt; on success, -1 on error.
++
+ The error codes can be obtained by L&lt;ERR_get_error(3)&gt;.
+ 
+ =head1 SEE ALSO
+@@ -53,7 +66,9 @@ L&lt;DH_new(3)&gt;, L&lt;ERR_get_error(3)&gt;, L&lt;RAND_bytes(3)&gt;, L&lt;DH_size(3)&gt;
+ 
+ =head1 HISTORY
+ 
+-Both of these functions were deprecated in OpenSSL 3.0.
++DH_compute_key_padded() was added in OpenSSL 1.0.2.
++
++All of these functions were deprecated in OpenSSL 3.0.
+ 
+ =head1 COPYRIGHT
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032743.html">[openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="032747.html">[openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32745">[ date ]</a>
+              <a href="thread.html#32745">[ thread ]</a>
+              <a href="subject.html#32745">[ subject ]</a>
+              <a href="author.html#32745">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>

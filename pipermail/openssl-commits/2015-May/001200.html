@@ -1,0 +1,683 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [openssl-commits] [openssl]  master update
+   </TITLE>
+   <LINK REL="Index" HREF="https://mta.openssl.org/pipermail/openssl-commits/2015-May/index.html" >
+   <LINK REL="made" HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432848521.357860.20715.nullmailer%40dev.openssl.org%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001195.html">
+   <LINK REL="Next"  HREF="001201.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[openssl-commits] [openssl]  master update</H1>
+    <B>Rich Salz</B> 
+    <A HREF="mailto:openssl-commits%40openssl.org?Subject=Re%3A%20%5Bopenssl-commits%5D%20%5Bopenssl%5D%20%20master%20update&In-Reply-To=%3C1432848521.357860.20715.nullmailer%40dev.openssl.org%3E"
+       TITLE="[openssl-commits] [openssl]  master update">rsalz at openssl.org
+       </A><BR>
+    <I>Thu May 28 21:28:41 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001195.html">[openssl-commits] [openssl]  master update
+</A></li>
+        <LI>Next message: <A HREF="001201.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1200">[ date ]</a>
+              <a href="thread.html#1200">[ thread ]</a>
+              <a href="subject.html#1200">[ subject ]</a>
+              <a href="author.html#1200">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The branch master has been updated
+       via  cc01d21756cc9c79231ef21039782c5fe42008a2 (commit)
+      from  f097f81c891bb1f479426d8ac9c9541390334983 (commit)
+
+
+- Log -----------------------------------------------------------------
+commit cc01d21756cc9c79231ef21039782c5fe42008a2
+Author: Rich Salz &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">rsalz at akamai.com</A>&gt;
+Date:   Thu May 28 13:52:55 2015 -0400
+
+    RT3876: Only load config when needed
+    
+    Create app_load_config(), a routine to load config file.  Remove the
+    &quot;always load config&quot; from the main app.  Change the places that used to
+    load config to call the new common routine.
+    
+    Reviewed-by: Richard Levitte &lt;<A HREF="../../../mailman/listinfo/openssl-commits.html">levitte at openssl.org</A>&gt;
+
+-----------------------------------------------------------------------
+
+Summary of changes:
+ apps/apps.c     | 47 +++++++++++++++++++++++++-------------
+ apps/apps.h     |  2 +-
+ apps/asn1pars.c | 16 ++-----------
+ apps/ca.c       | 51 +++++------------------------------------
+ apps/openssl.c  | 70 ++++++++++++---------------------------------------------
+ apps/req.c      | 33 +++++----------------------
+ apps/spkac.c    | 14 ++----------
+ apps/srp.c      | 47 +++++++-------------------------------
+ apps/ts.c       | 22 +++---------------
+ apps/x509.c     | 12 +---------
+ 10 files changed, 73 insertions(+), 241 deletions(-)
+
+diff --git a/apps/apps.c b/apps/apps.c
+index 593c036..74646af 100644
+--- a/apps/apps.c
++++ b/apps/apps.c
+@@ -496,6 +496,33 @@ static char *app_get_pass(char *arg, int keepbio)
+     return BUF_strdup(tpass);
+ }
+ 
++CONF *app_load_config(const char *filename)
++{
++    long errorline = -1;
++    CONF *conf;
++    int i;
++    BIO *in;
++
++    in = bio_open_default(filename, &quot;r&quot;);
++    if (in == NULL)
++        return NULL;
++
++    conf = NCONF_new(NULL);
++    i = NCONF_load_bio(conf, in, &amp;errorline);
++    BIO_free(in);
++    if (i &gt; 0)
++        return conf;
++
++    if (errorline &lt;= 0)
++        BIO_printf(bio_err, &quot;%s: Can't load config file \&quot;%s\&quot;\n&quot;,
++                   opt_getprog(), filename);
++    else
++        BIO_printf(bio_err, &quot;%s: Error on line %ld of config file \&quot;%s\&quot;\n&quot;,
++                   opt_getprog(), errorline, filename);
++    NCONF_free(conf);
++    return NULL;
++}
++
+ int add_oid_section(CONF *conf)
+ {
+     char *p;
+@@ -1559,8 +1586,7 @@ CA_DB *load_index(char *dbfile, DB_ATTR *db_attr)
+     TXT_DB *tmpdb = NULL;
+     BIO *in;
+     CONF *dbattr_conf = NULL;
+-    char buf[1][BSIZE];
+-    long errorline = -1;
++    char buf[BSIZE];
+ 
+     in = BIO_new_file(dbfile, &quot;r&quot;);
+     if (in == NULL) {
+@@ -1571,22 +1597,11 @@ CA_DB *load_index(char *dbfile, DB_ATTR *db_attr)
+         goto err;
+ 
+ #ifndef OPENSSL_SYS_VMS
+-    BIO_snprintf(buf[0], sizeof buf[0], &quot;%s.attr&quot;, dbfile);
++    BIO_snprintf(buf, sizeof buf, &quot;%s.attr&quot;, dbfile);
+ #else
+-    BIO_snprintf(buf[0], sizeof buf[0], &quot;%s-attr&quot;, dbfile);
++    BIO_snprintf(buf, sizeof buf, &quot;%s-attr&quot;, dbfile);
+ #endif
+-    dbattr_conf = NCONF_new(NULL);
+-    if (NCONF_load(dbattr_conf, buf[0], &amp;errorline) &lt;= 0) {
+-        if (errorline &gt; 0) {
+-            BIO_printf(bio_err,
+-                       &quot;error on line %ld of db attribute file '%s'\n&quot;,
+-                       errorline, buf[0]);
+-            goto err;
+-        } else {
+-            NCONF_free(dbattr_conf);
+-            dbattr_conf = NULL;
+-        }
+-    }
++    dbattr_conf = app_load_config(buf);
+ 
+     retdb = app_malloc(sizeof(*retdb), &quot;new DB&quot;);
+     retdb-&gt;db = tmpdb;
+diff --git a/apps/apps.h b/apps/apps.h
+index 33b2e65..a8e0071 100644
+--- a/apps/apps.h
++++ b/apps/apps.h
+@@ -147,7 +147,6 @@ long app_RAND_load_files(char *file); /* `file' is a list of files to read,
+                                        * (see e_os.h).  The string is
+                                        * destroyed! */
+ 
+-extern CONF *config;
+ extern char *default_config_file;
+ extern BIO *bio_in;
+ extern BIO *bio_out;
+@@ -155,6 +154,7 @@ extern BIO *bio_err;
+ BIO *dup_bio_in(void);
+ BIO *dup_bio_out(void);
+ BIO *bio_open_default(const char *filename, const char *mode);
++CONF *app_load_config(const char* filename);
+ void unbuffer(FILE *fp);
+ 
+ /* Often used in calls to bio_open_default. */
+diff --git a/apps/asn1pars.c b/apps/asn1pars.c
+index 42338da..d188f4a 100644
+--- a/apps/asn1pars.c
++++ b/apps/asn1pars.c
+@@ -334,14 +334,12 @@ static int do_generate(char *genstr, char *genconf, BUF_MEM *buf)
+ {
+     CONF *cnf = NULL;
+     int len;
+-    long errline = 0;
+     unsigned char *p;
+     ASN1_TYPE *atyp = NULL;
+ 
+     if (genconf) {
+-        cnf = NCONF_new(NULL);
+-        if (!NCONF_load(cnf, genconf, &amp;errline))
+-            goto conferr;
++        if ((cnf = app_load_config(genconf)) == NULL)
++            goto err;
+         if (!genstr)
+             genstr = NCONF_get_string(cnf, &quot;default&quot;, &quot;asn1&quot;);
+         if (!genstr) {
+@@ -372,18 +370,8 @@ static int do_generate(char *genstr, char *genconf, BUF_MEM *buf)
+     ASN1_TYPE_free(atyp);
+     return len;
+ 
+- conferr:
+-
+-    if (errline &gt; 0)
+-        BIO_printf(bio_err, &quot;Error on line %ld of config file '%s'\n&quot;,
+-                   errline, genconf);
+-    else
+-        BIO_printf(bio_err, &quot;Error loading config file '%s'\n&quot;, genconf);
+-
+  err:
+     NCONF_free(cnf);
+     ASN1_TYPE_free(atyp);
+-
+     return -1;
+-
+ }
+diff --git a/apps/ca.c b/apps/ca.c
+index 58f1243..437a375 100644
+--- a/apps/ca.c
++++ b/apps/ca.c
+@@ -99,7 +99,6 @@
+ #define BSIZE 256
+ 
+ #define BASE_SECTION    &quot;ca&quot;
+-#define CONFIG_FILE &quot;openssl.cnf&quot;
+ 
+ #define ENV_DEFAULT_CA          &quot;default_ca&quot;
+ 
+@@ -285,7 +284,8 @@ int ca_main(int argc, char **argv)
+     STACK_OF(X509) *cert_sk = NULL;
+     X509_CRL *crl = NULL;
+     const EVP_MD *dgst = NULL;
+-    char *configfile = NULL, *md = NULL, *policy = NULL, *keyfile = NULL;
++    char *configfile = default_config_file;
++    char *md = NULL, *policy = NULL, *keyfile = NULL;
+     char *certfile = NULL, *crl_ext = NULL, *crlnumberfile = NULL;
+     char *infile = NULL, *spkac_file = NULL, *ss_cert_file = NULL;
+     char *extensions = NULL, *extfile = NULL, *key = NULL, *passinarg = NULL;
+@@ -301,7 +301,7 @@ int ca_main(int argc, char **argv)
+     int keyformat = FORMAT_PEM, multirdn = 0, notext = 0, output_der = 0;
+     int ret = 1, email_dn = 1, req = 0, verbose = 0, gencrl = 0, dorevoke = 0;
+     int i, j, rev_type = REV_NONE, selfsign = 0;
+-    long crldays = 0, crlhours = 0, crlsec = 0, errorline = -1, days = 0;
++    long crldays = 0, crlhours = 0, crlsec = 0, days = 0;
+     unsigned long chtype = MBSTRING_ASC, nameopt = 0, certopt = 0;
+     X509 *x509 = NULL, *x509p = NULL, *x = NULL;
+     X509_REVOKED *r = NULL;
+@@ -482,40 +482,9 @@ end_of_options:
+     argc = opt_num_rest();
+     argv = opt_rest();
+ 
+-    tofree = NULL;
+-    if (configfile == NULL)
+-        configfile = getenv(&quot;OPENSSL_CONF&quot;);
+-    if (configfile == NULL)
+-        configfile = getenv(&quot;SSLEAY_CONF&quot;);
+-    if (configfile == NULL) {
+-        const char *s = X509_get_default_cert_area();
+-        size_t len;
+-
+-        len = strlen(s) + 1 + sizeof(CONFIG_FILE);
+-        tofree = app_malloc(len, &quot;config filename&quot;);
+-#ifdef OPENSSL_SYS_VMS
+-        strcpy(tofree, s);
+-#else
+-        BUF_strlcpy(tofree, s, len);
+-        BUF_strlcat(tofree, &quot;/&quot;, len);
+-#endif
+-        BUF_strlcat(tofree, CONFIG_FILE, len);
+-        configfile = tofree;
+-    }
+-
+     BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;, configfile);
+-    conf = NCONF_new(NULL);
+-    if (NCONF_load(conf, configfile, &amp;errorline) &lt;= 0) {
+-        if (errorline &lt;= 0)
+-            BIO_printf(bio_err, &quot;error loading the config file '%s'\n&quot;,
+-                       configfile);
+-        else
+-            BIO_printf(bio_err, &quot;error on line %ld of config file '%s'\n&quot;,
+-                       errorline, configfile);
++    if ((conf = app_load_config(configfile)) == NULL)
+         goto end;
+-    }
+-    OPENSSL_free(tofree);
+-    tofree = NULL;
+ 
+     /* Lets get the config section we are using */
+     if (section == NULL) {
+@@ -800,18 +769,10 @@ end_of_options:
+         }
+     }
+ 
+-        /*****************************************************************/
++    /*****************************************************************/
+     /* Read extensions config file                                   */
+     if (extfile) {
+-        extconf = NCONF_new(NULL);
+-        if (NCONF_load(extconf, extfile, &amp;errorline) &lt;= 0) {
+-            if (errorline &lt;= 0)
+-                BIO_printf(bio_err, &quot;ERROR: loading the config file '%s'\n&quot;,
+-                           extfile);
+-            else
+-                BIO_printf(bio_err,
+-                           &quot;ERROR: on line %ld of config file '%s'\n&quot;,
+-                           errorline, extfile);
++        if ((extconf = app_load_config(extfile)) == NULL) {
+             ret = 1;
+             goto end;
+         }
+diff --git a/apps/openssl.c b/apps/openssl.c
+index fa3b683..7713f9f 100644
+--- a/apps/openssl.c
++++ b/apps/openssl.c
+@@ -172,6 +172,7 @@ static void apps_startup()
+     ERR_load_SSL_strings();
+     OpenSSL_add_all_algorithms();
+     OpenSSL_add_ssl_algorithms();
++    OPENSSL_load_builtin_modules();
+     setup_ui_method();
+     /*SSL_library_init();*/
+ #ifndef OPENSSL_NO_ENGINE
+@@ -199,43 +200,26 @@ static void apps_shutdown()
+ 
+ static char *make_config_name()
+ {
+-    const char *t = X509_get_default_cert_area();
++    const char *t;
+     size_t len;
+     char *p;
+ 
+-    len = strlen(t) + strlen(OPENSSL_CONF) + 2;
++    if ((t = getenv(&quot;OPENSSL_CONF&quot;)) != NULL
++        || (t = getenv(&quot;SSLEAY_CONF&quot;)) != NULL)
++        return BUF_strdup(t);
++
++    t = X509_get_default_cert_area();
++    len = strlen(t) + 1 + strlen(OPENSSL_CONF) + 1;
+     p = app_malloc(len, &quot;config filename buffer&quot;);
+-    BUF_strlcpy(p, t, len);
++    strcpy(p, t);
+ #ifndef OPENSSL_SYS_VMS
+-    BUF_strlcat(p, &quot;/&quot;, len);
++    strcat(p, &quot;/&quot;);
+ #endif
+-    BUF_strlcat(p, OPENSSL_CONF, len);
++    strcat(p, OPENSSL_CONF);
+ 
+     return p;
+ }
+ 
+-static int load_config(CONF *cnf)
+-{
+-    static int load_config_called = 0;
+-
+-    if (load_config_called)
+-        return 1;
+-    load_config_called = 1;
+-    if (!cnf)
+-        cnf = config;
+-    if (!cnf)
+-        return 1;
+-
+-    OPENSSL_load_builtin_modules();
+-
+-    if (CONF_modules_load(cnf, NULL, 0) &lt;= 0) {
+-        BIO_printf(bio_err, &quot;Error configuring OpenSSL\n&quot;);
+-        ERR_print_errors(bio_err);
+-        return 0;
+-    }
+-    return 1;
+-}
+-
+ static void lock_dbg_cb(int mode, int type, const char *file, int line)
+ {
+     static int modes[CRYPTO_NUM_LOCKS];
+@@ -338,12 +322,11 @@ int main(int argc, char *argv[])
+     FUNCTION f, *fp;
+     LHASH_OF(FUNCTION) *prog = NULL;
+     char **copied_argv = NULL;
+-    char *p, *pname, *to_free = NULL;
++    char *p, *pname;
+     char buf[1024];
+     const char *prompt;
+     ARGS arg;
+     int first, n, i, ret = 0;
+-    long errline;
+ 
+     arg.argv = NULL;
+     arg.size = 0;
+@@ -394,36 +377,11 @@ int main(int argc, char *argv[])
+     pname = opt_progname(argv[0]);
+ 
+     /* Lets load up our environment a little */
++    default_config_file = make_config_name();
+     bio_in = dup_bio_in();
+     bio_out = dup_bio_out();
+     bio_err = BIO_new_fp(stderr, BIO_NOCLOSE | BIO_FP_TEXT);
+ 
+-    /* Determine and load the config file. */
+-    default_config_file = getenv(&quot;OPENSSL_CONF&quot;);
+-    if (default_config_file == NULL)
+-        default_config_file = getenv(&quot;SSLEAY_CONF&quot;);
+-    if (default_config_file == NULL)
+-        default_config_file = to_free = make_config_name();
+-    if (!load_config(NULL))
+-        goto end;
+-    config = NCONF_new(NULL);
+-    i = NCONF_load(config, default_config_file, &amp;errline);
+-    if (i == 0) {
+-        if (ERR_GET_REASON(ERR_peek_last_error())
+-            == CONF_R_NO_SUCH_FILE) {
+-            BIO_printf(bio_err,
+-                       &quot;%s: WARNING: can't open config file: %s\n&quot;,
+-                       pname, default_config_file);
+-            ERR_clear_error();
+-            NCONF_free(config);
+-            config = NULL;
+-        } else {
+-            ERR_print_errors(bio_err);
+-            NCONF_free(config);
+-            exit(1);
+-        }
+-    }
+-
+     /* first check the program name */
+     f.name = pname;
+     fp = lh_FUNCTION_retrieve(prog, &amp;f);
+@@ -510,7 +468,7 @@ int main(int argc, char *argv[])
+     ret = 1;
+  end:
+     OPENSSL_free(copied_argv);
+-    OPENSSL_free(to_free);
++    OPENSSL_free(default_config_file);
+     NCONF_free(config);
+     config = NULL;
+     lh_FUNCTION_free(prog);
+diff --git a/apps/req.c b/apps/req.c
+index 5514ee3..a0e0cc9 100644
+--- a/apps/req.c
++++ b/apps/req.c
+@@ -200,7 +200,7 @@ int req_main(int argc, char **argv)
+     char *outfile = NULL, *keyfile = NULL, *inrand = NULL;
+     char *keyalgstr = NULL, *p, *prog, *passargin = NULL, *passargout = NULL;
+     char *passin = NULL, *passout = NULL, *req_exts = NULL, *subj = NULL;
+-    char *template = NULL, *keyout = NULL;
++    char *template = default_config_file, *keyout = NULL;
+     const char *keyalg = NULL;
+     OPTION_CHOICE o;
+     int ret = 1, x509 = 0, days = 30, i = 0, newreq = 0, verbose =
+@@ -377,31 +377,9 @@ int req_main(int argc, char **argv)
+         goto end;
+     }
+ 
+-    if (template != NULL) {
+-        long errline = -1;
+-
+-        if (verbose)
+-            BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;, template);
+-        req_conf = NCONF_new(NULL);
+-        i = NCONF_load(req_conf, template, &amp;errline);
+-        if (i == 0) {
+-            BIO_printf(bio_err, &quot;error on line %ld of %s\n&quot;, errline,
+-                       template);
+-            goto end;
+-        }
+-    } else {
+-        req_conf = config;
+-
+-        if (req_conf == NULL) {
+-            BIO_printf(bio_err, &quot;Unable to load config info from %s\n&quot;,
+-                       default_config_file);
+-            if (newreq)
+-                goto end;
+-        } else if (verbose)
+-            BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;,
+-                       default_config_file);
+-    }
+-
++    if (verbose)
++        BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;, template);
++    req_conf = app_load_config(template);
+     if (req_conf != NULL) {
+         p = NCONF_get_string(req_conf, NULL, &quot;oid_file&quot;);
+         if (p == NULL)
+@@ -873,8 +851,7 @@ int req_main(int argc, char **argv)
+     if (ret) {
+         ERR_print_errors(bio_err);
+     }
+-    if (req_conf != config)
+-        NCONF_free(req_conf);
++    NCONF_free(req_conf);
+     BIO_free(in);
+     BIO_free_all(out);
+     EVP_PKEY_free(pkey);
+diff --git a/apps/spkac.c b/apps/spkac.c
+index abae0e1..bd99f0e 100644
+--- a/apps/spkac.c
++++ b/apps/spkac.c
+@@ -95,7 +95,7 @@ OPTIONS spkac_options[] = {
+ 
+ int spkac_main(int argc, char **argv)
+ {
+-    BIO *in = NULL, *out = NULL;
++    BIO *out = NULL;
+     CONF *conf = NULL;
+     ENGINE *e = NULL;
+     EVP_PKEY *pkey = NULL;
+@@ -184,18 +184,9 @@ int spkac_main(int argc, char **argv)
+         goto end;
+     }
+ 
+-    in = bio_open_default(infile, &quot;r&quot;);
+-    if (in == NULL)
++    if ((conf = app_load_config(infile)) == NULL)
+         goto end;
+ 
+-    conf = NCONF_new(NULL);
+-    i = NCONF_load_bio(conf, in, NULL);
+-    if (!i) {
+-        BIO_printf(bio_err, &quot;Error parsing config file\n&quot;);
+-        ERR_print_errors(bio_err);
+-        goto end;
+-    }
+-
+     spkstr = NCONF_get_string(conf, spksect, spkac);
+ 
+     if (!spkstr) {
+@@ -237,7 +228,6 @@ int spkac_main(int argc, char **argv)
+  end:
+     NCONF_free(conf);
+     NETSCAPE_SPKI_free(spki);
+-    BIO_free(in);
+     BIO_free_all(out);
+     EVP_PKEY_free(pkey);
+     OPENSSL_free(passin);
+diff --git a/apps/srp.c b/apps/srp.c
+index 161f2b8..b91d7d0 100644
+--- a/apps/srp.c
++++ b/apps/srp.c
+@@ -255,14 +255,13 @@ int srp_main(int argc, char **argv)
+     CA_DB *db = NULL;
+     DB_ATTR db_attr;
+     CONF *conf = NULL;
+-    int gNindex = -1, maxgN = -1, ret = 1, errors = 0, verbose =
+-        0, i, doupdatedb = 0;
+-    int mode = OPT_ERR;
++    int gNindex = -1, maxgN = -1, ret = 1, errors = 0, verbose = 0, i;
++    int doupdatedb = 0, mode = OPT_ERR;
+     char *user = NULL, *passinarg = NULL, *passoutarg = NULL;
+     char *passin = NULL, *passout = NULL, *gN = NULL, *userinfo = NULL;
+     char *randfile = NULL, *tofree = NULL, *section = NULL;
+-    char **gNrow = NULL, *configfile = NULL, *dbfile = NULL, **pp, *prog;
+-    long errorline = -1;
++    char **gNrow = NULL, *configfile = default_config_file;
++    char *dbfile = NULL, **pp, *prog;
+     OPTION_CHOICE o;
+ 
+     prog = opt_init(argc, argv, srp_options);
+@@ -349,42 +348,12 @@ int srp_main(int argc, char **argv)
+     }
+ 
+     if (!dbfile) {
+-
+-        /*****************************************************************/
+-        tofree = NULL;
+-        if (configfile == NULL)
+-            configfile = getenv(&quot;OPENSSL_CONF&quot;);
+-        if (configfile == NULL)
+-            configfile = getenv(&quot;SSLEAY_CONF&quot;);
+-        if (configfile == NULL) {
+-            const char *s = X509_get_default_cert_area();
+-            size_t len = strlen(s) + 1 + sizeof(CONFIG_FILE);
+-
+-            tofree = app_malloc(len, &quot;config filename space&quot;);
+-# ifdef OPENSSL_SYS_VMS
+-            strcpy(tofree, s);
+-# else
+-            BUF_strlcpy(tofree, s, len);
+-            BUF_strlcat(tofree, &quot;/&quot;, len);
+-# endif
+-            BUF_strlcat(tofree, CONFIG_FILE, len);
+-            configfile = tofree;
+-        }
+-
+         if (verbose)
+-            BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;, configfile);
+-        conf = NCONF_new(NULL);
+-        if (NCONF_load(conf, configfile, &amp;errorline) &lt;= 0) {
+-            if (errorline &lt;= 0)
+-                BIO_printf(bio_err, &quot;error loading the config file '%s'\n&quot;,
+-                           configfile);
+-            else
+-                BIO_printf(bio_err, &quot;error on line %ld of config file '%s'\n&quot;,
+-                           errorline, configfile);
++            BIO_printf(bio_err, &quot;Using configuration from %s\n&quot;,
++                       configfile);
++        conf = app_load_config(configfile);
++        if (conf == NULL)
+             goto end;
+-        }
+-        OPENSSL_free(tofree);
+-        tofree = NULL;
+ 
+         /* Lets get the config section we are using */
+         if (section == NULL) {
+diff --git a/apps/ts.c b/apps/ts.c
+index 5c42ff5..be2482c 100644
+--- a/apps/ts.c
++++ b/apps/ts.c
+@@ -188,7 +188,8 @@ int ts_main(int argc, char **argv)
+ {
+     CONF *conf = NULL;
+     char *CAfile = NULL, *untrusted = NULL, *engine = NULL, *prog, **helpp;
+-    char *configfile = NULL, *section = NULL, *password = NULL;
++    char *configfile = default_config_file;
++    char *section = NULL, *password = NULL;
+     char *data = NULL, *digest = NULL, *rnd = NULL, *policy = NULL;
+     char *in = NULL, *out = NULL, *queryfile = NULL, *passin = NULL;
+     char *inkey = NULL, *signer = NULL, *chain = NULL, *CApath = NULL;
+@@ -389,24 +390,7 @@ static ASN1_OBJECT *txt2obj(const char *oid)
+ 
+ static CONF *load_config_file(const char *configfile)
+ {
+-    CONF *conf = NULL;
+-    long errorline = -1;
+-
+-    if (!configfile)
+-        configfile = getenv(&quot;OPENSSL_CONF&quot;);
+-    if (!configfile)
+-        configfile = getenv(&quot;SSLEAY_CONF&quot;);
+-
+-    if (configfile &amp;&amp;
+-        ((conf = NCONF_new(NULL)) == NULL
+-         || NCONF_load(conf, configfile, &amp;errorline) &lt;= 0)) {
+-        if (errorline &lt;= 0)
+-            BIO_printf(bio_err, &quot;error loading the config file &quot;
+-                       &quot;'%s'\n&quot;, configfile);
+-        else
+-            BIO_printf(bio_err, &quot;error on line %ld of config file &quot;
+-                       &quot;'%s'\n&quot;, errorline, configfile);
+-    }
++    CONF *conf = app_load_config(configfile);
+ 
+     if (conf != NULL) {
+         const char *p;
+diff --git a/apps/x509.c b/apps/x509.c
+index f22eef1..1a6e327 100644
+--- a/apps/x509.c
++++ b/apps/x509.c
+@@ -521,19 +521,9 @@ int x509_main(int argc, char **argv)
+     }
+ 
+     if (extfile) {
+-        long errorline = -1;
+         X509V3_CTX ctx2;
+-        extconf = NCONF_new(NULL);
+-        if (!NCONF_load(extconf, extfile, &amp;errorline)) {
+-            if (errorline &lt;= 0)
+-                BIO_printf(bio_err,
+-                           &quot;error loading the config file '%s'\n&quot;, extfile);
+-            else
+-                BIO_printf(bio_err,
+-                           &quot;error on line %ld of config file '%s'\n&quot;,
+-                           errorline, extfile);
++        if ((extconf = app_load_config(extfile)) == NULL)
+             goto end;
+-        }
+         if (!extsect) {
+             extsect = NCONF_get_string(extconf, &quot;default&quot;, &quot;extensions&quot;);
+             if (!extsect) {
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001195.html">[openssl-commits] [openssl]  master update
+</A></li>
+	<LI>Next message: <A HREF="001201.html">[openssl-commits] [openssl]  master update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1200">[ date ]</a>
+              <a href="thread.html#1200">[ thread ]</a>
+              <a href="subject.html#1200">[ subject ]</a>
+              <a href="author.html#1200">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="../../../mailman/listinfo/openssl-commits.html">More information about the openssl-commits
+mailing list</a><br>
+</body></html>
